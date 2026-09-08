@@ -54,9 +54,13 @@ SPECS_LOCAL_ENV = "EUGENE_PLEXUS_SPECS_LOCAL_PATH"
 # models.py via common.yaml's transitive closure, and the gateway
 # only ever decodes identity responses (never serializes paths from
 # identity.yaml directly).
+# Spec filenames track SPECS_REF, not this repo's name. The pin below is
+# still a pre-rename commit where these documents are orchestrator.yaml /
+# hemisphere-driver.yaml; both names change in the same commit that bumps
+# the pin, because bumping it also deletes schemas this code still uses.
 SPECS_TO_GENERATE: list[tuple[str, str, list[str] | None]] = [
-    ("openapi/gateway.yaml", "models.py", None),
-    ("openapi/inference-driver.yaml", "hemisphere_models.py", None),
+    ("openapi/orchestrator.yaml", "models.py", None),
+    ("openapi/hemisphere-driver.yaml", "hemisphere_models.py", None),
 ]
 
 
