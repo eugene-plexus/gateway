@@ -21,7 +21,7 @@ class _DropHealthzFilter(logging.Filter):
 
     The watchdog probes /healthz on every supervised child constantly,
     and at INFO each probe produces a line. That floods the log file
-    and buries the bicameral DEBUG trace we actually want to read. Drop
+    and buries the routing DEBUG trace we actually want to read. Drop
     them — the watchdog already tracks component health on its side.
     """
 

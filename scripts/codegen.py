@@ -42,25 +42,16 @@ SPECS_TARBALL_URL_TEMPLATE = "https://github.com/eugene-plexus/specs/archive/{re
 # and bumping SPECS_REF.
 SPECS_LOCAL_ENV = "EUGENE_PLEXUS_SPECS_LOCAL_PATH"
 
-# The gateway's wire surface is gateway.yaml (chat, conversations,
-# config, admin). It also *consumes* inference-driver.yaml as an HTTP
-# client, so we generate a second module of those types. Each input
-# transitively pulls components/common.yaml types into its own module —
-# we live with the duplication of common types between the two modules
-# rather than introducing shared-code coupling.
+# The gateway's own wire surface is gateway.yaml (the OpenAI-compatible
+# front door, config, admin). It also *consumes* inference-driver.yaml as
+# an HTTP client, so we generate a second module of those types. Each
+# input transitively pulls components/common.yaml types into its own
+# module — we live with duplicating the common types between the two
+# modules rather than introducing shared-code coupling.
 #
-# Identity types (Constitution, SelfModelEntry, Person, RelationshipSummary)
-# are NOT generated as a third module: they're already pulled into
-# models.py via common.yaml's transitive closure, and the gateway
-# only ever decodes identity responses (never serializes paths from
-# identity.yaml directly).
-# Spec filenames track SPECS_REF, not this repo's name. The pin below is
-# still a pre-rename commit where these documents are orchestrator.yaml /
-# hemisphere-driver.yaml; both names change in the same commit that bumps
-# the pin, because bumping it also deletes schemas this code still uses.
 SPECS_TO_GENERATE: list[tuple[str, str, list[str] | None]] = [
-    ("openapi/orchestrator.yaml", "models.py", None),
-    ("openapi/hemisphere-driver.yaml", "hemisphere_models.py", None),
+    ("openapi/gateway.yaml", "models.py", None),
+    ("openapi/inference-driver.yaml", "driver_models.py", None),
 ]
 
 

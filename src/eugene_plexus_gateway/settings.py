@@ -49,22 +49,14 @@ class Settings(BaseSettings):
     has logged in at the watchdog; absent during the configured-but-
     locked window. Reserved for Phase 6; Phase 3 does not consume it."""
 
-    disable_embedding_scorer: bool = False
-    """When true, the lifespan skips loading the sentence-transformer
-    agreement-scoring model and uses the Jaccard word-overlap fallback
-    directly. Tests set this to keep torch out of the test environment;
-    operators can set EUGENE_PLEXUS_GATEWAY_DISABLE_EMBEDDING_SCORER=1 to
-    intentionally run on the lightweight scorer on resource-constrained
-    boxes."""
-
     watchdog_url: str = "http://127.0.0.1:8079"
-    """Watchdog endpoint used to auto-resolve peer component URLs
-    (memory, identity) when those aren't explicitly set in config.
-    The watchdog is the source of truth for body-component topology;
-    components consult it on startup to find their peers rather than
-    relying on the operator to duplicate URLs in every component's
-    config. Override with EUGENE_PLEXUS_GATEWAY_WATCHDOG_URL on networked
-    deployments where the watchdog isn't on the loopback."""
+    """Watchdog endpoint the routing table is built from.
+
+    The watchdog is the source of truth for topology, so the gateway
+    reads its inference-driver entries rather than keeping backend URLs
+    in its own config — a URL duplicated into two components is the trap
+    this avoids. Override with EUGENE_PLEXUS_GATEWAY_WATCHDOG_URL on
+    networked deployments where the watchdog isn't on loopback."""
 
 
 def load_settings() -> Settings:

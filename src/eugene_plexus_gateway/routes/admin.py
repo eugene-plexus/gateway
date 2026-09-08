@@ -1,4 +1,4 @@
-"""Admin endpoints: drivers (list, probe), nt-state, and restart."""
+"""Admin endpoints: drivers (list, probe) and restart."""
 
 from __future__ import annotations
 
@@ -14,11 +14,11 @@ from .._generated.models import (
     DriverHealth,
     DriverProbeRequest,
     DriversInfo,
-    NTState,
     Problem,
     RestartResult,
 )
 from ..driver_client import DriverClient, HttpDriverClient
+from ..routing import RoutingTable
 
 router = APIRouter(tags=["admin"])
 
@@ -59,24 +59,45 @@ async def _driver_health(client: DriverClient) -> DriverHealth:
 
 @router.get("/v1/admin/drivers", response_model=DriversInfo)
 async def list_drivers(request: Request) -> DriversInfo:
-    drivers: list[DriverClient] = request.app.state.drivers
+    """What the gateway currently sees behind each driver in the topology.
 
-    if not drivers:
+    Reads the last routing-table refresh rather than re-probing: the
+    refresh already asked every driver `/v1/info`, and an admin view that
+    fanned out again would report a different world from the one requests
+    are actually routed against.
+    """
+    table: RoutingTable | None = getattr(request.app.state, "routing", None)
+    if table is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=Problem(
-                type="https://github.com/eugene-plexus/gateway#no-drivers-configured",
-                title="No drivers configured",
+                type="https://github.com/eugene-plexus/gateway#no-routing-table",
+                title="No routing table",
                 status=503,
                 detail=(
-                    "The gateway has no drivers in its `drivers` config. "
-                    "PATCH /v1/config to populate, then restart."
+                    "The gateway is starting up or in safe mode, so it has not "
+                    "resolved any drivers yet."
                 ),
                 component="gateway",
             ).model_dump(exclude_none=True),
         )
 
-    healths = await asyncio.gather(*[_driver_health(c) for c in drivers])
+    healths = table.as_driver_health()
+    if not healths:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/gateway#no-drivers-in-topology",
+                title="No drivers in the topology",
+                status=503,
+                detail=(
+                    "The watchdog topology contains no inference-driver entries, "
+                    "so there is nothing to route to. Add one via the watchdog's "
+                    "POST /v1/components."
+                ),
+                component="gateway",
+            ).model_dump(exclude_none=True),
+        )
 
     if not any(h.reachable for h in healths):
         summary = "; ".join(f"{h.name}={h.url} ({h.error})" for h in healths)
@@ -86,12 +107,12 @@ async def list_drivers(request: Request) -> DriversInfo:
                 type="https://github.com/eugene-plexus/gateway#drivers-unreachable",
                 title="No drivers reachable",
                 status=503,
-                detail=f"None of the configured drivers are reachable. {summary}",
+                detail=f"No driver in the topology is reachable. {summary}",
                 component="gateway",
             ).model_dump(exclude_none=True),
         )
 
-    return DriversInfo(drivers=list(healths))
+    return DriversInfo(drivers=healths)
 
 
 @router.post("/v1/admin/drivers/probe", response_model=DriverHealth)
@@ -120,14 +141,6 @@ async def probe_driver(request: Request, body: DriverProbeRequest) -> DriverHeal
         await client.aclose()
 
 
-@router.get("/v1/admin/nt-state", response_model=NTState)
-async def get_nt_state(request: Request) -> NTState:
-    """Return the live NT state. Mutated by the chat handler on every
-    turn; reset to neutral on process restart (in-memory only)."""
-    state: NTState = request.app.state.nt_state
-    return state
-
-
 # Long enough for the 202 response body to flush back to the client over
 # a slow LAN, short enough that the operator doesn't sit waiting.
 _RESTART_DELAY_MS = 500
@@ -137,10 +150,9 @@ _RESTART_DELAY_MS = 500
 async def restart() -> RestartResult:
     """Schedule a process exit so a supervisor can relaunch with new config.
 
-    Mirrors the inference-driver restart endpoint. The gateway
-    only re-reads `requiresRestart: true` config keys (drivers list,
-    port, etc.) at startup; this is the UI's mechanism for completing a
-    config-change flow.
+    Mirrors the inference-driver restart endpoint. The gateway only
+    re-reads `requiresRestart: true` config keys at startup; this is the
+    UI's mechanism for completing a config-change flow.
     """
     log.warning("restart requested via /v1/admin/restart; exiting in %dms", _RESTART_DELAY_MS)
 

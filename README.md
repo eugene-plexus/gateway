@@ -4,48 +4,61 @@
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.12](https://img.shields.io/badge/python-3.12-3776AB.svg)](https://www.python.org)
 
-Front door of [Eugene Plexus](https://github.com/eugene-plexus). Owns the bicameral loop: dispatches each turn to **two** [`inference-driver`](https://github.com/eugene-plexus/inference-driver) instances in parallel (typically configured with different model families), runs the corpus-callosum blend on their outputs, decides terminate or another pass, and returns the final response.
+Front door of [Eugene Plexus](https://github.com/eugene-plexus): **one OpenAI-compatible endpoint over every configured backend.** It resolves a requested model to a backend, load-balances across the drivers serving it, and cascades down a priority list when one fails. That is its whole job.
 
-## Status
+**It holds no backend knowledge.** One [`inference-driver`](https://github.com/eugene-plexus/inference-driver) runs per backend and owns everything backend-specific — provider choice, model id, secrets, generation params, health. The two layers are never collapsed; see the [design doc](https://github.com/eugene-plexus/specs/blob/main/docs/design/local-inference-control-plane.md) for why.
 
-**v0.1, working bicameral loop.** Calls two configured hemisphere drivers, runs a trivial agreement-based corpus callosum, writes conversation history to in-process memory, and returns blended responses. Streaming (`/v1/chat/stream`) is stubbed pending the UI consumer.
+## The routing table is derived, not configured
+
+The gateway stores no backend URLs and no model list. It reads the watchdog topology for `inference-driver` entries, asks each one's `/v1/info` what it is serving, and groups the answers by model id. Three things follow:
+
+- Backend addresses live in exactly **one** place — the watchdog topology. A URL duplicated into two components is the trap this avoids.
+- **Adding a model is not a config edit.** Start an engine, point a driver at it, and it becomes routable on the next refresh.
+- **Failover falls out of the topology.** Two drivers serving the same model are automatically a priority list, so the cascade needs nothing configured.
 
 ## Wire contract
 
 This service implements the [`gateway.yaml`](https://github.com/eugene-plexus/specs/blob/main/openapi/gateway.yaml) OpenAPI 3.1 spec from [`eugene-plexus/specs`](https://github.com/eugene-plexus/specs). Pydantic models in `src/eugene_plexus_gateway/_generated/` are produced via codegen — see [Codegen](#codegen).
 
-Endpoints:
+| Method | Path | Notes |
+|--------|------|-------|
+| GET    | `/healthz`                | unauthenticated |
+| POST   | `/v1/chat/completions`    | OpenAI-compatible; `stream: true` for SSE |
+| GET    | `/v1/models`              | OpenAI-compatible; a view of the routing table |
+| GET    | `/v1/admin/drivers`       | operator-only |
+| POST   | `/v1/admin/drivers/probe` | operator-only |
+| POST   | `/v1/admin/restart`       | operator-only |
+| GET    | `/v1/config`              | operator-only |
+| GET    | `/v1/config/schema`       | operator-only |
+| PATCH  | `/v1/config`              | operator-only |
+| POST   | `/v1/config/test`         | operator-only |
 
-| Method | Path                            | Status      |
-|--------|---------------------------------|-------------|
-| GET    | `/healthz`                      | ✅           |
-| POST   | `/v1/chat`                      | ✅           |
-| POST   | `/v1/chat/stream`               | stub (501)  |
-| GET    | `/v1/conversations/{id}`        | ✅           |
-| GET    | `/v1/admin/drivers`             | ✅           |
-| POST   | `/v1/admin/drivers/probe`       | ✅           |
-| GET    | `/v1/admin/nt-state`            | ✅           |
-| POST   | `/v1/admin/restart`             | ✅           |
-| GET    | `/v1/config`                    | ✅           |
-| GET    | `/v1/config/schema`             | ✅           |
-| PATCH  | `/v1/config`                    | ✅           |
-| POST   | `/v1/config/test`               | ✅           |
+`/v1/chat/completions` and `/v1/models` are the **only** operations in Eugene Plexus that use snake_case field names and OpenAI's error envelope. That is deliberate and not negotiable: "OpenAI-compatible" is worth nothing unless an unmodified OpenAI SDK can point its `base_url` here and work, and those SDKs parse the error shape to build their exceptions. Renaming `max_tokens` to `maxTokens` for house consistency would break the entire audience.
 
-## What v0.1 does
+Both carry a namespaced `x_eugene_plexus` extension reporting which driver and backend served a request, its latency, and how many backends were tried. Clients ignore unknown fields, so it costs nothing — and the failure mode of a routing layer is opacity, so `attempts > 1` being visible is the point.
 
-- **A `drivers` list** in config (operator-supplied name + URL per entry). The gateway calls each in parallel for every turn. v0.1 requires exactly two; the agreement and blend functions are pairwise.
-- **Trivial corpus callosum:** agreement = Jaccard similarity of word-sets between the two outputs. Above the configured `agreementThreshold` → terminate; below → another pass; cap at `defaultMaxPasses`.
-- **Trivial blend:** when terminating, picks the longer of the two hemispheres' responses as the final assistant message. (Honest about the lack of a smart blend; deferred until we have data on what real disagreements look like.)
-- **Static neutral NT state.** The endpoint and schema exist so consumers can begin reading NT now; modulation lands in v0.2.
-- **Memory client.** Calls a separate `memory` component over HTTP (configurable `memoryUrl`); fails gracefully into degraded mode when memory is unreachable so chat doesn't fully die when storage hiccups.
-- **Safe-mode boot.** `EUGENE_PLEXUS_GATEWAY_SAFE_MODE=1` (set by the watchdog when a previous boot failed) skips loading the persisted config and keeps the gateway reachable for config edits while `/v1/chat` returns 503. Recovery path when bad config breaks startup.
-- **Restart endpoint.** `POST /v1/admin/restart` schedules a graceful process exit; an external supervisor (the watchdog, or systemd/docker for non-personal-use installs) respawns. Used by the UI's Restart Now flow after config changes that require it.
-- **DEBUG-level content trace.** Set `logLevel: DEBUG` in config and the bicameral loop logs every outgoing message (role + driverName + content), each hemisphere's response (finish reason + latency + content), the callosum agreement, and the final blended text. Useful when cross-vendor disagreements need debugging.
+## The gateway owns every output-affecting parameter
 
-## What v0.1 does NOT do
+Temperature, max tokens and stop sequences ride on every request the gateway makes downstream. A driver never substitutes a local default: if a value reaches a backend, the gateway put it there. Anything the caller omits is filled from the install defaults in config — per-model settings profiles will resolve here too, once the library lands.
 
-- Streaming (the gateway's `/v1/chat/stream` endpoint and the underlying inference-driver streaming both wait on the UI consumer).
-- Drives, sleep consolidation, plasticity, EWC, autonomous thinking, real vector memory / RAG, tool/MCP integration, auth (assumes Tailscale tailnet).
+Correspondingly nothing here refuses a model. A backend that rejects `temperature`, as some reasoning models do, has the parameter dropped with a warning by the driver. You own the model; routing to it is the job.
+
+## Failure taxonomy
+
+The status codes distinguish the cases that differ operationally, because "it didn't work" is not an actionable answer:
+
+| Code | Meaning | Retry? |
+|------|---------|--------|
+| 404 | Nothing serves the requested model at all | No — fix the topology |
+| 400 | A backend rejected the request (4xx). Does **not** cascade: the next backend would reject it identically, and cascading past it would bury the real error | No — fix the request |
+| 503 | A driver serves the model but isn't ready — usually an engine still loading its weights | Yes |
+| 502 | The cascade ran and every eligible backend failed | Maybe |
+
+Transport errors, timeouts and 5xx cascade to the next backend; 4xx fails hard.
+
+## Safe mode
+
+`EUGENE_PLEXUS_GATEWAY_SAFE_MODE=1` (set by the watchdog after a failed boot) skips the persisted config and builds no routing table. `PATCH /v1/config` still writes to disk so the repair survives the next normal boot; `/v1/chat/completions` returns 503 until then, and `/v1/models` returns an empty list — "nothing available" being a valid answer to "what have you got".
 
 ## Running
 
@@ -56,20 +69,19 @@ python -m eugene_plexus_gateway
 
 Default port: `8080`, overridable via `EUGENE_PLEXUS_GATEWAY_BIND_PORT` (the watchdog uses this when supervising). Other startup behavior is configured via env vars (12-factor) or by editing `config.yaml` (auto-created in the working directory on first run).
 
-You'll need two `inference-driver` instances reachable. Typical local dev:
+The gateway needs a reachable **watchdog** — that is where it reads the topology from — and at least one `inference-driver` declared in it. Typical local dev:
 
 ```bash
-# in one shell
-EUGENE_PLEXUS_HD_CONFIG_FILE=./left.yaml EUGENE_PLEXUS_HD_BIND_PORT=8081 \
-  python -m eugene_plexus_inference_driver
-# in another
-EUGENE_PLEXUS_HD_CONFIG_FILE=./right.yaml EUGENE_PLEXUS_HD_BIND_PORT=8082 \
+# a driver, pointed at whatever backend you want
+EUGENE_PLEXUS_DRIVER_CONFIG_FILE=./qwen.yaml EUGENE_PLEXUS_DRIVER_BIND_PORT=8081 \
   python -m eugene_plexus_inference_driver
 ```
 
-…then add both to the gateway's `drivers` config (operator-chosen names; URLs match the driver bind ports). For personal-use installs the watchdog handles all of this automatically — this is the manual path for tinkering.
+…then declare it on the watchdog (`POST /v1/components` with `kind: inference-driver` and that url). Nothing goes into the gateway's own config: it discovers the driver, asks what it serves, and routes. For normal installs the watchdog does all of this — this is the manual path for tinkering.
 
-> **v0.1 has no auth.** Deployment assumption: behind a [Tailscale](https://tailscale.com/) tailnet or equivalent network boundary. Anyone reachable on the network can hit any endpoint. Auth lands in v0.2.
+Override the watchdog address with `EUGENE_PLEXUS_GATEWAY_WATCHDOG_URL` when it isn't on loopback.
+
+> **Auth is on by default when supervised.** The watchdog threads a signing key and a service token in at spawn; every endpoint except `/healthz` then requires a bearer token. Run standalone without those env vars and the gateway serves unauthenticated — dev only. A mesh VPN (Tailscale/WireGuard) is still the network boundary between hosts.
 
 ## Codegen
 

@@ -1,10 +1,13 @@
-"""HTTP client for talking to a single inference-driver instance.
+"""HTTP clients for talking to inference-driver instances.
 
-Implemented as a thin wrapper around an httpx.AsyncClient: one client per
-driver, lifetime managed by the FastAPI lifespan. The gateway calls
-all configured drivers in parallel via asyncio.gather. Each client carries
-the operator-supplied driver `name` so the bicameral loop can stamp it
-onto every emitted message and the admin endpoint can label it.
+Thin wrappers around httpx.AsyncClient: one client per driver, cached and
+reused by the routing table. Each carries the driver's topology `name` so
+a response can say which backend answered it.
+
+`FailoverDriverClient` composes several into a priority list. That is
+where failover lives — and because the routing table groups drivers by
+the model they serve, a slot's members come from the topology rather than
+from configuration.
 """
 
 from __future__ import annotations
@@ -15,7 +18,7 @@ from typing import Any, Protocol
 import httpx
 from pydantic import ValidationError
 
-from ._generated.hemisphere_models import (
+from ._generated.driver_models import (
     DriverInfo,
     GenerateRequest,
     GenerateResponse,
@@ -92,7 +95,7 @@ def _problem_from_response(response: httpx.Response) -> Problem | None:
 
 
 class DriverClient(Protocol):
-    """Contract every hemisphere client implements (real or fake-for-tests)."""
+    """Contract every driver client implements (real or fake-for-tests)."""
 
     name: str
     base_url: str
@@ -115,6 +118,10 @@ class HttpDriverClient:
     ) -> None:
         self.name = name
         self.base_url = base_url.rstrip("/")
+        # Mirrors FailoverDriverClient's surface so the route can read
+        # these off either without asking which kind it holds.
+        self.attempts = 1
+        self.served_by: str | None = name
         # When the watchdog threaded a service token in, attach it to
         # every outbound call. The driver validates against the shared
         # HMAC signing key. Headers stay unset when running unauthenticated
@@ -175,21 +182,16 @@ class FailoverDriverClient:
     """A driver *slot* backed by an ordered priority list of backends.
 
     Implements the same `DriverClient` protocol as
-    `HttpDriverClient`, so the bicameral loop is oblivious to
-    failover — it still sees exactly two slots and calls `.generate()`
-    on each. Internally this slot tries its candidate backends in order,
-    cascading to the next on a cascade-eligible failure (transport / 5xx
-    / timeout) and failing hard on a 4xx. See `_is_cascade_eligible`.
+    `HttpDriverClient`, so the caller is oblivious to failover — it
+    holds a client and calls `.generate()`. Internally this tries its
+    candidates in order, cascading on a cascade-eligible failure
+    (transport / 5xx / timeout) and failing hard on a 4xx. See
+    `_is_cascade_eligible`.
 
-    Granularity is per-turn-attempt, not per-pass: each `.generate()`
-    call independently walks the priority list from the top. A slot that
-    fell over to its backup on one pass will retry the primary on the
-    next — cheap, and it means a transiently-down primary recovers
-    without operator intervention.
-
-    A single-URL slot (the stock install) constructs one candidate and
-    behaves identically to the pre-v0.2.1 `HttpDriverClient`: the
-    loop runs once and the sole backend's error propagates unchanged.
+    Granularity is per-call: each `.generate()` independently walks the
+    list from the top, so a slot that fell over to its backup recovers to
+    the primary as soon as the primary is healthy again — no operator
+    intervention, and no sticky state to reset.
     """
 
     def __init__(self, *, name: str, candidates: list[DriverClient]) -> None:
@@ -201,6 +203,14 @@ class FailoverDriverClient:
         # The active backend on a given turn may differ after failover,
         # but the slot's identity is its primary.
         self.base_url = candidates[0].base_url
+
+        # What the last call actually did, for the response's routing
+        # extension. Per-instance mutable state, which is safe ONLY
+        # because an instance is per-request: `RoutingTable.resolve`
+        # builds a fresh wrapper around the shared, long-lived
+        # HttpDriverClients on every call. Do not cache one of these.
+        self.attempts = 0
+        self.served_by: str | None = None
 
     async def info(self) -> DriverInfo:
         """Report the first reachable backend's `/v1/info`.
@@ -223,8 +233,9 @@ class FailoverDriverClient:
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
         last_exc: Exception | None = None
         for index, candidate in enumerate(self._candidates):
+            self.attempts = index + 1
             try:
-                return await candidate.generate(request)
+                result = await candidate.generate(request)
             except Exception as exc:
                 if not _is_cascade_eligible(exc):
                     # 4xx / non-HTTP error — surface it without trying the
@@ -232,6 +243,9 @@ class FailoverDriverClient:
                     raise
                 last_exc = exc
                 self._log_cascade("generate", index, candidate, exc)
+            else:
+                self.served_by = getattr(candidate, "name", None)
+                return result
         # Every backend failed in a cascade-eligible way. Re-raise the
         # last failure so the chat route's existing DriverError
         # / httpx.HTTPError handlers surface it as they would for a

@@ -11,7 +11,7 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from eugene_plexus_gateway._generated.hemisphere_models import (
+from eugene_plexus_gateway._generated.driver_models import (
     FinishReason,
     GenerateRequest,
     GenerateResponse,
@@ -22,7 +22,7 @@ from eugene_plexus_gateway.driver_client import (
     FailoverDriverClient,
 )
 
-from .conftest import FakeHemisphereClient
+from .conftest import FakeDriverClient
 
 
 def _request() -> GenerateRequest:
@@ -39,14 +39,14 @@ def _driver_error(status_code: int) -> DriverError:
     )
 
 
-def _slot(*candidates: FakeHemisphereClient) -> FailoverDriverClient:
+def _slot(*candidates: FakeDriverClient) -> FailoverDriverClient:
     return FailoverDriverClient(name="left", candidates=list(candidates))
 
 
 async def test_primary_success_does_not_touch_backup() -> None:
-    primary = FakeHemisphereClient(name="left")
+    primary = FakeDriverClient(name="left")
     primary.responses = ["primary reply"]
-    backup = FakeHemisphereClient(name="left")
+    backup = FakeDriverClient(name="left")
     backup.responses = ["backup reply"]
 
     resp = await _slot(primary, backup).generate(_request())
@@ -57,9 +57,9 @@ async def test_primary_success_does_not_touch_backup() -> None:
 
 
 async def test_transport_error_cascades_to_backup() -> None:
-    primary = FakeHemisphereClient(name="left")
+    primary = FakeDriverClient(name="left")
     primary.generate_error = httpx.ConnectError("connection refused")
-    backup = FakeHemisphereClient(name="left")
+    backup = FakeDriverClient(name="left")
     backup.responses = ["backup reply"]
 
     resp = await _slot(primary, backup).generate(_request())
@@ -69,9 +69,9 @@ async def test_transport_error_cascades_to_backup() -> None:
 
 
 async def test_5xx_cascades_to_backup() -> None:
-    primary = FakeHemisphereClient(name="left")
+    primary = FakeDriverClient(name="left")
     primary.generate_error = _driver_error(503)
-    backup = FakeHemisphereClient(name="left")
+    backup = FakeDriverClient(name="left")
     backup.responses = ["backup reply"]
 
     resp = await _slot(primary, backup).generate(_request())
@@ -80,9 +80,9 @@ async def test_5xx_cascades_to_backup() -> None:
 
 
 async def test_timeout_cascades_to_backup() -> None:
-    primary = FakeHemisphereClient(name="left")
+    primary = FakeDriverClient(name="left")
     primary.generate_error = httpx.ReadTimeout("timed out")
-    backup = FakeHemisphereClient(name="left")
+    backup = FakeDriverClient(name="left")
     backup.responses = ["backup reply"]
 
     resp = await _slot(primary, backup).generate(_request())
@@ -94,9 +94,9 @@ async def test_4xx_fails_hard_without_cascading() -> None:
     """A 4xx is a request/auth/config bug — the next backend would hit
     it identically, so we surface it instead of masking it as 'all
     backends down'."""
-    primary = FakeHemisphereClient(name="left")
+    primary = FakeDriverClient(name="left")
     primary.generate_error = _driver_error(401)
-    backup = FakeHemisphereClient(name="left")
+    backup = FakeDriverClient(name="left")
     backup.responses = ["backup reply"]
 
     with pytest.raises(DriverError) as exc:
@@ -107,9 +107,9 @@ async def test_4xx_fails_hard_without_cascading() -> None:
 
 
 async def test_all_backends_fail_raises_last_error() -> None:
-    primary = FakeHemisphereClient(name="left")
+    primary = FakeDriverClient(name="left")
     primary.generate_error = httpx.ConnectError("primary down")
-    backup = FakeHemisphereClient(name="left")
+    backup = FakeDriverClient(name="left")
     backup.generate_error = _driver_error(502)
 
     with pytest.raises(DriverError) as exc:
@@ -121,7 +121,7 @@ async def test_all_backends_fail_raises_last_error() -> None:
 
 
 async def test_single_backend_behaves_like_passthrough() -> None:
-    only = FakeHemisphereClient(name="left")
+    only = FakeDriverClient(name="left")
     only.generate_error = _driver_error(500)
 
     with pytest.raises(DriverError):
@@ -129,9 +129,9 @@ async def test_single_backend_behaves_like_passthrough() -> None:
 
 
 async def test_info_failover_returns_first_reachable() -> None:
-    primary = FakeHemisphereClient(name="left")
+    primary = FakeDriverClient(name="left")
     primary.info_error = httpx.ConnectError("down")
-    backup = FakeHemisphereClient(name="left", model_id="backup-model")
+    backup = FakeDriverClient(name="left", model_id="backup-model")
 
     info = await _slot(primary, backup).info()
 
@@ -144,15 +144,15 @@ async def test_empty_candidates_rejected() -> None:
 
 
 async def test_base_url_is_primary() -> None:
-    primary = FakeHemisphereClient(name="left", base_url="http://primary")
-    backup = FakeHemisphereClient(name="left", base_url="http://backup")
+    primary = FakeDriverClient(name="left", base_url="http://primary")
+    backup = FakeDriverClient(name="left", base_url="http://backup")
     assert _slot(primary, backup).base_url == "http://primary"
 
 
 async def test_aclose_closes_every_backend() -> None:
     closed: list[str] = []
 
-    class _Tracking(FakeHemisphereClient):
+    class _Tracking(FakeDriverClient):
         async def aclose(self) -> None:
             closed.append(self.base_url)
 
@@ -168,7 +168,7 @@ async def test_retry_walks_from_top_each_call() -> None:
     recovers is used again on the next call rather than being stuck on
     the backup."""
 
-    class _FlakyPrimary(FakeHemisphereClient):
+    class _FlakyPrimary(FakeDriverClient):
         def __init__(self) -> None:
             super().__init__(name="left")
             self.fail_next = True
@@ -187,7 +187,7 @@ async def test_retry_walks_from_top_each_call() -> None:
             )
 
     primary = _FlakyPrimary()
-    backup = FakeHemisphereClient(name="left")
+    backup = FakeDriverClient(name="left")
     backup.responses = ["backup reply"]
     slot = _slot(primary, backup)
 

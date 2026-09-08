@@ -6,7 +6,7 @@ Per specs/openapi/gateway.yaml: when started with
   - skip loading its persisted config file (defaults only)
   - still expose /v1/config endpoints (operator can repair via UI)
   - report /healthz as `degraded` with `safeMode: true`
-  - return 503 from /v1/events (no drivers configured)
+  - return 503 from /v1/chat/completions (no routing table)
   - allow PATCH /v1/config to write to the on-disk file as normal
 """
 
@@ -30,12 +30,9 @@ def safe_mode_settings(tmp_path: Path) -> Settings:
     config.write_text(
         yaml.safe_dump(
             {
-                "drivers": [
-                    {"name": "left", "url": "http://127.0.0.1:8081"},
-                    {"name": "right", "url": "http://127.0.0.1:8082"},
-                ],
-                "memoryUrl": "http://memory.persisted.example:8083",
                 "logLevel": "DEBUG",
+                "defaultTemperature": 1.9,
+                "requestTimeoutSeconds": 900,
             }
         ),
         encoding="utf-8",
@@ -63,27 +60,39 @@ def test_healthz_reports_safe_mode_and_degraded(safe_mode_client: TestClient) ->
 
 
 def test_config_get_returns_defaults_not_disk_values(safe_mode_client: TestClient) -> None:
-    """Disk had a custom memoryUrl + DEBUG log level; safe mode must ignore
-    the file and serve the built-in defaults instead. Drivers in safe
-    mode fall back to the canonical left/right localhost pair (the field
-    default), not to the persisted disk values."""
+    """Disk had DEBUG plus tweaked generation values; safe mode must
+    ignore the file and serve the built-in defaults instead. That is the
+    whole point — a config that breaks startup can't be the config we
+    boot from."""
     response = safe_mode_client.get("/v1/config")
     assert response.status_code == 200
     body = response.json()
     assert body["logLevel"] == "INFO"
-    assert "memory.persisted.example" not in str(body.get("memoryUrl", "")), (
-        "safe mode loaded memoryUrl from disk"
-    )
+    assert body["defaultTemperature"] == 0.7
+    assert body["requestTimeoutSeconds"] == 180
 
 
-def test_events_return_503_in_safe_mode(safe_mode_client: TestClient) -> None:
-    from tests.conftest import make_message_event
-
+def test_chat_returns_503_in_safe_mode(safe_mode_client: TestClient) -> None:
+    """No routing table is built in safe mode, so there is nothing to
+    route to — and the error uses OpenAI's envelope, since a client
+    hitting the front door gets the same shape whatever went wrong."""
     response = safe_mode_client.post(
-        "/v1/events",
-        json=make_message_event("hi").model_dump(mode="json", exclude_none=True),
+        "/v1/chat/completions",
+        json={"model": "anything", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert response.status_code == 503
+    assert "error" in response.json()
+    assert response.json()["error"]["type"] == "service_unavailable"
+
+
+def test_models_is_empty_but_not_an_error_in_safe_mode(
+    safe_mode_client: TestClient,
+) -> None:
+    """A client discovering models should get an empty list, not a 503 —
+    "nothing available" is a valid answer to "what have you got"."""
+    response = safe_mode_client.get("/v1/models")
+    assert response.status_code == 200
+    assert response.json() == {"object": "list", "data": []}
 
 
 def test_patch_config_writes_to_disk_in_safe_mode(

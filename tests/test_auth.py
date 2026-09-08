@@ -28,9 +28,8 @@ from fastapi.testclient import TestClient
 
 from eugene_plexus_gateway.app import create_app
 from eugene_plexus_gateway.auth_state import AuthState
-from eugene_plexus_gateway.memory import InProcessMemory
 from eugene_plexus_gateway.settings import Settings
-from tests.conftest import FakeHemisphereClient, make_message_event
+from tests.conftest import FakeDriverClient, make_routing_table
 
 _JWT_ALG = "HS256"
 
@@ -68,13 +67,10 @@ def signing_key() -> bytes:
 def authed_app(
     settings: Settings,
     signing_key: bytes,
-    left_fake: FakeHemisphereClient,
-    right_fake: FakeHemisphereClient,
+    fake_driver: FakeDriverClient,
 ) -> FastAPI:
     app = create_app(settings=settings)
-    app.state.drivers = [left_fake, right_fake]
-    app.state.memory = InProcessMemory()
-    app.state.memory_url = "in-process"
+    app.state.routing = make_routing_table(fake_driver)
     # Pre-populate auth_state with a real signing key; the lifespan
     # leaves it alone because hasattr is True.
     app.state.auth_state = AuthState(
@@ -189,76 +185,58 @@ def test_operator_token_accepted_on_admin(authed_client: TestClient, operator_to
     assert response.status_code == 200
 
 
-def test_operator_token_accepted_on_events(
-    authed_client: TestClient,
-    operator_token: str,
+def test_operator_token_accepted_on_chat(
+    authed_client: TestClient, operator_token: str, fake_driver: FakeDriverClient
 ) -> None:
+    fake_driver.responses = ["hello from the model"]
     response = authed_client.post(
-        "/v1/events",
-        json=make_message_event("hi").model_dump(mode="json", exclude_none=True),
+        "/v1/chat/completions",
+        json={
+            "model": fake_driver.model_id,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
         headers={"Authorization": f"Bearer {operator_token}"},
     )
-    assert response.status_code == 202, response.text
-
-
-# --------------------------------------------------------------------------- #
-# Service audience — accepted on mixed routes, REJECTED on operator routes
-# --------------------------------------------------------------------------- #
+    assert response.status_code == 200, response.text
 
 
 def test_service_token_rejected_on_config(authed_client: TestClient, service_token: str) -> None:
-    """A leaked service token must not be usable to edit config."""
-    response = authed_client.patch(
-        "/v1/config",
-        json={"logLevel": "DEBUG"},
-        headers={"Authorization": f"Bearer {service_token}"},
-    )
+    """Config is operator-only: a peer component has no business editing it."""
+    response = authed_client.get("/v1/config", headers={"Authorization": f"Bearer {service_token}"})
     assert response.status_code == 401
 
 
 def test_service_token_rejected_on_admin_restart(
     authed_client: TestClient, service_token: str
 ) -> None:
+    """And it certainly has no business restarting the gateway."""
     response = authed_client.post(
-        "/v1/admin/restart",
-        headers={"Authorization": f"Bearer {service_token}"},
+        "/v1/admin/restart", headers={"Authorization": f"Bearer {service_token}"}
     )
     assert response.status_code == 401
 
 
-def test_service_token_accepted_on_events(
-    authed_client: TestClient,
-    service_token: str,
+def test_service_token_accepted_on_chat(
+    authed_client: TestClient, service_token: str, fake_driver: FakeDriverClient
 ) -> None:
-    """Peer components (e.g. the connector injecting an event when a
-    Discord message arrives) authenticate with a service-audience token."""
+    """The front door accepts service tokens: another component calling
+    in (a Discord connector, say) is a legitimate caller of the one
+    OpenAI-compatible endpoint."""
+    fake_driver.responses = ["hello"]
     response = authed_client.post(
-        "/v1/events",
-        json=make_message_event("ping").model_dump(mode="json", exclude_none=True),
+        "/v1/chat/completions",
+        json={
+            "model": fake_driver.model_id,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
         headers={"Authorization": f"Bearer {service_token}"},
     )
-    assert response.status_code == 202, response.text
+    assert response.status_code == 200, response.text
 
 
-def test_service_token_accepted_on_conversation_read(
-    authed_client: TestClient,
-    service_token: str,
-) -> None:
-    """Both audiences are accepted on /v1/conversations. A service-token
-    read of an unknown conversation passes auth (404), not 401 — which is
-    what proves the token was accepted."""
-    from uuid import uuid4
-
-    read = authed_client.get(
-        f"/v1/conversations/{uuid4()}",
-        headers={"Authorization": f"Bearer {service_token}"},
-    )
-    assert read.status_code == 404, read.text  # auth passed; conversation absent
-
-
-# --------------------------------------------------------------------------- #
-# auth_state.load_auth_state contract
-# --------------------------------------------------------------------------- #
+def test_service_token_accepted_on_models(authed_client: TestClient, service_token: str) -> None:
+    response = authed_client.get("/v1/models", headers={"Authorization": f"Bearer {service_token}"})
+    assert response.status_code == 200
 
 
 def test_load_auth_state_disabled_when_no_signing_key() -> None:

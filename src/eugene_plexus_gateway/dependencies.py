@@ -5,7 +5,7 @@ true (the dev/standalone path):
 
   * `require_authorized` — accepts an operator-audience OR any
     `service:*`-audience token. Used for routes reachable from both the
-    UI and peer components (chat, conversations, NT-state read).
+    UI and peer components (the OpenAI-compatible front door).
 
   * `require_operator` — accepts operator-audience only. Used for
     operator-only routes (config edits, admin/restart, drivers
