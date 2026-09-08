@@ -245,6 +245,10 @@ def _routing_info(
     )
     return CompletionRoutingInfo(
         driver=served_by,
+        # The engine process behind that driver, when the watchdog
+        # supervises one. Absent for hosted and CLI backends, and for a
+        # model with replicas — see RoutingTable.runtime_for.
+        runtime=table.runtime_for(model),
         backend=backend_kind,
         latency_ms=int((time.monotonic() - started) * 1000),
         attempts=attempts if isinstance(attempts, int) and attempts >= 1 else 1,

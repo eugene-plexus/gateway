@@ -11,6 +11,13 @@ watchdog topology for `inference-driver` entries, asks each one's
     list, which means failover falls out of the topology rather than
     needing to be configured
 
+The same refresh also reads `/v1/runtimes`, so a served request can name
+the engine process behind it and a model can report a context window
+even when its driver doesn't know one. Correlation is by model id: a
+runtime's `modelAlias` is by definition what a client asks the gateway
+for, so an alias that equals what a driver serves identifies the runtime
+behind that driver, with no new field on any contract.
+
 The refresh is periodic rather than on-demand because a request should
 never pay for topology discovery, and because engines come and go under
 the watchdog without telling anyone.
@@ -57,6 +64,14 @@ class _Unreachable:
     error: str
 
 
+@dataclass(frozen=True)
+class _RuntimeFacts:
+    """What the watchdog knows about the engine serving one model alias."""
+
+    name: str
+    context_length: int | None
+
+
 @dataclass
 class _Snapshot:
     """One resolved view of the world. Replaced wholesale on refresh so a
@@ -65,6 +80,10 @@ class _Snapshot:
     by_model: dict[str, list[_Backend]] = field(default_factory=dict)
     reachable: list[_Backend] = field(default_factory=list)
     unreachable: list[_Unreachable] = field(default_factory=list)
+    # Keyed by model alias. An alias claimed by more than one runtime is
+    # absent: that is a replica pair, and naming one of them would be a
+    # coin flip presented as a fact.
+    runtimes: dict[str, _RuntimeFacts] = field(default_factory=dict)
 
 
 class RoutingTable:
@@ -131,7 +150,12 @@ class RoutingTable:
     # --- refresh ----------------------------------------------------------
 
     async def refresh(self) -> None:
-        entries = await self.fetch_driver_entries()
+        # Both reads hit the same watchdog; do them together so a refresh
+        # costs one round trip's latency rather than two.
+        entries, runtimes = await asyncio.gather(
+            self.fetch_driver_entries(),
+            self.fetch_runtime_facts(),
+        )
 
         # Drop clients for drivers that left the topology.
         live_keys = {(name, url) for name, url in entries}
@@ -147,7 +171,7 @@ class RoutingTable:
             return_exceptions=True,
         )
 
-        snapshot = _Snapshot()
+        snapshot = _Snapshot(runtimes=runtimes)
         for result in results:
             if isinstance(result, BaseException):
                 log.warning("driver probe raised unexpectedly: %s", result)
@@ -179,10 +203,12 @@ class RoutingTable:
 
         self._snapshot = snapshot
         log.debug(
-            "routing table refreshed: %d model(s) across %d reachable driver(s), %d unreachable",
+            "routing table refreshed: %d model(s) across %d reachable driver(s), "
+            "%d unreachable, %d runtime alias(es)",
             len(snapshot.by_model),
             len(snapshot.reachable),
             len(snapshot.unreachable),
+            len(snapshot.runtimes),
         )
 
     async def fetch_driver_entries(self) -> list[tuple[str, str]]:
@@ -227,6 +253,67 @@ class RoutingTable:
                 out.append((name, url.rstrip("/")))
         return out
 
+    async def fetch_runtime_facts(self) -> dict[str, _RuntimeFacts]:
+        """Model alias -> the engine runtime serving it, from the watchdog.
+
+        Purely additive: everything the gateway routes on still comes
+        from the drivers. This only lets a response say *which engine
+        process* answered and how big its context actually is — two
+        fields the contract documents and nothing could previously fill,
+        because a driver knows its base URL but not that a supervised
+        runtime is listening on the other end of it.
+
+        An unreachable watchdog yields an empty map, so both fields go
+        back to being absent. Nothing stops routing over it.
+        """
+        headers = {"Authorization": f"Bearer {self._service_token}"} if self._service_token else {}
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(
+                    f"{self._watchdog_url.rstrip('/')}/v1/runtimes",
+                    headers=headers,
+                )
+            if response.status_code >= 400:
+                log.debug(
+                    "watchdog /v1/runtimes returned %d; no runtime attribution this refresh",
+                    response.status_code,
+                )
+                return {}
+            body: Any = response.json()
+        except (httpx.HTTPError, ValueError) as e:
+            log.debug("could not read watchdog runtimes (%s); no runtime attribution", e)
+            return {}
+
+        runtimes = body.get("runtimes") if isinstance(body, dict) else None
+        if not isinstance(runtimes, list):
+            return {}
+
+        facts: dict[str, _RuntimeFacts] = {}
+        ambiguous: set[str] = set()
+        for entry in runtimes:
+            if not isinstance(entry, dict):
+                continue
+            alias = entry.get("modelAlias")
+            name = entry.get("name")
+            if not isinstance(alias, str) or not alias or not isinstance(name, str) or not name:
+                continue
+            if alias in facts:
+                # Two runtimes under one alias are replicas. Which one
+                # served a given request is knowable, but not from here
+                # — the driver would have to say. Drop the alias rather
+                # than report a guess.
+                ambiguous.add(alias)
+                continue
+            capabilities = entry.get("capabilities")
+            context = capabilities.get("contextLength") if isinstance(capabilities, dict) else None
+            facts[alias] = _RuntimeFacts(
+                name=name,
+                context_length=context if isinstance(context, int) and context > 0 else None,
+            )
+        for alias in ambiguous:
+            facts.pop(alias, None)
+        return facts
+
     async def _probe(self, name: str, url: str) -> _Backend | _Unreachable:
         client = self._clients.get((name, url))
         if client is None:
@@ -266,6 +353,15 @@ class RoutingTable:
     def backends_for(self, model: str) -> list[_Backend]:
         return list(self._snapshot.by_model.get(model, []))
 
+    def runtime_for(self, model: str) -> str | None:
+        """Name of the engine runtime serving `model`, when there is one.
+
+        Absent for a hosted or CLI backend, which has no runtime of ours,
+        and for a model served by several runtimes at once.
+        """
+        facts = self._snapshot.runtimes.get(model)
+        return facts.name if facts is not None else None
+
     def known_models(self) -> list[str]:
         return sorted(self._snapshot.by_model)
 
@@ -296,7 +392,9 @@ class RoutingTable:
                     x_eugene_plexus=ModelRoutingInfo(
                         drivers=[b.name for b in backends],
                         backends=sorted({_backend_kind(b) for b in backends}),
-                        context_length=_smallest_context(backends),
+                        context_length=_smallest_context(
+                            backends, self._snapshot.runtimes.get(model_id)
+                        ),
                     ),
                 )
             )
@@ -338,18 +436,26 @@ def _backend_kind(backend: _Backend) -> BackendKind:
     return BackendKind(backend.info.backend.value)
 
 
-def _smallest_context(backends: list[_Backend]) -> int | None:
+def _smallest_context(backends: list[_Backend], runtime: _RuntimeFacts | None) -> int | None:
     """Smallest context window among the backends serving one model.
 
     The honest number to report, since a request may land on any of
     them — promising the largest would mean a prompt that fits the
     advertised window can still be rejected.
+
+    The supervised runtime counts as one of those numbers. An
+    `openai_compat_http` driver reports no capabilities at all (it can
+    only see an HTTP endpoint), so without this the local-engine case —
+    the one where we *do* know the answer, because the engine told the
+    watchdog after it loaded — would report nothing.
     """
     lengths = [
         b.info.capabilities.maxContextTokens
         for b in backends
         if b.info.capabilities is not None and b.info.capabilities.maxContextTokens
     ]
+    if runtime is not None and runtime.context_length:
+        lengths.append(runtime.context_length)
     return min(lengths) if lengths else None
 
 

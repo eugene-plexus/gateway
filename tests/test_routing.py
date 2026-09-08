@@ -39,15 +39,46 @@ def _info(model_id: str | None, *, context: int | None = None) -> dict[str, Any]
     return body
 
 
+def _runtime_entry(name: str, alias: str, *, context: int | None = None) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "name": name,
+        "engine": "llama_cpp",
+        "modelPath": f"/models/{alias}.gguf",
+        "modelAlias": alias,
+        "status": "ready",
+    }
+    if context is not None:
+        body["capabilities"] = {"contextLength": context}
+    return body
+
+
 @pytest.fixture
 def route_http(monkeypatch: pytest.MonkeyPatch):
-    """Route every httpx.AsyncClient in the process through one handler."""
+    """Route every httpx.AsyncClient in the process through one handler.
 
-    def install(handler: Any) -> None:
+    `/v1/runtimes` is answered by the fixture, not the test's handler:
+    every refresh reads it, and threading an empty list through a dozen
+    handlers that don't care about runtimes would bury the thing each
+    test is actually about. Tests that DO care pass `runtimes=[...]`, or
+    `handle_runtimes=True` to take the path over entirely (which is the
+    only way to make it fail).
+    """
+
+    def install(
+        handler: Any,
+        *,
+        runtimes: list[dict[str, Any]] | None = None,
+        handle_runtimes: bool = False,
+    ) -> None:
+        def wrapped(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/v1/runtimes" and not handle_runtimes:
+                return httpx.Response(200, json={"runtimes": runtimes or []})
+            return handler(request)
+
         real_init = httpx.AsyncClient.__init__
 
         def init(self: httpx.AsyncClient, *args: Any, **kwargs: Any) -> None:
-            kwargs["transport"] = httpx.MockTransport(handler)
+            kwargs["transport"] = httpx.MockTransport(wrapped)
             real_init(self, *args, **kwargs)
 
         monkeypatch.setattr(httpx.AsyncClient, "__init__", init)
@@ -266,4 +297,104 @@ async def test_a_watchdog_error_response_is_not_a_crash(route_http: Any) -> None
     table = RoutingTable(watchdog_url="http://watchdog")
     await table.refresh()
     assert table.is_empty()
+    await table.aclose()
+
+
+async def test_runtime_attribution_matches_alias_to_what_the_driver_serves(
+    route_http: Any,
+) -> None:
+    """A runtime's modelAlias IS what a client asks the gateway for, so
+    an alias equal to a driver's modelId identifies the engine process
+    behind that driver — no new field on any contract."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/components":
+            return httpx.Response(200, json=_components(_driver_entry("a", 8081)))
+        return httpx.Response(200, json=_info("qwen"))
+
+    route_http(handler, runtimes=[_runtime_entry("qwen3-27b", "qwen", context=4096)])
+    table = RoutingTable(watchdog_url="http://watchdog")
+    await table.refresh()
+
+    assert table.runtime_for("qwen") == "qwen3-27b"
+    # The driver reported no capabilities of its own — an
+    # openai_compat_http driver only sees an HTTP endpoint — so without
+    # the runtime this would be None.
+    assert table.as_model_list()[0].x_eugene_plexus.context_length == 4096
+    await table.aclose()
+
+
+async def test_runtime_attribution_is_absent_for_a_model_with_replicas(
+    route_http: Any,
+) -> None:
+    """Which of two identical runtimes served a request is knowable, but
+    not from here. Report nothing rather than a coin flip."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/components":
+            return httpx.Response(200, json=_components(_driver_entry("a", 8081)))
+        return httpx.Response(200, json=_info("qwen"))
+
+    route_http(
+        handler,
+        runtimes=[
+            _runtime_entry("qwen-gpu0", "qwen", context=4096),
+            _runtime_entry("qwen-gpu1", "qwen", context=8192),
+        ],
+    )
+    table = RoutingTable(watchdog_url="http://watchdog")
+    await table.refresh()
+
+    assert table.runtime_for("qwen") is None
+    assert table.as_model_list()[0].x_eugene_plexus.context_length is None
+    await table.aclose()
+
+
+async def test_runtime_attribution_is_absent_when_no_runtime_serves_the_model(
+    route_http: Any,
+) -> None:
+    """A hosted or CLI backend has no runtime of ours. Routing is
+    unaffected — the field is just absent."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/components":
+            return httpx.Response(200, json=_components(_driver_entry("a", 8081)))
+        return httpx.Response(200, json=_info("claude-opus-4-7"))
+
+    route_http(handler)
+    table = RoutingTable(watchdog_url="http://watchdog")
+    await table.refresh()
+
+    assert table.runtime_for("claude-opus-4-7") is None
+    assert table.resolve("claude-opus-4-7") is not None
+    await table.aclose()
+
+
+async def test_unreadable_runtimes_endpoint_does_not_stop_routing(route_http: Any) -> None:
+    """The watchdog can 500 on /v1/runtimes and everything still routes;
+    attribution is additive, never load-bearing."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/components":
+            return httpx.Response(200, json=_components(_driver_entry("a", 8081)))
+        return httpx.Response(200, json=_info("qwen"))
+
+    seen: list[str] = []
+
+    def wrapped(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/runtimes":
+            seen.append("runtimes")
+            return httpx.Response(500, text="boom")
+        return handler(request)
+
+    # Take over /v1/runtimes so the failure actually reaches the table;
+    # the fixture would otherwise answer it with an empty list and this
+    # test would pass without exercising anything.
+    route_http(wrapped, handle_runtimes=True)
+    table = RoutingTable(watchdog_url="http://watchdog")
+    await table.refresh()
+
+    assert seen == ["runtimes"], "the 500 must actually reach the table"
+    assert table.known_models() == ["qwen"]
+    assert table.runtime_for("qwen") is None
     await table.aclose()
