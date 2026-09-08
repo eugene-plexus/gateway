@@ -1,6 +1,6 @@
 """Identity client: Protocol + HTTP and in-process implementations.
 
-The orchestrator pulls constitution + relevant self-model entries +
+The gateway pulls constitution + relevant self-model entries +
 per-person relationship context from the identity component every chat
 turn, and assembles per-hemisphere system prompts from them. The HTTP
 path talks to `eugene-plexus/identity`; the in-process variant is the
@@ -9,7 +9,7 @@ test double / "no identity configured" fallback.
 Both implementations satisfy the `IdentityClient` Protocol so callers
 type against the contract.
 
-When `identityUrl` is unset in config, the orchestrator skips identity
+When `identityUrl` is unset in config, the gateway skips identity
 entirely and falls back to the v0.1 single-shared-system-prompt path —
 that keeps existing installs working until the operator adds an
 identity component to their topology.

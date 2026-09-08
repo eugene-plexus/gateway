@@ -30,15 +30,15 @@ async def inject_event(request: Request, body: AfferentEvent) -> dict[str, objec
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=Problem(
-                type="https://github.com/eugene-plexus/orchestrator#loop-unavailable",
+                type="https://github.com/eugene-plexus/gateway#loop-unavailable",
                 title="Consciousness loop unavailable",
                 status=503,
                 detail=(
-                    "The orchestrator has fewer than two driver slots resolved "
+                    "The gateway has fewer than two driver slots resolved "
                     "(or is in safe mode), so it cannot deliberate. Check the "
                     "`drivers` config and the watchdog topology, then restart."
                 ),
-                component="orchestrator",
+                component="gateway",
             ).model_dump(exclude_none=True),
         )
     accepted = app.state.loop.submit(body)
@@ -49,14 +49,14 @@ async def inject_event(request: Request, body: AfferentEvent) -> dict[str, objec
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=Problem(
-                type="https://github.com/eugene-plexus/orchestrator#loop-saturated",
+                type="https://github.com/eugene-plexus/gateway#loop-saturated",
                 title="Consciousness loop saturated",
                 status=503,
                 detail=(
                     "The event queue is full — Eugene is processing events "
                     "slower than they arrive. Retry shortly."
                 ),
-                component="orchestrator",
+                component="gateway",
             ).model_dump(exclude_none=True),
         )
     return {"eventId": str(body.eventId), "accepted": True}

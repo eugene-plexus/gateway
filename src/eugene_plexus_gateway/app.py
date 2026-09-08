@@ -17,7 +17,7 @@ from .bicameral.callosum import JaccardAgreementScorer, load_default_scorer
 from .bicameral.nt import neutral_state
 from .config import ConfigStore
 from .dependencies import require_authorized, require_operator
-from .hemisphere_client import FailoverHemisphereClient, HemisphereClient, HttpHemisphereClient
+from .driver_client import DriverClient, FailoverDriverClient, HttpDriverClient
 from .identity import HttpIdentity, IdentityClient
 from .memory import HttpMemory, MemoryClient
 from .routes import admin as admin_routes
@@ -38,7 +38,7 @@ def _resolve_backend_url(backend: str, topology: dict[str, str]) -> str | None:
     """Resolve one slot backend (a topology entry name) to a URL.
 
     Resolution order:
-      1. Exact match against a watchdog-topology hemisphere-driver name.
+      1. Exact match against a watchdog-topology inference-driver name.
       2. URL-shaped fallback — a backend that looks like a URL (`http…`)
          is used directly. This covers configs migrated from the
          pre-v0.2.1-item-2 `urls` shape, where the stored values are
@@ -63,16 +63,16 @@ def build_clients(
     store: ConfigStore,
     auth_state: AuthState,
     topology: dict[str, str],
-) -> list[HemisphereClient]:
-    """Construct one HemisphereClient per configured driver slot.
+) -> list[DriverClient]:
+    """Construct one DriverClient per configured driver slot.
 
     Reads the `drivers` config — `[{name, backends: [topology-name, …]}]`
     — and resolves each backend NAME to a URL via `topology` (a
-    name→url map of the watchdog's hemisphere-driver entries, fetched
+    name→url map of the watchdog's inference-driver entries, fetched
     once at startup). Order is preserved so the bicameral loop and admin
     endpoints walk slots and their failover backends in declared order.
     Threads `auth_state.service_token` through so each outbound
-    /v1/generate carries the orchestrator's service-audience bearer.
+    /v1/generate carries the gateway's service-audience bearer.
 
     A backend that resolves to no URL (unknown topology name, not
     URL-shaped) is skipped with a warning. A slot left with zero
@@ -81,7 +81,7 @@ def build_clients(
     """
     raw = store.get("drivers") or []
     timeout = float(store.get("requestTimeoutSeconds") or 180)
-    clients: list[HemisphereClient] = []
+    clients: list[DriverClient] = []
     for entry in raw:
         # Validation in ConfigStore.apply_patch already enforces shape, but
         # in-memory config can also be loaded straight from YAML so guard
@@ -89,7 +89,7 @@ def build_clients(
         # `backends` shape, so by here every slot carries `backends`.
         name = entry["name"]
         backends = entry["backends"]
-        candidates: list[HemisphereClient] = []
+        candidates: list[DriverClient] = []
         for backend in backends:
             url = _resolve_backend_url(backend, topology)
             if url is None:
@@ -102,7 +102,7 @@ def build_clients(
                 )
                 continue
             candidates.append(
-                HttpHemisphereClient(
+                HttpDriverClient(
                     name=name,
                     base_url=url,
                     timeout_seconds=timeout,
@@ -117,9 +117,9 @@ def build_clients(
             )
             continue
         # One slot = an ordered priority list of backends. A single-backend
-        # slot still goes through FailoverHemisphereClient (one candidate),
-        # which behaves identically to a bare HttpHemisphereClient.
-        clients.append(FailoverHemisphereClient(name=name, candidates=candidates))
+        # slot still goes through FailoverDriverClient (one candidate),
+        # which behaves identically to a bare HttpDriverClient.
+        clients.append(FailoverDriverClient(name=name, candidates=candidates))
     return clients
 
 
@@ -133,9 +133,9 @@ async def fetch_components(
 
     The watchdog is the source of truth for body-component topology;
     duplicating URLs in every component's config is the OpenClaw-style
-    trap we're avoiding. The orchestrator resolves its peers (memory,
+    trap we're avoiding. The gateway resolves its peers (memory,
     identity) and its driver backends from this one snapshot at startup
-    — item 3 (v0.2.1) made the endpoint accept the orchestrator's
+    — item 3 (v0.2.1) made the endpoint accept the gateway's
     service token.
 
     Returns the list of component dicts, or `[]` when the watchdog
@@ -170,14 +170,14 @@ def peer_url_from(components: list[dict[str, Any]], kind: str) -> str | None:
 
 
 def driver_topology(components: list[dict[str, Any]]) -> dict[str, str]:
-    """Build a {name: url} map of the hemisphere-driver topology entries.
+    """Build a {name: url} map of the inference-driver topology entries.
 
     This is what `build_clients` resolves slot backends against. URLs
     keep their trailing slash here; `_resolve_backend_url` strips it.
     """
     out: dict[str, str] = {}
     for c in components:
-        if isinstance(c, dict) and c.get("kind") == "hemisphere-driver":
+        if isinstance(c, dict) and c.get("kind") == "inference-driver":
             name, url = c.get("name"), c.get("url")
             if isinstance(name, str) and name and isinstance(url, str) and url:
                 out[name] = url
@@ -223,7 +223,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # operator's repair survives the next non-safe-mode boot. No
         # drivers, no memory client — chat returns 503 until restart.
         log.warning(
-            "starting in SAFE MODE (EUGENE_PLEXUS_ORCH_SAFE_MODE=1); "
+            "starting in SAFE MODE (EUGENE_PLEXUS_GATEWAY_SAFE_MODE=1); "
             "ignoring %s and running on defaults. Fix config via "
             "/v1/config, then restart without the env var.",
             settings.config_file,
@@ -252,10 +252,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     auth_state: AuthState = app.state.auth_state
 
     # Fetch the watchdog topology ONCE and resolve everything from it:
-    # peer URLs (memory, identity) and the hemisphere-driver name→url map
+    # peer URLs (memory, identity) and the inference-driver name→url map
     # that `build_clients` resolves slot backends against. One round-trip
     # instead of one-per-peer; the source of truth is the watchdog, so
-    # backend URLs aren't duplicated into the orchestrator's own config.
+    # backend URLs aren't duplicated into the gateway's own config.
     components = (
         []
         if settings.safe_mode
@@ -268,7 +268,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Resolve peer URLs. Operator-supplied config wins; otherwise we take
     # it from the topology snapshot. The duplicate-URL trap — where an
     # operator who set up identity in the wizard nevertheless has
-    # identityUrl unset on the orchestrator and silently runs without
+    # identityUrl unset on the gateway and silently runs without
     # identity — is exactly what this auto-resolve closes.
     def _resolve(kind: str, config_key: str) -> str | None:
         explicit = str(store.get(config_key) or "").strip()
@@ -330,7 +330,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.identity_url = getattr(app.state, "identity_url", "")
 
     if not hasattr(app.state, "drivers"):
-        # Slot backends are resolved against the hemisphere-driver entries
+        # Slot backends are resolved against the inference-driver entries
         # in the topology snapshot. In safe mode (or when the watchdog is
         # unreachable) the map is empty → no drivers built → chat 503.
         app.state.drivers = (
@@ -346,7 +346,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # flag short-circuits the heavy load path — tests set it via the
     # fixture in `conftest.py` so the suite doesn't pull torch +
     # transformers, and operators can set
-    # EUGENE_PLEXUS_ORCH_DISABLE_EMBEDDING_SCORER=1 on resource-
+    # EUGENE_PLEXUS_GATEWAY_DISABLE_EMBEDDING_SCORER=1 on resource-
     # constrained boxes. Production loads the embedding model via
     # `to_thread` so the lifespan doesn't block uvicorn's event loop
     # during the (multi-second) first-time model download + warmup.
@@ -358,7 +358,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.scorer = await asyncio.to_thread(load_default_scorer, model_name)
 
     # Tool-wire retrofit (Phase 1): in-process tool registry. Re-expresses
-    # the orchestrator's own operations as channel-tagged tools dispatched
+    # the gateway's own operations as channel-tagged tools dispatched
     # through a ToolRunner. Built once here; reload-capable via
     # build_tool_runner for a future config surface. Tests that inject
     # app.state.memory get a runner over their InProcessMemory.
@@ -401,8 +401,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
 
     app = FastAPI(
-        title="Eugene Plexus — orchestrator",
-        description="Continuous-loop consciousness orchestrator.",
+        title="Eugene Plexus — gateway",
+        description="Continuous-loop consciousness gateway.",
         version=__version__,
         lifespan=_lifespan,
     )
@@ -425,7 +425,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     # Mixed surfaces: chat and conversation reads are reachable from
     # both the UI (operator token) and peer components (service tokens
-    # — e.g. connector → orchestrator when a Discord message comes in).
+    # — e.g. connector → gateway when a Discord message comes in).
     authorized = [Depends(require_authorized)]
     app.include_router(conversations_routes.router, dependencies=authorized)
     app.include_router(events_routes.router, dependencies=authorized)

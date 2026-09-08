@@ -1,10 +1,10 @@
 """v0.2 security primitives — verify-only.
 
-The orchestrator never issues tokens. The watchdog (the install's
+The gateway never issues tokens. The watchdog (the install's
 trust root) generates the per-restart HMAC signing key and distributes
 it to spawned children, along with a long-lived service token, via env
-vars (`EUGENE_PLEXUS_ORCH_AUTH_SIGNING_KEY`,
-`EUGENE_PLEXUS_ORCH_SERVICE_TOKEN`). This module exposes just the
+vars (`EUGENE_PLEXUS_GATEWAY_AUTH_SIGNING_KEY`,
+`EUGENE_PLEXUS_GATEWAY_SERVICE_TOKEN`). This module exposes just the
 decode side so route dependencies can validate inbound bearer tokens.
 
 Mirror of the corresponding watchdog primitives at

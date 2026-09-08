@@ -1,4 +1,4 @@
-<!-- Thanks for contributing to Eugene Plexus / orchestrator! -->
+<!-- Thanks for contributing to Eugene Plexus / gateway! -->
 
 ## Summary
 

@@ -11,15 +11,15 @@ from __future__ import annotations
 import httpx
 import pytest
 
-from eugene_plexus_orchestrator._generated.hemisphere_models import (
+from eugene_plexus_gateway._generated.hemisphere_models import (
     FinishReason,
     GenerateRequest,
     GenerateResponse,
     Problem,
 )
-from eugene_plexus_orchestrator.hemisphere_client import (
-    FailoverHemisphereClient,
-    HemisphereDriverError,
+from eugene_plexus_gateway.driver_client import (
+    DriverError,
+    FailoverDriverClient,
 )
 
 from .conftest import FakeHemisphereClient
@@ -29,8 +29,8 @@ def _request() -> GenerateRequest:
     return GenerateRequest(messages=[{"role": "user", "content": "hi"}])
 
 
-def _driver_error(status_code: int) -> HemisphereDriverError:
-    return HemisphereDriverError(
+def _driver_error(status_code: int) -> DriverError:
+    return DriverError(
         driver_name="slot",
         driver_url="http://backend",
         status_code=status_code,
@@ -39,8 +39,8 @@ def _driver_error(status_code: int) -> HemisphereDriverError:
     )
 
 
-def _slot(*candidates: FakeHemisphereClient) -> FailoverHemisphereClient:
-    return FailoverHemisphereClient(name="left", candidates=list(candidates))
+def _slot(*candidates: FakeHemisphereClient) -> FailoverDriverClient:
+    return FailoverDriverClient(name="left", candidates=list(candidates))
 
 
 async def test_primary_success_does_not_touch_backup() -> None:
@@ -99,7 +99,7 @@ async def test_4xx_fails_hard_without_cascading() -> None:
     backup = FakeHemisphereClient(name="left")
     backup.responses = ["backup reply"]
 
-    with pytest.raises(HemisphereDriverError) as exc:
+    with pytest.raises(DriverError) as exc:
         await _slot(primary, backup).generate(_request())
 
     assert exc.value.status_code == 401
@@ -112,7 +112,7 @@ async def test_all_backends_fail_raises_last_error() -> None:
     backup = FakeHemisphereClient(name="left")
     backup.generate_error = _driver_error(502)
 
-    with pytest.raises(HemisphereDriverError) as exc:
+    with pytest.raises(DriverError) as exc:
         await _slot(primary, backup).generate(_request())
 
     # The LAST cascade-eligible failure propagates so the chat route's
@@ -124,7 +124,7 @@ async def test_single_backend_behaves_like_passthrough() -> None:
     only = FakeHemisphereClient(name="left")
     only.generate_error = _driver_error(500)
 
-    with pytest.raises(HemisphereDriverError):
+    with pytest.raises(DriverError):
         await _slot(only).generate(_request())
 
 
@@ -140,7 +140,7 @@ async def test_info_failover_returns_first_reachable() -> None:
 
 async def test_empty_candidates_rejected() -> None:
     with pytest.raises(ValueError, match="at least one backend"):
-        FailoverHemisphereClient(name="left", candidates=[])
+        FailoverDriverClient(name="left", candidates=[])
 
 
 async def test_base_url_is_primary() -> None:

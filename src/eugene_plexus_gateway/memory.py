@@ -12,7 +12,7 @@ type against the contract without caring which backend is in play.
 
 v0.2 surfaces:
   - `append_entry()` writes a full `MemoryEntry` (with `personId` and
-    optional NT snapshot / hemisphere attribution). The orchestrator
+    optional NT snapshot / hemisphere attribution). The gateway
     uses this on every chat turn.
   - `person_recent()` reads back recent entries for a `personId` —
     feeds the relationship-context section of per-hemisphere prompts.
@@ -30,7 +30,7 @@ import httpx
 
 from ._generated.models import Conversation, MemoryEntry, Message, Role
 
-# When the orchestrator can't resolve a personId (no identity component
+# When the gateway can't resolve a personId (no identity component
 # wired, or identity unreachable, and body.personId not supplied),
 # memory entries land under this sentinel. Matches memory component's
 # NIL_PERSON_ID — same byte pattern, same intent.
@@ -149,8 +149,8 @@ class HttpMemory:
         service_token: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
-        # See HttpHemisphereClient — same pattern: thread the
-        # orchestrator's service-audience bearer onto every outbound
+        # See HttpDriverClient — same pattern: thread the
+        # gateway's service-audience bearer onto every outbound
         # request to the memory service.
         headers = {"Authorization": f"Bearer {service_token}"} if service_token else None
         self._client = httpx.AsyncClient(

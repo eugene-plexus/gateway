@@ -38,7 +38,7 @@ from .._generated.models import (
     PassRecord,
     Role,
 )
-from ..hemisphere_client import HemisphereClient
+from ..driver_client import DriverClient
 from .callosum import AgreementScorer, blend
 from .nt import net_valence
 from .plateau import BoutGate
@@ -104,9 +104,9 @@ def _format_twin_turn(
     """Wrap the twin hemisphere's response so the model can react to it
     without misinterpreting it as user input.
 
-    Pre-v0.2.1 history: the orchestrator originally appended both
+    Pre-v0.2.1 history: the gateway originally appended both
     hemispheres' outputs to each driver's message list as
-    `role=hemisphere`, intending that the hemisphere-driver would
+    `role=hemisphere`, intending that the inference-driver would
     translate that into something the upstream LLM understood as "the
     other side's reply". But every API adapter we ship coerces
     `hemisphere` to `assistant` (the upstream APIs only know
@@ -152,7 +152,7 @@ def _format_twin_turn(
 
 
 class BicameralPairRequired(RuntimeError):
-    """Raised when the orchestrator's `drivers` list is not exactly two.
+    """Raised when the gateway's `drivers` list is not exactly two.
 
     v0.1's agreement / blend functions are pairwise; running with a
     different driver count would silently misbehave. v0.2+ will replace
@@ -194,7 +194,7 @@ async def run_bicameral_loop(
     *,
     history: list[Message],
     system_prompts: dict[str, str],
-    drivers: list[HemisphereClient],
+    drivers: list[DriverClient],
     nt_state: NTState,
     max_passes: int,
     gate: BoutGate,
@@ -214,7 +214,7 @@ async def run_bicameral_loop(
     twin is running — see `chat.py::_build_per_driver_system_prompts`.
 
     `temperature` and `max_tokens` are applied to every `GenerateRequest`
-    built here. The orchestrator owns LLM-output-affecting parameters; the
+    built here. The gateway owns LLM-output-affecting parameters; the
     driver does not substitute defaults of its own.
 
     `gate` is the per-bout `BoutGate` (constructed fresh per turn by the
@@ -260,7 +260,7 @@ async def run_bicameral_loop(
         right.name: [],
     }
 
-    def _build_messages_for(driver: HemisphereClient) -> list[Message]:
+    def _build_messages_for(driver: DriverClient) -> list[Message]:
         out: list[Message] = []
         sys_prompt = system_prompts[driver.name]
         if sys_prompt:
@@ -269,7 +269,7 @@ async def run_bicameral_loop(
         out.extend(per_driver_intermediate[driver.name])
         return out
 
-    def _build_request_for(driver: HemisphereClient, pass_index: int) -> GenerateRequest:
+    def _build_request_for(driver: DriverClient, pass_index: int) -> GenerateRequest:
         messages = _build_messages_for(driver)
         request_payload: dict[str, object] = {
             "messages": [m.model_dump(mode="json", exclude_none=True) for m in messages],
@@ -284,7 +284,7 @@ async def run_bicameral_loop(
 
     for pass_index in range(max_passes):
         # Build the cross-spec GenerateRequest by serializing through dict.
-        # The orchestrator.yaml and hemisphere-driver.yaml each have their
+        # The gateway.yaml and inference-driver.yaml each have their
         # own generated Message / NTState classes (same wire shape, distinct
         # Python types because we keep the two model modules independent).
         left_request = _build_request_for(left, pass_index)
@@ -432,7 +432,7 @@ async def run_bicameral_loop(
         # prior response as `assistant` (role=hemisphere with their
         # own driverName coerces to assistant downstream) and the
         # twin's response embedded in a labeled `user` message that
-        # also carries the reprompt. After hemisphere-driver's role
+        # also carries the reprompt. After inference-driver's role
         # coercion the LLM sees:
         #   assistant: <own response>
         #   user: "[corpus callosum] Your twin (driver `<twin>`)

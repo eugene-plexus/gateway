@@ -47,7 +47,7 @@ from ..bicameral.loop import run_bicameral_loop
 from ..bicameral.nt import modulated_temperature, net_valence
 from ..bicameral.plateau import BoutGate, PlateauParams
 from ..bicameral.voice import run_voice_pass
-from ..hemisphere_client import HemisphereClient, HemisphereDriverError
+from ..driver_client import DriverClient, DriverError
 from ..memory import NIL_PERSON_ID, MemoryClient
 from ..tools import (
     TOOL_MEMORY_APPEND_ENTRY,
@@ -196,7 +196,7 @@ class ConsciousnessLoop:
         if getattr(app.state, "safe_mode", False):
             log.warning("loop received a message in safe mode — nothing to think with; dropping")
             return
-        drivers: list[HemisphereClient] = app.state.drivers
+        drivers: list[DriverClient] = app.state.drivers
         if len(drivers) < 2:
             log.warning(
                 "loop received a message but %d driver slot(s) resolved (need 2) — dropping",
@@ -388,7 +388,7 @@ class ConsciousnessLoop:
                 scorer=scorer,
                 cross_pass_framing=cross_pass_framing,
             )
-        except (HemisphereDriverError, httpx.HTTPError) as e:
+        except (DriverError, httpx.HTTPError) as e:
             log.warning("deliberation failed for message %s: %s — no reply", event.eventId, e)
             return
 
@@ -483,7 +483,7 @@ class ConsciousnessLoop:
                 temperature=voice_temperature,
                 max_tokens=max_tokens,
             )
-        except (HemisphereDriverError, httpx.HTTPError) as e:
+        except (DriverError, httpx.HTTPError) as e:
             log.warning("voice pass failed for message %s: %s — no reply", event.eventId, e)
             return
 

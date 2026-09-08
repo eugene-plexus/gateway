@@ -17,12 +17,12 @@ async def healthz(request: Request) -> Health:
         return Health(
             status=Status.degraded,
             version=__version__,
-            component="orchestrator",
+            component="gateway",
             safeMode=True,
         )
     return Health(
         status=Status.ok,
         version=__version__,
-        component="orchestrator",
+        component="gateway",
         safeMode=False,
     )

@@ -19,13 +19,13 @@ from __future__ import annotations
 import math
 import random
 
-from eugene_plexus_orchestrator.bicameral.action import (
+from eugene_plexus_gateway.bicameral.action import (
     Action,
     ActionPolicyParams,
     action_value,
     select_action,
 )
-from eugene_plexus_orchestrator.settings import Settings
+from eugene_plexus_gateway.settings import Settings
 from tests.conftest import (
     FakeHemisphereClient,
     build_loop_app,

@@ -1,8 +1,8 @@
 """Runtime configuration: schema declaration + file-backed state + PATCH apply.
 
-Implements the shared Eugene Plexus config protocol on the orchestrator
+Implements the shared Eugene Plexus config protocol on the gateway
 (`GET /v1/config/schema`, `GET /v1/config`, `PATCH /v1/config`). This is the
-same code shape as in `hemisphere-driver/config.py` — the two have to agree
+same code shape as in `inference-driver/config.py` — the two have to agree
 on protocol semantics so a single UI can edit both.
 """
 
@@ -40,8 +40,8 @@ CATEGORY_LABELS: dict[str, str] = {
 }
 
 # Default driver topology: the canonical bicameral pair. Each slot's
-# `backends` is a priority list of watchdog-topology hemisphere-driver
-# entry NAMES (v0.2.1) — the orchestrator resolves them to URLs at
+# `backends` is a priority list of watchdog-topology inference-driver
+# entry NAMES (v0.2.1) — the gateway resolves them to URLs at
 # startup. The default names match the stock wizard's "left"/"right"
 # topology entries; operators rename / re-point via PATCH /v1/config.
 DEFAULT_DRIVERS: list[dict[str, Any]] = [
@@ -70,7 +70,7 @@ DEFAULT_SYSTEM_PROMPT = (
 # - Pre-2026-05-09: exposed bicameral architecture ("Two of you exist
 #   in superposition", "reconciled by a corpus-callosum process") and
 #   used assistant-directive language ("Be thoughtful, concise,
-#   honest"). Together that made Eugene address the orchestrator
+#   honest"). Together that made Eugene address the gateway
 #   instead of the user, and default to the helpful-explainer
 #   register.
 #
@@ -100,13 +100,13 @@ FIELDS: list[ConfigField] = [
         key="drivers",
         label="Drivers",
         description=(
-            'The two LLM driver slots ("hemispheres") the orchestrator '
+            'The two LLM driver slots ("hemispheres") the gateway '
             "talks to on every chat turn. Each slot has a `name` "
             '(free-form label, e.g. "left" / "right" / "claude" / '
             '"local-llama" — appears on the UI\'s tabs and beside that '
             "slot's outputs) and `backends`: an ordered priority list of "
-            "watchdog-topology hemisphere-driver entry NAMES. The "
-            "orchestrator resolves each name to a URL via the watchdog "
+            "watchdog-topology inference-driver entry NAMES. The "
+            "gateway resolves each name to a URL via the watchdog "
             "topology at startup, so backend URLs live in exactly one "
             "place (watchdog.yaml) instead of being duplicated here. On "
             "each turn it tries the first backend; on a transport error "
@@ -119,11 +119,11 @@ FIELDS: list[ConfigField] = [
         ),
         category="topology",
         valueType=ConfigValueType.driver_list,
-        # Each backend names a watchdog-supervised hemisphere-driver
+        # Each backend names a watchdog-supervised inference-driver
         # topology entry; the UI renders backends as a dropdown of those
-        # names (sourced via componentKindHint) and the orchestrator
+        # names (sourced via componentKindHint) and the gateway
         # resolves them to URLs at startup. v0.2.1 item 2 removed the
-        # old URL-duplicating design: the orchestrator keeps the slot /
+        # old URL-duplicating design: the gateway keeps the slot /
         # pairing / failover structure (which topology can't express)
         # but no longer stores backend URLs — those live only in the
         # watchdog topology.
@@ -154,7 +154,7 @@ FIELDS: list[ConfigField] = [
         description=(
             "Which `eugene-plexus/identity` instance owns Eugene's "
             "constitution + self-model + person registry. When set, the "
-            "orchestrator pulls constitution + relevant self-model "
+            "gateway pulls constitution + relevant self-model "
             "entries + the speaker's relationship summary on every chat "
             "turn and assembles per-hemisphere system prompts from "
             "them. Pick `(off)` to fall back to v0.1's single shared-"
@@ -167,16 +167,16 @@ FIELDS: list[ConfigField] = [
         required=False,
         requiresRestart=True,
     ),
-    # The orchestrator's bind port used to live here. It moved out:
+    # The gateway's bind port used to live here. It moved out:
     # ports are owned by the watchdog topology now and passed to spawned
-    # children via EUGENE_PLEXUS_ORCH_BIND_PORT. One source of truth
+    # children via EUGENE_PLEXUS_GATEWAY_BIND_PORT. One source of truth
     # avoids the OpenClaw-style "config says 8080 but watchdog spawned
-    # at 8090, nobody can reach the orchestrator" trap.
+    # at 8090, nobody can reach the gateway" trap.
     ConfigField(
         key="logLevel",
         label="Log level",
         description=(
-            "How chatty the orchestrator's terminal output is. `DEBUG` "
+            "How chatty the gateway's terminal output is. `DEBUG` "
             "prints every bicameral pass and per-driver dispatch "
             "(useful for debugging); `INFO` is the normal level; "
             "`WARNING` and `ERROR` go progressively quieter."
@@ -463,7 +463,7 @@ FIELDS: list[ConfigField] = [
             "(e.g. `all-mpnet-base-v2`) catch finer distinctions at "
             "more memory + latency. If the model can't load (no "
             "torch, no network for first-run download), the "
-            "orchestrator falls back to word-overlap (Jaccard) and "
+            "gateway falls back to word-overlap (Jaccard) and "
             "logs a warning — chat still works, just with more "
             "false-disagreement loops."
         ),
@@ -521,7 +521,7 @@ FIELDS: list[ConfigField] = [
         key="requestTimeoutSeconds",
         label="Driver request timeout",
         description=(
-            "How long the orchestrator waits on one driver's response "
+            "How long the gateway waits on one driver's response "
             "before giving up. Counts from the start of the HTTP "
             "request to the driver, NOT the end of the bicameral loop. "
             "Bump this if your slowest model needs more time per pass."
@@ -559,7 +559,7 @@ FIELDS: list[ConfigField] = [
             "Sampling temperature for the voice pass. Lower values "
             "produce more consistent / less surprising user-facing "
             "replies; higher values are more expressive. Leave blank "
-            "to use the orchestrator's default temperature."
+            "to use the gateway's default temperature."
         ),
         category="bicameral",
         valueType=ConfigValueType.number,
@@ -610,7 +610,7 @@ def _migrate_drivers(value: Any) -> Any:
 
 
 def as_schema(*, driver_names: list[str] | None = None) -> ConfigSchema:
-    """Emit the orchestrator config schema.
+    """Emit the gateway config schema.
 
     `driver_names` — when supplied — turns the `voiceDriver` field into
     a strict dropdown (dynamic enum) of the currently-configured driver
@@ -633,7 +633,7 @@ def as_schema(*, driver_names: list[str] | None = None) -> ConfigSchema:
     else:
         fields = list(FIELDS)
     return ConfigSchema(
-        component="orchestrator",
+        component="gateway",
         fields=fields,
         categories=CATEGORY_LABELS,
     )

@@ -1,4 +1,4 @@
-"""Entrypoint: `python -m eugene_plexus_orchestrator`."""
+"""Entrypoint: `python -m eugene_plexus_gateway`."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from .config import ConfigStore
 from .settings import load_settings
 
 # Default bind port for standalone launch (no watchdog). The watchdog
-# always overrides via EUGENE_PLEXUS_ORCH_BIND_PORT.
+# always overrides via EUGENE_PLEXUS_GATEWAY_BIND_PORT.
 _DEFAULT_PORT = 8080
 
 
@@ -40,7 +40,7 @@ def main() -> None:
     if not settings.safe_mode:
         bootstrap_store.load()
 
-    env_port = os.environ.get("EUGENE_PLEXUS_ORCH_BIND_PORT")
+    env_port = os.environ.get("EUGENE_PLEXUS_GATEWAY_BIND_PORT")
     port = int(env_port) if env_port else _DEFAULT_PORT
     log_level = str(bootstrap_store.get("logLevel") or "INFO").upper()
 

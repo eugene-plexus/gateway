@@ -18,7 +18,7 @@ from .._generated.models import (
     Problem,
     RestartResult,
 )
-from ..hemisphere_client import HemisphereClient, HttpHemisphereClient
+from ..driver_client import DriverClient, HttpDriverClient
 
 router = APIRouter(tags=["admin"])
 
@@ -31,12 +31,12 @@ log = logging.getLogger(__name__)
 _PROBE_TIMEOUT_SECONDS = 10.0
 
 
-async def _driver_health(client: HemisphereClient) -> DriverHealth:
+async def _driver_health(client: DriverClient) -> DriverHealth:
     base_url = client.base_url
     try:
         info = await client.info()
-        # info.backend is hemisphere-driver.yaml's BackendKind; DriverHealth
-        # expects orchestrator.yaml's BackendKind. Same wire values, distinct
+        # info.backend is inference-driver.yaml's BackendKind; DriverHealth
+        # expects gateway.yaml's BackendKind. Same wire values, distinct
         # generated classes — bridge via .value.
         backend = BackendKind(info.backend.value)
         return DriverHealth(
@@ -59,20 +59,20 @@ async def _driver_health(client: HemisphereClient) -> DriverHealth:
 
 @router.get("/v1/admin/drivers", response_model=DriversInfo)
 async def list_drivers(request: Request) -> DriversInfo:
-    drivers: list[HemisphereClient] = request.app.state.drivers
+    drivers: list[DriverClient] = request.app.state.drivers
 
     if not drivers:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=Problem(
-                type="https://github.com/eugene-plexus/orchestrator#no-drivers-configured",
+                type="https://github.com/eugene-plexus/gateway#no-drivers-configured",
                 title="No drivers configured",
                 status=503,
                 detail=(
-                    "The orchestrator has no drivers in its `drivers` config. "
+                    "The gateway has no drivers in its `drivers` config. "
                     "PATCH /v1/config to populate, then restart."
                 ),
-                component="orchestrator",
+                component="gateway",
             ).model_dump(exclude_none=True),
         )
 
@@ -83,11 +83,11 @@ async def list_drivers(request: Request) -> DriversInfo:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=Problem(
-                type="https://github.com/eugene-plexus/orchestrator#drivers-unreachable",
+                type="https://github.com/eugene-plexus/gateway#drivers-unreachable",
                 title="No drivers reachable",
                 status=503,
                 detail=f"None of the configured drivers are reachable. {summary}",
-                component="orchestrator",
+                component="gateway",
             ).model_dump(exclude_none=True),
         )
 
@@ -106,7 +106,7 @@ async def probe_driver(request: Request, body: DriverProbeRequest) -> DriverHeal
     """
     url = str(body.url).rstrip("/")
     service_token = request.app.state.auth_state.service_token
-    client = HttpHemisphereClient(
+    client = HttpDriverClient(
         # `name` is optional on a probe (the operator may be testing a
         # URL before naming the slot); fall back to a diagnostic label.
         name=body.name or "(probe)",
@@ -137,7 +137,7 @@ _RESTART_DELAY_MS = 500
 async def restart() -> RestartResult:
     """Schedule a process exit so a supervisor can relaunch with new config.
 
-    Mirrors the hemisphere-driver restart endpoint. The orchestrator
+    Mirrors the inference-driver restart endpoint. The gateway
     only re-reads `requiresRestart: true` config keys (drivers list,
     port, etc.) at startup; this is the UI's mechanism for completing a
     config-change flow.

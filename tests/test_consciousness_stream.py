@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 
-from eugene_plexus_orchestrator.settings import Settings
+from eugene_plexus_gateway.settings import Settings
 from tests.conftest import (
     FakeHemisphereClient,
     build_loop_app,

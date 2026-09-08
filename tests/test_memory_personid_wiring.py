@@ -21,16 +21,16 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
-from eugene_plexus_orchestrator._generated.hemisphere_models import Role as HemisphereRole
-from eugene_plexus_orchestrator._generated.models import (
+from eugene_plexus_gateway._generated.hemisphere_models import Role as HemisphereRole
+from eugene_plexus_gateway._generated.models import (
     Constitution,
     MemoryEntry,
     Person,
     Role,
 )
-from eugene_plexus_orchestrator.identity import InProcessIdentity
-from eugene_plexus_orchestrator.memory import NIL_PERSON_ID, InProcessMemory
-from eugene_plexus_orchestrator.settings import Settings
+from eugene_plexus_gateway.identity import InProcessIdentity
+from eugene_plexus_gateway.memory import NIL_PERSON_ID, InProcessMemory
+from eugene_plexus_gateway.settings import Settings
 from tests.conftest import (
     FakeHemisphereClient,
     build_loop_app,

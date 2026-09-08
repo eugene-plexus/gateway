@@ -13,8 +13,8 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 
-from eugene_plexus_orchestrator._generated.models import Conversation, Message, Role
-from eugene_plexus_orchestrator.memory import HttpMemory, InProcessMemory
+from eugene_plexus_gateway._generated.models import Conversation, Message, Role
+from eugene_plexus_gateway.memory import HttpMemory, InProcessMemory
 
 # ---------------------------------------------------------------------------
 # InProcessMemory

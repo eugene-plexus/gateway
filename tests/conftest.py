@@ -16,32 +16,32 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from eugene_plexus_orchestrator._generated.hemisphere_models import (
+from eugene_plexus_gateway._generated.hemisphere_models import (
     BackendKind,
     DriverInfo,
     FinishReason,
     GenerateRequest,
     GenerateResponse,
 )
-from eugene_plexus_orchestrator._generated.models import (
+from eugene_plexus_gateway._generated.models import (
     AfferentEvent,
     IncomingMessage,
     MessageSource,
 )
-from eugene_plexus_orchestrator.app import create_app
-from eugene_plexus_orchestrator.bicameral.callosum import JaccardAgreementScorer
-from eugene_plexus_orchestrator.bicameral.nt import neutral_state
-from eugene_plexus_orchestrator.config import ConfigStore
-from eugene_plexus_orchestrator.identity import IdentityClient, InProcessIdentity
-from eugene_plexus_orchestrator.memory import NIL_PERSON_ID, InProcessMemory, MemoryClient
-from eugene_plexus_orchestrator.runtime.loop import ConsciousnessLoop
-from eugene_plexus_orchestrator.runtime.stream import ConsciousnessBroker
-from eugene_plexus_orchestrator.settings import Settings
-from eugene_plexus_orchestrator.tools import build_tool_runner
+from eugene_plexus_gateway.app import create_app
+from eugene_plexus_gateway.bicameral.callosum import JaccardAgreementScorer
+from eugene_plexus_gateway.bicameral.nt import neutral_state
+from eugene_plexus_gateway.config import ConfigStore
+from eugene_plexus_gateway.identity import IdentityClient, InProcessIdentity
+from eugene_plexus_gateway.memory import NIL_PERSON_ID, InProcessMemory, MemoryClient
+from eugene_plexus_gateway.runtime.loop import ConsciousnessLoop
+from eugene_plexus_gateway.runtime.stream import ConsciousnessBroker
+from eugene_plexus_gateway.settings import Settings
+from eugene_plexus_gateway.tools import build_tool_runner
 
 
 class FakeHemisphereClient:
-    """In-memory test double implementing HemisphereClient."""
+    """In-memory test double implementing DriverClient."""
 
     def __init__(
         self,

@@ -1,13 +1,13 @@
 """In-process tool dispatch — the Phase-1 retrofit of v0.2 operations
 onto the tool-calling wire format.
 
-Every operation the orchestrator performs is being re-expressed as a
+Every operation the gateway performs is being re-expressed as a
 `ToolCall` dispatched through a `ToolRunner` to a channel-tagged
 executor, so the wire format is the genuine spine of all operations
 (not a bolt-on for "real" external tools).
 
 Phase 1 is **behavior-preserving plumbing**:
-  - The orchestrator CONSTRUCTS the calls for ops it already does; the
+  - The gateway CONSTRUCTS the calls for ops it already does; the
     model does not yet emit tool calls.
   - Tool RESULTS do not yet cross into the model's view — they stay as
     in-process typed payloads on `ToolInvocation.payload`. So Phase 1
@@ -20,7 +20,7 @@ Phase 1 is **behavior-preserving plumbing**:
     Phase 2, when the model sees the failure and reacts.
   - Phase-1 calls carry their inputs on `ToolContext` (live typed
     objects already in scope), not in `ToolCall.arguments` — the
-    orchestrator invokes known ops with real objects rather than
+    gateway invokes known ops with real objects rather than
     model-style JSON. `arguments` becomes load-bearing in Phase 2.
 
 `build_tool_runner()` is reload-capable: call it again to rebuild the
@@ -70,7 +70,7 @@ TOOL_IDENTITY_LIST_PERSONS = "identity_list_persons"
 class ToolContext:
     """Per-invocation live context for Phase-1 executors.
 
-    Holds in-scope typed objects (UUIDs, domain models) the orchestrator
+    Holds in-scope typed objects (UUIDs, domain models) the gateway
     passes when it constructs a call. Phase-2 model-driven calls will
     mostly carry their inputs in `ToolCall.arguments` instead; this bag
     is the transitional seam for objects that never leave the process
@@ -156,7 +156,7 @@ class ToolRunner:
         entry = self._tools.get(call.name)
         if entry is None:
             # Unknown tool in Phase 1 is a programming error (the
-            # orchestrator only invokes tools it registered), not a model
+            # gateway only invokes tools it registered), not a model
             # misfire — fail loud rather than returning an isError result.
             raise KeyError(f"no tool registered under {call.name!r}")
         definition, executor = entry
@@ -326,7 +326,7 @@ def build_tool_runner(
     memory: MemoryClient | None,
     identity: IdentityClient | None = None,
 ) -> ToolRunner:
-    """Build the orchestrator's tool registry.
+    """Build the gateway's tool registry.
 
     Reload-capable and idempotent: returns a fresh runner each call, so a
     config reload can swap `app.state.tool_runner` wholesale. Tools whose

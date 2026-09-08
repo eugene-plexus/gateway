@@ -1,6 +1,6 @@
 """build_clients resolves driver-slot backends (topology names) to URLs.
 
-v0.2.1 item 2: a slot's `backends` are watchdog-topology hemisphere-driver
+v0.2.1 item 2: a slot's `backends` are watchdog-topology inference-driver
 entry NAMES; `build_clients` resolves them against a name->url map fetched
 once at startup. These tests pin the resolution + degraded-mode rules.
 """
@@ -9,12 +9,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from eugene_plexus_orchestrator.app import (
+from eugene_plexus_gateway.app import (
     _resolve_backend_url,
     build_clients,
     driver_topology,
 )
-from eugene_plexus_orchestrator.hemisphere_client import FailoverHemisphereClient
+from eugene_plexus_gateway.driver_client import FailoverDriverClient
 
 
 class _FakeStore:
@@ -29,9 +29,7 @@ class _FakeAuth:
     service_token: str | None = None
 
 
-def _build(
-    drivers: list[dict[str, Any]], topology: dict[str, str]
-) -> list[FailoverHemisphereClient]:
+def _build(drivers: list[dict[str, Any]], topology: dict[str, str]) -> list[FailoverDriverClient]:
     return build_clients(_FakeStore(drivers), _FakeAuth(), topology)  # type: ignore[arg-type]
 
 
@@ -105,8 +103,8 @@ def test_resolve_backend_url_precedence() -> None:
 
 def test_driver_topology_filters_kind() -> None:
     components = [
-        {"name": "left", "kind": "hemisphere-driver", "url": "http://h:8081"},
+        {"name": "left", "kind": "inference-driver", "url": "http://h:8081"},
         {"name": "mem", "kind": "memory", "url": "http://h:8083"},
-        {"name": "nourl", "kind": "hemisphere-driver"},  # dropped (no url)
+        {"name": "nourl", "kind": "inference-driver"},  # dropped (no url)
     ]
     assert driver_topology(components) == {"left": "http://h:8081"}

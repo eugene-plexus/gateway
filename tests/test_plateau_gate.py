@@ -19,8 +19,8 @@ from __future__ import annotations
 
 import random
 
-from eugene_plexus_orchestrator.bicameral.plateau import BoutGate, PlateauParams
-from eugene_plexus_orchestrator.settings import Settings
+from eugene_plexus_gateway.bicameral.plateau import BoutGate, PlateauParams
+from eugene_plexus_gateway.settings import Settings
 from tests.conftest import (
     FakeHemisphereClient,
     build_loop_app,

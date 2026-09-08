@@ -1,19 +1,19 @@
-"""Auth state for the orchestrator's verify-only role.
+"""Auth state for the gateway's verify-only role.
 
 Built once at startup from the env vars the watchdog threads in
-when it spawns the orchestrator:
+when it spawns the gateway:
 
-  * `EUGENE_PLEXUS_ORCH_AUTH_SIGNING_KEY` — base64 of the 32-byte HMAC
+  * `EUGENE_PLEXUS_GATEWAY_AUTH_SIGNING_KEY` — base64 of the 32-byte HMAC
     key used to validate inbound bearer tokens.
-  * `EUGENE_PLEXUS_ORCH_SERVICE_TOKEN` — long-lived JWT (`aud:
-    service:orchestrator`) presented as `Authorization: Bearer ...` on
+  * `EUGENE_PLEXUS_GATEWAY_SERVICE_TOKEN` — long-lived JWT (`aud:
+    service:gateway`) presented as `Authorization: Bearer ...` on
     every outbound call to a peer component.
-  * `EUGENE_PLEXUS_ORCH_MASTER_KEY` — base64 of the 32-byte secretbox
+  * `EUGENE_PLEXUS_GATEWAY_MASTER_KEY` — base64 of the 32-byte secretbox
     key. Populated only after the operator has logged in at the
     watchdog; absent during the "configured-but-locked" window.
     Reserved for Phase 6 at-rest decryption — not consumed in Phase 3.
 
-If `AUTH_SIGNING_KEY` is unset, the orchestrator runs in
+If `AUTH_SIGNING_KEY` is unset, the gateway runs in
 `auth_disabled=True` mode: route dependencies short-circuit and let
 everything through, and outbound clients send no Authorization header.
 That's the dev/standalone-test path; production via the watchdog
@@ -31,7 +31,7 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class AuthState:
-    """Process-wide auth posture. Immutable for the orchestrator's
+    """Process-wide auth posture. Immutable for the gateway's
     lifetime — rotating the signing key requires a restart, which is
     by design (per-restart key rotation is the v0.2 revocation story)."""
 
@@ -91,7 +91,7 @@ def load_auth_state(
                 "AUTH_SIGNING_KEY is not — refusing to start in a partially-auth state"
             )
         log.warning(
-            "EUGENE_PLEXUS_ORCH_AUTH_SIGNING_KEY not set — running unauthenticated "
+            "EUGENE_PLEXUS_GATEWAY_AUTH_SIGNING_KEY not set — running unauthenticated "
             "(dev/standalone mode). Production spawns via watchdog always supply this."
         )
         return AuthState(signing_key=None, service_token=None, master_key=None)

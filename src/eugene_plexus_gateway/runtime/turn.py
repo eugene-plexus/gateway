@@ -29,7 +29,7 @@ from .._generated.models import (
 )
 from ..bicameral.loop import BICAMERAL_SUBSTRATE_NOTE, BicameralOutcome
 from ..bicameral.nt import Observations
-from ..hemisphere_client import HemisphereClient
+from ..driver_client import DriverClient
 from ..tools import (
     TOOL_IDENTITY_GET_CONSTITUTION,
     TOOL_IDENTITY_GET_RELATIONSHIP,
@@ -63,7 +63,7 @@ async def resolve_operator_person_id(tool_runner: ToolRunner) -> UUID | None:
     """Look up the operator's personId from the identity component.
 
     UI turns may post `NIL_PERSON_ID` as a "this is the operator" marker;
-    the orchestrator resolves the real id on demand. Returns None when no
+    the gateway resolves the real id on demand. Returns None when no
     operator person exists yet (e.g. an install whose first-run wizard
     hasn't run `ensure_operator`).
     """
@@ -85,7 +85,7 @@ def build_memory_entry(
 ) -> MemoryEntry:
     """Wrap a `Message` in a `MemoryEntry` with full metadata.
 
-    The orchestrator is the source of truth for the NT snapshot and the
+    The gateway is the source of truth for the NT snapshot and the
     hemisphere attribution — the memory component stores both as opaque
     blobs.
     """
@@ -138,9 +138,7 @@ def render_recent_turns(entries: list[MemoryEntry]) -> str:
     return "\n".join(lines)
 
 
-def resolve_voice_driver(
-    drivers: list[HemisphereClient], configured_name: object
-) -> HemisphereClient:
+def resolve_voice_driver(drivers: list[DriverClient], configured_name: object) -> DriverClient:
     """Pick which driver performs the voice pass (the speak effector).
 
     Operator-configurable via `voiceDriver`. When unset (or unknown),
@@ -200,7 +198,7 @@ def render_relationship(summary: RelationshipSummary, person: Person | None) -> 
 
 async def build_per_driver_system_prompts(
     *,
-    drivers: list[HemisphereClient],
+    drivers: list[DriverClient],
     tool_runner: ToolRunner,
     person_id: UUID | None,
     operator_person_id: UUID | None,
@@ -215,7 +213,7 @@ async def build_per_driver_system_prompts(
     relationship). Otherwise every driver gets the shared
     `fallback_default`. Both hemispheres receive the same persona body —
     exposing the bicameral architecture in the system prompt made the
-    LLMs address the orchestrator and treat cross-pass content as
+    LLMs address the gateway and treat cross-pass content as
     conversation with a sibling.
     """
     if len(drivers) != 2:

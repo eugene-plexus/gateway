@@ -69,7 +69,7 @@ jobs:
       - name: Assert no diff
         shell: bash
         run: |
-          if ! git diff --exit-code src/eugene_plexus_orchestrator/_generated/; then
+          if ! git diff --exit-code src/eugene_plexus_gateway/_generated/; then
             echo "::error::Generated models are out of sync with SPECS_REF."
             echo "Run 'python scripts/codegen.py' locally and commit the result."
             exit 1

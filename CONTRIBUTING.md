@@ -1,6 +1,6 @@
-# Contributing to Eugene Plexus `orchestrator`
+# Contributing to Eugene Plexus `gateway`
 
-Thanks for your interest. This service implements the `orchestrator` OpenAPI contract from [`eugene-plexus/specs`](https://github.com/eugene-plexus/specs) — please read this before opening a PR.
+Thanks for your interest. This service implements the `gateway` OpenAPI contract from [`eugene-plexus/specs`](https://github.com/eugene-plexus/specs) — please read this before opening a PR.
 
 ## Developer Certificate of Origin (DCO)
 
@@ -36,14 +36,14 @@ PRs to this repo should generally cover one or more of:
 ## Local setup
 
 ```bash
-git clone https://github.com/eugene-plexus/orchestrator
-cd orchestrator
+git clone https://github.com/eugene-plexus/gateway
+cd gateway
 python -m venv .venv
 . .venv/bin/activate           # or: .venv\Scripts\activate on Windows
 pip install -e ".[dev]"
 ```
 
-To exercise the full stack you also need two `hemisphere-driver` instances reachable. See its [README](https://github.com/eugene-plexus/hemisphere-driver) for setup; configure orchestrator's `leftDriverUrl` and `rightDriverUrl` accordingly.
+To exercise the full stack you also need two `inference-driver` instances reachable. See its [README](https://github.com/eugene-plexus/inference-driver) for setup; configure gateway's `leftDriverUrl` and `rightDriverUrl` accordingly.
 
 ## Git hooks
 
@@ -72,9 +72,9 @@ ruff format --check .
 mypy src/
 pytest
 python scripts/codegen.py
-git diff --exit-code src/eugene_plexus_orchestrator/_generated/
+git diff --exit-code src/eugene_plexus_gateway/_generated/
 ```
 
 ## Reporting issues
 
-File issues at <https://github.com/eugene-plexus/orchestrator/issues>. This repo is the right place for broader architectural questions about Eugene Plexus too.
+File issues at <https://github.com/eugene-plexus/gateway/issues>. This repo is the right place for broader architectural questions about Eugene Plexus too.

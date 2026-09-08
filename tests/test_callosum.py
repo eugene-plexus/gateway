@@ -3,7 +3,7 @@
 The `EmbeddingAgreementScorer` isn't exercised here — it would pull torch
 into the test environment and lengthen CI by several seconds for model
 load. Its semantics are covered by hand-tested traces against the
-running orchestrator. The Jaccard scorer remains in the suite because
+running gateway. The Jaccard scorer remains in the suite because
 it's the test-time fallback every chat test runs through.
 """
 
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import pytest
 
-from eugene_plexus_orchestrator.bicameral.callosum import (
+from eugene_plexus_gateway.bicameral.callosum import (
     JaccardAgreementScorer,
     blend,
     jaccard_word_agreement,

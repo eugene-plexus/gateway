@@ -1,6 +1,6 @@
 """The continuous loop emits a `tool_call` event per ToolRunner invocation.
 
-Every orchestrator operation runs through the ToolRunner; in the
+Every gateway operation runs through the ToolRunner; in the
 continuous runtime each invocation is published to the consciousness
 stream as a `tool_call` event — the live evolution of the v0.2
 `ChatResponse.toolInvocations` trace — so the UI can render the
@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from uuid import uuid4
 
-from eugene_plexus_orchestrator.settings import Settings
+from eugene_plexus_gateway.settings import Settings
 from tests.conftest import (
     FakeHemisphereClient,
     build_loop_app,

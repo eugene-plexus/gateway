@@ -1,7 +1,7 @@
-"""HTTP client for talking to a single hemisphere-driver instance.
+"""HTTP client for talking to a single inference-driver instance.
 
 Implemented as a thin wrapper around an httpx.AsyncClient: one client per
-driver, lifetime managed by the FastAPI lifespan. The orchestrator calls
+driver, lifetime managed by the FastAPI lifespan. The gateway calls
 all configured drivers in parallel via asyncio.gather. Each client carries
 the operator-supplied driver `name` so the bicameral loop can stamp it
 onto every emitted message and the admin endpoint can label it.
@@ -25,8 +25,8 @@ from ._generated.hemisphere_models import (
 log = logging.getLogger(__name__)
 
 
-class HemisphereDriverError(Exception):
-    """Raised when a hemisphere-driver responds with 4xx/5xx.
+class DriverError(Exception):
+    """Raised when an inference-driver responds with 4xx/5xx.
 
     Carries the driver's parsed `Problem` body (when present) so the
     chat route can surface the *actual* upstream error instead of the
@@ -91,7 +91,7 @@ def _problem_from_response(response: httpx.Response) -> Problem | None:
     return None
 
 
-class HemisphereClient(Protocol):
+class DriverClient(Protocol):
     """Contract every hemisphere client implements (real or fake-for-tests)."""
 
     name: str
@@ -102,8 +102,8 @@ class HemisphereClient(Protocol):
     async def aclose(self) -> None: ...
 
 
-class HttpHemisphereClient:
-    """Real HTTP-backed client. Talks to a hemisphere-driver over its OpenAPI."""
+class HttpDriverClient:
+    """Real HTTP-backed client. Talks to an inference-driver over its OpenAPI."""
 
     def __init__(
         self,
@@ -135,7 +135,7 @@ class HttpHemisphereClient:
         payload = request.model_dump(mode="json", exclude_none=True)
         response = await self._client.post("/v1/generate", json=payload)
         if response.status_code >= 400:
-            raise HemisphereDriverError(
+            raise DriverError(
                 driver_name=self.name,
                 driver_url=self.base_url,
                 status_code=response.status_code,
@@ -166,16 +166,16 @@ def _is_cascade_eligible(exc: Exception) -> bool:
     cascade; 4xx hard-fails. Timeouts surface as `httpx.TimeoutException`
     (an `httpx.HTTPError`), so they fall into the transport branch.
     """
-    if isinstance(exc, HemisphereDriverError):
+    if isinstance(exc, DriverError):
         return exc.status_code >= 500
     return isinstance(exc, httpx.HTTPError)
 
 
-class FailoverHemisphereClient:
+class FailoverDriverClient:
     """A driver *slot* backed by an ordered priority list of backends.
 
-    Implements the same `HemisphereClient` protocol as
-    `HttpHemisphereClient`, so the bicameral loop is oblivious to
+    Implements the same `DriverClient` protocol as
+    `HttpDriverClient`, so the bicameral loop is oblivious to
     failover — it still sees exactly two slots and calls `.generate()`
     on each. Internally this slot tries its candidate backends in order,
     cascading to the next on a cascade-eligible failure (transport / 5xx
@@ -188,11 +188,11 @@ class FailoverHemisphereClient:
     without operator intervention.
 
     A single-URL slot (the stock install) constructs one candidate and
-    behaves identically to the pre-v0.2.1 `HttpHemisphereClient`: the
+    behaves identically to the pre-v0.2.1 `HttpDriverClient`: the
     loop runs once and the sole backend's error propagates unchanged.
     """
 
-    def __init__(self, *, name: str, candidates: list[HemisphereClient]) -> None:
+    def __init__(self, *, name: str, candidates: list[DriverClient]) -> None:
         if not candidates:
             raise ValueError(f"driver slot {name!r} needs at least one backend URL")
         self.name = name
@@ -233,15 +233,13 @@ class FailoverHemisphereClient:
                 last_exc = exc
                 self._log_cascade("generate", index, candidate, exc)
         # Every backend failed in a cascade-eligible way. Re-raise the
-        # last failure so the chat route's existing HemisphereDriverError
+        # last failure so the chat route's existing DriverError
         # / httpx.HTTPError handlers surface it as they would for a
         # single-backend slot — no new error path to maintain.
         assert last_exc is not None  # candidates is non-empty (checked in __init__)
         raise last_exc
 
-    def _log_cascade(
-        self, op: str, index: int, candidate: HemisphereClient, exc: Exception
-    ) -> None:
+    def _log_cascade(self, op: str, index: int, candidate: DriverClient, exc: Exception) -> None:
         """Emit a WARNING when a backend fails and we cascade.
 
         Failover that silently always-works hides a broken primary

@@ -133,7 +133,7 @@ def test_config_schema_lists_orchestrator_fields(client: TestClient) -> None:
     response = client.get("/v1/config/schema")
     assert response.status_code == 200
     body = response.json()
-    assert body["component"] == "orchestrator"
+    assert body["component"] == "gateway"
     keys = {f["key"] for f in body["fields"]}
     expected = {
         "drivers",

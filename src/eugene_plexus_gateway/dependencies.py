@@ -32,11 +32,11 @@ def _problem(status_code: int, title: str, detail: str) -> HTTPException:
     return HTTPException(
         status_code=status_code,
         detail=Problem(
-            type=f"https://github.com/eugene-plexus/orchestrator#{title.replace(' ', '-').lower()}",
+            type=f"https://github.com/eugene-plexus/gateway#{title.replace(' ', '-').lower()}",
             title=title,
             status=status_code,
             detail=detail,
-            component="orchestrator",
+            component="gateway",
         ).model_dump(exclude_none=True),
     )
 

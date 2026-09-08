@@ -2,7 +2,7 @@
 
 Reads `SPECS_REF` (a single line: the git SHA of `eugene-plexus/specs`),
 downloads the OpenAPI tree at that SHA, and runs `datamodel-code-generator`
-to produce Pydantic v2 models under `src/eugene_plexus_orchestrator/_generated/`.
+to produce Pydantic v2 models under `src/eugene_plexus_gateway/_generated/`.
 
 The generated files are committed to the repo so builds are reproducible
 without network access. CI re-runs this script and fails the build if the
@@ -27,7 +27,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SPECS_REF_FILE = REPO_ROOT / "SPECS_REF"
-GENERATED_DIR = REPO_ROOT / "src" / "eugene_plexus_orchestrator" / "_generated"
+GENERATED_DIR = REPO_ROOT / "src" / "eugene_plexus_gateway" / "_generated"
 WORKING_DIR = REPO_ROOT / ".codegen-cache"
 
 SPECS_TARBALL_URL_TEMPLATE = "https://github.com/eugene-plexus/specs/archive/{ref}.tar.gz"
@@ -42,8 +42,8 @@ SPECS_TARBALL_URL_TEMPLATE = "https://github.com/eugene-plexus/specs/archive/{re
 # and bumping SPECS_REF.
 SPECS_LOCAL_ENV = "EUGENE_PLEXUS_SPECS_LOCAL_PATH"
 
-# The orchestrator's wire surface is orchestrator.yaml (chat, conversations,
-# config, admin). It also *consumes* hemisphere-driver.yaml as an HTTP
+# The gateway's wire surface is gateway.yaml (chat, conversations,
+# config, admin). It also *consumes* inference-driver.yaml as an HTTP
 # client, so we generate a second module of those types. Each input
 # transitively pulls components/common.yaml types into its own module —
 # we live with the duplication of common types between the two modules
@@ -51,12 +51,12 @@ SPECS_LOCAL_ENV = "EUGENE_PLEXUS_SPECS_LOCAL_PATH"
 #
 # Identity types (Constitution, SelfModelEntry, Person, RelationshipSummary)
 # are NOT generated as a third module: they're already pulled into
-# models.py via common.yaml's transitive closure, and the orchestrator
+# models.py via common.yaml's transitive closure, and the gateway
 # only ever decodes identity responses (never serializes paths from
 # identity.yaml directly).
 SPECS_TO_GENERATE: list[tuple[str, str, list[str] | None]] = [
-    ("openapi/orchestrator.yaml", "models.py", None),
-    ("openapi/hemisphere-driver.yaml", "hemisphere_models.py", None),
+    ("openapi/gateway.yaml", "models.py", None),
+    ("openapi/inference-driver.yaml", "hemisphere_models.py", None),
 ]
 
 

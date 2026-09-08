@@ -1,9 +1,9 @@
-"""Tests for v0.2 bearer auth on the orchestrator.
+"""Tests for v0.2 bearer auth on the gateway.
 
-The orchestrator is verify-only — the watchdog issues the signing key
+The gateway is verify-only — the watchdog issues the signing key
 and tokens. These tests stand in for the watchdog by constructing
 JWTs directly via PyJWT against a known key, then asserting the
-orchestrator's dependencies accept / reject the right shapes.
+gateway's dependencies accept / reject the right shapes.
 
 Auth posture is selected by whether `app.state.auth_state` is
 pre-populated before the lifespan runs:
@@ -26,10 +26,10 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from eugene_plexus_orchestrator.app import create_app
-from eugene_plexus_orchestrator.auth_state import AuthState
-from eugene_plexus_orchestrator.memory import InProcessMemory
-from eugene_plexus_orchestrator.settings import Settings
+from eugene_plexus_gateway.app import create_app
+from eugene_plexus_gateway.auth_state import AuthState
+from eugene_plexus_gateway.memory import InProcessMemory
+from eugene_plexus_gateway.settings import Settings
 from tests.conftest import FakeHemisphereClient, make_message_event
 
 _JWT_ALG = "HS256"
@@ -81,8 +81,8 @@ def authed_app(
         signing_key=signing_key,
         service_token=_issue(
             signing_key=signing_key,
-            sub="orchestrator",
-            aud="service:orchestrator",
+            sub="gateway",
+            aud="service:gateway",
             ttl_seconds=365 * 24 * 3600,
         ),
         master_key=None,
@@ -142,7 +142,7 @@ def test_missing_bearer_rejects_with_401(authed_client: TestClient) -> None:
     assert response.status_code == 401
     body = response.json()
     assert "detail" in body
-    assert body["detail"]["component"] == "orchestrator"
+    assert body["detail"]["component"] == "gateway"
 
 
 def test_wrong_signing_key_rejects(authed_client: TestClient) -> None:
@@ -262,7 +262,7 @@ def test_service_token_accepted_on_conversation_read(
 
 
 def test_load_auth_state_disabled_when_no_signing_key() -> None:
-    from eugene_plexus_orchestrator.auth_state import load_auth_state
+    from eugene_plexus_gateway.auth_state import load_auth_state
 
     state = load_auth_state(signing_key_b64=None, service_token=None, master_key_b64=None)
     assert state.auth_disabled is True
@@ -271,7 +271,7 @@ def test_load_auth_state_disabled_when_no_signing_key() -> None:
 def test_load_auth_state_rejects_partial_auth() -> None:
     """SERVICE_TOKEN without AUTH_SIGNING_KEY is a configuration bug —
     fail loudly rather than silently disabling auth."""
-    from eugene_plexus_orchestrator.auth_state import load_auth_state
+    from eugene_plexus_gateway.auth_state import load_auth_state
 
     with pytest.raises(ValueError, match="inconsistent"):
         load_auth_state(
@@ -282,11 +282,11 @@ def test_load_auth_state_rejects_partial_auth() -> None:
 
 
 def test_load_auth_state_requires_service_token_when_enabled(signing_key: bytes) -> None:
-    """AUTH_SIGNING_KEY without SERVICE_TOKEN means the orchestrator
+    """AUTH_SIGNING_KEY without SERVICE_TOKEN means the gateway
     has nothing to present on outbound calls — refuse."""
     import base64
 
-    from eugene_plexus_orchestrator.auth_state import load_auth_state
+    from eugene_plexus_gateway.auth_state import load_auth_state
 
     with pytest.raises(ValueError, match="SERVICE_TOKEN is missing"):
         load_auth_state(
@@ -301,7 +301,7 @@ def test_load_auth_state_rejects_wrong_length_signing_key() -> None:
     failure half a second after a request lands."""
     import base64
 
-    from eugene_plexus_orchestrator.auth_state import load_auth_state
+    from eugene_plexus_gateway.auth_state import load_auth_state
 
     short = base64.b64encode(b"\x00" * 16).decode("ascii")
     with pytest.raises(ValueError, match="32 bytes"):

@@ -8,8 +8,8 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from eugene_plexus_orchestrator._generated.models import NTLevel, NTState
-from eugene_plexus_orchestrator.bicameral.nt import (
+from eugene_plexus_gateway._generated.models import NTLevel, NTState
+from eugene_plexus_gateway.bicameral.nt import (
     Observations,
     modulated_temperature,
     net_valence,

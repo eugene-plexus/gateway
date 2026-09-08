@@ -41,7 +41,7 @@ from .._generated.models import (
     NTState,
     Role,
 )
-from ..hemisphere_client import HemisphereClient
+from ..driver_client import DriverClient
 
 log = logging.getLogger(__name__)
 
@@ -214,7 +214,7 @@ def _format_deliberation_summary(deliberation_finals: list[Message]) -> str:
 
 async def run_voice_pass(
     *,
-    voice_driver: HemisphereClient,
+    voice_driver: DriverClient,
     user_message: Message,
     history: list[Message],
     system_prompt: str,

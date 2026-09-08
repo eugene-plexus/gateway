@@ -1,7 +1,7 @@
-"""Tests for the watchdog safe-mode contract on the orchestrator.
+"""Tests for the watchdog safe-mode contract on the gateway.
 
-Per specs/openapi/orchestrator.yaml: when started with
-`EUGENE_PLEXUS_ORCH_SAFE_MODE=1` the orchestrator must
+Per specs/openapi/gateway.yaml: when started with
+`EUGENE_PLEXUS_GATEWAY_SAFE_MODE=1` the gateway must
 
   - skip loading its persisted config file (defaults only)
   - still expose /v1/config endpoints (operator can repair via UI)
@@ -20,8 +20,8 @@ import yaml
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from eugene_plexus_orchestrator.app import create_app
-from eugene_plexus_orchestrator.settings import Settings
+from eugene_plexus_gateway.app import create_app
+from eugene_plexus_gateway.settings import Settings
 
 
 @pytest.fixture

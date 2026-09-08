@@ -134,14 +134,14 @@ async def test_config(
     if failures:
         return ConfigTestResult(
             ok=False,
-            component="orchestrator",
+            component="gateway",
             latencyMs=elapsed_ms,
             error="; ".join(failures),
         )
     driver_count = len(drivers_raw)
     return ConfigTestResult(
         ok=True,
-        component="orchestrator",
+        component="gateway",
         latencyMs=elapsed_ms,
         summary=f"all {driver_count} driver(s) + memory reachable in {elapsed_ms}ms",
     )

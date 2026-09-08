@@ -147,7 +147,7 @@ class EmbeddingAgreementScorer:
 def load_default_scorer(model_name: str = "all-MiniLM-L6-v2") -> AgreementScorer:
     """Build the production scorer, falling back to Jaccard on failure.
 
-    The orchestrator's lifespan calls this through `asyncio.to_thread`.
+    The gateway's lifespan calls this through `asyncio.to_thread`.
     Any exception during model load — missing torch, no network for the
     first-run model download, corrupted cache — degrades to Jaccard
     instead of failing startup. Logs the reason so the operator can fix

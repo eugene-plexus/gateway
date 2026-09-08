@@ -26,11 +26,11 @@ async def get_conversation(request: Request, conversation_id: UUID) -> Conversat
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=Problem(
-                type="https://github.com/eugene-plexus/orchestrator#memory-error",
+                type="https://github.com/eugene-plexus/gateway#memory-error",
                 title="Memory service error",
                 status=502,
                 detail=f"Memory service at {request.app.state.memory_url} is unreachable: {e}",
-                component="orchestrator",
+                component="gateway",
             ).model_dump(exclude_none=True),
         ) from e
 
@@ -38,11 +38,11 @@ async def get_conversation(request: Request, conversation_id: UUID) -> Conversat
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=Problem(
-                type="https://github.com/eugene-plexus/orchestrator#conversation-not-found",
+                type="https://github.com/eugene-plexus/gateway#conversation-not-found",
                 title="Conversation not found",
                 status=404,
                 detail=f"No conversation with id {conversation_id}.",
-                component="orchestrator",
+                component="gateway",
             ).model_dump(exclude_none=True),
         )
     return conversation

@@ -30,19 +30,19 @@ from uuid import UUID, uuid4
 
 import httpx
 
-from eugene_plexus_orchestrator._generated.hemisphere_models import (
+from eugene_plexus_gateway._generated.hemisphere_models import (
     GenerateRequest,
     Role,
 )
-from eugene_plexus_orchestrator._generated.models import (
+from eugene_plexus_gateway._generated.models import (
     Constitution,
     Person,
     RelationshipSummary,
     SelfModelEntry,
 )
-from eugene_plexus_orchestrator.identity import InProcessIdentity
-from eugene_plexus_orchestrator.memory import NIL_PERSON_ID, InProcessMemory
-from eugene_plexus_orchestrator.settings import Settings
+from eugene_plexus_gateway.identity import InProcessIdentity
+from eugene_plexus_gateway.memory import NIL_PERSON_ID, InProcessMemory
+from eugene_plexus_gateway.settings import Settings
 from tests.conftest import (
     FakeHemisphereClient,
     build_loop_app,
@@ -307,7 +307,7 @@ async def test_pass0_preambles_are_identical_for_both_hemispheres(
     Earlier versions added a distinguishing preamble ("you are the left
     hemisphere, your twin is the right hemisphere running on backend X")
     to make cross-vendor bicameral commitment visible. That backfired:
-    the LLMs started addressing the orchestrator and treating each other
+    the LLMs started addressing the gateway and treating each other
     as siblings to chat with. We now derive divergence from the
     underlying models being different (cross-vendor) and from per-pass
     cross-talk, which surfaces the other side's content as the SAME
