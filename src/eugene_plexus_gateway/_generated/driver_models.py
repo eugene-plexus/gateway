@@ -249,16 +249,26 @@ class ConfigValueType(StrEnum):
     The kind of value a config field holds. The UI uses this to pick
     a renderer (text input, dropdown, password field, etc.).
 
-    Two of these hold more than a scalar. `path_list` is an ordered
-    JSON array of directory paths on the component host — the
-    library's model roots are the first and so far only user — and
-    the UI renders it as an add/remove list of directory pickers
+    Three of these hold more than a scalar. `path_list` is an
+    ordered JSON array of directory paths on the component host —
+    the library's model roots are the first and so far only user —
+    and the UI renders it as an add/remove list of directory pickers
     rather than a text field, because asking someone to
     comma-separate Windows paths is asking for a bug report. Order
     is preserved and meaningful: it is the order the operator sees,
     and M3's downloader offers the first entry as the default
-    destination. `driver_list` stays reserved for M5's ordered
-    model→driver priority lists.
+    destination.
+
+    `url_list` is the same argument one type over: an ordered JSON
+    array of URLs, rendered as an add/remove list of address fields.
+    Added at M5 for the control root's standby endpoints, which are
+    inherently plural — *"N standbys is a configuration, not a
+    mechanism"* — and which have no natural single-value spelling.
+    A comma-separated text field would be the same bug report
+    `path_list` exists to avoid, and reusing `path_list` for
+    addresses would tell every UI to open a directory picker.
+    Validation is the field's business rather than the type's; what
+    the type promises is a list whose entries are addresses.
 
     `runtime_name` holds the `name` of a supervised engine runtime,
     and UIs render it as a dropdown sourced from the agent's
@@ -294,6 +304,7 @@ class ConfigValueType(StrEnum):
     file_path = 'file_path'
     path_list = 'path_list'
     url = 'url'
+    url_list = 'url_list'
     duration = 'duration'
     runtime_name = 'runtime_name'
     node_name = 'node_name'
