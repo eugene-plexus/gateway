@@ -81,12 +81,68 @@ class ComponentKind(StrEnum):
     `gateway` is the one OpenAI-compatible front door and there is
     exactly one. `inference-driver` instances are the per-backend
     wrappers and there are N — one per backend, wherever that
-    backend lives.
+    backend lives. `library` scans the operator's model
+    directories and holds per-model launch profiles; there is
+    exactly one, and it is deliberately not in the request path.
 
     """
 
     gateway = 'gateway'
     inference_driver = 'inference-driver'
+    library = 'library'
+
+
+class EngineKind(StrEnum):
+    """
+    Which engine adapter constructs the argv and interprets
+    readiness. Deliberately a closed enum rather than a free string:
+    an engine is supported exactly when an adapter exists for it,
+    and without an adapter there is nothing that knows how to start
+    it or tell when it is ready.
+
+    `llama_cpp` drives upstream `llama-server`. vLLM is a second
+    adapter later, and MLX after that. We never ship an engine — all
+    three are upstream projects we wrap and track.
+
+    Lives here rather than on the watchdog because two components
+    reference it: the watchdog's engines and runtimes, and a
+    library `ModelProfile`, which names the engine its launch flags
+    are written for.
+
+    """
+
+    llama_cpp = 'llama_cpp'
+
+
+class ModelFormat(StrEnum):
+    """
+    On-disk format of a model. A dimension of the data model rather
+    than an assumption (locked 2026-09-08): both are implemented at
+    v0.1, and the differences are load-bearing rather than
+    cosmetic.
+
+    * `gguf` — a single file, quantized, carrying its own metadata
+      and tokenizer. Large models may be **split** into
+      `…-00001-of-0000N.gguf` shards, of which only the first is
+      named on a launch line. A multimodal GGUF ships its vision
+      projector as a separate file in the same directory, which is
+      not itself a model.
+    * `safetensors` — a directory: `config.json` plus one or more
+      weight files plus tokenizer files. Unquantized in practice,
+      so **no quant tier** — a safetensors model is sized, not
+      tiered, and the quant fields exist only on the GGUF side.
+
+    Shared because it appears on both sides of a join: a library
+    entry declares what a model *is*, and
+    `EngineDescriptor.modelFormats` declares what an engine can
+    *load*. Nothing can serve a safetensors model until the vLLM
+    adapter lands, and that answer comes from the engine's
+    descriptor rather than from anything the library knows.
+
+    """
+
+    gguf = 'gguf'
+    safetensors = 'safetensors'
 
 
 class Problem(BaseModel):
@@ -145,6 +201,17 @@ class ConfigValueType(StrEnum):
     The kind of value a config field holds. The UI uses this to pick
     a renderer (text input, dropdown, password field, etc.).
 
+    Two of these hold more than a scalar. `path_list` is an ordered
+    JSON array of directory paths on the component host — the
+    library's model roots are the first and so far only user — and
+    the UI renders it as an add/remove list of directory pickers
+    rather than a text field, because asking someone to
+    comma-separate Windows paths is asking for a bug report. Order
+    is preserved and meaningful: it is the order the operator sees,
+    and M3's downloader offers the first entry as the default
+    destination. `driver_list` stays reserved for M5's ordered
+    model→driver priority lists.
+
     """
 
     string = 'string'
@@ -154,6 +221,7 @@ class ConfigValueType(StrEnum):
     enum = 'enum'
     secret = 'secret'
     file_path = 'file_path'
+    path_list = 'path_list'
     url = 'url'
     duration = 'duration'
     driver_list = 'driver_list'
