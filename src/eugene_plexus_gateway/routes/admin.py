@@ -91,8 +91,8 @@ async def list_drivers(request: Request) -> DriversInfo:
                 title="No drivers in the topology",
                 status=503,
                 detail=(
-                    "The watchdog topology contains no inference-driver entries, "
-                    "so there is nothing to route to. Add one via the watchdog's "
+                    "The agent topology contains no inference-driver entries, "
+                    "so there is nothing to route to. Add one via the agent's "
                     "POST /v1/components."
                 ),
                 component="gateway",

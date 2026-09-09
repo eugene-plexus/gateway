@@ -2,7 +2,7 @@
 
 The gateway's whole job is routing, so the lifespan is short: load
 config, resolve auth, and build the routing table. Everything the table
-needs comes from the watchdog topology plus each driver's `/v1/info`, so
+needs comes from the agent topology plus each driver's `/v1/info`, so
 there are no peer URLs to resolve and no clients to construct from
 config.
 
@@ -53,7 +53,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Tests can pre-populate `app.state.auth_state` to exercise authed
     # paths; the default build reads env vars via Settings and produces
-    # an auth-disabled state when the watchdog didn't supply a signing
+    # an auth-disabled state when the agent didn't supply a signing
     # key (dev / standalone).
     if not hasattr(app.state, "auth_state"):
         app.state.auth_state = load_auth_state(
@@ -74,7 +74,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.routing = None
         else:
             table = RoutingTable(
-                watchdog_url=settings.watchdog_url,
+                agent_url=settings.agent_url,
                 service_token=auth_state.service_token,
                 request_timeout_seconds=float(store.get("requestTimeoutSeconds") or 180),
                 refresh_seconds=float(store.get("routingRefreshSeconds") or 15),

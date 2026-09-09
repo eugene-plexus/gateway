@@ -7,7 +7,7 @@ on protocol semantics so a single UI can edit both.
 
 The gateway's config is deliberately small. It holds no backend URLs and
 no model list: the routing table is *derived* at runtime from the
-watchdog topology plus each driver's `/v1/info`, so backend addresses
+agent topology plus each driver's `/v1/info`, so backend addresses
 live in exactly one place and adding a model is not a config edit. What
 is left here is the generation defaults the gateway stamps onto requests
 and a few operational knobs.
@@ -92,7 +92,7 @@ FIELDS: list[ConfigField] = [
         key="routingRefreshSeconds",
         label="Routing table refresh",
         description=(
-            "How often the gateway re-reads the watchdog topology and "
+            "How often the gateway re-reads the agent topology and "
             "asks each driver what it serves. This is what makes a "
             "newly-started engine routable without restarting the "
             "gateway, and what drops one that went away. Lower is more "

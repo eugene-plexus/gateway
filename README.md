@@ -10,9 +10,9 @@ Front door of [Eugene Plexus](https://github.com/eugene-plexus): **one OpenAI-co
 
 ## The routing table is derived, not configured
 
-The gateway stores no backend URLs and no model list. It reads the watchdog topology for `inference-driver` entries, asks each one's `/v1/info` what it is serving, and groups the answers by model id. Three things follow:
+The gateway stores no backend URLs and no model list. It reads the agent topology for `inference-driver` entries, asks each one's `/v1/info` what it is serving, and groups the answers by model id. Three things follow:
 
-- Backend addresses live in exactly **one** place — the watchdog topology. A URL duplicated into two components is the trap this avoids.
+- Backend addresses live in exactly **one** place — the agent topology. A URL duplicated into two components is the trap this avoids.
 - **Adding a model is not a config edit.** Start an engine, point a driver at it, and it becomes routable on the next refresh.
 - **Failover falls out of the topology.** Two drivers serving the same model are automatically a priority list, so the cascade needs nothing configured.
 
@@ -58,7 +58,7 @@ Transport errors, timeouts and 5xx cascade to the next backend; 4xx fails hard.
 
 ## Safe mode
 
-`EUGENE_PLEXUS_GATEWAY_SAFE_MODE=1` (set by the watchdog after a failed boot) skips the persisted config and builds no routing table. `PATCH /v1/config` still writes to disk so the repair survives the next normal boot; `/v1/chat/completions` returns 503 until then, and `/v1/models` returns an empty list — "nothing available" being a valid answer to "what have you got".
+`EUGENE_PLEXUS_GATEWAY_SAFE_MODE=1` (set by the agent after a failed boot) skips the persisted config and builds no routing table. `PATCH /v1/config` still writes to disk so the repair survives the next normal boot; `/v1/chat/completions` returns 503 until then, and `/v1/models` returns an empty list — "nothing available" being a valid answer to "what have you got".
 
 ## Running
 
@@ -67,9 +67,9 @@ pip install -e ".[dev]"
 python -m eugene_plexus_gateway
 ```
 
-Default port: `8080`, overridable via `EUGENE_PLEXUS_GATEWAY_BIND_PORT` (the watchdog uses this when supervising). Other startup behavior is configured via env vars (12-factor) or by editing `config.yaml` (auto-created in the working directory on first run).
+Default port: `8080`, overridable via `EUGENE_PLEXUS_GATEWAY_BIND_PORT` (the agent uses this when supervising). Other startup behavior is configured via env vars (12-factor) or by editing `config.yaml` (auto-created in the working directory on first run).
 
-The gateway needs a reachable **watchdog** — that is where it reads the topology from — and at least one `inference-driver` declared in it. Typical local dev:
+The gateway needs a reachable **agent** — that is where it reads the topology from — and at least one `inference-driver` declared in it. Typical local dev:
 
 ```bash
 # a driver, pointed at whatever backend you want
@@ -77,11 +77,11 @@ EUGENE_PLEXUS_DRIVER_CONFIG_FILE=./qwen.yaml EUGENE_PLEXUS_DRIVER_BIND_PORT=8081
   python -m eugene_plexus_inference_driver
 ```
 
-…then declare it on the watchdog (`POST /v1/components` with `kind: inference-driver` and that url). Nothing goes into the gateway's own config: it discovers the driver, asks what it serves, and routes. For normal installs the watchdog does all of this — this is the manual path for tinkering.
+…then declare it on the agent (`POST /v1/components` with `kind: inference-driver` and that url). Nothing goes into the gateway's own config: it discovers the driver, asks what it serves, and routes. For normal installs the agent does all of this — this is the manual path for tinkering.
 
-Override the watchdog address with `EUGENE_PLEXUS_GATEWAY_WATCHDOG_URL` when it isn't on loopback.
+Override the agent address with `EUGENE_PLEXUS_GATEWAY_AGENT_URL` when it isn't on loopback.
 
-> **Auth is on by default when supervised.** The watchdog threads a signing key and a service token in at spawn; every endpoint except `/healthz` then requires a bearer token. Run standalone without those env vars and the gateway serves unauthenticated — dev only. A mesh VPN (Tailscale/WireGuard) is still the network boundary between hosts.
+> **Auth is on by default when supervised.** The agent threads a signing key and a service token in at spawn; every endpoint except `/healthz` then requires a bearer token. Run standalone without those env vars and the gateway serves unauthenticated — dev only. A mesh VPN (Tailscale/WireGuard) is still the network boundary between hosts.
 
 ## Codegen
 

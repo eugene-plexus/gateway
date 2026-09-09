@@ -1,7 +1,7 @@
 """Tests for v0.2 bearer auth on the gateway.
 
-The gateway is verify-only — the watchdog issues the signing key
-and tokens. These tests stand in for the watchdog by constructing
+The gateway is verify-only — the agent issues the signing key
+and tokens. These tests stand in for the agent by constructing
 JWTs directly via PyJWT against a known key, then asserting the
 gateway's dependencies accept / reject the right shapes.
 
@@ -42,7 +42,7 @@ def _issue(
     ttl_seconds: int = 60,
     iat: int | None = None,
 ) -> str:
-    """Mint a JWT exactly the way the watchdog would."""
+    """Mint a JWT exactly the way the agent would."""
     issued_at = iat if iat is not None else int(time.time())
     claims = {
         "sub": sub,
@@ -110,7 +110,7 @@ def service_token(signing_key: bytes) -> str:
 def test_auth_disabled_lets_everything_through(client: TestClient) -> None:
     """When no signing key is wired in, every route should answer
     normally without a bearer header. That's the dev / standalone
-    posture — production via the watchdog supplies the env vars."""
+    posture — production via the agent supplies the env vars."""
     assert client.get("/healthz").status_code == 200
     assert client.get("/v1/admin/drivers").status_code == 200
     assert client.get("/v1/config").status_code == 200

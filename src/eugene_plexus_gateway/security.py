@@ -1,14 +1,14 @@
 """v0.2 security primitives — verify-only.
 
-The gateway never issues tokens. The watchdog (the install's
+The gateway never issues tokens. The agent (the install's
 trust root) generates the per-restart HMAC signing key and distributes
 it to spawned children, along with a long-lived service token, via env
 vars (`EUGENE_PLEXUS_GATEWAY_AUTH_SIGNING_KEY`,
 `EUGENE_PLEXUS_GATEWAY_SERVICE_TOKEN`). This module exposes just the
 decode side so route dependencies can validate inbound bearer tokens.
 
-Mirror of the corresponding watchdog primitives at
-`eugene_plexus_watchdog.security`. Keeping the same constant names
+Mirror of the corresponding agent primitives at
+`eugene_plexus_agent.security`. Keeping the same constant names
 (`AUDIENCE_OPERATOR`, `SERVICE_AUDIENCE_PREFIX`) makes the two-sided
 contract obvious when reading either side.
 """
@@ -22,7 +22,7 @@ import jwt
 
 _JWT_ALG = "HS256"
 
-# Audience claim values — kept in sync with the watchdog.
+# Audience claim values — kept in sync with the agent.
 AUDIENCE_OPERATOR = "operator"
 SERVICE_AUDIENCE_PREFIX = "service:"
 

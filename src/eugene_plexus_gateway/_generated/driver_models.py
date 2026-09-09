@@ -67,17 +67,19 @@ class ComponentKind(StrEnum):
     """
     Which Eugene Plexus component class a topology entry
     represents. Lives in `common.yaml` because more than one
-    component references it: the watchdog's `/v1/components`, and
+    component references it: the agent's `/v1/components`, and
     (via `ConfigField.componentKindHint`) any component declaring
     a config field that points at a peer of a specific kind.
 
     A component is a **Eugene Plexus process**. Engine processes
     are not components and are not named here — they are runtimes,
-    declared separately on the watchdog, because a third-party
+    declared separately on the agent, because a third-party
     binary shares none of a component's declarative shape (no
-    module, no config trio, no service token). See the watchdog's
+    module, no config trio, no service token). See the agent's
     `GET /v1/runtimes`.
 
+    `control` is the trust root, node registry, install-wide
+    topology and UI host — exactly one active, plus warm standbys.
     `gateway` is the one OpenAI-compatible front door and there is
     exactly one. `inference-driver` instances are the per-backend
     wrappers and there are N — one per backend, wherever that
@@ -85,11 +87,44 @@ class ComponentKind(StrEnum):
     directories and holds per-model launch profiles; there is
     exactly one, and it is deliberately not in the request path.
 
+    **The agent is not in this list**, for the same reason engine
+    runtimes are not: it supervises, it is not supervised. Its
+    lifecycle belongs to the platform — a systemd unit, a container
+    entrypoint — not to a topology entry. `control` *is* in the list
+    precisely because the agent on its host supervises it like
+    anything else, which is what stops the control root needing a
+    second copy of the supervision machinery.
+
     """
 
+    control = 'control'
     gateway = 'gateway'
     inference_driver = 'inference-driver'
     library = 'library'
+
+
+class ComputeDeviceKind(StrEnum):
+    """
+    What kind of device this is.
+
+    A named schema rather than an inline enum because an inline one
+    generated a bare `Kind` class, which is too generic to sit in a
+    module every component imports.
+
+    Note `cpu` is a member, which is why the surrounding schema is
+    `ComputeDevice` and not `Accelerator`: a list that includes CPUs
+    is a device list. The narrower `HostAccelerator.accelerator` on
+    the agent keeps its own name and its own values — it answers
+    "which prebuilt engine build fits this machine", not "what can
+    this host compute on".
+
+    """
+
+    cuda = 'cuda'
+    rocm = 'rocm'
+    xpu = 'xpu'
+    metal = 'metal'
+    cpu = 'cpu'
 
 
 class EngineKind(StrEnum):
@@ -100,18 +135,31 @@ class EngineKind(StrEnum):
     and without an adapter there is nothing that knows how to start
     it or tell when it is ready.
 
-    `llama_cpp` drives upstream `llama-server`. vLLM is a second
-    adapter later, and MLX after that. We never ship an engine — all
-    three are upstream projects we wrap and track.
+    `llama_cpp` drives upstream `llama-server` and loads GGUF.
+    `vllm` drives upstream `vllm serve` and loads safetensors. MLX
+    is a third adapter later. We never ship an engine — every one of
+    them is an upstream project we wrap and track.
 
-    Lives here rather than on the watchdog because two components
-    reference it: the watchdog's engines and runtimes, and a
+    The two differ in far more than argv, and that is why readiness
+    is per-adapter rather than one shared TCP check:
+    `llama-server` answers `/health` while it loads and reports that
+    it is loading, whereas vLLM binds its port *before* loading the
+    model and refuses connections until the model is in memory — so
+    for minutes it is indistinguishable, over the network alone,
+    from a process that died. They differ in acquisition too: a
+    llama.cpp build is fetched and verified by us, while vLLM is a
+    Python package the operator installs themselves. See
+    `EngineAcquisition.policy`.
+
+    Lives here rather than on the agent because two components
+    reference it: the agent's engines and runtimes, and a
     library `ModelProfile`, which names the engine its launch flags
     are written for.
 
     """
 
     llama_cpp = 'llama_cpp'
+    vllm = 'vllm'
 
 
 class ModelFormat(StrEnum):
@@ -189,7 +237,7 @@ class Health(BaseModel):
     )
     safeMode: bool | None = Field(
         False,
-        description="True when the component was started with the watchdog's\nsafe-mode env var set\n(`EUGENE_PLEXUS_<KIND>_SAFE_MODE=1`) and is therefore\nrunning on built-in defaults instead of its persisted\nconfig. Components in safe mode are reachable for config\nediting (`PATCH /v1/config` writes to disk normally) but\nshould be considered non-functional for their primary\npurpose until restarted without the flag. `status` is\nalso reported as `degraded` while safe mode is in effect.\n",
+        description="True when the component was started with the agent's\nsafe-mode env var set\n(`EUGENE_PLEXUS_<KIND>_SAFE_MODE=1`) and is therefore\nrunning on built-in defaults instead of its persisted\nconfig. Components in safe mode are reachable for config\nediting (`PATCH /v1/config` writes to disk normally) but\nshould be considered non-functional for their primary\npurpose until restarted without the flag. `status` is\nalso reported as `degraded` while safe mode is in effect.\n",
     )
     details: dict[str, Any] | None = Field(
         None, description='Optional component-specific health detail.'
@@ -212,6 +260,29 @@ class ConfigValueType(StrEnum):
     destination. `driver_list` stays reserved for M5's ordered
     model→driver priority lists.
 
+    `runtime_name` holds the `name` of a supervised engine runtime,
+    and UIs render it as a dropdown sourced from the agent's
+    `GET /v1/runtimes`. It exists because `componentKindHint` cannot
+    do this job: a runtime is deliberately not a component, so
+    `/v1/components` does not list one. What is saved is the
+    runtime's *name*, never its URL — the agent assigns the port
+    when the operator does not pick one, so a stored URL would
+    encode a number the operator never chose and does not own, and
+    would be wrong the moment the runtime moved. Its first user is
+    the inference-driver's `runtimeName`, which is how a driver
+    follows the engine process it fronts.
+
+    `node_name` holds the `name` of an enrolled node, rendered as a
+    dropdown sourced from the control root's `GET /v1/nodes`. Same
+    reasoning as `runtime_name` one level up: a node is not a
+    component either, so `componentKindHint` cannot source it, and
+    what is saved is the name rather than a URL because the address
+    of a host is topology the control root owns.
+
+    `driver_list` stays reserved for the ordered model→driver
+    priority lists that arrive with lifecycle policy — **M6** since
+    multi-host and trust took M5.
+
     """
 
     string = 'string'
@@ -224,6 +295,8 @@ class ConfigValueType(StrEnum):
     path_list = 'path_list'
     url = 'url'
     duration = 'duration'
+    runtime_name = 'runtime_name'
+    node_name = 'node_name'
     driver_list = 'driver_list'
 
 
@@ -358,11 +431,11 @@ class ConfigTestResult(BaseModel):
 
 class SecurityMode(StrEnum):
     """
-    Operator's choice for how the watchdog handles its master key
+    Operator's choice for how the agent handles its master key
     between restarts. Set during the wizard's security screen; can
     be changed later from the Config page.
 
-    * `prompt_on_startup` — passphrase required at every watchdog
+    * `prompt_on_startup` — passphrase required at every agent
       start. Master key lives only in process memory. Best for
       shared environments, sensitive conversations, security-
       conscious operators. A power outage means Eugene stays
@@ -383,8 +456,8 @@ class SecurityMode(StrEnum):
 class AuthLoginRequest(BaseModel):
     """
     Login request body sent by the UI to `POST /v1/auth/login` on
-    the watchdog. The passphrase is the same one the operator set
-    in the wizard. The watchdog bcrypt-compares it; on match,
+    the agent. The passphrase is the same one the operator set
+    in the wizard. The agent bcrypt-compares it; on match,
     issues a session token.
 
     """
@@ -425,7 +498,7 @@ class MasterKeyEnvelope(BaseModel):
     Encrypted-at-rest envelope for sensitive config fields. The
     on-disk YAML for fields marked `sensitive: true` is stored as
     this envelope when v0.2 security is enabled; the component
-    decrypts using the master key passed in by the watchdog at
+    decrypts using the master key passed in by the agent at
     spawn time (env var `EUGENE_PLEXUS_<KIND>_MASTER_KEY`,
     base64-encoded).
 
@@ -433,7 +506,7 @@ class MasterKeyEnvelope(BaseModel):
     is generated per-encryption and stored alongside the
     ciphertext. The master key is 32 bytes derived from the
     operator's passphrase via Argon2id with parameters chosen at
-    first-run time and persisted in the watchdog's state.
+    first-run time and persisted in the agent's state.
 
     Components MAY accept plaintext values in PATCH requests
     (current behavior); on persist, they encrypt to this envelope
@@ -511,7 +584,7 @@ class DriverInfo(BaseModel):
     """
     Driver self-description, and the gateway's only source of truth
     for what this backend serves. A driver does not know its position
-    in any topology: its operator-supplied name lives in the watchdog
+    in any topology: its operator-supplied name lives in the agent
     topology, not here.
 
     """
@@ -524,6 +597,10 @@ class DriverInfo(BaseModel):
     modelId: str | None = Field(
         None,
         description='Backend-specific model identifier (e.g. `"claude-opus-4-7"`).\nOptional — omitted when the driver is configured to use the\nadapter\'s built-in default rather than pinning a specific model.\n',
+    )
+    runtime: str | None = Field(
+        None,
+        description="The supervised engine runtime this driver is following, when\nit was configured with `runtimeName` rather than a literal\n`baseUrl`. Absent for a cloud provider, a CLI subscription,\nor any backend that is not a runtime this install\nsupervises.\n\nReported here despite the rule that a driver never says\nwhere it sits, because this is not the driver's own address —\nit is *what it serves*, which is exactly what `/v1/info` is\nfor. It lets the gateway and the UI show which engine\nprocess is behind a driver, so a model that is loaded but\nunroutable is diagnosable from the routing table instead of\nby reading two components' configs side by side.\n",
     )
     capabilities: Capabilities | None = Field(
         None, description='Backend capabilities the gateway keys off when routing.'
@@ -551,6 +628,44 @@ class GenerateRequest(BaseModel):
     requestId: UUID | None = Field(
         None,
         description='Caller-supplied id for log correlation. Echoed in the response.',
+    )
+
+
+class ComputeDevice(BaseModel):
+    """
+    One compute device on one host, as that host's agent detected it.
+
+    Shared because it appears on both sides of a join: an agent
+    reports its own devices on `GET /v1/node`, and the control root
+    aggregates them into `Node.devices` — the cross-host
+    inventory M3 deferred with the note that *"building a real
+    inventory is topology work"*. Two copies of this shape would be
+    two definitions of one fact, and the copy would be the one that
+    went stale.
+
+    Deliberately **not** the same thing as the agent's
+    `HostAccelerator`, which answers a narrower question — "which
+    prebuilt engine build should we fetch for this machine" — and
+    describes a host in the singular. This is a device *list*,
+    because a host with two cards is the case that makes replicas of
+    one model possible.
+
+    """
+
+    kind: ComputeDeviceKind
+    name: str | None = Field(
+        None,
+        description='Device name as the vendor reports it, e.g. `NVIDIA GeForce RTX 5090`.',
+    )
+    index: int | None = Field(
+        None,
+        description="Device ordinal on its own host — what `CUDA_VISIBLE_DEVICES`\nor `HIP_VISIBLE_DEVICES` in a runtime's `env` selects to pin\nthat runtime to one card.\n",
+        ge=0,
+    )
+    memoryTotalBytes: int | None = None
+    memoryFreeBytes: int | None = Field(
+        None,
+        description='Free decides whether a model fits, not total — M3 measured\n2.9 GiB of a 32 GiB card already held on an idle desktop.\nBoth are reported so the difference is visible rather than\nsurprising.\n',
     )
 
 
@@ -586,7 +701,7 @@ class ConfigField(BaseModel):
     )
     componentKindHint: ComponentKind | None = Field(
         None,
-        description="Declarative rendering hint: this field references a peer\ncomponent of the given kind. UIs render any kind-hinted\nfield as a dropdown sourced from the watchdog's\n`/v1/components` (filtered by kind), with `(off)` as the\nfirst option (saves an empty string). For single-instance\nkinds (memory, identity, etc.) the dropdown UX collapses\nto effectively a toggle; for multi-instance kinds\n(inference-driver) the operator picks one. Pairs with a\nstring/url `valueType` — the saved value is still the\npeer's URL, the hint only changes how the UI looks it up.\nAvoids the OpenClaw trap of duplicating topology into\nfree-text URL fields the operator has to type by hand.\n",
+        description="Declarative rendering hint: this field references a peer\ncomponent of the given kind. UIs render any kind-hinted\nfield as a dropdown sourced from the agent's\n`/v1/components` (filtered by kind), with `(off)` as the\nfirst option (saves an empty string). For single-instance\nkinds (memory, identity, etc.) the dropdown UX collapses\nto effectively a toggle; for multi-instance kinds\n(inference-driver) the operator picks one. Pairs with a\nstring/url `valueType` — the saved value is still the\npeer's URL, the hint only changes how the UI looks it up.\nAvoids the OpenClaw trap of duplicating topology into\nfree-text URL fields the operator has to type by hand.\n",
     )
     enumLabels: list[str] | None = Field(
         None,

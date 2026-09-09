@@ -1,7 +1,7 @@
 """The routing table's refresh: topology in, model->drivers out.
 
 The other tests inject a pre-built table. These exercise the part that
-actually talks HTTP — reading the watchdog topology and each driver's
+actually talks HTTP — reading the agent topology and each driver's
 `/v1/info` — because that is where "adding a model is not a config edit"
 either works or doesn't.
 """
@@ -97,7 +97,7 @@ async def test_refresh_groups_drivers_by_the_model_they_serve(route_http: Any) -
         return httpx.Response(200, json=_info("llama"))
 
     route_http(handler)
-    table = RoutingTable(watchdog_url="http://watchdog")
+    table = RoutingTable(agent_url="http://agent")
     await table.refresh()
 
     assert table.known_models() == ["llama", "qwen"]
@@ -117,7 +117,7 @@ async def test_two_drivers_on_one_model_become_a_priority_list(route_http: Any) 
         return httpx.Response(200, json=_info("qwen"))
 
     route_http(handler)
-    table = RoutingTable(watchdog_url="http://watchdog")
+    table = RoutingTable(agent_url="http://agent")
     await table.refresh()
 
     # Sorted by name, so repeated requests hit the same backend first.
@@ -137,7 +137,7 @@ async def test_one_driver_resolves_without_a_failover_wrapper(route_http: Any) -
         return httpx.Response(200, json=_info("qwen"))
 
     route_http(handler)
-    table = RoutingTable(watchdog_url="http://watchdog")
+    table = RoutingTable(agent_url="http://agent")
     await table.refresh()
 
     assert isinstance(table.resolve("qwen"), HttpDriverClient)
@@ -166,7 +166,7 @@ async def test_non_driver_components_are_ignored(route_http: Any) -> None:
         return httpx.Response(200, json=_info("qwen"))
 
     route_http(handler)
-    table = RoutingTable(watchdog_url="http://watchdog")
+    table = RoutingTable(agent_url="http://agent")
     await table.refresh()
 
     assert [b.name for b in table.backends_for("qwen")] == ["a"]
@@ -184,7 +184,7 @@ async def test_an_unreachable_driver_is_reported_not_routed_to(route_http: Any) 
         return httpx.Response(200, json=_info("qwen"))
 
     route_http(handler)
-    table = RoutingTable(watchdog_url="http://watchdog")
+    table = RoutingTable(agent_url="http://agent")
     await table.refresh()
 
     assert [b.name for b in table.backends_for("qwen")] == ["ok"]
@@ -195,15 +195,15 @@ async def test_an_unreachable_driver_is_reported_not_routed_to(route_http: Any) 
     await table.aclose()
 
 
-async def test_an_unreachable_watchdog_leaves_nothing_routable(route_http: Any) -> None:
+async def test_an_unreachable_agent_leaves_nothing_routable(route_http: Any) -> None:
     """Degrades rather than crashing: config endpoints stay up so the
     operator can fix whatever is wrong."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("no watchdog")
+        raise httpx.ConnectError("no agent")
 
     route_http(handler)
-    table = RoutingTable(watchdog_url="http://watchdog")
+    table = RoutingTable(agent_url="http://agent")
     await table.refresh()
 
     assert table.is_empty()
@@ -222,7 +222,7 @@ async def test_a_refresh_replaces_the_table_wholesale(route_http: Any) -> None:
         return httpx.Response(200, json=_info(state["model"]))
 
     route_http(handler)
-    table = RoutingTable(watchdog_url="http://watchdog")
+    table = RoutingTable(agent_url="http://agent")
     await table.refresh()
     assert table.known_models() == ["qwen"]
 
@@ -243,7 +243,7 @@ async def test_clients_are_reused_across_refreshes(route_http: Any) -> None:
         return httpx.Response(200, json=_info("qwen"))
 
     route_http(handler)
-    table = RoutingTable(watchdog_url="http://watchdog")
+    table = RoutingTable(agent_url="http://agent")
     await table.refresh()
     first = table.backends_for("qwen")[0].client
     await table.refresh()
@@ -260,7 +260,7 @@ async def test_a_driver_leaving_the_topology_closes_its_client(route_http: Any) 
         return httpx.Response(200, json=_info("qwen"))
 
     route_http(handler)
-    table = RoutingTable(watchdog_url="http://watchdog")
+    table = RoutingTable(agent_url="http://agent")
     await table.refresh()
     assert len(table.backends_for("qwen")) == 2
 
@@ -280,7 +280,7 @@ async def test_smallest_context_wins_across_replicas(route_http: Any) -> None:
         return httpx.Response(200, json=_info("qwen", context=context))
 
     route_http(handler)
-    table = RoutingTable(watchdog_url="http://watchdog")
+    table = RoutingTable(agent_url="http://agent")
     await table.refresh()
 
     models = table.as_model_list()
@@ -289,12 +289,12 @@ async def test_smallest_context_wins_across_replicas(route_http: Any) -> None:
     await table.aclose()
 
 
-async def test_a_watchdog_error_response_is_not_a_crash(route_http: Any) -> None:
+async def test_a_agent_error_response_is_not_a_crash(route_http: Any) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(401, json={"detail": "nope"})
 
     route_http(handler)
-    table = RoutingTable(watchdog_url="http://watchdog")
+    table = RoutingTable(agent_url="http://agent")
     await table.refresh()
     assert table.is_empty()
     await table.aclose()
@@ -313,7 +313,7 @@ async def test_runtime_attribution_matches_alias_to_what_the_driver_serves(
         return httpx.Response(200, json=_info("qwen"))
 
     route_http(handler, runtimes=[_runtime_entry("qwen3-27b", "qwen", context=4096)])
-    table = RoutingTable(watchdog_url="http://watchdog")
+    table = RoutingTable(agent_url="http://agent")
     await table.refresh()
 
     assert table.runtime_for("qwen") == "qwen3-27b"
@@ -342,7 +342,7 @@ async def test_runtime_attribution_is_absent_for_a_model_with_replicas(
             _runtime_entry("qwen-gpu1", "qwen", context=8192),
         ],
     )
-    table = RoutingTable(watchdog_url="http://watchdog")
+    table = RoutingTable(agent_url="http://agent")
     await table.refresh()
 
     assert table.runtime_for("qwen") is None
@@ -362,7 +362,7 @@ async def test_runtime_attribution_is_absent_when_no_runtime_serves_the_model(
         return httpx.Response(200, json=_info("claude-opus-4-7"))
 
     route_http(handler)
-    table = RoutingTable(watchdog_url="http://watchdog")
+    table = RoutingTable(agent_url="http://agent")
     await table.refresh()
 
     assert table.runtime_for("claude-opus-4-7") is None
@@ -371,7 +371,7 @@ async def test_runtime_attribution_is_absent_when_no_runtime_serves_the_model(
 
 
 async def test_unreadable_runtimes_endpoint_does_not_stop_routing(route_http: Any) -> None:
-    """The watchdog can 500 on /v1/runtimes and everything still routes;
+    """The agent can 500 on /v1/runtimes and everything still routes;
     attribution is additive, never load-bearing."""
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -391,7 +391,7 @@ async def test_unreadable_runtimes_endpoint_does_not_stop_routing(route_http: An
     # the fixture would otherwise answer it with an empty list and this
     # test would pass without exercising anything.
     route_http(wrapped, handle_runtimes=True)
-    table = RoutingTable(watchdog_url="http://watchdog")
+    table = RoutingTable(agent_url="http://agent")
     await table.refresh()
 
     assert seen == ["runtimes"], "the 500 must actually reach the table"

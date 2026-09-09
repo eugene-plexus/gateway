@@ -27,16 +27,16 @@ class Settings(BaseSettings):
     safe_mode: bool = False
     """If true, skip loading the persisted config file at startup and run on
     built-in defaults (no drivers configured, default memory URL). Set by
-    the watchdog via EUGENE_PLEXUS_GATEWAY_SAFE_MODE=1 when a previous boot
+    the agent via EUGENE_PLEXUS_GATEWAY_SAFE_MODE=1 when a previous boot
     failed. PATCH /v1/config still writes to `config_file` normally so
     the operator's repair survives the next non-safe-mode boot. Per the
     safe-mode contract in specs/openapi/gateway.yaml."""
 
     auth_signing_key: str | None = None
-    """Base64-encoded 32-byte HMAC signing key, supplied by the watchdog at
+    """Base64-encoded 32-byte HMAC signing key, supplied by the agent at
     spawn time (EUGENE_PLEXUS_GATEWAY_AUTH_SIGNING_KEY). When absent the
     gateway runs unauthenticated — dev / standalone path only;
-    production via the watchdog always supplies this."""
+    production via the agent always supplies this."""
 
     service_token: str | None = None
     """Long-lived service JWT for outbound calls to peer components
@@ -46,17 +46,17 @@ class Settings(BaseSettings):
     master_key: str | None = None
     """Base64-encoded 32-byte secretbox key for at-rest decryption
     (EUGENE_PLEXUS_GATEWAY_MASTER_KEY). Populated only after the operator
-    has logged in at the watchdog; absent during the configured-but-
+    has logged in at the agent; absent during the configured-but-
     locked window. Reserved for Phase 6; Phase 3 does not consume it."""
 
-    watchdog_url: str = "http://127.0.0.1:8079"
-    """Watchdog endpoint the routing table is built from.
+    agent_url: str = "http://127.0.0.1:8079"
+    """Agent endpoint the routing table is built from.
 
-    The watchdog is the source of truth for topology, so the gateway
+    The agent is the source of truth for topology, so the gateway
     reads its inference-driver entries rather than keeping backend URLs
     in its own config — a URL duplicated into two components is the trap
-    this avoids. Override with EUGENE_PLEXUS_GATEWAY_WATCHDOG_URL on
-    networked deployments where the watchdog isn't on loopback."""
+    this avoids. Override with EUGENE_PLEXUS_GATEWAY_AGENT_URL on
+    networked deployments where the agent isn't on loopback."""
 
 
 def load_settings() -> Settings:

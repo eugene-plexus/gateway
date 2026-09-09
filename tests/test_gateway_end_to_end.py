@@ -5,7 +5,7 @@ here — the lifespan builds an actual `RoutingTable`, which fetches an
 actual `/v1/components`, probes an actual `/v1/info`, and a chat
 completion goes over the wire to an actual `/v1/generate`.
 
-The watchdog and the inference-driver are stand-ins: one threaded HTTP
+The agent and the inference-driver are stand-ins: one threaded HTTP
 server answering all three paths. The point is to prove OUR wiring, and
 the contracts it speaks are the ones in specs.
 """
@@ -29,7 +29,7 @@ MODEL = "Qwen3-30B-A3B-Q4_K_M"
 
 
 class _FakeInstall(BaseHTTPRequestHandler):
-    """One server playing both the watchdog and an inference-driver.
+    """One server playing both the agent and an inference-driver.
 
     Collapsing them is fine because the gateway reaches both purely over
     HTTP and never assumes they are distinct hosts — which is itself
@@ -139,7 +139,7 @@ def real_client(tmp_path: Path, fake_install: tuple[str, list[dict]]) -> Iterato
     resolves against the fake install.
     """
     base_url, _ = fake_install
-    settings = Settings(config_file=tmp_path / "config.yaml", watchdog_url=base_url)
+    settings = Settings(config_file=tmp_path / "config.yaml", agent_url=base_url)
     with TestClient(create_app(settings=settings)) as c:
         yield c
 

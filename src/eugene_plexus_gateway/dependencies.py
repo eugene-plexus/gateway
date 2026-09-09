@@ -12,7 +12,7 @@ true (the dev/standalone path):
     list/probe).
 
 Both raise 401 with a Problem JSON body on missing / malformed /
-expired / wrong-audience tokens, mirroring the watchdog's shape so the
+expired / wrong-audience tokens, mirroring the agent's shape so the
 UI can render one error path across components.
 """
 

@@ -49,7 +49,7 @@ async def test_config(
 
     Uses the saved config merged with the optional `overrides`; override
     values are NOT persisted. There is no driver list to test any more —
-    the drivers come from the watchdog topology — so what this verifies
+    the drivers come from the agent topology — so what this verifies
     is that the topology resolves and its entries answer, which is
     exactly what a chat turn depends on.
     """
@@ -72,7 +72,7 @@ async def test_config(
     # point of a Test button is to check the world as it is now, which
     # may differ from the last refresh.
     probe_table = RoutingTable(
-        watchdog_url=settings.watchdog_url,
+        agent_url=settings.agent_url,
         service_token=service_token,
         request_timeout_seconds=timeout,
     )
@@ -90,9 +90,9 @@ async def test_config(
             component="gateway",
             latencyMs=elapsed(),
             error=(
-                f"No inference-driver entries in the watchdog topology at "
-                f"{settings.watchdog_url}, so there is nothing to route to. Add one "
-                f"via the watchdog's POST /v1/components."
+                f"No inference-driver entries in the agent topology at "
+                f"{settings.agent_url}, so there is nothing to route to. Add one "
+                f"via the agent's POST /v1/components."
             ),
         )
 

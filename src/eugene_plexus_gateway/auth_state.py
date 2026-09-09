@@ -1,6 +1,6 @@
 """Auth state for the gateway's verify-only role.
 
-Built once at startup from the env vars the watchdog threads in
+Built once at startup from the env vars the agent threads in
 when it spawns the gateway:
 
   * `EUGENE_PLEXUS_GATEWAY_AUTH_SIGNING_KEY` — base64 of the 32-byte HMAC
@@ -10,13 +10,13 @@ when it spawns the gateway:
     every outbound call to a peer component.
   * `EUGENE_PLEXUS_GATEWAY_MASTER_KEY` — base64 of the 32-byte secretbox
     key. Populated only after the operator has logged in at the
-    watchdog; absent during the "configured-but-locked" window.
+    agent; absent during the "configured-but-locked" window.
     Reserved for Phase 6 at-rest decryption — not consumed in Phase 3.
 
 If `AUTH_SIGNING_KEY` is unset, the gateway runs in
 `auth_disabled=True` mode: route dependencies short-circuit and let
 everything through, and outbound clients send no Authorization header.
-That's the dev/standalone-test path; production via the watchdog
+That's the dev/standalone-test path; production via the agent
 always supplies the env var.
 """
 
@@ -43,7 +43,7 @@ class AuthState:
 
     master_key: bytes | None
     """At-rest secretbox key. Only set when the operator has logged in
-    at the watchdog. Phase 6 uses this; Phase 3 leaves it untouched."""
+    at the agent. Phase 6 uses this; Phase 3 leaves it untouched."""
 
     @property
     def auth_disabled(self) -> bool:
@@ -78,7 +78,7 @@ def load_auth_state(
     Tolerates the disabled case (no signing key) by returning an
     auth-disabled state with a one-shot warning logged. Any other
     inconsistency (signing-key set but service-token absent, malformed
-    base64) raises so the watchdog operator sees the failure rather
+    base64) raises so the agent operator sees the failure rather
     than mysterious 401s downstream.
     """
     signing_key = _decode_b64_key(signing_key_b64, expected_len=32, label="AUTH_SIGNING_KEY")
@@ -92,14 +92,14 @@ def load_auth_state(
             )
         log.warning(
             "EUGENE_PLEXUS_GATEWAY_AUTH_SIGNING_KEY not set — running unauthenticated "
-            "(dev/standalone mode). Production spawns via watchdog always supply this."
+            "(dev/standalone mode). Production spawns via agent always supply this."
         )
         return AuthState(signing_key=None, service_token=None, master_key=None)
 
     if not service_token:
         raise ValueError(
             "AUTH_SIGNING_KEY is set but SERVICE_TOKEN is missing — children spawned "
-            "by the watchdog must receive both. Check the supervisor wiring."
+            "by the agent must receive both. Check the supervisor wiring."
         )
 
     return AuthState(

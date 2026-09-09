@@ -1,7 +1,7 @@
 """Pytest fixtures shared across the gateway test suite.
 
 The routing table is injected on `app.state.routing` before the FastAPI
-lifespan runs, so tests never reach a real watchdog or a real driver.
+lifespan runs, so tests never reach a real agent or a real driver.
 Each test scripts its fake drivers' responses by mutating them.
 """
 
@@ -110,7 +110,7 @@ def make_routing_table(
     only for tests, and the snapshot dataclasses are the honest seam:
     the real `refresh()` builds exactly this and assigns exactly here.
     """
-    table = RoutingTable(watchdog_url="http://fake-watchdog")
+    table = RoutingTable(agent_url="http://fake-agent")
     snapshot = _Snapshot()
     for fake in fakes:
         backend = _Backend(

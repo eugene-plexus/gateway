@@ -122,7 +122,7 @@ class HttpDriverClient:
         # these off either without asking which kind it holds.
         self.attempts = 1
         self.served_by: str | None = name
-        # When the watchdog threaded a service token in, attach it to
+        # When the agent threaded a service token in, attach it to
         # every outbound call. The driver validates against the shared
         # HMAC signing key. Headers stay unset when running unauthenticated
         # (dev / standalone) so the existing test path still works.

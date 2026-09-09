@@ -1,10 +1,10 @@
 """The routing table: model id -> the drivers that serve it.
 
 The gateway stores no backend URLs and no model list. It reads the
-watchdog topology for `inference-driver` entries, asks each one's
+agent topology for `inference-driver` entries, asks each one's
 `/v1/info` what it is serving, and groups the answers by model id. So:
 
-  * backend addresses live in exactly one place, the watchdog topology
+  * backend addresses live in exactly one place, the agent topology
   * adding a model is not a config edit — start an engine, point a
     driver at it, and it becomes routable on the next refresh
   * two drivers serving the same model are automatically a priority
@@ -20,7 +20,7 @@ behind that driver, with no new field on any contract.
 
 The refresh is periodic rather than on-demand because a request should
 never pay for topology discovery, and because engines come and go under
-the watchdog without telling anyone.
+the agent without telling anyone.
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ class _Unreachable:
 
 @dataclass(frozen=True)
 class _RuntimeFacts:
-    """What the watchdog knows about the engine serving one model alias."""
+    """What the agent knows about the engine serving one model alias."""
 
     name: str
     context_length: int | None
@@ -92,12 +92,12 @@ class RoutingTable:
     def __init__(
         self,
         *,
-        watchdog_url: str,
+        agent_url: str,
         service_token: str | None = None,
         request_timeout_seconds: float = 180.0,
         refresh_seconds: float = 15.0,
     ) -> None:
-        self._watchdog_url = watchdog_url
+        self._agent_url = agent_url
         self._service_token = service_token
         self._request_timeout = request_timeout_seconds
         self._refresh_seconds = refresh_seconds
@@ -141,7 +141,7 @@ class RoutingTable:
                 except Exception as e:
                     # Never let a bad refresh kill the loop — the previous
                     # snapshot stays serving, which is strictly better than
-                    # a gateway that stops routing because the watchdog
+                    # a gateway that stops routing because the agent
                     # blipped.
                     log.warning("routing refresh failed; keeping previous table: %s", e)
         except asyncio.CancelledError:
@@ -150,7 +150,7 @@ class RoutingTable:
     # --- refresh ----------------------------------------------------------
 
     async def refresh(self) -> None:
-        # Both reads hit the same watchdog; do them together so a refresh
+        # Both reads hit the same agent; do them together so a refresh
         # costs one round trip's latency rather than two.
         entries, runtimes = await asyncio.gather(
             self.fetch_driver_entries(),
@@ -212,13 +212,13 @@ class RoutingTable:
         )
 
     async def fetch_driver_entries(self) -> list[tuple[str, str]]:
-        """`(name, url)` for every inference-driver in the watchdog topology.
+        """`(name, url)` for every inference-driver in the agent topology.
 
         Public because `POST /v1/config/test` reads the topology fresh
         rather than off the last refresh — the point of a Test button is
         the world as it is now.
 
-        An unreachable watchdog yields an empty list, which degrades to
+        An unreachable agent yields an empty list, which degrades to
         "nothing is routable" rather than crashing — the config endpoints
         stay up so the operator can fix whatever is wrong.
         """
@@ -226,18 +226,18 @@ class RoutingTable:
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.get(
-                    f"{self._watchdog_url.rstrip('/')}/v1/components",
+                    f"{self._agent_url.rstrip('/')}/v1/components",
                     headers=headers,
                 )
             if response.status_code >= 400:
                 log.warning(
-                    "watchdog topology returned %d; nothing is routable this refresh",
+                    "agent topology returned %d; nothing is routable this refresh",
                     response.status_code,
                 )
                 return []
             body: Any = response.json()
         except (httpx.HTTPError, ValueError) as e:
-            log.warning("could not reach the watchdog topology (%s); nothing is routable", e)
+            log.warning("could not reach the agent topology (%s); nothing is routable", e)
             return []
 
         components = body.get("components") if isinstance(body, dict) else None
@@ -254,7 +254,7 @@ class RoutingTable:
         return out
 
     async def fetch_runtime_facts(self) -> dict[str, _RuntimeFacts]:
-        """Model alias -> the engine runtime serving it, from the watchdog.
+        """Model alias -> the engine runtime serving it, from the agent.
 
         Purely additive: everything the gateway routes on still comes
         from the drivers. This only lets a response say *which engine
@@ -263,25 +263,25 @@ class RoutingTable:
         because a driver knows its base URL but not that a supervised
         runtime is listening on the other end of it.
 
-        An unreachable watchdog yields an empty map, so both fields go
+        An unreachable agent yields an empty map, so both fields go
         back to being absent. Nothing stops routing over it.
         """
         headers = {"Authorization": f"Bearer {self._service_token}"} if self._service_token else {}
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.get(
-                    f"{self._watchdog_url.rstrip('/')}/v1/runtimes",
+                    f"{self._agent_url.rstrip('/')}/v1/runtimes",
                     headers=headers,
                 )
             if response.status_code >= 400:
                 log.debug(
-                    "watchdog /v1/runtimes returned %d; no runtime attribution this refresh",
+                    "agent /v1/runtimes returned %d; no runtime attribution this refresh",
                     response.status_code,
                 )
                 return {}
             body: Any = response.json()
         except (httpx.HTTPError, ValueError) as e:
-            log.debug("could not read watchdog runtimes (%s); no runtime attribution", e)
+            log.debug("could not read agent runtimes (%s); no runtime attribution", e)
             return {}
 
         runtimes = body.get("runtimes") if isinstance(body, dict) else None
@@ -447,7 +447,7 @@ def _smallest_context(backends: list[_Backend], runtime: _RuntimeFacts | None) -
     `openai_compat_http` driver reports no capabilities at all (it can
     only see an HTTP endpoint), so without this the local-engine case —
     the one where we *do* know the answer, because the engine told the
-    watchdog after it loaded — would report nothing.
+    agent after it loaded — would report nothing.
     """
     lengths = [
         b.info.capabilities.maxContextTokens

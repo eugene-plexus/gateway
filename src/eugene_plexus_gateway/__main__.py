@@ -11,7 +11,7 @@ from .app import create_app
 from .config import ConfigStore
 from .settings import load_settings
 
-# Default bind port for standalone launch (no watchdog). The watchdog
+# Default bind port for standalone launch (no agent). The agent
 # always overrides via EUGENE_PLEXUS_GATEWAY_BIND_PORT.
 _DEFAULT_PORT = 8080
 
@@ -19,10 +19,10 @@ _DEFAULT_PORT = 8080
 class _DropHealthzFilter(logging.Filter):
     """Suppress uvicorn.access lines for /healthz.
 
-    The watchdog probes /healthz on every supervised child constantly,
+    The agent probes /healthz on every supervised child constantly,
     and at INFO each probe produces a line. That floods the log file
     and buries the routing DEBUG trace we actually want to read. Drop
-    them — the watchdog already tracks component health on its side.
+    them — the agent already tracks component health on its side.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:

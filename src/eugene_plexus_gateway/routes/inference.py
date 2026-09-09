@@ -97,7 +97,7 @@ def _no_such_model(model: str, table: RoutingTable | None) -> JSONResponse:
         hint = f" Available models: {', '.join(known)}."
     else:
         hint = (
-            " No models are currently routable. Check the watchdog's "
+            " No models are currently routable. Check the agent's "
             "GET /v1/runtimes for an engine in `ready` state, and that an "
             "inference-driver in GET /v1/components is pointed at its url."
         )
@@ -159,7 +159,7 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
             code=502,
             message=(
                 f"Every backend serving {body.model!r} failed. Last error: {e}. "
-                f"The engine may have stopped — check GET /v1/runtimes on the watchdog."
+                f"The engine may have stopped — check GET /v1/runtimes on the agent."
             ),
             error_type="upstream_error",
         )
@@ -245,7 +245,7 @@ def _routing_info(
     )
     return CompletionRoutingInfo(
         driver=served_by,
-        # The engine process behind that driver, when the watchdog
+        # The engine process behind that driver, when the agent
         # supervises one. Absent for hosted and CLI backends, and for a
         # model with replicas — see RoutingTable.runtime_for.
         runtime=table.runtime_for(model),

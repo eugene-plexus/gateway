@@ -184,7 +184,7 @@ def test_config_patch_validates_ranges(client: TestClient) -> None:
 def test_config_test_reports_no_drivers_when_the_topology_is_empty(
     client: TestClient,
 ) -> None:
-    """The Test button reads the topology fresh, and the fake watchdog
+    """The Test button reads the topology fresh, and the fake agent
     URL isn't reachable — which is exactly the "nothing to route to"
     answer an operator needs before they've wired anything up."""
     response = client.post("/v1/config/test")

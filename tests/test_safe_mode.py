@@ -1,4 +1,4 @@
-"""Tests for the watchdog safe-mode contract on the gateway.
+"""Tests for the agent safe-mode contract on the gateway.
 
 Per specs/openapi/gateway.yaml: when started with
 `EUGENE_PLEXUS_GATEWAY_SAFE_MODE=1` the gateway must
