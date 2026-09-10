@@ -401,3 +401,68 @@ def test_load_balancing_is_an_enum(client: TestClient) -> None:
         "loadBalancing"
     ]
     assert client.patch("/v1/config", json={"loadBalancing": "random"}).json()["rejected"]
+
+
+# --- refresh on demand -----------------------------------------------------------
+
+
+def test_a_request_that_finds_nothing_eligible_refreshes_before_answering(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The first live run's seam: the snapshot said `loading` for up to a
+    refresh interval after the agent said `ready`, and every request in
+    that window was a 503. Now a request that finds nothing eligible
+    pays for one refresh before concluding anything."""
+    from datetime import UTC, datetime, timedelta
+
+    from .conftest import install_snapshot
+
+    a, b = _replicas()
+    a.responses = ["fresh"]
+    table = make_routing_table(
+        a,
+        b,
+        runtimes=[
+            runtime_facts("qwen3-a", status="loading"),
+            runtime_facts("qwen3-b", status="loading"),
+        ],
+    )
+    table._snapshot.refreshed_at = datetime.now(UTC) - timedelta(seconds=10)
+    refreshed: list[bool] = []
+
+    async def refresh() -> None:
+        refreshed.append(True)
+        install_snapshot(table, a, b, runtimes=[runtime_facts("qwen3-a"), runtime_facts("qwen3-b")])
+
+    monkeypatch.setattr(table, "refresh", refresh)
+    with _app(settings, table) as c:
+        response = c.post("/v1/chat/completions", json=_chat())
+    assert response.status_code == 200, response.text
+    assert refreshed == [True]
+    assert response.json()["x_eugene_plexus"]["swapped_in"] is False
+
+
+def test_a_young_snapshot_is_not_refreshed_again(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    a, b = _replicas()
+    table = make_routing_table(
+        a,
+        b,
+        runtimes=[
+            runtime_facts("qwen3-a", status="loading"),
+            runtime_facts("qwen3-b", status="loading"),
+        ],
+    )
+    calls: list[bool] = []
+
+    async def refresh() -> None:
+        calls.append(True)
+
+    monkeypatch.setattr(table, "refresh", refresh)
+    with _app(settings, table) as c:
+        response = c.post("/v1/chat/completions", json=_chat())
+    # Freshly installed snapshot: younger than the floor, so no refresh,
+    # and the honest 503.
+    assert response.status_code == 503
+    assert calls == []

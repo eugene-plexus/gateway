@@ -250,6 +250,8 @@ class RoutingTable:
         # connection pool and leak sockets.
         self._clients: dict[tuple[str, str], HttpDriverClient] = {}
         self._task: asyncio.Task[None] | None = None
+        # One refresh at a time; on-demand callers share it.
+        self._refreshing: asyncio.Task[None] | None = None
         # Demand, by driver and by runtime. Monotonic seconds; never
         # persisted, never replicated — a promoted control root re-reads
         # what is loaded from the agents, not from here.
@@ -300,6 +302,30 @@ class RoutingTable:
             return
 
     # --- refresh ----------------------------------------------------------
+
+    async def refresh_if_stale(self, max_age_seconds: float = 1.0) -> bool:
+        """Refresh now unless the snapshot is younger than `max_age_seconds`.
+
+        The first live run found the seam: the periodic refresh can be
+        `routingRefreshSeconds` behind the agent about readiness, so a
+        request arriving in the seconds after an engine turned `ready` —
+        or after one was killed — met a stale table and a 503. A request
+        that finds nothing eligible pays for one topology read before
+        concluding anything; a request that finds a backend never does.
+        Concurrent callers share one refresh, and the age floor keeps a
+        burst during a long load from turning into a poll storm.
+        """
+        age = (datetime.now(UTC) - self._snapshot.refreshed_at).total_seconds()
+        if age < max_age_seconds:
+            return False
+        if self._refreshing is None or self._refreshing.done():
+            self._refreshing = asyncio.create_task(self.refresh(), name="routing-refresh-on-demand")
+        try:
+            await asyncio.shield(self._refreshing)
+        except Exception as e:
+            log.warning("on-demand routing refresh failed; keeping previous table: %s", e)
+            return False
+        return True
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._service_token}"} if self._service_token else {}

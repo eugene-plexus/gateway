@@ -167,11 +167,19 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
     if not resolution.has_backends():
         return _no_such_model(body.model, table)
 
-    # Nothing eligible: wake a `startOnDemand` runtime if the slot has
-    # one, wait for it, and try again. A tier with a startable runtime is
-    # awaited rather than skipped — see the lifecycle module.
+    # Nothing eligible: first make sure that is still true — the snapshot
+    # can be a refresh interval behind the agent about readiness, and the
+    # first live run met exactly that seam. Then wake a `startOnDemand`
+    # runtime if the slot has one, wait for it, and try again. A tier
+    # with a startable runtime is awaited rather than skipped — see the
+    # lifecycle module.
     wake: WakeResult | None = None
     client = table.pick(resolution)
+    if client is None and await table.refresh_if_stale():
+        resolution = table.resolve(body.model)
+        if not resolution.has_backends():
+            return _no_such_model(body.model, table)
+        client = table.pick(resolution)
     if client is None:
         lifecycle = _lifecycle(request)
         if lifecycle is not None:
