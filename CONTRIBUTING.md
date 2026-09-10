@@ -28,9 +28,9 @@ If your change touches the HTTP API — endpoints, request/response shapes, sche
 PRs to this repo should generally cover one or more of:
 
 - **Implementation** of an existing spec endpoint
-- **Bicameral loop work** — corpus-callosum blends, NT modulation, multi-pass policy
-- **Memory work** — once the in-process stub is replaced by a real backend
-- **Adapter / hemisphere-client work** — e.g. streaming, retries, circuit breakers
+- **Routing** - model discovery, replica balancing, priority tiers and failover
+- **Lifecycle policy** - idle unload and wake on demand, executed by node agents
+- **Driver-client work** - protocol handling, retries and failure reporting
 - **Tooling** — CI, type-checking, lint config, codegen script
 
 ## Local setup
@@ -43,7 +43,11 @@ python -m venv .venv
 pip install -e ".[dev]"
 ```
 
-To exercise the full stack you also need two `inference-driver` instances reachable. See its [README](https://github.com/eugene-plexus/inference-driver) for setup; configure gateway's `leftDriverUrl` and `rightDriverUrl` accordingly.
+To exercise routing, use an agent with at least one declared inference-driver or
+supervised runtime and its companion driver. The gateway discovers addresses
+from agent topology; there are no `leftDriverUrl`/`rightDriverUrl` settings.
+Use additional replicas to test balancing and `modelSlots` to test priority tiers.
+See the [driver README](https://github.com/eugene-plexus/inference-driver).
 
 ## Git hooks
 
@@ -77,4 +81,6 @@ git diff --exit-code src/eugene_plexus_gateway/_generated/
 
 ## Reporting issues
 
-File issues at <https://github.com/eugene-plexus/gateway/issues>. This repo is the right place for broader architectural questions about Eugene Plexus too.
+File routing issues at <https://github.com/eugene-plexus/gateway/issues>.
+Cross-component architecture questions belong in
+<https://github.com/eugene-plexus/specs/issues>.
