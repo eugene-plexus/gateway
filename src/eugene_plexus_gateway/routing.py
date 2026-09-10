@@ -252,6 +252,15 @@ class RoutingTable:
         self._task: asyncio.Task[None] | None = None
         # One refresh at a time; on-demand callers share it.
         self._refreshing: asyncio.Task[None] | None = None
+        # And refreshes never overlap. Three things call `refresh()` — the
+        # periodic loop, the lifecycle manager after a stop, and a request
+        # that found nothing eligible — and two in flight at once is a
+        # lost update: the M7 live run saw a periodic refresh that began
+        # before an idle unload finish AFTER the post-unload one and put a
+        # `ready` runtime back over a `stopped` one, so the next request
+        # went to a driver whose engine was gone. Snapshots now land in
+        # the order the refreshes began.
+        self._refresh_lock = asyncio.Lock()
         # Demand, by driver and by runtime. Monotonic seconds; never
         # persisted, never replicated — a promoted control root re-reads
         # what is loaded from the agents, not from here.
@@ -376,6 +385,10 @@ class RoutingTable:
         return agents
 
     async def refresh(self) -> None:
+        async with self._refresh_lock:
+            await self._refresh_locked()
+
+    async def _refresh_locked(self) -> None:
         agents = await self.discover_agents()
 
         # Every agent, concurrently: its drivers and its runtimes.
