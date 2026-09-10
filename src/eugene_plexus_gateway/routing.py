@@ -762,13 +762,46 @@ class RoutingTable:
 
     def resolve(self, model: str) -> Resolution:
         """The slot for `model`: its own replicas, then each configured
-        target's, empty tiers dropped."""
+        target's, **every configured tier kept — including empty ones**.
+
+        Empty tiers used to be dropped here, and that quietly renumbered
+        the ones after them. A slot configured `[local-8b, cloud]` whose
+        `local-8b` had never been launched (no runtime, so no companion
+        driver, so nothing advertising that model id) collapsed to one
+        tier, and the cloud fallback answered reporting `tier: 1` — so an
+        operator whose primary was missing was told the primary served
+        the request.
+
+        Routing was never wrong; the order is the same either way. Only
+        the label was, and `TieredClient` had already been written the
+        other way ("empty tiers are kept so `tier` counts the slot's
+        tiers, not the eligible ones"). It kept a tier whose target
+        existed but was ineligible, while this dropped one whose target
+        had nothing at all — two rules for one question, and the
+        contract's `tier` description states this one.
+
+        **The exception is the slot's own name**, which `_slot_targets`
+        always puts first. That tier is implicit — "this model's own
+        replicas" — rather than something the operator listed, so a
+        virtual alias that nothing serves directly has no self-tier at
+        all. Keeping an empty one would push every configured target up
+        a number, which is the same defect in the other direction and is
+        how the first attempt at this fix broke five tests.
+
+        A slot where nothing resolves is still a 404, because
+        `has_backends()` asks whether any tier has backends rather than
+        whether any tier exists. And `GET /v1/admin/routing` now shows a
+        configured target with an empty backend list, which is the
+        diagnosis an operator wants: *you asked for `local-8b` and
+        nothing serves it.*
+        """
         configured, targets = self._slot_targets(model)
-        tiers = [
-            _Tier(target=t, backends=list(self._snapshot.by_model.get(t, [])))
-            for t in targets
-            if self._snapshot.by_model.get(t)
-        ]
+        tiers: list[_Tier] = []
+        for index, target in enumerate(targets):
+            backends = list(self._snapshot.by_model.get(target, []))
+            if index == 0 and not backends:
+                continue
+            tiers.append(_Tier(target=target, backends=backends))
         return Resolution(model=model, configured=configured, tiers=tiers)
 
     def _order(self, target: str, backends: list[_Backend]) -> list[_Backend]:

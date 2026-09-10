@@ -211,14 +211,57 @@ def test_a_real_alias_can_be_given_a_fallback() -> None:
     assert [t.target for t in table.resolve(LOCAL).tiers] == [LOCAL, CLOUD]
 
 
-def test_empty_tiers_are_dropped_and_a_slot_with_nothing_is_a_404(settings: Settings) -> None:
+def test_an_empty_tier_is_kept_so_the_ones_after_it_keep_their_number(
+    settings: Settings,
+) -> None:
+    """Reverses an earlier decision, deliberately.
+
+    Dropping a tier whose target nothing serves renumbered every tier
+    after it, so a slot configured `[nope, cloud]` reported the cloud
+    fallback as `tier: 1` - telling an operator whose primary was never
+    launched that the primary had served the request. `TieredClient` was
+    already written the other way, and the contract's `tier` description
+    says positional. Routing order is identical either way; only the
+    label moved.
+    """
     cloud = FakeDriverClient(name="claude", base_url="http://c", model_id=CLOUD)
     table = make_routing_table(cloud, slots=[{"model": "coder", "targets": ["nope", CLOUD]}])
-    assert [t.target for t in table.resolve("coder").tiers] == [CLOUD]
+    resolution = table.resolve("coder")
+    # `coder` is a virtual alias nothing serves directly, so its implicit
+    # self-tier is absent - but `nope`, which the operator DID list, is
+    # kept as an empty tier so the cloud target stays tier 2.
+    assert [t.target for t in resolution.tiers] == ["nope", CLOUD]
+    assert [[x.name for x in t.backends] for t in resolution.tiers] == [[], ["claude"]]
+
+    # Still a 404 when nothing in the slot resolves: `has_backends` asks
+    # whether any tier HAS backends, not whether any tier exists.
     with _app(
         settings, make_routing_table(cloud, slots=[{"model": "ghost", "targets": ["nope"]}])
     ) as c:
         assert c.post("/v1/chat/completions", json=_chat("ghost")).status_code == 404
+
+
+def test_a_fallback_after_a_never_launched_primary_reports_its_real_tier(
+    settings: Settings,
+) -> None:
+    """The defect this reversal exists for, end to end.
+
+    Same operator config and same backend answering as when the primary
+    is merely asleep - which already reported tier 2 correctly, because
+    M6 keeps a stopped runtime's companion driver alive. The two cases
+    disagreed only because one target had a driver and the other had
+    none.
+    """
+    cloud = FakeDriverClient(name="claude", base_url="http://c", model_id=CLOUD)
+    table = make_routing_table(
+        cloud, slots=[{"model": "chat", "targets": ["never-launched", CLOUD]}]
+    )
+    with _app(settings, table) as c:
+        body = c.post("/v1/chat/completions", json=_chat("chat")).json()
+    info = body["x_eugene_plexus"]
+    assert info["driver"] == "claude"
+    # Second of the operator's two targets, and it says so.
+    assert info["tier"] == 2, "a fallback still reported itself as the primary"
 
 
 def test_the_cascade_walks_the_tier_then_the_next_tier(settings: Settings) -> None:
