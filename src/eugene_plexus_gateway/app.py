@@ -25,10 +25,12 @@ from .auth_state import AuthState, load_auth_state
 from .config import ConfigStore
 from .dependencies import require_operator
 from .lifecycle import AgentLifecycleClient, LifecycleManager
+from .metrics import MetricsStore
 from .routes import admin as admin_routes
 from .routes import config as config_routes
 from .routes import health as health_routes
 from .routes import inference as inference_routes
+from .routes import metrics as metrics_routes
 from .routing import RoutingTable
 from .settings import Settings, load_settings
 
@@ -63,6 +65,39 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             master_key_b64=settings.master_key,
         )
     auth_state: AuthState = app.state.auth_state
+
+    # Retained request metrics (M8). Built before the routing table, so
+    # the very first completion is recorded — the gateway is routable the
+    # moment `table.start()` returns, and a store opened after it would
+    # miss whatever arrived in between.
+    #
+    # Off in safe mode: safe mode exists to get a broken install back to
+    # a config endpoint, and opening a database is one more thing that
+    # can fail on the way there.
+    metrics: MetricsStore | None = None
+    if not hasattr(app.state, "metrics"):
+        app.state.metrics = None
+        if not settings.safe_mode and bool(store.get("metricsEnabled")):
+            candidate = MetricsStore(
+                settings.metrics_file,
+                retention_days=int(store.get("metricsRetentionDays") or 7),
+                rollup_enabled=bool(store.get("metricsRollupEnabled")),
+            )
+            try:
+                await candidate.start()
+            except Exception as e:
+                # Never fatal. A gateway that will not serve because it
+                # could not open a metrics file has traded the product
+                # for its instrumentation.
+                log.warning(
+                    "could not open the metrics store at %s: %s. Inference is "
+                    "unaffected; GET /v1/metrics will report it as disabled.",
+                    settings.metrics_file,
+                    e,
+                )
+            else:
+                metrics = candidate
+                app.state.metrics = candidate
 
     # Tests inject `app.state.routing` with a pre-populated table; the
     # lifespan otherwise builds the real one and owns its teardown.
@@ -108,6 +143,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await lifecycle.aclose()
         if owns_routing and app.state.routing is not None:
             await app.state.routing.aclose()
+        # Last, so rows queued by requests still in flight during
+        # shutdown are flushed rather than dropped.
+        if metrics is not None:
+            await metrics.aclose()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -135,6 +174,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     operator_only = [Depends(require_operator)]
     app.include_router(config_routes.router, dependencies=operator_only)
     app.include_router(admin_routes.router, dependencies=operator_only)
+    # Metrics are operator-only too, and unlike other reads they do not
+    # accept a service token: no component needs them, and model names
+    # plus traffic volumes are not nothing on a shared tailnet.
+    app.include_router(metrics_routes.router, dependencies=operator_only)
 
     # The front door accepts operator OR service tokens: a UI playground
     # and another component are both legitimate callers. Declared on the

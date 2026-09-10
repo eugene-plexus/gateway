@@ -831,6 +831,164 @@ class OpenAIErrorResponse(BaseModel):
     error: Error
 
 
+class Percentiles(BaseModel):
+    """
+    A latency distribution, in milliseconds. Percentiles rather than
+    a mean because generation latency is long-tailed, and a mean
+    hides exactly the requests an operator is asking about.
+
+    """
+
+    p50: int = Field(..., ge=0)
+    p90: int = Field(..., ge=0)
+    p99: int | None = Field(None, ge=0)
+    max: int = Field(..., ge=0)
+
+
+class Throughput(BaseModel):
+    """
+    Completion tokens per second, computed from the **serving
+    attempt's** elapsed time — not the request total, which
+    includes failed attempts.
+
+    `samples` is how many requests in the group actually reported
+    token usage, and can be lower than the group's `requests`. A
+    group where nothing reported usage is not given a zeroed
+    `Throughput`: the field is null instead, so "unmeasured" and
+    "zero" stay distinguishable.
+
+    """
+
+    p50: float
+    p90: float | None = None
+    samples: int = Field(..., ge=1)
+
+
+class MetricsGroup(BaseModel):
+    """
+    One dimension tuple's numbers over the window, or over one hour
+    of it when `bucket=hour`.
+
+    """
+
+    bucketStart: AwareDatetime | None = Field(
+        None, description='Present only when `bucket=hour`.'
+    )
+    model: str | None = Field(
+        None,
+        description='The model id the client **asked for**. After a cascade this\nis not what answered — `driver` and `runtime` say that —\nand grouping by the requested id is what makes "this model\nis slow" answerable at all.\n',
+    )
+    driver: str | None = None
+    runtime: str | None = Field(
+        None,
+        description='The engine runtime behind the driver, by name so replicas\nare distinguished. Null for hosted and CLI backends, which\nhave no runtime of ours.\n',
+    )
+    node: str | None = Field(
+        None, description="Which host's agent supervises it. Null before enrollment."
+    )
+    backend: BackendKind | None = None
+    requests: int = Field(..., ge=0)
+    errors: int = Field(
+        ..., description='Requests that ended with no backend having served them.', ge=0
+    )
+    cascaded: int = Field(
+        ...,
+        description='Requests with `attempts > 1`. A cascade that silently\nalways works hides a broken primary, which is why this is\ncounted rather than only logged.\n',
+        ge=0,
+    )
+    swappedIn: int = Field(
+        ...,
+        description="Requests that had to wake a `startOnDemand` runtime. The\nmeasured cost of M6's idle unload, which shipped with no\nway to see what it costs.\n",
+        ge=0,
+    )
+    latencyMs: Percentiles
+    tokensPerSecond: Throughput | None = Field(
+        None, description='Null when no request in this group reported token usage.'
+    )
+    waitedMs: Percentiles | None = Field(
+        None,
+        description='Wake latency, over the `swappedIn` requests only. Null when\nnone of them woke anything.\n',
+    )
+    tierCounts: dict[str, int] | None = Field(
+        None,
+        description='Requests served, keyed by the 1-based tier that answered. A\nslot whose tier 2 answers everything has a primary that is\nnot working, and this is where that becomes visible.\n',
+    )
+
+
+class MetricsSummary(BaseModel):
+    windowStart: AwareDatetime
+    windowEnd: AwareDatetime
+    gatewayStartedAt: AwareDatetime = Field(
+        ...,
+        description='When this gateway process started. Present so a history\nthat begins mid-window reads as partial rather than as an\ninstall that served nothing — the gateway is respawned on\noperator login, so a fresh start time is routine.\n',
+    )
+    rowsDropped: int = Field(
+        ...,
+        description='Measurements discarded since startup because the write\nqueue was full. Non-zero means these numbers are a sample\nrather than a census, and the endpoint says so instead of\nquietly under-reporting. Recording degrades before\ninference does.\n',
+        ge=0,
+    )
+    truncated: bool | None = Field(
+        None,
+        description='True when the window reaches past `metricsRetentionDays`,\nso raw rows for its early part no longer exist. With\n`bucket=hour` the rollups still cover it.\n',
+    )
+    groups: list[MetricsGroup]
+
+
+class MetricAttempt(BaseModel):
+    """
+    One backend touched by one request, in the order tried.
+    """
+
+    driver: str
+    runtime: str | None = None
+    node: str | None = None
+    backend: BackendKind | None = None
+    elapsedMs: int = Field(
+        ..., description='This attempt alone, not the request.', ge=0
+    )
+    served: bool
+    error: str | None = Field(
+        None,
+        description="The exception **class name** only, never its message.\nDriver error text can carry a provider's response body, and\na metrics table is the kind of thing that gets pasted into\nan issue — this must not become an accidental credential\nstore.\n",
+    )
+
+
+class Outcome(StrEnum):
+    served = 'served'
+    error = 'error'
+
+
+class MetricRequest(BaseModel):
+    startedAt: AwareDatetime
+    requestedModel: str
+    servedModel: str | None = Field(
+        None,
+        description='What actually answered. Differs from the requested id after\na cascade.\n',
+    )
+    attempts: int = Field(..., ge=1)
+    tier: int | None = Field(None, ge=1)
+    totalMs: int = Field(
+        ...,
+        description='Gateway-side wall clock for the whole request, including\nfailed attempts and excluding the wake — the same figure\n`x_eugene_plexus.latency_ms` reports. Per-backend\nthroughput comes from `tries[].elapsedMs`, never from here.\n',
+        ge=0,
+    )
+    waitedMs: int | None = Field(None, ge=0)
+    swappedIn: bool | None = None
+    streamed: bool | None = Field(
+        None,
+        description='Whether the client asked for SSE. Recorded because streamed\nrequests were invisible to the response envelope, and a\nstore that could not tell them apart would hide the very\ngap it was built to close.\n',
+    )
+    promptTokens: int | None = None
+    completionTokens: int | None = None
+    outcome: Outcome
+    tries: list[MetricAttempt] = Field(..., min_length=1)
+
+
+class MetricRequestPage(BaseModel):
+    requests: list[MetricRequest]
+    nextCursor: str | None = Field(None, description='Absent or null on the last page.')
+
+
 class DriverHealth(BaseModel):
     """
     What the gateway sees from one inference-driver's `/v1/info`,
@@ -1039,7 +1197,9 @@ class ChatCompletionResponse(BaseModel):
         description='The model that actually served the request. Equal to the\nrequested id in the normal case; after a cascade it names\nwhat answered, which may differ.\n',
     )
     choices: list[ChatCompletionChoice]
-    usage: CompletionUsage | None = None
+    usage: CompletionUsage | None = Field(
+        None, description='Present on the final chunk only.'
+    )
     x_eugene_plexus: CompletionRoutingInfo | None = None
 
 
@@ -1053,8 +1213,10 @@ class ChatCompletionChunk(BaseModel):
     created: int
     model: str
     choices: list[ChatCompletionChunkChoice]
-    usage: CompletionUsage | None = Field(
-        None, description='Present on the final chunk only.'
+    usage: CompletionUsage | None = None
+    x_eugene_plexus: CompletionRoutingInfo | None = Field(
+        None,
+        description='Set on the **final frame only**, alongside `usage` — the\nsame place OpenAI puts its own end-of-stream extras.\nAbsent on every earlier frame, because the values are not\nknown until the completion is done.\n\nAdded at M8. Until then a streaming client could see no\nrouting information at all: the non-streaming response\ncarried this and the stream did not, so exactly the clients\nthat stream — the UI playground among them — were the ones\nthat could not tell which backend answered. Retained\nmetrics do not depend on this (they are recorded at the\nrouting hooks, which fire on both paths); this closes the\nmatching gap in what a caller can see.\n',
     )
 
 

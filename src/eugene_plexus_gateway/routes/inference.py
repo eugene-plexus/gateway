@@ -15,6 +15,7 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -47,7 +48,8 @@ from ..config import ConfigStore
 from ..dependencies import require_authorized
 from ..driver_client import DriverClient, DriverError
 from ..lifecycle import LifecycleManager, WakeResult
-from ..routing import Resolution, RoutingTable
+from ..metrics import AttemptRow, MetricsStore, RequestRow
+from ..routing import Resolution, RoutingTable, collect_attempts
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +71,63 @@ def _lifecycle(request: Request) -> LifecycleManager | None:
 
 def _store(request: Request) -> ConfigStore | None:
     return getattr(request.app.state, "config_store", None)
+
+
+def _metrics(request: Request) -> MetricsStore | None:
+    return getattr(request.app.state, "metrics", None)
+
+
+def _record(
+    metrics: MetricsStore | None,
+    body: ChatCompletionRequest,
+    tries: list[AttemptRow],
+    started: float,
+    *,
+    waited_ms: int = 0,
+    swapped_in: bool = False,
+    streamed: bool = False,
+    served_model: str | None = None,
+    tier: int | None = None,
+    usage: Any = None,
+) -> None:
+    """Join the per-attempt rows to the facts only this route holds.
+
+    The hooks see every attempt and its own elapsed time; the route sees
+    the requested model, the wake cost, the token counts and which tier
+    answered. Neither is sufficient alone, which is why the two row
+    shapes exist rather than one.
+
+    Called on the failure paths as well as the success path, deliberately:
+    a request that exhausted every backend is the most interesting row in
+    the table, and recording only successes would make a failing backend
+    look like an idle one.
+
+    Never raises. An instrumentation bug must not turn a served
+    completion into a 500.
+    """
+    if metrics is None:
+        return
+    try:
+        served = next((a for a in tries if a.served), None)
+        metrics.record(
+            RequestRow(
+                started_at=datetime.now(UTC),
+                requested_model=body.model,
+                served_model=served_model,
+                attempts=max(1, len(tries)),
+                tier=tier if served is not None else None,
+                total_ms=int((time.monotonic() - started) * 1000),
+                waited_ms=waited_ms,
+                swapped_in=swapped_in,
+                streamed=streamed,
+                prompt_tokens=getattr(usage, "promptTokens", None),
+                completion_tokens=getattr(usage, "completionTokens", None),
+                outcome="served" if served is not None else "error",
+                tries=list(tries),
+            )
+        )
+    except Exception:
+        log.debug("could not record request metrics", exc_info=True)
 
 
 def _error(
@@ -195,29 +254,59 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
     waited_ms = wake.waited_ms if wake is not None and wake.ok else 0
     swapped_in = bool(wake is not None and wake.ok)
 
+    metrics = _metrics(request)
     started = time.monotonic()
-    try:
-        if body.stream:
-            return StreamingResponse(
-                _stream_completion(body, generate, client, table, started),
-                media_type="text/event-stream",
-            )
-        response = await client.generate(generate)
-    except DriverError as e:
-        return _driver_error_response(e)
-    except httpx.HTTPError as e:
-        return _error(
-            code=502,
-            message=(
-                f"Every backend serving {body.model!r} failed. Last error: {e}. "
-                f"The engine may have stopped — check GET /v1/runtimes on the agent."
+    if body.stream:
+        # The generator runs AFTER this function returns, so its
+        # collection scope has to live inside it — a `with` block here
+        # would be closed before the first attempt was made. The stream
+        # records itself.
+        return StreamingResponse(
+            _stream_completion(
+                body,
+                generate,
+                client,
+                table,
+                started,
+                metrics=metrics,
+                waited_ms=waited_ms,
+                swapped_in=swapped_in,
             ),
-            error_type="upstream_error",
+            media_type="text/event-stream",
         )
 
-    return _to_chat_completion(
-        body, response, client, table, started, waited_ms=waited_ms, swapped_in=swapped_in
-    )
+    with collect_attempts() as tries:
+        try:
+            response = await client.generate(generate)
+        except DriverError as e:
+            _record(metrics, body, tries, started, waited_ms=waited_ms, swapped_in=swapped_in)
+            return _driver_error_response(e)
+        except httpx.HTTPError as e:
+            _record(metrics, body, tries, started, waited_ms=waited_ms, swapped_in=swapped_in)
+            return _error(
+                code=502,
+                message=(
+                    f"Every backend serving {body.model!r} failed. Last error: {e}. "
+                    f"The engine may have stopped — check GET /v1/runtimes on the agent."
+                ),
+                error_type="upstream_error",
+            )
+
+        result = _to_chat_completion(
+            body, response, client, table, started, waited_ms=waited_ms, swapped_in=swapped_in
+        )
+        _record(
+            metrics,
+            body,
+            tries,
+            started,
+            waited_ms=waited_ms,
+            swapped_in=swapped_in,
+            served_model=result.model,
+            tier=getattr(client, "tier", 1),
+            usage=response.usage,
+        )
+        return result
 
 
 # --------------------------------------------------------------------------- #
@@ -360,6 +449,10 @@ async def _stream_completion(
     client: DriverClient,
     table: RoutingTable,
     started: float,
+    *,
+    metrics: MetricsStore | None = None,
+    waited_ms: int = 0,
+    swapped_in: bool = False,
 ) -> AsyncIterator[str]:
     """SSE framed exactly as OpenAI frames it.
 
@@ -369,6 +462,13 @@ async def _stream_completion(
     right matters more than incremental delivery, and true token
     pass-through needs the driver's SSE surface plumbed through the
     cascade logic — which is its own piece of work.
+
+    Since M8 this path also records itself and carries the routing
+    extension on its final frame. Both were missing, and the second
+    caused the first to be nearly overlooked: the non-streaming response
+    carried `x_eugene_plexus` and this one did not, so a recorder written
+    against the response would have been blind to exactly the clients
+    that stream.
     """
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
@@ -377,7 +477,12 @@ async def _stream_completion(
         return f"data: {chunk.model_dump_json(exclude_none=True)}\n\n"
 
     def envelope(
-        *, delta: Delta, finish: FinishReason | None, model: str, usage: Any = None
+        *,
+        delta: Delta,
+        finish: FinishReason | None,
+        model: str,
+        usage: Any = None,
+        routing: CompletionRoutingInfo | None = None,
     ) -> ChatCompletionChunk:
         return ChatCompletionChunk(
             id=completion_id,
@@ -392,51 +497,91 @@ async def _stream_completion(
                 )
             ],
             usage=usage,
+            x_eugene_plexus=routing,
         )
 
-    try:
-        response = await client.generate(generate)
-    except (DriverError, httpx.HTTPError) as e:
-        # An error after the stream has been opened cannot become an HTTP
-        # status — the 200 is already sent. OpenAI's own behaviour is to
-        # emit an error frame, so do that and then terminate normally.
-        log.warning("streaming completion for %r failed: %s", body.model, e)
-        yield (
-            "data: "
-            + json.dumps(
-                {
-                    "error": {
-                        "message": str(e),
-                        "type": "upstream_error",
-                        "param": None,
-                        "code": None,
-                    }
-                }
+    with collect_attempts() as tries:
+        try:
+            response = await client.generate(generate)
+        except (DriverError, httpx.HTTPError) as e:
+            # An error after the stream has been opened cannot become an
+            # HTTP status — the 200 is already sent. OpenAI's own
+            # behaviour is to emit an error frame, so do that and then
+            # terminate normally.
+            log.warning("streaming completion for %r failed: %s", body.model, e)
+            _record(
+                metrics,
+                body,
+                tries,
+                started,
+                waited_ms=waited_ms,
+                swapped_in=swapped_in,
+                streamed=True,
             )
-            + "\n\n"
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "error": {
+                            "message": str(e),
+                            "type": "upstream_error",
+                            "param": None,
+                            "code": None,
+                        }
+                    }
+                )
+                + "\n\n"
+            )
+            yield "data: [DONE]\n\n"
+            return
+
+        served_model = response.modelId or body.model
+        # First chunk carries the role, per OpenAI.
+        yield frame(envelope(delta=Delta(role=Role2.assistant), finish=None, model=served_model))
+        if response.content:
+            yield frame(
+                envelope(delta=Delta(content=response.content), finish=None, model=served_model)
+            )
+
+        usage = None
+        if response.usage is not None:
+            usage = CompletionUsage(
+                prompt_tokens=response.usage.promptTokens,
+                completion_tokens=response.usage.completionTokens,
+                total_tokens=response.usage.totalTokens,
+            )
+        _record(
+            metrics,
+            body,
+            tries,
+            started,
+            waited_ms=waited_ms,
+            swapped_in=swapped_in,
+            streamed=True,
+            served_model=served_model,
+            tier=getattr(client, "tier", 1),
+            usage=response.usage,
+        )
+        # The routing extension rides the final frame, beside `usage` —
+        # the same place OpenAI puts its end-of-stream extras, and the
+        # earliest point at which any of it is known.
+        yield frame(
+            envelope(
+                delta=Delta(),
+                finish=_finish_reason(response),
+                model=served_model,
+                usage=usage,
+                routing=_routing_info(
+                    client,
+                    table,
+                    body.model,
+                    started,
+                    waited_ms=waited_ms,
+                    swapped_in=swapped_in,
+                ),
+            )
         )
         yield "data: [DONE]\n\n"
-        return
-
-    served_model = response.modelId or body.model
-    # First chunk carries the role, per OpenAI.
-    yield frame(envelope(delta=Delta(role=Role2.assistant), finish=None, model=served_model))
-    if response.content:
-        yield frame(
-            envelope(delta=Delta(content=response.content), finish=None, model=served_model)
-        )
-
-    usage = None
-    if response.usage is not None:
-        usage = CompletionUsage(
-            prompt_tokens=response.usage.promptTokens,
-            completion_tokens=response.usage.completionTokens,
-            total_tokens=response.usage.totalTokens,
-        )
-    yield frame(
-        envelope(delta=Delta(), finish=_finish_reason(response), model=served_model, usage=usage)
-    )
-    yield "data: [DONE]\n\n"
 
 
 def _driver_error_response(e: DriverError) -> JSONResponse:

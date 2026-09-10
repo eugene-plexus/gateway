@@ -16,6 +16,7 @@ the one-tier case, kept under its old name.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Protocol
 
 import httpx
@@ -111,10 +112,31 @@ class DriverClient(Protocol):
 class RoutingHooks(Protocol):
     """What a slot tells the routing table around every attempt, so the
     table can count in-flight requests per backend — the load signal the
-    balancer runs on — and remember when each backend last served."""
+    balancer runs on — and remember when each backend last served.
+
+    Since M8 this is also the **only** place per-attempt facts are
+    observable. `elapsed_ms` is this attempt alone: a request's total
+    includes every failed attempt before it, so attributing that total
+    to the backend that finally answered reports a fast backend as slow
+    in exactly the cascade an operator is investigating. And the route
+    above cannot supply it — it sees one exception, not which of four
+    backends produced it.
+
+    The other half of why it is here rather than on the response: the
+    streaming path returns a `StreamingResponse` and never builds the
+    routing envelope, but it does call `generate()`. Recording here
+    covers streams; recording off the response would not.
+    """
 
     def on_attempt_start(self, driver: str) -> None: ...
-    def on_attempt_end(self, driver: str, *, served: bool) -> None: ...
+    def on_attempt_end(
+        self,
+        driver: str,
+        *,
+        served: bool,
+        elapsed_ms: int = 0,
+        error: str | None = None,
+    ) -> None: ...
 
 
 class HttpDriverClient:
@@ -270,11 +292,21 @@ class TieredClient:
                 driver = getattr(candidate, "name", None)
                 if self._hooks is not None and driver:
                     self._hooks.on_attempt_start(driver)
+                started = time.monotonic()
                 try:
                     result = await candidate.generate(request)
                 except Exception as exc:
                     if self._hooks is not None and driver:
-                        self._hooks.on_attempt_end(driver, served=False)
+                        self._hooks.on_attempt_end(
+                            driver,
+                            served=False,
+                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                            # The exception CLASS, never its message: a
+                            # driver error can carry a provider's response
+                            # body, and this string is retained and
+                            # rendered in a UI.
+                            error=type(exc).__name__,
+                        )
                     if not _is_cascade_eligible(exc):
                         # 4xx / non-HTTP error — surface it without trying
                         # the next backend. A 4xx is the same bad request
@@ -285,7 +317,11 @@ class TieredClient:
                     index += 1
                 else:
                     if self._hooks is not None and driver:
-                        self._hooks.on_attempt_end(driver, served=True)
+                        self._hooks.on_attempt_end(
+                            driver,
+                            served=True,
+                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                        )
                     self.served_by = driver
                     self.tier = tier_index + 1
                     return result

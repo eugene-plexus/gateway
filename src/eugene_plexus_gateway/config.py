@@ -38,6 +38,7 @@ CATEGORY_LABELS: dict[str, str] = {
     "generation": "Generation defaults",
     "routing": "Routing",
     "lifecycle": "Lifecycle policy",
+    "metrics": "Request metrics",
     "logging": "Logging",
 }
 
@@ -208,6 +209,59 @@ FIELDS: list[ConfigField] = [
         valueType=ConfigValueType.enum,
         default="INFO",
         enumValues=["DEBUG", "INFO", "WARNING", "ERROR"],
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key="metricsEnabled",
+        label="Retain request metrics",
+        description=(
+            "Keep a record of how each completion was served - which "
+            "backend answered, how long it took, how many tokens it "
+            "produced, whether failover fired, whether a sleeping model "
+            "had to be woken. This is what makes 'is this backend faster "
+            "than that one for this model' answerable.\n\n"
+            "Stored on this machine only, in `metrics.sqlite3` beside "
+            "this config. Never sent anywhere, and never part of the "
+            "replicated install log. Turning it off stops recording from "
+            "then on; nothing reconstructs the traffic served while it "
+            "was off."
+        ),
+        category="metrics",
+        valueType=ConfigValueType.boolean,
+        default=True,
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key="metricsRetentionDays",
+        label="Keep individual requests for",
+        description=(
+            "How long the per-request rows are kept. Aggregates by hour "
+            "are kept indefinitely regardless - they are tiny - so "
+            "lowering this loses the ability to ask about a specific "
+            "request, not the shape of a day.\n\n"
+            "A request costs roughly 200 bytes, so a busy install at one "
+            "completion per second is about 17 MB a day. A normal one is "
+            "far below that."
+        ),
+        category="metrics",
+        valueType=ConfigValueType.integer,
+        default=7,
+        minimum=0,
+        maximum=365,
+        requiresRestart=True,
+    ),
+    ConfigField(
+        key="metricsRollupEnabled",
+        label="Keep hourly aggregates",
+        description=(
+            "Summarise each hour once it has passed, and keep those "
+            "summaries after the individual requests age out. This is "
+            "what can still answer 'what did last night look like' a "
+            "month later."
+        ),
+        category="metrics",
+        valueType=ConfigValueType.boolean,
+        default=True,
         requiresRestart=True,
     ),
 ]

@@ -38,3 +38,13 @@ config.yaml
 
 # --- Codegen working dirs ---
 .codegen-cache/
+
+# --- Eugene Plexus runtime state ---
+# The gateway's retained request metrics (M8). It lands in the process's
+# cwd, which for a real install is the install directory - but a test run
+# or a bare `python -m eugene_plexus_gateway` from the checkout puts it
+# here, and `git add -A` would then commit an operator's traffic history.
+metrics.sqlite3
+metrics.sqlite3-wal
+metrics.sqlite3-shm
+metrics.*.bak

@@ -193,7 +193,13 @@ def install_snapshot(
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
-    return Settings(config_file=tmp_path / "config.yaml")
+    # `metrics_file` is relative by default, so leaving it unset writes a
+    # metrics database into the checkout on every test run - which then
+    # sits there waiting for a `git add -A`. Both paths belong in tmp.
+    return Settings(
+        config_file=tmp_path / "config.yaml",
+        metrics_file=tmp_path / "metrics.sqlite3",
+    )
 
 
 @pytest.fixture

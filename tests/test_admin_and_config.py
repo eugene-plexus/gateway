@@ -158,6 +158,9 @@ def test_config_schema_lists_the_gateway_fields(client: TestClient) -> None:
         "swapWaitSeconds",
         "idleCheckSeconds",
         "controlUrl",
+        "metricsEnabled",
+        "metricsRetentionDays",
+        "metricsRollupEnabled",
         "logLevel",
     }
     # No backend URLs and no model list: routing is derived, so there is

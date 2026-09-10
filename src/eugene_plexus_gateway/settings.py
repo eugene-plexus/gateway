@@ -21,6 +21,14 @@ class Settings(BaseSettings):
     config_file: Path = Path("config.yaml")
     """Where the runtime config is persisted. PATCH /v1/config writes here."""
 
+    metrics_file: Path = Path("metrics.sqlite3")
+    """Where retained request metrics live (M8).
+
+    Relative, so it lands in the gateway's cwd — which the agent sets to
+    the install directory, beside `gateway.yaml` and outside every source
+    checkout. That is the property the install rework established and
+    that a developer's own install depends on."""
+
     bind_host: str = "127.0.0.1"
     """Network interface to bind. Override to 0.0.0.0 for tailnet exposure."""
 

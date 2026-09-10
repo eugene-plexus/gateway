@@ -52,7 +52,9 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
@@ -71,8 +73,31 @@ from ._generated.models import (
     RoutingTierView,
 )
 from .driver_client import DriverClient, HttpDriverClient, TieredClient
+from .metrics import AttemptRow
 
 log = logging.getLogger(__name__)
+
+# Per-request collection of attempt rows (M8). A contextvar rather than
+# state on the table, because the table is shared and long-lived while
+# these rows belong to one request; and because the DriverClient
+# protocol has no room for a request id to key them by.
+_attempts: ContextVar[list[AttemptRow] | None] = ContextVar("ep_attempts", default=None)
+
+
+@contextmanager
+def collect_attempts() -> Iterator[list[AttemptRow]]:
+    """Collect the attempts made inside this block.
+
+    Outside such a block the hooks record nothing, so `generate()` stays
+    usable from tests and from anything that is not a served request.
+    """
+    rows: list[AttemptRow] = []
+    token = _attempts.set(rows)
+    try:
+        yield rows
+    finally:
+        _attempts.reset(token)
+
 
 READY = "ready"
 STOPPED = "stopped"
@@ -625,7 +650,14 @@ class RoutingTable:
         if runtime is not None:
             self._runtime_inflight[runtime] = self._runtime_inflight.get(runtime, 0) + 1
 
-    def on_attempt_end(self, driver: str, *, served: bool) -> None:
+    def on_attempt_end(
+        self,
+        driver: str,
+        *,
+        served: bool,
+        elapsed_ms: int = 0,
+        error: str | None = None,
+    ) -> None:
         self._inflight[driver] = max(0, self._inflight.get(driver, 0) - 1)
         runtime = self._runtime_name_for_driver(driver)
         if runtime is not None:
@@ -635,6 +667,48 @@ class RoutingTable:
             self._last_request[driver] = now
             if runtime is not None:
                 self._runtime_last_request[runtime] = now
+        self._note_attempt(
+            AttemptRow(
+                driver=driver,
+                elapsed_ms=elapsed_ms,
+                served=served,
+                runtime=runtime,
+                node=self._node_for_driver(driver),
+                backend=self._backend_for_driver(driver),
+                error=error,
+            )
+        )
+
+    # --- per-attempt collection (M8) ----------------------------------------
+    #
+    # The hooks fire on whatever task is running the request, so the rows
+    # are collected into a contextvar rather than onto the table: the
+    # table is shared and long-lived, and a dict keyed by anything else
+    # would need a request id the driver protocol has no room for.
+    #
+    # The route opens a collection scope, reads it back after the
+    # response is built, and joins it to the facts only it holds (tokens,
+    # wake cost). Without a scope open, noting an attempt is a no-op —
+    # which is what keeps the existing tests, and anything calling
+    # `generate()` outside a request, working unchanged.
+
+    def _note_attempt(self, row: AttemptRow) -> None:
+        collected = _attempts.get()
+        if collected is not None:
+            collected.append(row)
+
+    def _node_for_driver(self, driver: str) -> str | None:
+        for backend in self._snapshot.reachable:
+            if backend.name == driver:
+                return backend.runtime.node if backend.runtime is not None else None
+        return None
+
+    def _backend_for_driver(self, driver: str) -> str | None:
+        for backend in self._snapshot.reachable:
+            if backend.name == driver:
+                kind = getattr(backend.info, "backend", None)
+                return getattr(kind, "value", None) if kind is not None else None
+        return None
 
     def inflight(self, driver: str) -> int:
         return self._inflight.get(driver, 0)
