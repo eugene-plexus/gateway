@@ -501,7 +501,11 @@ class RoutingTable:
         return out
 
     async def _fetch_driver_entries(self, agent_url: str) -> list[tuple[str, str]]:
-        """An unreachable agent yields an empty list, which degrades to
+        """`(name, url)` for each inference-driver one agent declares, at
+        the address a peer reaches it — `Component.advertiseUrl` when the
+        agent stamps one, else `url`.
+
+        An unreachable agent yields an empty list, which degrades to
         "nothing is routable from it" rather than crashing — the config
         endpoints stay up so the operator can fix whatever is wrong."""
         body = await self._get_json(f"{agent_url}/v1/components")
@@ -515,7 +519,15 @@ class RoutingTable:
         for entry in components:
             if not isinstance(entry, dict) or entry.get("kind") != "inference-driver":
                 continue
-            name, url = entry.get("name"), entry.get("url")
+            # `advertiseUrl` is where a peer on another host reaches the
+            # component — the agent's advertise host with that component's
+            # port — and `url` is what the agent binds and probes, which is
+            # loopback for everything an agent spawns. Prefer the first; a
+            # single-host agent sends no advertiseUrl and the two would say
+            # the same thing. This one line is what makes a companion
+            # driver on another node routable from here (M7).
+            name = entry.get("name")
+            url = entry.get("advertiseUrl") or entry.get("url")
             if isinstance(name, str) and name and isinstance(url, str) and url:
                 out.append((name, url.rstrip("/")))
         return out
