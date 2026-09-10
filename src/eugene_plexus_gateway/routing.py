@@ -73,7 +73,7 @@ from ._generated.models import (
     RoutingTierView,
 )
 from .driver_client import DriverClient, HttpDriverClient, TieredClient
-from .metrics import AttemptRow
+from .metrics import AttemptRow, CandidateRow
 
 log = logging.getLogger(__name__)
 
@@ -838,6 +838,31 @@ class RoutingTable:
         if not any(tiers):
             return None
         return TieredClient(name=resolution.model, tiers=tiers, hooks=self)
+
+    def candidates_considered(self, resolution: Resolution) -> list[CandidateRow]:
+        """What the balancer saw for each candidate, in tier order.
+
+        Deliberately does **not** call `_order`. That method rotates a
+        per-target cursor, so asking it a second time in order to find
+        out what it did would change what it does next — the observation
+        would move the thing observed. Recording the *inputs* to the
+        decision avoids that, and is what the contract promises for this
+        reason as much as for the absence of a score.
+        """
+        rows: list[CandidateRow] = []
+        for index, tier in enumerate(resolution.tiers, start=1):
+            for backend in tier.backends:
+                rows.append(
+                    CandidateRow(
+                        driver=backend.name,
+                        tier=index,
+                        eligible=backend.eligible,
+                        reason=backend.ineligible_reason,
+                        in_flight=self.inflight(backend.name),
+                        slots=backend.parallel_slots,
+                    )
+                )
+        return rows
 
     def backends_for(self, model: str) -> list[_Backend]:
         return self.resolve(model).backends()

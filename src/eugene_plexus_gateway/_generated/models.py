@@ -909,6 +909,14 @@ class MetricsGroup(BaseModel):
         None,
         description='Wake latency, over the `swappedIn` requests only. Null when\nnone of them woke anything.\n',
     )
+    routingMs: Percentiles | None = Field(
+        None,
+        description='How long deciding where to send the request took. Null for\ngroups recorded before this was measured.\n',
+    )
+    overheadMs: Percentiles | None = Field(
+        None,
+        description="The control plane's own cost: the serving attempt's\ngateway-side time minus the driver's measurement of its\nbackend call. Null when no request in the group had a\nbackend that reported its own latency.\n",
+    )
     tierCounts: dict[str, int] | None = Field(
         None,
         description='Requests served, keyed by the 1-based tier that answered. A\nslot whose tier 2 answers everything has a primary that is\nnot working, and this is where that becomes visible.\n',
@@ -929,7 +937,7 @@ class MetricsSummary(BaseModel):
     )
     truncated: bool | None = Field(
         None,
-        description='True when the window reaches past `metricsRetentionDays`,\nso raw rows for its early part no longer exist. With\n`bucket=hour` the rollups still cover it.\n',
+        description='True when the window reaches past `metricsRetentionDays`,\nso raw rows for its early part no longer exist and the\nnumbers describe less than the window asked for. Hourly\nrollups do cover that period on disk; nothing serves them\nyet.\n',
     )
     groups: list[MetricsGroup]
 
@@ -944,7 +952,14 @@ class MetricAttempt(BaseModel):
     node: str | None = None
     backend: BackendKind | None = None
     elapsedMs: int = Field(
-        ..., description='This attempt alone, not the request.', ge=0
+        ...,
+        description='This attempt alone, not the request. Gateway-side, so it\nincludes the local hop to the driver.\n',
+        ge=0,
+    )
+    backendMs: int | None = Field(
+        None,
+        description='The **driver\'s** own measurement of its backend call\n(`GenerateResponse.latencyMs`), when it reported one.\n\n`elapsedMs - backendMs` is therefore the cost of the\ngateway-to-driver hop plus the driver\'s own work: the\ncontrol plane\'s overhead on this request. This document has\nasserted since M0 that the extra local hop is\n"sub-millisecond against a multi-second generation" and "not\na cost worth optimising away" - an architectural\njustification nobody had measured. Both numbers were already\nbeing produced; subtracting them makes the claim checkable\non any install.\n',
+        ge=0,
     )
     served: bool
     error: str | None = Field(
@@ -958,35 +973,43 @@ class Outcome(StrEnum):
     error = 'error'
 
 
-class MetricRequest(BaseModel):
-    startedAt: AwareDatetime
-    requestedModel: str
-    servedModel: str | None = Field(
-        None,
-        description='What actually answered. Differs from the requested id after\na cascade.\n',
-    )
-    attempts: int = Field(..., ge=1)
-    tier: int | None = Field(None, ge=1)
-    totalMs: int = Field(
+class MetricCandidate(BaseModel):
+    """
+    One backend the balancer considered for a request, and what it
+    saw when it decided.
+
+    Deliberately the **input** to the decision rather than a score.
+    There is no score: `least_busy` is a sort by in-flight requests
+    per slot of capacity, and inventing a number to display would be
+    inventing the smarter balancer that was explicitly deferred.
+    What this answers is the question an operator actually asks —
+    why did this request go there and not to the other one.
+
+    Recorded only when there was a decision to make: more than one
+    candidate, or at least one rejected. A single eligible backend is
+    not an audit trail.
+
+    """
+
+    driver: str
+    tier: int = Field(..., ge=1)
+    eligible: bool = Field(
         ...,
-        description='Gateway-side wall clock for the whole request, including\nfailed attempts and excluding the wake — the same figure\n`x_eugene_plexus.latency_ms` reports. Per-backend\nthroughput comes from `tries[].elapsedMs`, never from here.\n',
+        description='Whether this backend could take the request at all. A driver\nfollowing a runtime is eligible only while that runtime is\n`ready`; one following nothing of ours is eligible whenever\nit is reachable.\n',
+    )
+    reason: str | None = Field(
+        None, description='Why not, when `eligible` is false. Null when it was.'
+    )
+    inFlight: int | None = Field(
+        None,
+        description='Requests already outstanding to this backend when the choice\nwas made. The load signal `least_busy` sorts on.\n',
         ge=0,
     )
-    waitedMs: int | None = Field(None, ge=0)
-    swappedIn: bool | None = None
-    streamed: bool | None = Field(
+    slots: int | None = Field(
         None,
-        description='Whether the client asked for SSE. Recorded because streamed\nrequests were invisible to the response envelope, and a\nstore that could not tell them apart would hide the very\ngap it was built to close.\n',
+        description="The runtime's `parallelSlots`, its concurrent capacity. The\nbalancer compares `inFlight / slots`, not `inFlight`, so a\nfour-slot replica holding two requests is less loaded than a\none-slot replica holding one.\n",
+        ge=1,
     )
-    promptTokens: int | None = None
-    completionTokens: int | None = None
-    outcome: Outcome
-    tries: list[MetricAttempt] = Field(..., min_length=1)
-
-
-class MetricRequestPage(BaseModel):
-    requests: list[MetricRequest]
-    nextCursor: str | None = Field(None, description='Absent or null on the last page.')
 
 
 class DriverHealth(BaseModel):
@@ -1225,6 +1248,54 @@ class RoutingTierView(BaseModel):
         ..., description='The model id this tier is the replica set of.'
     )
     backends: list[RoutingBackendView]
+
+
+class MetricRequest(BaseModel):
+    startedAt: AwareDatetime
+    requestedModel: str
+    servedModel: str | None = Field(
+        None,
+        description='What actually answered. Differs from the requested id after\na cascade.\n',
+    )
+    attempts: int = Field(..., ge=1)
+    tier: int | None = Field(None, ge=1)
+    totalMs: int = Field(
+        ...,
+        description='Gateway-side wall clock for the whole request, including\nfailed attempts and excluding the wake — the same figure\n`x_eugene_plexus.latency_ms` reports. Per-backend\nthroughput comes from `tries[].elapsedMs`, never from here.\n',
+        ge=0,
+    )
+    routingMs: int | None = Field(
+        None,
+        description="Time spent deciding where to send this request - resolving\nthe model to a slot, picking a backend, and any\nrouting-table refresh that happened on the way - measured\n**before** `totalMs` starts and excluding the wake, which is\n`waitedMs`.\n\nPreviously invisible, and not always small: a refresh does\nHTTP to the agent and to every driver's `/v1/info`, inside\nthe request that triggered it.\n",
+        ge=0,
+    )
+    refreshed: bool | None = Field(
+        None,
+        description='Whether a routing-table refresh ran inside this request.\nThe expensive and surprising case, so it is a flag rather\nthan something to infer from `routingMs`.\n',
+    )
+    strategy: str | None = Field(
+        None,
+        description='The `loadBalancing` value in effect when this request was\nrouted. Recorded per request because the config can change\nbetween them, and `least_busy` and `round_robin` explain\ndifferent orderings.\n',
+    )
+    candidates: list[MetricCandidate] | None = Field(
+        None,
+        description='What the balancer considered. Present only when there was a\ndecision to make - more than one candidate, or at least one\nrejected.\n',
+    )
+    waitedMs: int | None = Field(None, ge=0)
+    swappedIn: bool | None = None
+    streamed: bool | None = Field(
+        None,
+        description='Whether the client asked for SSE. Recorded because streamed\nrequests were invisible to the response envelope, and a\nstore that could not tell them apart would hide the very\ngap it was built to close.\n',
+    )
+    promptTokens: int | None = None
+    completionTokens: int | None = None
+    outcome: Outcome
+    tries: list[MetricAttempt] = Field(..., min_length=1)
+
+
+class MetricRequestPage(BaseModel):
+    requests: list[MetricRequest]
+    nextCursor: str | None = Field(None, description='Absent or null on the last page.')
 
 
 class DriversInfo(BaseModel):

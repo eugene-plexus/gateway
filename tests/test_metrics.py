@@ -412,3 +412,180 @@ def test_paging_is_stable_while_rows_arrive(tmp_path: Path) -> None:
             await store.aclose()
 
     asyncio.run(run())
+
+
+# --------------------------------------------------------------------------- #
+# Phase decomposition and balancer decisions
+# --------------------------------------------------------------------------- #
+
+
+def test_the_routing_phase_is_measured_separately_from_the_backend(
+    metrics_client: TestClient,
+) -> None:
+    """`routingMs` covers work that used to happen before any clock started.
+
+    Resolve, pick and any routing-table refresh run before `totalMs`
+    begins, so they were invisible - and a refresh does HTTP to the
+    agent and to every driver inside the request that triggered it.
+    """
+    metrics_client.post(
+        "/v1/chat/completions",
+        json={"model": "qwen", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    _drain(metrics_client)
+
+    record = metrics_client.get("/v1/metrics/requests").json()["requests"][0]
+    assert record["routingMs"] is not None
+    assert record["refreshed"] is False
+    # Present and not conflated with the wake, which is its own field.
+    assert record["routingMs"] >= 0
+    assert record["strategy"] == "least_busy"
+
+
+def test_the_control_planes_own_overhead_is_derivable(metrics_client: TestClient) -> None:
+    """`elapsedMs - backendMs` is the local hop plus the driver's work.
+
+    gateway.yaml has asserted since M0 that the extra hop is
+    "sub-millisecond against a multi-second generation" and "not a cost
+    worth optimising away". Both numbers were already being produced;
+    keeping the driver's own measurement makes that claim checkable
+    rather than asserted.
+    """
+    metrics_client.post(
+        "/v1/chat/completions",
+        json={"model": "qwen", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    _drain(metrics_client)
+
+    served = metrics_client.get("/v1/metrics/requests").json()["requests"][0]["tries"][0]
+    assert served["backendMs"] is not None
+    assert served["backendMs"] <= served["elapsedMs"]
+
+    group = metrics_client.get("/v1/metrics").json()["groups"][0]
+    assert group["overheadMs"] is not None
+    assert group["overheadMs"]["p50"] >= 0
+    assert group["routingMs"] is not None
+
+
+class SilentLatencyDriver(FakeDriverClient):
+    """A backend that answers without reporting its own latency.
+
+    `GenerateResponse.latencyMs` is optional, and a driver that omits it
+    leaves the control plane's overhead uncomputable - not zero.
+    """
+
+    async def generate(self, request):  # type: ignore[no-untyped-def]
+        response = await super().generate(request)
+        response.latencyMs = None
+        return response
+
+
+def test_a_backend_that_reports_no_latency_leaves_overhead_unmeasured(
+    settings: Settings,
+) -> None:
+    """Null, not zero - the same rule as throughput.
+
+    A zero overhead would read as "the hop is free", which is a claim,
+    where the data says "this backend did not tell us how long it took".
+    """
+    fake = SilentLatencyDriver(name="quiet", model_id="qwen")
+    fake.usage = Usage(promptTokens=1, completionTokens=1, totalTokens=2)
+    app = create_app(settings=settings)
+    app.state.routing = make_routing_table(fake)
+    with TestClient(app) as client:
+        client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        _drain(client)
+        record = client.get("/v1/metrics/requests").json()["requests"][0]
+        assert record["tries"][0]["backendMs"] is None
+        group = client.get("/v1/metrics").json()["groups"][0]
+        assert group["overheadMs"] is None, "overhead was invented from a missing measurement"
+        # The routing phase is ours to measure and is still there.
+        assert group["routingMs"] is not None
+
+
+def test_the_balancer_records_what_it_saw_when_there_was_a_choice(
+    settings: Settings,
+) -> None:
+    """Two replicas of one model, one of them asleep.
+
+    The recorded candidates are the *inputs* to the decision - eligible,
+    why not, in-flight, capacity - not a score. There is no score:
+    least-busy is a sort, and inventing a number to display would be
+    inventing the smarter balancer that was deliberately deferred.
+    """
+    a = FakeDriverClient(name="replica-a", model_id="qwen", runtime="rt-a")
+    b = FakeDriverClient(name="replica-b", model_id="qwen", runtime="rt-b")
+    app = create_app(settings=settings)
+    app.state.routing = make_routing_table(
+        a,
+        b,
+        runtimes=[runtime_facts("rt-a"), runtime_facts("rt-b", status="stopped")],
+    )
+    with TestClient(app) as client:
+        client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        _drain(client)
+        record = client.get("/v1/metrics/requests").json()["requests"][0]
+
+    considered = {c["driver"]: c for c in record["candidates"]}
+    assert set(considered) == {"replica-a", "replica-b"}
+    assert considered["replica-a"]["eligible"] is True
+    assert considered["replica-a"]["reason"] is None
+    # The rejection carries its reason, which is the answer to "why did
+    # this not go to the other replica".
+    assert considered["replica-b"]["eligible"] is False
+    assert "stopped" in considered["replica-b"]["reason"]
+    # And the load signal the sort actually runs on.
+    assert considered["replica-a"]["inFlight"] == 0
+    assert considered["replica-a"]["slots"] == 1
+    assert all(c["tier"] == 1 for c in record["candidates"])
+
+
+def test_one_eligible_backend_records_no_candidate_list(
+    metrics_client: TestClient,
+) -> None:
+    """A row per request saying "the only option was chosen" is noise.
+
+    The list is for answering "why there and not the other one", so with
+    no other one there is nothing to answer.
+    """
+    metrics_client.post(
+        "/v1/chat/completions",
+        json={"model": "qwen", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    _drain(metrics_client)
+    record = metrics_client.get("/v1/metrics/requests").json()["requests"][0]
+    assert record["candidates"] == []
+
+
+def test_asking_what_the_balancer_saw_does_not_change_what_it_does(
+    settings: Settings,
+) -> None:
+    """The observation must not move the thing observed.
+
+    `_order` rotates a per-target cursor so an idle install alternates
+    between replicas. Reading it to find out what it did would advance
+    that cursor - so the recorded candidates are the inputs, and this
+    test pins the property that reading them is free.
+    """
+    a = FakeDriverClient(name="replica-a", model_id="qwen", runtime="rt-a")
+    b = FakeDriverClient(name="replica-b", model_id="qwen", runtime="rt-b")
+    table = make_routing_table(a, b, runtimes=[runtime_facts("rt-a"), runtime_facts("rt-b")])
+
+    firsts = []
+    for _ in range(4):
+        resolution = table.resolve("qwen")
+        # Interleave the read with the pick, the way the route does.
+        table.candidates_considered(resolution)
+        client = table.pick(resolution)
+        assert client is not None
+        firsts.append(client.candidates[0].name)
+        table.candidates_considered(resolution)
+
+    # Still strictly alternating, as it would be with no reads at all.
+    assert firsts == ["replica-a", "replica-b", "replica-a", "replica-b"]

@@ -15,6 +15,8 @@ import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from datetime import UTC, datetime
 from typing import Any
 
@@ -48,7 +50,7 @@ from ..config import ConfigStore
 from ..dependencies import require_authorized
 from ..driver_client import DriverClient, DriverError
 from ..lifecycle import LifecycleManager, WakeResult
-from ..metrics import AttemptRow, MetricsStore, RequestRow
+from ..metrics import AttemptRow, CandidateRow, MetricsStore, RequestRow
 from ..routing import Resolution, RoutingTable, collect_attempts
 
 log = logging.getLogger(__name__)
@@ -77,18 +79,36 @@ def _metrics(request: Request) -> MetricsStore | None:
     return getattr(request.app.state, "metrics", None)
 
 
+@dataclass(slots=True)
+class _Recording:
+    """The per-request facts settled before the backend call.
+
+    One value rather than nine keyword arguments threaded through the
+    route and into the streaming generator. Everything here is known by
+    the time a backend is chosen; what `_record` adds afterwards is only
+    what the response taught us.
+    """
+
+    metrics: MetricsStore | None
+    started: float
+    waited_ms: int = 0
+    swapped_in: bool = False
+    routing_ms: int | None = None
+    refreshed: bool = False
+    strategy: str | None = None
+    candidates: list[CandidateRow] = dc_field(default_factory=list)
+    streamed: bool = False
+
+
 def _record(
-    metrics: MetricsStore | None,
+    rec: _Recording,
     body: ChatCompletionRequest,
     tries: list[AttemptRow],
-    started: float,
     *,
-    waited_ms: int = 0,
-    swapped_in: bool = False,
-    streamed: bool = False,
     served_model: str | None = None,
     tier: int | None = None,
     usage: Any = None,
+    backend_ms: int | None = None,
 ) -> None:
     """Join the per-attempt rows to the facts only this route holds.
 
@@ -105,25 +125,42 @@ def _record(
     Never raises. An instrumentation bug must not turn a served
     completion into a 500.
     """
-    if metrics is None:
+    if rec.metrics is None:
         return
     try:
         served = next((a for a in tries if a.served), None)
-        metrics.record(
+        # The driver's own measurement belongs to the attempt that
+        # produced it, and only the serving attempt has one — a failed
+        # attempt returned an exception, not a response with a latency
+        # on it.
+        if served is not None and backend_ms is not None:
+            served.backend_ms = backend_ms
+        # Keep the candidate list only when there was a decision to
+        # make. One eligible backend and nothing rejected is not an
+        # audit trail, it is a row per request saying "the only option
+        # was chosen".
+        considered = rec.candidates
+        if len(considered) < 2 and all(c.eligible for c in considered):
+            considered = []
+        rec.metrics.record(
             RequestRow(
                 started_at=datetime.now(UTC),
                 requested_model=body.model,
                 served_model=served_model,
                 attempts=max(1, len(tries)),
                 tier=tier if served is not None else None,
-                total_ms=int((time.monotonic() - started) * 1000),
-                waited_ms=waited_ms,
-                swapped_in=swapped_in,
-                streamed=streamed,
+                total_ms=int((time.monotonic() - rec.started) * 1000),
+                waited_ms=rec.waited_ms,
+                swapped_in=rec.swapped_in,
+                streamed=rec.streamed,
                 prompt_tokens=getattr(usage, "promptTokens", None),
                 completion_tokens=getattr(usage, "completionTokens", None),
                 outcome="served" if served is not None else "error",
                 tries=list(tries),
+                routing_ms=rec.routing_ms,
+                refreshed=rec.refreshed,
+                strategy=rec.strategy,
+                candidates=considered,
             )
         )
     except Exception:
@@ -214,6 +251,15 @@ async def list_models(request: Request) -> ModelList:
 
 @router.post("/v1/chat/completions", dependencies=_auth)
 async def create_chat_completion(request: Request, body: ChatCompletionRequest) -> Any:
+    # The routing phase starts here, and it used to be unmeasured: the
+    # clock below is taken after the wake, so resolving, picking and any
+    # refresh happened before anything was timing. A refresh does HTTP
+    # to the agent and to every driver, inside the request that
+    # triggered it, so "before the clock starts" was not the same as
+    # "free".
+    arrived = time.monotonic()
+    refreshed = False
+
     table = _routing(request)
     if table is None:
         return _error(
@@ -235,10 +281,15 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
     wake: WakeResult | None = None
     client = table.pick(resolution)
     if client is None and await table.refresh_if_stale():
+        refreshed = True
         resolution = table.resolve(body.model)
         if not resolution.has_backends():
             return _no_such_model(body.model, table)
         client = table.pick(resolution)
+    # What the balancer saw, read before the wake so the numbers are the
+    # ones the decision was made on. Read even when only one backend is
+    # eligible; `_record` decides whether it is worth keeping.
+    considered = table.candidates_considered(resolution)
     if client is None:
         lifecycle = _lifecycle(request)
         if lifecycle is not None:
@@ -246,32 +297,38 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
             if wake.ok:
                 resolution = table.resolve(body.model)
                 client = table.pick(resolution)
+                considered = table.candidates_considered(resolution)
         if client is None:
             return _not_ready(resolution, wake)
 
     store = _store(request)
     generate = _to_generate_request(body, store)
     waited_ms = wake.waited_ms if wake is not None and wake.ok else 0
+    # Excludes the wake, which is `waited_ms` and already reported. The
+    # two must not overlap or a swap would be counted twice.
+    routing_ms = int((time.monotonic() - arrived) * 1000) - waited_ms
     swapped_in = bool(wake is not None and wake.ok)
 
-    metrics = _metrics(request)
     started = time.monotonic()
+    rec = _Recording(
+        metrics=_metrics(request),
+        started=started,
+        waited_ms=waited_ms,
+        swapped_in=swapped_in,
+        routing_ms=max(0, routing_ms),
+        refreshed=refreshed,
+        strategy=str(store.get("loadBalancing")) if store is not None else None,
+        candidates=considered,
+        streamed=bool(body.stream),
+    )
+
     if body.stream:
         # The generator runs AFTER this function returns, so its
         # collection scope has to live inside it — a `with` block here
         # would be closed before the first attempt was made. The stream
         # records itself.
         return StreamingResponse(
-            _stream_completion(
-                body,
-                generate,
-                client,
-                table,
-                started,
-                metrics=metrics,
-                waited_ms=waited_ms,
-                swapped_in=swapped_in,
-            ),
+            _stream_completion(body, generate, client, table, started, rec=rec),
             media_type="text/event-stream",
         )
 
@@ -279,10 +336,10 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
         try:
             response = await client.generate(generate)
         except DriverError as e:
-            _record(metrics, body, tries, started, waited_ms=waited_ms, swapped_in=swapped_in)
+            _record(rec, body, tries)
             return _driver_error_response(e)
         except httpx.HTTPError as e:
-            _record(metrics, body, tries, started, waited_ms=waited_ms, swapped_in=swapped_in)
+            _record(rec, body, tries)
             return _error(
                 code=502,
                 message=(
@@ -296,15 +353,13 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
             body, response, client, table, started, waited_ms=waited_ms, swapped_in=swapped_in
         )
         _record(
-            metrics,
+            rec,
             body,
             tries,
-            started,
-            waited_ms=waited_ms,
-            swapped_in=swapped_in,
             served_model=result.model,
             tier=getattr(client, "tier", 1),
             usage=response.usage,
+            backend_ms=response.latencyMs,
         )
         return result
 
@@ -450,9 +505,7 @@ async def _stream_completion(
     table: RoutingTable,
     started: float,
     *,
-    metrics: MetricsStore | None = None,
-    waited_ms: int = 0,
-    swapped_in: bool = False,
+    rec: _Recording,
 ) -> AsyncIterator[str]:
     """SSE framed exactly as OpenAI frames it.
 
@@ -509,15 +562,7 @@ async def _stream_completion(
             # behaviour is to emit an error frame, so do that and then
             # terminate normally.
             log.warning("streaming completion for %r failed: %s", body.model, e)
-            _record(
-                metrics,
-                body,
-                tries,
-                started,
-                waited_ms=waited_ms,
-                swapped_in=swapped_in,
-                streamed=True,
-            )
+            _record(rec, body, tries)
             yield (
                 "data: "
                 + json.dumps(
@@ -551,16 +596,13 @@ async def _stream_completion(
                 total_tokens=response.usage.totalTokens,
             )
         _record(
-            metrics,
+            rec,
             body,
             tries,
-            started,
-            waited_ms=waited_ms,
-            swapped_in=swapped_in,
-            streamed=True,
             served_model=served_model,
             tier=getattr(client, "tier", 1),
             usage=response.usage,
+            backend_ms=response.latencyMs,
         )
         # The routing extension rides the final frame, beside `usage` —
         # the same place OpenAI puts its end-of-stream extras, and the
@@ -576,8 +618,8 @@ async def _stream_completion(
                     table,
                     body.model,
                     started,
-                    waited_ms=waited_ms,
-                    swapped_in=swapped_in,
+                    waited_ms=rec.waited_ms,
+                    swapped_in=rec.swapped_in,
                 ),
             )
         )

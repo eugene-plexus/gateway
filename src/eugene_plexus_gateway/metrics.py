@@ -50,7 +50,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # Bounded because the alternative to dropping rows is stalling
 # completions, and that trade is never worth making. Sized so a burst
@@ -74,6 +74,18 @@ PRUNE_INTERVAL_SECONDS = 3600.0
 
 
 @dataclass(slots=True)
+class CandidateRow:
+    """One backend the balancer considered, and what it saw."""
+
+    driver: str
+    tier: int
+    eligible: bool
+    reason: str | None = None
+    in_flight: int | None = None
+    slots: int | None = None
+
+
+@dataclass(slots=True)
 class AttemptRow:
     """One backend touched by one request, in the order tried."""
 
@@ -84,6 +96,11 @@ class AttemptRow:
     node: str | None = None
     backend: str | None = None
     error: str | None = None
+    # The DRIVER's own measurement of its backend call. `elapsed_ms`
+    # minus this is the control plane's overhead on the attempt - the
+    # local hop plus the driver's work - which the design has asserted
+    # is negligible since M0 without measuring it.
+    backend_ms: int | None = None
 
 
 @dataclass(slots=True)
@@ -103,6 +120,14 @@ class RequestRow:
     streamed: bool = False
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    # Deciding where to send it: resolve, pick, and any routing-table
+    # refresh. Measured before `total_ms` starts and excluding the wake.
+    routing_ms: int | None = None
+    refreshed: bool = False
+    strategy: str | None = None
+    # What the balancer saw, when there was a choice to make. Empty when
+    # there was one eligible backend - that is not an audit trail.
+    candidates: list[CandidateRow] = field(default_factory=list)
 
 
 _DDL = """
@@ -124,7 +149,10 @@ CREATE TABLE IF NOT EXISTS request (
     streamed          INTEGER NOT NULL DEFAULT 0,
     prompt_tokens     INTEGER,
     completion_tokens INTEGER,
-    outcome           TEXT    NOT NULL
+    outcome           TEXT    NOT NULL,
+    routing_ms        INTEGER,
+    refreshed         INTEGER NOT NULL DEFAULT 0,
+    strategy          TEXT
 );
 
 CREATE INDEX IF NOT EXISTS request_started_at ON request (started_at);
@@ -139,10 +167,28 @@ CREATE TABLE IF NOT EXISTS attempt (
     backend    TEXT,
     elapsed_ms INTEGER NOT NULL,
     served     INTEGER NOT NULL,
-    error      TEXT
+    error      TEXT,
+    backend_ms INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS attempt_request ON attempt (request_id);
+
+-- What the balancer considered, when there was a choice. A separate
+-- table rather than JSON on the request, because the whole point is to
+-- be able to ask questions across it - "which backend keeps being
+-- rejected, and why" - and that is a GROUP BY, not a scan of blobs.
+CREATE TABLE IF NOT EXISTS candidate (
+    request_id INTEGER NOT NULL REFERENCES request (id) ON DELETE CASCADE,
+    seq        INTEGER NOT NULL,
+    driver     TEXT    NOT NULL,
+    tier       INTEGER NOT NULL,
+    eligible   INTEGER NOT NULL,
+    reason     TEXT,
+    in_flight  INTEGER,
+    slots      INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS candidate_request ON candidate (request_id);
 
 -- Hourly aggregates, kept indefinitely: a few hundred rows a day, and
 -- the only thing that can answer "what did last night look like" once
@@ -383,8 +429,8 @@ class MetricsStore:
                 cursor = conn.execute(
                     "INSERT INTO request (started_at, requested_model, served_model, attempts,"
                     " tier, total_ms, waited_ms, swapped_in, streamed, prompt_tokens,"
-                    " completion_tokens, outcome)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " completion_tokens, outcome, routing_ms, refreshed, strategy)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         _iso(row.started_at),
                         row.requested_model,
@@ -398,12 +444,16 @@ class MetricsStore:
                         row.prompt_tokens,
                         row.completion_tokens,
                         row.outcome,
+                        row.routing_ms,
+                        int(row.refreshed),
+                        row.strategy,
                     ),
                 )
                 request_id = cursor.lastrowid
                 conn.executemany(
                     "INSERT INTO attempt (request_id, seq, driver, runtime, node, backend,"
-                    " elapsed_ms, served, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " elapsed_ms, served, error, backend_ms)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         (
                             request_id,
@@ -415,8 +465,26 @@ class MetricsStore:
                             a.elapsed_ms,
                             int(a.served),
                             a.error,
+                            a.backend_ms,
                         )
                         for seq, a in enumerate(row.tries)
+                    ],
+                )
+                conn.executemany(
+                    "INSERT INTO candidate (request_id, seq, driver, tier, eligible, reason,"
+                    " in_flight, slots) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            request_id,
+                            seq,
+                            c.driver,
+                            c.tier,
+                            int(c.eligible),
+                            c.reason,
+                            c.in_flight,
+                            c.slots,
+                        )
+                        for seq, c in enumerate(row.candidates)
                     ],
                 )
 
@@ -550,7 +618,7 @@ class MetricsStore:
             SELECT r.started_at, r.requested_model, r.outcome, r.attempts, r.tier,
                    r.total_ms, r.waited_ms, r.swapped_in, r.completion_tokens,
                    served.driver, served.runtime, served.node, served.backend,
-                   served.elapsed_ms
+                   served.elapsed_ms, r.routing_ms, served.backend_ms
             FROM request r
             LEFT JOIN attempt served
                    ON served.request_id = r.id AND served.served = 1
@@ -575,6 +643,8 @@ class MetricsStore:
             s_node,
             s_backend,
             s_elapsed,
+            routing_ms,
+            s_backend_ms,
         ) in rows:
             bucket_start = started_at[:13] + ":00:00Z" if bucket == "hour" else None
             key = (bucket_start, requested_model, s_driver, s_runtime, s_node, s_backend)
@@ -594,6 +664,8 @@ class MetricsStore:
                     "_latency": [],
                     "_waited": [],
                     "_tps": [],
+                    "_routing": [],
+                    "_overhead": [],
                     "tierCounts": {},
                 }
             g["requests"] += 1
@@ -613,12 +685,25 @@ class MetricsStore:
             # exists to prevent.
             if completion_tokens and s_elapsed and s_elapsed > 0:
                 g["_tps"].append(completion_tokens * 1000.0 / s_elapsed)
+            if routing_ms is not None:
+                g["_routing"].append(int(routing_ms))
+            # The control plane's own cost. Clamped at zero because the
+            # two clocks are different processes' and a sub-millisecond
+            # hop can round to the driver measuring marginally MORE than
+            # the gateway did - a negative overhead is a rounding
+            # artefact, not a discovery.
+            if s_elapsed is not None and s_backend_ms is not None:
+                g["_overhead"].append(max(0, int(s_elapsed) - int(s_backend_ms)))
 
         out: list[dict[str, Any]] = []
         for g in groups.values():
             latency = sorted(g.pop("_latency"))
             waited = sorted(g.pop("_waited"))
             tps = sorted(g.pop("_tps"))
+            routing = sorted(g.pop("_routing"))
+            overhead = sorted(g.pop("_overhead"))
+            g["routingMs"] = _spread(routing)
+            g["overheadMs"] = _spread(overhead)
             g["latencyMs"] = {
                 "p50": _percentile(latency, 0.50),
                 "p90": _percentile(latency, 0.90),
@@ -689,7 +774,7 @@ class MetricsStore:
                 f"""
                 SELECT id, started_at, requested_model, served_model, attempts, tier,
                        total_ms, waited_ms, swapped_in, streamed, prompt_tokens,
-                       completion_tokens, outcome
+                       completion_tokens, outcome, routing_ms, refreshed, strategy
                 FROM request r {clause}
                 ORDER BY id DESC LIMIT ?
                 """,
@@ -716,9 +801,11 @@ class MetricsStore:
                 elapsed_ms,
                 served,
                 error,
+                backend_ms,
             ) in conn.execute(
                 f"""
-                SELECT request_id, driver, runtime, node, backend, elapsed_ms, served, error
+                SELECT request_id, driver, runtime, node, backend, elapsed_ms, served,
+                       error, backend_ms
                 FROM attempt WHERE request_id IN ({placeholders}) ORDER BY request_id, seq
                 """,
                 ids,
@@ -732,6 +819,35 @@ class MetricsStore:
                         "elapsedMs": elapsed_ms,
                         "served": bool(served),
                         "error": error,
+                        "backendMs": backend_ms,
+                    }
+                )
+
+            # Same one-query-per-page shape as the attempts above.
+            considered: dict[int, list[dict[str, Any]]] = {i: [] for i in ids}
+            for (
+                request_id,
+                driver,
+                tier,
+                eligible,
+                reason,
+                in_flight,
+                slots,
+            ) in conn.execute(
+                f"""
+                SELECT request_id, driver, tier, eligible, reason, in_flight, slots
+                FROM candidate WHERE request_id IN ({placeholders}) ORDER BY request_id, seq
+                """,
+                ids,
+            ).fetchall():
+                considered[request_id].append(
+                    {
+                        "driver": driver,
+                        "tier": tier,
+                        "eligible": bool(eligible),
+                        "reason": reason,
+                        "inFlight": in_flight,
+                        "slots": slots,
                     }
                 )
 
@@ -749,11 +865,32 @@ class MetricsStore:
                 "promptTokens": r[10],
                 "completionTokens": r[11],
                 "outcome": r[12],
+                "routingMs": r[13],
+                "refreshed": bool(r[14]),
+                "strategy": r[15],
                 "tries": tries[r[0]],
+                "candidates": considered[r[0]],
             }
             for r in rows
         ]
         return out, (str(rows[-1][0]) if more else None)
+
+
+def _spread(values: list[int]) -> dict[str, int] | None:
+    """Percentiles for a sorted list, or None when there is nothing.
+
+    None rather than a zeroed object, for the same reason throughput is:
+    "not measured" and "measured as zero" are different facts and a UI
+    cannot recover the difference.
+    """
+    if not values:
+        return None
+    return {
+        "p50": _percentile(values, 0.50),
+        "p90": _percentile(values, 0.90),
+        "p99": _percentile(values, 0.99),
+        "max": values[-1],
+    }
 
 
 def _pct_float(values: list[float], fraction: float) -> float:
