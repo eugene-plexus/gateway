@@ -45,6 +45,7 @@ async def _driver_health(client: DriverClient) -> DriverHealth:
             url=base_url,  # type: ignore[arg-type]
             backend=backend,
             modelId=info.modelId,
+            runtime=info.runtime,
             version=info.version,
         )
     except httpx.HTTPError as e:

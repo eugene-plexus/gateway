@@ -37,6 +37,21 @@ def test_admin_drivers_reports_what_the_routing_table_saw(
     assert drivers[0]["modelId"] == fake_driver.model_id
 
 
+def test_admin_drivers_carries_the_runtime_a_driver_follows(settings: Settings) -> None:
+    """Straight off the driver's /v1/info. A reachable driver serving
+    nothing, next to a `ready` runtime routed to by nobody, is the visible
+    shape of a mis-wired install — and this is the field that shows it.
+    Absent for a backend that is not a runtime this install supervises."""
+    following = FakeDriverClient(name="local", runtime="qwen3-8b")
+    cloud = FakeDriverClient(name="cloud", provider="openai")
+    app = _app_with(settings, make_routing_table(following, cloud))
+    with TestClient(app) as c:
+        drivers = {d["name"]: d for d in c.get("/v1/admin/drivers").json()["drivers"]}
+
+    assert drivers["local"]["runtime"] == "qwen3-8b"
+    assert drivers["cloud"].get("runtime") is None
+
+
 def test_admin_drivers_lists_unreachable_ones_too(
     settings: Settings, fake_driver: FakeDriverClient
 ) -> None:

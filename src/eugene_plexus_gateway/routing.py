@@ -409,6 +409,11 @@ class RoutingTable:
                 url=b.url,  # type: ignore[arg-type]
                 backend=_backend_kind(b),
                 modelId=b.info.modelId,
+                # Straight off the driver's /v1/info: which supervised
+                # runtime it follows. A reachable driver serving nothing,
+                # next to a `ready` runtime routed to by nobody, is the
+                # visible shape of a mis-wired install.
+                runtime=b.info.runtime,
                 version=b.info.version,
             )
             for b in sorted(self._snapshot.reachable, key=lambda b: b.name)

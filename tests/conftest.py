@@ -40,6 +40,7 @@ class FakeDriverClient:
         model_id: str | None = "fake-model",
         provider: str | None = None,
         max_context_tokens: int | None = None,
+        runtime: str | None = None,
     ) -> None:
         self.name = name
         self.base_url = base_url
@@ -47,6 +48,7 @@ class FakeDriverClient:
         self.model_id = model_id
         self.provider = provider
         self.max_context_tokens = max_context_tokens
+        self.runtime = runtime
 
         # Mirrors the real clients' surface so the route can read these
         # off either without asking which kind it holds.
@@ -72,6 +74,7 @@ class FakeDriverClient:
             backend=self.backend,
             provider=self.provider,
             modelId=self.model_id,
+            runtime=self.runtime,
             capabilities=capabilities,
             version="0.0.0-fake",
         )
