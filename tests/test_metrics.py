@@ -328,6 +328,18 @@ def test_rows_past_retention_are_dropped_and_the_hour_is_kept(tmp_path: Path) ->
                     ),
                 ).fetchone()
             assert rolled == (1, 40), "the pruned hour left no aggregate behind"
+
+            # Idempotent. The rollup runs hourly on the writer's own loop,
+            # so it WILL see hours it has already summarised; without the
+            # `rollup_through` guard an INSERT OR REPLACE over a widening
+            # window double-counts, and a metrics table that inflates
+            # slowly is worse than one that is obviously broken.
+            store.maintain()
+            store.maintain()
+            with store._reader() as conn:
+                assert conn is not None
+                again = conn.execute("SELECT SUM(requests) FROM rollup").fetchone()
+            assert again == (1,), "re-running maintenance double-counted"
         finally:
             await store.aclose()
 
