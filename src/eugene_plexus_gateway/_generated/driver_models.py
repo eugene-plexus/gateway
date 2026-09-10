@@ -289,9 +289,20 @@ class ConfigValueType(StrEnum):
     what is saved is the name rather than a URL because the address
     of a host is topology the control root owns.
 
-    `driver_list` stays reserved for the ordered model→driver
-    priority lists that arrive with lifecycle policy — **M6** since
-    multi-host and trust took M5.
+    `model_slots` is the gateway's priority-list surface, and the
+    one value here that holds objects. An ordered JSON array of
+    `{"model": <alias a client asks for>, "targets": [<model id>,
+    ...]}`: a request for `model` is served by the drivers serving
+    `model` itself, then by the drivers serving each target in
+    order, cascading on failure. Targets are **model ids, not driver
+    names**, because a model id names a replica set — every driver
+    currently serving it, load-balanced — and a driver name would
+    name one process. That is why the value reserved since M2 as
+    `driver_list` was renamed when M6 defined it: the old name said
+    the wrong thing about what goes in the list. A cloud
+    subscription is a target like any other, because a
+    `claude_code_cli` driver already serves a model id. UIs without
+    a structured renderer for it fall back to editing the JSON.
 
     """
 
@@ -308,7 +319,7 @@ class ConfigValueType(StrEnum):
     duration = 'duration'
     runtime_name = 'runtime_name'
     node_name = 'node_name'
-    driver_list = 'driver_list'
+    model_slots = 'model_slots'
 
 
 class ConfigFieldShowWhen(BaseModel):

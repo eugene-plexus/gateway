@@ -153,11 +153,17 @@ def test_config_schema_lists_the_gateway_fields(client: TestClient) -> None:
         "defaultMaxTokens",
         "requestTimeoutSeconds",
         "routingRefreshSeconds",
+        "modelSlots",
+        "loadBalancing",
+        "swapWaitSeconds",
+        "idleCheckSeconds",
+        "controlUrl",
         "logLevel",
     }
     # No backend URLs and no model list: routing is derived, so there is
-    # nothing here to get out of step with reality.
-    assert not any("url" in k.lower() for k in keys)
+    # nothing here to get out of step with reality. `controlUrl` is the
+    # one address, and it points at the control root, not a backend.
+    assert not any("url" in k.lower() for k in keys - {"controlUrl"})
     assert "drivers" not in keys
 
     for field in schema["fields"]:

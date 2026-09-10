@@ -46,7 +46,8 @@ from .._generated.models import (
 from ..config import ConfigStore
 from ..dependencies import require_authorized
 from ..driver_client import DriverClient, DriverError
-from ..routing import RoutingTable
+from ..lifecycle import LifecycleManager, WakeResult
+from ..routing import Resolution, RoutingTable
 
 log = logging.getLogger(__name__)
 
@@ -60,6 +61,10 @@ _auth = [Depends(require_authorized)]
 
 def _routing(request: Request) -> RoutingTable | None:
     return getattr(request.app.state, "routing", None)
+
+
+def _lifecycle(request: Request) -> LifecycleManager | None:
+    return getattr(request.app.state, "lifecycle", None)
 
 
 def _store(request: Request) -> ConfigStore | None:
@@ -109,6 +114,27 @@ def _no_such_model(model: str, table: RoutingTable | None) -> JSONResponse:
     )
 
 
+def _not_ready(resolution: Resolution, wake: WakeResult | None) -> JSONResponse:
+    """503: something serves this model and none of it can take a request
+    right now. Retryable, so deliberately not a 502."""
+    states = sorted(
+        {
+            f"{b.runtime.name}={b.runtime.status}"
+            for b in resolution.backends()
+            if b.runtime is not None and b.runtime.status
+        }
+    )
+    detail = wake.message if wake is not None else "; ".join(states) or "no backend is ready"
+    return _error(
+        code=503,
+        message=(
+            f"No backend serving {resolution.model!r} is ready: {detail}. "
+            f"Runtimes: {', '.join(states) if states else 'none reported'}."
+        ),
+        error_type="service_unavailable",
+    )
+
+
 # --------------------------------------------------------------------------- #
 # /v1/models
 # --------------------------------------------------------------------------- #
@@ -137,12 +163,29 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
             error_type="service_unavailable",
         )
 
-    client = table.resolve(body.model)
-    if client is None:
+    resolution = table.resolve(body.model)
+    if not resolution.has_backends():
         return _no_such_model(body.model, table)
+
+    # Nothing eligible: wake a `startOnDemand` runtime if the slot has
+    # one, wait for it, and try again. A tier with a startable runtime is
+    # awaited rather than skipped — see the lifecycle module.
+    wake: WakeResult | None = None
+    client = table.pick(resolution)
+    if client is None:
+        lifecycle = _lifecycle(request)
+        if lifecycle is not None:
+            wake = await lifecycle.wake(resolution)
+            if wake.ok:
+                resolution = table.resolve(body.model)
+                client = table.pick(resolution)
+        if client is None:
+            return _not_ready(resolution, wake)
 
     store = _store(request)
     generate = _to_generate_request(body, store)
+    waited_ms = wake.waited_ms if wake is not None and wake.ok else 0
+    swapped_in = bool(wake is not None and wake.ok)
 
     started = time.monotonic()
     try:
@@ -164,7 +207,9 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
             error_type="upstream_error",
         )
 
-    return _to_chat_completion(body, response, client, table, started)
+    return _to_chat_completion(
+        body, response, client, table, started, waited_ms=waited_ms, swapped_in=swapped_in
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -220,6 +265,9 @@ def _routing_info(
     table: RoutingTable,
     model: str,
     started: float,
+    *,
+    waited_ms: int = 0,
+    swapped_in: bool = False,
 ) -> CompletionRoutingInfo:
     """Which backend actually served this, and whether failover fired.
 
@@ -227,12 +275,15 @@ def _routing_info(
     because the failure mode of a routing layer is opacity — with several
     backends behind one name, an operator seeing a slow or odd response
     needs to know which one answered without going to the logs.
-    `attempts > 1` is the visible evidence the cascade ran.
+    `attempts > 1` is the visible evidence the cascade ran; `tier > 1`
+    says a later target answered; `swapped_in` is the visible cost of
+    idle unload, next to the request that paid it.
     """
     # `served_by` is the backend that actually answered, which after a
     # cascade is not the primary. Both client kinds expose it.
     served_by = getattr(client, "served_by", None) or getattr(client, "name", model)
     attempts = getattr(client, "attempts", 1)
+    tier = getattr(client, "tier", 1)
     # inference-driver.yaml and gateway.yaml each generate their own
     # BackendKind with the same wire values; cross via `.value`.
     backend_kind = next(
@@ -245,13 +296,15 @@ def _routing_info(
     )
     return CompletionRoutingInfo(
         driver=served_by,
-        # The engine process behind that driver, when the agent
-        # supervises one. Absent for hosted and CLI backends, and for a
-        # model with replicas — see RoutingTable.runtime_for.
-        runtime=table.runtime_for(model),
+        # The engine process behind the driver that answered, when the
+        # agent supervises one — by name, so replicas are attributed too.
+        runtime=table.runtime_for(model, served_by),
         backend=backend_kind,
         latency_ms=int((time.monotonic() - started) * 1000),
         attempts=attempts if isinstance(attempts, int) and attempts >= 1 else 1,
+        tier=tier if isinstance(tier, int) and tier >= 1 else 1,
+        swapped_in=swapped_in,
+        waited_ms=waited_ms,
     )
 
 
@@ -261,6 +314,9 @@ def _to_chat_completion(
     client: DriverClient,
     table: RoutingTable,
     started: float,
+    *,
+    waited_ms: int = 0,
+    swapped_in: bool = False,
 ) -> ChatCompletionResponse:
     usage = None
     if response.usage is not None:
@@ -284,7 +340,9 @@ def _to_chat_completion(
             )
         ],
         usage=usage,
-        x_eugene_plexus=_routing_info(client, table, body.model, started),
+        x_eugene_plexus=_routing_info(
+            client, table, body.model, started, waited_ms=waited_ms, swapped_in=swapped_in
+        ),
     )
 
 

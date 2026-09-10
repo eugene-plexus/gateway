@@ -16,6 +16,7 @@ from .._generated.models import (
     DriversInfo,
     Problem,
     RestartResult,
+    RoutingTableView,
 )
 from ..driver_client import DriverClient, HttpDriverClient
 from ..routing import RoutingTable
@@ -114,6 +115,30 @@ async def list_drivers(request: Request) -> DriversInfo:
         )
 
     return DriversInfo(drivers=healths)
+
+
+@router.get("/v1/admin/routing", response_model=RoutingTableView)
+async def get_routing_table(request: Request) -> RoutingTableView:
+    """The resolved table: slots, tiers, backends, and what each is doing.
+
+    A view of the last refresh — the same snapshot requests are routed
+    from — so what it shows is what a request would meet. The page an
+    operator reads when a request went somewhere surprising, and what
+    the acceptance run reads to see the balancer alternate.
+    """
+    table: RoutingTable | None = getattr(request.app.state, "routing", None)
+    if table is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=Problem(
+                type="https://github.com/eugene-plexus/gateway#no-routing-table",
+                title="No routing table",
+                status=503,
+                detail="The gateway is starting up or in safe mode, so there is no routing table.",
+                component="gateway",
+            ).model_dump(exclude_none=True),
+        )
+    return table.as_routing_view()
 
 
 @router.post("/v1/admin/drivers/probe", response_model=DriverHealth)

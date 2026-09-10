@@ -306,9 +306,20 @@ class ConfigValueType(StrEnum):
     what is saved is the name rather than a URL because the address
     of a host is topology the control root owns.
 
-    `driver_list` stays reserved for the ordered model→driver
-    priority lists that arrive with lifecycle policy — **M6** since
-    multi-host and trust took M5.
+    `model_slots` is the gateway's priority-list surface, and the
+    one value here that holds objects. An ordered JSON array of
+    `{"model": <alias a client asks for>, "targets": [<model id>,
+    ...]}`: a request for `model` is served by the drivers serving
+    `model` itself, then by the drivers serving each target in
+    order, cascading on failure. Targets are **model ids, not driver
+    names**, because a model id names a replica set — every driver
+    currently serving it, load-balanced — and a driver name would
+    name one process. That is why the value reserved since M2 as
+    `driver_list` was renamed when M6 defined it: the old name said
+    the wrong thing about what goes in the list. A cloud
+    subscription is a target like any other, because a
+    `claude_code_cli` driver already serves a model id. UIs without
+    a structured renderer for it fall back to editing the JSON.
 
     """
 
@@ -325,7 +336,7 @@ class ConfigValueType(StrEnum):
     duration = 'duration'
     runtime_name = 'runtime_name'
     node_name = 'node_name'
-    driver_list = 'driver_list'
+    model_slots = 'model_slots'
 
 
 class ConfigFieldShowWhen(BaseModel):
@@ -599,6 +610,19 @@ class ModelRoutingInfo(BaseModel):
         None,
         description='Smallest context window among the serving backends — the\nhonest number, since a request may land on any of them.\n',
     )
+    tiers: list[list[str]] | None = Field(
+        None,
+        description="The slot's tiers in priority order, each the driver names\nin it. One tier for an unconfigured model; more when a\n`modelSlots` entry adds targets. Empty tiers are omitted.\n",
+    )
+    ready_backends: int | None = Field(
+        None,
+        description='How many of those drivers can take a request right now — a\nreachable driver whose runtime is `ready`, or that follows\nno runtime. Zero with the model still listed means every\nruntime behind it is asleep and at least one will wake on\ndemand.\n',
+        ge=0,
+    )
+    on_demand: bool | None = Field(
+        None,
+        description='True when a request for this model may have to wait for a\nruntime to start — every eligible backend is `stopped` and\nat least one declared `startOnDemand`.\n',
+    )
 
 
 class Role1(StrEnum):
@@ -721,6 +745,63 @@ class CompletionRoutingInfo(BaseModel):
         None,
         description='How many backends were tried. Greater than 1 means the\npriority-list cascade fired and an earlier backend failed.\n',
         ge=1,
+    )
+    tier: int | None = Field(
+        None,
+        description='Which tier of the slot answered, 1-based. Greater than 1\nmeans every backend in an earlier tier was ineligible or\nfailed — a cloud target answering for a local model, say.\n',
+        ge=1,
+    )
+    swapped_in: bool | None = Field(
+        None,
+        description='True when the gateway had to start a `startOnDemand`\nruntime to serve this request. The visible cost of idle\nunload, next to the request that paid it.\n',
+    )
+    waited_ms: int | None = Field(
+        None,
+        description='How long the request waited for a runtime to reach `ready`\nbefore being sent. Zero when nothing had to be woken.\n',
+        ge=0,
+    )
+
+
+class RoutingBackendView(BaseModel):
+    driver: str
+    url: AnyUrl | None = None
+    eligible: bool = Field(
+        ..., description='Whether a request could be sent here right now.'
+    )
+    ineligible_reason: str | None = Field(
+        None,
+        description="Why not, when `eligible` is false — the runtime's status\n(`stopped`, `loading`, `crashed`), or that the driver was\nunreachable.\n",
+    )
+    in_flight: int | None = Field(
+        None, description='Requests this gateway currently has outstanding to it.', ge=0
+    )
+    parallel_slots: int | None = Field(
+        None,
+        description="The runtime's capacity, when it reported one; 1 otherwise.",
+        ge=1,
+    )
+    runtime: str | None = Field(
+        None, description='The engine runtime this driver follows, when it follows one.'
+    )
+    runtime_status: str | None = Field(
+        None,
+        description="The agent's `RuntimeStatus` for that runtime, as a string —\nthe agent owns the enum.\n",
+    )
+    node: str | None = Field(
+        None, description='The node the runtime runs on, when the agent reports one.'
+    )
+    stop_reason: str | None = Field(
+        None,
+        description="The agent's `Runtime.stopReason`, when the runtime is stopped.",
+    )
+    idle_unload_seconds: int | None = Field(
+        None, description="The runtime's declared idle timeout, when it has one."
+    )
+    start_on_demand: bool | None = None
+    idle_seconds: int | None = Field(
+        None,
+        description='Seconds since the gateway last sent this backend a request.\nAbsent when it never has.\n',
+        ge=0,
     )
 
 
@@ -977,6 +1058,13 @@ class ChatCompletionChunk(BaseModel):
     )
 
 
+class RoutingTierView(BaseModel):
+    target: str = Field(
+        ..., description='The model id this tier is the replica set of.'
+    )
+    backends: list[RoutingBackendView]
+
+
 class DriversInfo(BaseModel):
     drivers: list[DriverHealth] = Field(
         ...,
@@ -987,3 +1075,30 @@ class DriversInfo(BaseModel):
 class ModelList(BaseModel):
     object: Literal['list']
     data: list[Model]
+
+
+class RoutingSlotView(BaseModel):
+    model: str = Field(..., description='What a client asks for.')
+    configured: bool | None = Field(
+        None,
+        description='True when a `modelSlots` entry exists for this model; false\nfor the implicit one-tier slot every served model id gets.\n',
+    )
+    tiers: list[RoutingTierView]
+
+
+class RoutingTableView(BaseModel):
+    """
+    The gateway's resolved routing table, as of the last refresh.
+    The same snapshot requests are routed from, opened up so an
+    operator can see why a request went where it did.
+
+    """
+
+    refreshed_at: AwareDatetime
+    load_balancing: str | None = Field(
+        None, description='The strategy in effect — the `loadBalancing` config value.'
+    )
+    slots: list[RoutingSlotView]
+    unreachable_drivers: list[str] | None = Field(
+        None, description='Drivers in the topology that did not answer `/v1/info`.'
+    )

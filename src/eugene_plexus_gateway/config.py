@@ -22,6 +22,7 @@ from typing import Any
 import yaml
 
 from ._generated.models import (
+    ComponentKind,
     ConfigDocument,
     ConfigField,
     ConfigFieldError,
@@ -36,8 +37,11 @@ REDACTED = "<redacted>"
 CATEGORY_LABELS: dict[str, str] = {
     "generation": "Generation defaults",
     "routing": "Routing",
+    "lifecycle": "Lifecycle policy",
     "logging": "Logging",
 }
+
+LOAD_BALANCING_VALUES = ["least_busy", "round_robin"]
 
 FIELDS: list[ConfigField] = [
     ConfigField(
@@ -103,6 +107,92 @@ FIELDS: list[ConfigField] = [
         default=15,
         minimum=2,
         maximum=300,
+    ),
+    ConfigField(
+        key="modelSlots",
+        label="Model slots (priority lists)",
+        description=(
+            'Ordered fallbacks per model. Each entry is {"model": the name a '
+            'client asks for, "targets": [model ids to try in order]}. A '
+            "request for `model` is served by the drivers serving `model` "
+            "itself (load-balanced across replicas), then by each target's "
+            "drivers in turn when everything before it has nothing that "
+            "answers. Targets are model ids, not driver names, because a "
+            "model id names every replica serving it. A cloud subscription "
+            "is a target like any other — a claude_code_cli driver already "
+            "serves a model id. Example: "
+            '[{"model": "coder", "targets": ["qwen3-coder-30b", "claude-opus-4-7"]}]. '
+            "Takes effect on the next request; no restart."
+        ),
+        category="lifecycle",
+        valueType=ConfigValueType.model_slots,
+        default=[],
+    ),
+    ConfigField(
+        key="loadBalancing",
+        label="Load balancing",
+        description=(
+            "How a request picks among the replicas serving one model. "
+            "`least_busy` sends it to the driver with the fewest requests "
+            "in flight per slot of capacity, breaking ties round-robin — "
+            "the default, and what fills capacity before queueing on a "
+            "saturated replica. `round_robin` alternates strictly, which is "
+            "worth having when comparing two replicas or reproducing a "
+            "report. The signal is the gateway's own in-flight count, so it "
+            "works for every engine."
+        ),
+        category="lifecycle",
+        valueType=ConfigValueType.enum,
+        default="least_busy",
+        enumValues=LOAD_BALANCING_VALUES,
+        enumLabels=["Least busy (ties round-robin)", "Round-robin"],
+    ),
+    ConfigField(
+        key="swapWaitSeconds",
+        label="Start-on-demand wait",
+        description=(
+            "How long a request waits for a stopped runtime marked "
+            "`startOnDemand` to reach `ready` before the next fallback is "
+            "tried (or a 503 is returned). Engine-dependent: llama.cpp loads "
+            "a small model in seconds, a 30B off disk in a minute; vLLM's "
+            "silent load is minutes. The response reports what it waited in "
+            "`x_eugene_plexus.waited_ms`."
+        ),
+        category="lifecycle",
+        valueType=ConfigValueType.duration,
+        default=120,
+        minimum=5,
+        maximum=900,
+    ),
+    ConfigField(
+        key="idleCheckSeconds",
+        label="Idle check interval",
+        description=(
+            "How often the gateway checks each runtime's `idleUnloadSeconds` "
+            "and asks its agent to unload one that has been idle that long "
+            "with nothing in flight. A runtime that declared no timeout is "
+            "never unloaded by the gateway."
+        ),
+        category="lifecycle",
+        valueType=ConfigValueType.duration,
+        default=15,
+        minimum=2,
+        maximum=300,
+    ),
+    ConfigField(
+        key="controlUrl",
+        label="Control root",
+        description=(
+            "The control root's address, for a multi-host install. When set, "
+            "the gateway reads the node list from it and talks to each "
+            "node's own agent for that node's drivers and runtimes, and "
+            "sends stop/start for a runtime to the agent that owns it. "
+            "Leave empty on a single-host install: the one configured agent "
+            "is both. Takes effect on the next routing refresh."
+        ),
+        category="routing",
+        valueType=ConfigValueType.url,
+        componentKindHint=ComponentKind.control,
     ),
     ConfigField(
         key="logLevel",
@@ -197,7 +287,38 @@ def _validate_value(field: ConfigField, value: Any) -> str | None:
             return f"must be one of {allowed}"
         return None
 
+    if vt == ConfigValueType.model_slots:
+        return _validate_model_slots(value)
+
     return f"unsupported valueType: {vt}"
+
+
+def _validate_model_slots(value: Any) -> str | None:
+    """An ordered list of `{model, targets}`; every name a non-empty
+    string, every model named once. Validated per entry so a typo says
+    which line rather than "invalid"."""
+    if not isinstance(value, list):
+        return f"expected a list of {{model, targets}} entries, got {type(value).__name__}"
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            return f"entry {index}: expected an object with `model` and `targets`"
+        model = item.get("model")
+        if not isinstance(model, str) or not model.strip():
+            return f"entry {index}: `model` must be a non-empty string"
+        if model in seen:
+            return f"entry {index}: model {model!r} is listed twice"
+        seen.add(model)
+        targets = item.get("targets")
+        if not isinstance(targets, list) or not targets:
+            return f"entry {index} ({model!r}): `targets` must be a non-empty list of model ids"
+        for t_index, target in enumerate(targets):
+            if not isinstance(target, str) or not target.strip():
+                return f"entry {index} ({model!r}): target {t_index} must be a non-empty string"
+        unknown = sorted(set(item) - {"model", "targets"})
+        if unknown:
+            return f"entry {index} ({model!r}): unknown key(s) {unknown}"
+    return None
 
 
 class ConfigStore:

@@ -120,17 +120,18 @@ async def test_two_drivers_on_one_model_become_a_priority_list(route_http: Any) 
     table = RoutingTable(agent_url="http://agent")
     await table.refresh()
 
-    # Sorted by name, so repeated requests hit the same backend first.
-    # Round-robin is load balancing and deliberately isn't here yet.
+    # Sorted by name as the base order; the balancer rotates from there
+    # (M6), so the first pick starts at `a`.
     assert [b.name for b in table.backends_for("qwen")] == ["a", "b"]
 
-    client = table.resolve("qwen")
+    client = table.pick(table.resolve("qwen"))
     assert client is not None
-    assert type(client).__name__ == "FailoverDriverClient"
+    assert type(client).__name__ == "TieredClient"
+    assert [c.name for c in client.candidates] == ["a", "b"]
     await table.aclose()
 
 
-async def test_one_driver_resolves_without_a_failover_wrapper(route_http: Any) -> None:
+async def test_one_driver_resolves_to_a_one_candidate_slot(route_http: Any) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/components":
             return httpx.Response(200, json=_components(_driver_entry("a", 8081)))
@@ -140,7 +141,10 @@ async def test_one_driver_resolves_without_a_failover_wrapper(route_http: Any) -
     table = RoutingTable(agent_url="http://agent")
     await table.refresh()
 
-    assert isinstance(table.resolve("qwen"), HttpDriverClient)
+    client = table.pick(table.resolve("qwen"))
+    assert client is not None
+    assert len(client.candidates) == 1
+    assert isinstance(client.candidates[0], HttpDriverClient)
     await table.aclose()
 
 
@@ -207,7 +211,7 @@ async def test_an_unreachable_agent_leaves_nothing_routable(route_http: Any) -> 
     await table.refresh()
 
     assert table.is_empty()
-    assert table.resolve("anything") is None
+    assert not table.resolve("anything").has_backends()
     await table.aclose()
 
 
@@ -229,7 +233,7 @@ async def test_a_refresh_replaces_the_table_wholesale(route_http: Any) -> None:
     state["model"] = "llama"
     await table.refresh()
     assert table.known_models() == ["llama"]
-    assert table.resolve("qwen") is None
+    assert not table.resolve("qwen").has_backends()
     await table.aclose()
 
 

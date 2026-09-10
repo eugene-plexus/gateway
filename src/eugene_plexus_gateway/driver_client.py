@@ -4,10 +4,13 @@ Thin wrappers around httpx.AsyncClient: one client per driver, cached and
 reused by the routing table. Each carries the driver's topology `name` so
 a response can say which backend answered it.
 
-`FailoverDriverClient` composes several into a priority list. That is
-where failover lives — and because the routing table groups drivers by
-the model they serve, a slot's members come from the topology rather than
-from configuration.
+`TieredClient` composes several into a slot: an ordered list of tiers,
+each an ordered list of backends. That is where failover lives — within
+a tier first (the other replicas of the same model), then the next tier
+(the next target in the slot's priority list) — and because the routing
+table groups drivers by the model they serve, a slot's members come from
+the topology rather than from configuration. `FailoverDriverClient` is
+the one-tier case, kept under its old name.
 """
 
 from __future__ import annotations
@@ -105,6 +108,15 @@ class DriverClient(Protocol):
     async def aclose(self) -> None: ...
 
 
+class RoutingHooks(Protocol):
+    """What a slot tells the routing table around every attempt, so the
+    table can count in-flight requests per backend — the load signal the
+    balancer runs on — and remember when each backend last served."""
+
+    def on_attempt_start(self, driver: str) -> None: ...
+    def on_attempt_end(self, driver: str, *, served: bool) -> None: ...
+
+
 class HttpDriverClient:
     """Real HTTP-backed client. Talks to an inference-driver over its OpenAPI."""
 
@@ -118,10 +130,11 @@ class HttpDriverClient:
     ) -> None:
         self.name = name
         self.base_url = base_url.rstrip("/")
-        # Mirrors FailoverDriverClient's surface so the route can read
-        # these off either without asking which kind it holds.
+        # Mirrors TieredClient's surface so the route can read these off
+        # either without asking which kind it holds.
         self.attempts = 1
         self.served_by: str | None = name
+        self.tier = 1
         # When the agent threaded a service token in, attach it to
         # every outbound call. The driver validates against the shared
         # HMAC signing key. Headers stay unset when running unauthenticated
@@ -178,27 +191,39 @@ def _is_cascade_eligible(exc: Exception) -> bool:
     return isinstance(exc, httpx.HTTPError)
 
 
-class FailoverDriverClient:
-    """A driver *slot* backed by an ordered priority list of backends.
+class TieredClient:
+    """A slot: ordered tiers of ordered backends, walked on failure.
 
-    Implements the same `DriverClient` protocol as
-    `HttpDriverClient`, so the caller is oblivious to failover — it
-    holds a client and calls `.generate()`. Internally this tries its
-    candidates in order, cascading on a cascade-eligible failure
+    Implements the same `DriverClient` protocol as `HttpDriverClient`,
+    so the caller is oblivious to failover — it holds a client and calls
+    `.generate()`. Internally this tries the first tier's candidates in
+    order, then the next tier's, cascading on a cascade-eligible failure
     (transport / 5xx / timeout) and failing hard on a 4xx. See
     `_is_cascade_eligible`.
 
     Granularity is per-call: each `.generate()` independently walks the
     list from the top, so a slot that fell over to its backup recovers to
     the primary as soon as the primary is healthy again — no operator
-    intervention, and no sticky state to reset.
+    intervention, and no sticky state to reset. Within a tier the order
+    is the balancer's, decided when the routing table built this client.
     """
 
-    def __init__(self, *, name: str, candidates: list[DriverClient]) -> None:
+    def __init__(
+        self,
+        *,
+        name: str,
+        tiers: list[list[DriverClient]],
+        hooks: RoutingHooks | None = None,
+    ) -> None:
+        candidates = [c for tier in tiers for c in tier]
         if not candidates:
-            raise ValueError(f"driver slot {name!r} needs at least one backend URL")
+            raise ValueError(f"driver slot {name!r} needs at least one backend")
         self.name = name
-        self._candidates = candidates
+        # Empty tiers are kept so `tier` counts the slot's tiers, not the
+        # eligible ones: a cloud target answering because every local
+        # replica was asleep is tier 2, whatever tier 1 held.
+        self._tiers = [list(tier) for tier in tiers]
+        self._hooks = hooks
         # `base_url` is the primary backend — used for labelling / logs.
         # The active backend on a given turn may differ after failover,
         # but the slot's identity is its primary.
@@ -206,11 +231,16 @@ class FailoverDriverClient:
 
         # What the last call actually did, for the response's routing
         # extension. Per-instance mutable state, which is safe ONLY
-        # because an instance is per-request: `RoutingTable.resolve`
-        # builds a fresh wrapper around the shared, long-lived
-        # HttpDriverClients on every call. Do not cache one of these.
+        # because an instance is per-request: `RoutingTable.pick` builds
+        # a fresh wrapper around the shared, long-lived HttpDriverClients
+        # on every call. Do not cache one of these.
         self.attempts = 0
         self.served_by: str | None = None
+        self.tier = 0
+
+    @property
+    def candidates(self) -> list[DriverClient]:
+        return [c for tier in self._tiers for c in tier]
 
     async def info(self) -> DriverInfo:
         """Report the first reachable backend's `/v1/info`.
@@ -219,7 +249,7 @@ class FailoverDriverClient:
         reflects what a real chat turn would actually reach.
         """
         last_exc: Exception | None = None
-        for index, candidate in enumerate(self._candidates):
+        for index, candidate in enumerate(self.candidates):
             try:
                 return await candidate.info()
             except Exception as exc:
@@ -232,20 +262,33 @@ class FailoverDriverClient:
 
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
         last_exc: Exception | None = None
-        for index, candidate in enumerate(self._candidates):
-            self.attempts = index + 1
-            try:
-                result = await candidate.generate(request)
-            except Exception as exc:
-                if not _is_cascade_eligible(exc):
-                    # 4xx / non-HTTP error — surface it without trying the
-                    # next backend. A 4xx is the same bad request everywhere.
-                    raise
-                last_exc = exc
-                self._log_cascade("generate", index, candidate, exc)
-            else:
-                self.served_by = getattr(candidate, "name", None)
-                return result
+        total = len(self.candidates)
+        index = 0
+        for tier_index, tier in enumerate(self._tiers):
+            for candidate in tier:
+                self.attempts = index + 1
+                driver = getattr(candidate, "name", None)
+                if self._hooks is not None and driver:
+                    self._hooks.on_attempt_start(driver)
+                try:
+                    result = await candidate.generate(request)
+                except Exception as exc:
+                    if self._hooks is not None and driver:
+                        self._hooks.on_attempt_end(driver, served=False)
+                    if not _is_cascade_eligible(exc):
+                        # 4xx / non-HTTP error — surface it without trying
+                        # the next backend. A 4xx is the same bad request
+                        # everywhere.
+                        raise
+                    last_exc = exc
+                    self._log_cascade("generate", index, candidate, exc, total=total)
+                    index += 1
+                else:
+                    if self._hooks is not None and driver:
+                        self._hooks.on_attempt_end(driver, served=True)
+                    self.served_by = driver
+                    self.tier = tier_index + 1
+                    return result
         # Every backend failed in a cascade-eligible way. Re-raise the
         # last failure so the chat route's existing DriverError
         # / httpx.HTTPError handlers surface it as they would for a
@@ -253,7 +296,15 @@ class FailoverDriverClient:
         assert last_exc is not None  # candidates is non-empty (checked in __init__)
         raise last_exc
 
-    def _log_cascade(self, op: str, index: int, candidate: DriverClient, exc: Exception) -> None:
+    def _log_cascade(
+        self,
+        op: str,
+        index: int,
+        candidate: DriverClient,
+        exc: Exception,
+        *,
+        total: int | None = None,
+    ) -> None:
         """Emit a WARNING when a backend fails and we cascade.
 
         Failover that silently always-works hides a broken primary
@@ -261,23 +312,44 @@ class FailoverDriverClient:
         surface operators grep for; the UI failover badge reads the
         same signal in a later release.
         """
-        is_last = index == len(self._candidates) - 1
+        total = total if total is not None else len(self.candidates)
+        is_last = index == total - 1
         next_action = (
             "no more backends in slot — failing"
             if is_last
-            else f"trying backend {index + 2}/{len(self._candidates)}"
+            else f"trying backend {index + 2}/{total}"
         )
         log.warning(
             "failover[%s]: slot %r backend %d/%d (%s) failed (%s); %s",
             op,
             self.name,
             index + 1,
-            len(self._candidates),
+            total,
             candidate.base_url,
             exc,
             next_action,
         )
 
     async def aclose(self) -> None:
-        for candidate in self._candidates:
+        for candidate in self.candidates:
             await candidate.aclose()
+
+
+class FailoverDriverClient(TieredClient):
+    """A one-tier slot: an ordered priority list of backends.
+
+    The pre-M6 shape, kept under its name because the cascade rules it
+    documented are unchanged — M6 added tiers above it, not a different
+    walk within one.
+    """
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        candidates: list[DriverClient],
+        hooks: RoutingHooks | None = None,
+    ) -> None:
+        if not candidates:
+            raise ValueError(f"driver slot {name!r} needs at least one backend URL")
+        super().__init__(name=name, tiers=[list(candidates)], hooks=hooks)

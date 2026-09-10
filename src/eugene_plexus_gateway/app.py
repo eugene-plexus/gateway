@@ -24,6 +24,7 @@ from . import __version__
 from .auth_state import AuthState, load_auth_state
 from .config import ConfigStore
 from .dependencies import require_operator
+from .lifecycle import AgentLifecycleClient, LifecycleManager
 from .routes import admin as admin_routes
 from .routes import config as config_routes
 from .routes import health as health_routes
@@ -66,6 +67,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Tests inject `app.state.routing` with a pre-populated table; the
     # lifespan otherwise builds the real one and owns its teardown.
     owns_routing = False
+    lifecycle: LifecycleManager | None = None
     if not hasattr(app.state, "routing"):
         if settings.safe_mode:
             # No table at all in safe mode, rather than an empty one:
@@ -73,20 +75,37 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             # different answers, and the inference route says so.
             app.state.routing = None
         else:
+            control_url = str(store.get("controlUrl") or "").strip() or None
             table = RoutingTable(
                 agent_url=settings.agent_url,
                 service_token=auth_state.service_token,
                 request_timeout_seconds=float(store.get("requestTimeoutSeconds") or 180),
                 refresh_seconds=float(store.get("routingRefreshSeconds") or 15),
+                # Read live, so a PATCH takes effect on the next request.
+                slots=lambda: store.get("modelSlots"),
+                strategy=lambda: store.get("loadBalancing"),
+                control_url=control_url,
             )
             app.state.routing = table
             owns_routing = True
             # Awaited, so the gateway is routable the moment it serves.
             await table.start()
+            # Lifecycle policy rides on the same table: idle unload and
+            # start on demand, with the gateway's own service token.
+            lifecycle = LifecycleManager(
+                table,
+                client=AgentLifecycleClient(auth_state.service_token),
+                swap_wait_seconds=lambda: float(store.get("swapWaitSeconds") or 120),
+                idle_check_seconds=lambda: float(store.get("idleCheckSeconds") or 15),
+            )
+            await lifecycle.start()
+            app.state.lifecycle = lifecycle
 
     try:
         yield
     finally:
+        if lifecycle is not None:
+            await lifecycle.aclose()
         if owns_routing and app.state.routing is not None:
             await app.state.routing.aclose()
 
