@@ -279,9 +279,13 @@ async def _store(path: Path, **kwargs: object) -> MetricsStore:
 def test_throughput_is_null_when_no_backend_reports_tokens(tmp_path: Path) -> None:
     """Null, not zero.
 
-    The CLI subscription backends report no token counts, permanently. A
+    A backend that reported no usage leaves the rate uncomputable. A
     zero here says "slow" where it means "unmeasured", and a UI cannot
     recover the difference.
+
+    Not a property of a backend kind, which an earlier version of this
+    docstring claimed: the CLI subscription backends do report usage,
+    and omit it only when their CLI emitted none.
     """
 
     async def run() -> None:

@@ -706,8 +706,13 @@ class ChatCompletionChunkChoice(BaseModel):
 class CompletionUsage(BaseModel):
     """
     Token accounting in OpenAI's field names. Fields may be absent
-    when the backend does not report them — the CLI subprocess
-    backends generally do not.
+    when the backend did not report them on that request.
+
+    This used to say the CLI subprocess backends "generally do not",
+    which is wrong and was believed downstream: both of them parse a
+    usage block out of their CLI's output — Claude's envelope,
+    Codex's `turn.completed` — and omit it only when the CLI emitted
+    none.
 
     """
 
