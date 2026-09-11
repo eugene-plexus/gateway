@@ -27,6 +27,11 @@ from eugene_plexus_gateway.settings import Settings
 
 MODEL = "Qwen3-30B-A3B-Q4_K_M"
 
+#: SSE separators, named because a literal newline escape is easy to
+#: get wrong and impossible to see in a diff.
+CHUNK_SEP = chr(10)
+FRAME_SEP = chr(10) * 2
+
 
 class _FakeInstall(BaseHTTPRequestHandler):
     """One server playing both the agent and an inference-driver.
@@ -100,8 +105,39 @@ class _FakeInstall(BaseHTTPRequestHandler):
                     "latencyMs": 12,
                 },
             )
+        elif self.path == "/v1/generate/stream":
+            # A real SSE driver, word by word. The whole point of the
+            # end-to-end test is that the gateway talks to this endpoint
+            # rather than to /v1/generate -- before M10 it did not exist
+            # here and the chain answered 404, which is exactly how this
+            # fixture caught the switch.
+            type(self).generate_calls.append(payload)
+            self._send_stream("hello from the engine")
         else:
             self._send(404, {"error": "nope"})
+
+    def _send_stream(self, text: str) -> None:
+        words = text.split(" ")
+        pieces = [w + " " for w in words[:-1]] + [words[-1]]
+        events = [
+            "event: token" + CHUNK_SEP + "data: " + json.dumps({"text": piece}) + FRAME_SEP
+            for piece in pieces
+        ]
+        final = {
+            "content": text,
+            "finishReason": "stop",
+            "backend": "openai_compat_http",
+            "modelId": MODEL,
+            "usage": {"promptTokens": 5, "completionTokens": 4, "totalTokens": 9},
+            "latencyMs": 12,
+        }
+        events.append("event: done" + CHUNK_SEP + "data: " + json.dumps(final) + FRAME_SEP)
+        raw = "".join(events).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
     def _send(self, code: int, body: dict) -> None:
         raw = json.dumps(body).encode()

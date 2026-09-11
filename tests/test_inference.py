@@ -347,3 +347,24 @@ def test_a_failure_mid_stream_emits_an_error_frame(
     frames = _sse_frames(response.text)
     assert frames[-1] == "[DONE]"
     assert json.loads(frames[0])["error"]["type"] == "upstream_error"
+
+
+def test_a_streamed_completion_arrives_in_more_than_one_frame(
+    client: TestClient, fake_driver: FakeDriverClient
+) -> None:
+    """The regression guard for the whole of M10.
+
+    From M0 to M9 this endpoint framed SSE correctly and delivered the
+    answer as **one** content chunk, because the driver's stream endpoint
+    was a 501 stub -- so every "does it stream" assertion that only
+    checked framing passed throughout. The thing that changed is the
+    frame *count*, which is why that is what this asserts.
+    """
+    fake_driver.responses = ["one two three four"]
+    response = client.post("/v1/chat/completions", json=_chat(stream=True))
+    assert response.status_code == 200
+
+    frames = _sse_frames(response.text)
+    chunks = [json.loads(f) for f in frames[:-1]]
+    content_frames = [c for c in chunks if c["choices"][0]["delta"].get("content")]
+    assert len(content_frames) > 1, "a single content frame means nothing is streaming"

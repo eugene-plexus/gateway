@@ -507,14 +507,23 @@ async def _stream_completion(
     *,
     rec: _Recording,
 ) -> AsyncIterator[str]:
-    """SSE framed exactly as OpenAI frames it.
+    """SSE framed exactly as OpenAI frames it, one frame per token.
 
-    M0 streams the whole completion as a single content chunk rather than
-    proxying the driver's token stream. That is a deliberate, visible
-    limitation: the framing is what clients depend on, so getting it
-    right matters more than incremental delivery, and true token
-    pass-through needs the driver's SSE surface plumbed through the
-    cascade logic — which is its own piece of work.
+    From M0 to M9 this framed correctly and **did not stream**: it
+    awaited the whole completion and emitted it as a single content
+    chunk, because the driver's own stream endpoint was a 501 stub. The
+    framing was right, which is why every OpenAI client worked
+    unmodified, and the delivery was not, which is why the playground
+    sat silent and then printed everything at once. M10 plumbed the
+    driver's SSE through the cascade and this loop forwards tokens as
+    they arrive.
+
+    **The rule that came with it**: past the first token the slot is
+    committed and cannot fail over — see `TieredClient.stream`. So the
+    error path below carries two cases that look identical from here: a
+    backend that never produced anything (the cascade ran and lost) and
+    one that broke mid-answer (truncation). Both become an error frame,
+    because the 200 is long gone either way.
 
     Since M8 this path also records itself and carries the routing
     extension on its final frame. Both were missing, and the second
@@ -554,13 +563,46 @@ async def _stream_completion(
         )
 
     with collect_attempts() as tries:
+        emitted_role = False
+        response: GenerateResponse | None = None
         try:
-            response = await client.generate(generate)
+            async for event in client.stream(generate):
+                if event.done:
+                    # Captured, NOT broken out of. Breaking here abandons
+                    # the generator while it is suspended at its yield, so
+                    # `TieredClient.stream` never reaches the branch that
+                    # reports the attempt as served -- and the request is
+                    # recorded with zero attempts. The driver's stream ends
+                    # immediately after `done`, so letting the loop finish
+                    # costs nothing and keeps the bookkeeping honest.
+                    response = event.result
+                    continue
+                if not emitted_role:
+                    # OpenAI puts the role on the first chunk, and it has
+                    # to wait until there is a first chunk: emitting it
+                    # before the stream opens would commit a model name
+                    # the cascade might still change.
+                    emitted_role = True
+                    yield frame(
+                        envelope(
+                            delta=Delta(role=Role2.assistant),
+                            finish=None,
+                            model=body.model,
+                        )
+                    )
+                yield frame(
+                    envelope(delta=Delta(content=event.text), finish=None, model=body.model)
+                )
         except (DriverError, httpx.HTTPError) as e:
             # An error after the stream has been opened cannot become an
             # HTTP status — the 200 is already sent. OpenAI's own
             # behaviour is to emit an error frame, so do that and then
             # terminate normally.
+            #
+            # Since M10 this also covers the truncation case: past the
+            # first token the slot is committed, so `TieredClient.stream`
+            # re-raises instead of failing over, and what the client has
+            # already received stands.
             log.warning("streaming completion for %r failed: %s", body.model, e)
             _record(rec, body, tries)
             yield (
@@ -580,12 +622,21 @@ async def _stream_completion(
             yield "data: [DONE]\n\n"
             return
 
+        if response is None:
+            # The driver ended without a `done` event. Nothing to
+            # summarise, and pretending otherwise would invent a usage
+            # and a finish reason nobody reported.
+            log.warning("driver stream for %r ended without a done event", body.model)
+            _record(rec, body, tries)
+            yield "data: [DONE]\n\n"
+            return
+
         served_model = response.modelId or body.model
-        # First chunk carries the role, per OpenAI.
-        yield frame(envelope(delta=Delta(role=Role2.assistant), finish=None, model=served_model))
-        if response.content:
+        if not emitted_role:
+            # A backend that produced no tokens at all still owes the
+            # client a well-formed stream.
             yield frame(
-                envelope(delta=Delta(content=response.content), finish=None, model=served_model)
+                envelope(delta=Delta(role=Role2.assistant), finish=None, model=served_model)
             )
 
         usage = None

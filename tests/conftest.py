@@ -7,7 +7,7 @@ Each test scripts its fake drivers' responses by mutating them.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import AsyncGenerator, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +25,7 @@ from eugene_plexus_gateway._generated.driver_models import (
     Usage,
 )
 from eugene_plexus_gateway.app import create_app
+from eugene_plexus_gateway.driver_client import StreamEvent
 from eugene_plexus_gateway.routing import (
     RoutingTable,
     _Backend,
@@ -68,6 +69,11 @@ class FakeDriverClient:
         self.info_error: Exception | None = None
         self.generate_error: Exception | None = None
         """If set, `generate()` raises this instead of returning."""
+        self.stream_error_after: int | None = None
+        """If set, `stream()` raises after this many token events. The
+        knob the commit-point tests turn: 0 means "fail before the first
+        token" (still cascadable) and 1 means "fail after it" (not)."""
+        self.stream_error: Exception = RuntimeError("stream died")
         self.usage: Usage | None = None
 
     def describe(self) -> DriverInfo:
@@ -103,6 +109,41 @@ class FakeDriverClient:
             modelId=self.model_id,
             usage=self.usage,
             latencyMs=1,
+        )
+
+    async def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]:
+        """Mirror `generate`, but a word at a time.
+
+        Chunked rather than one-shot on purpose: a fake that yielded the
+        whole answer in a single event would pass every assertion the
+        M0-to-M9 implementation already passed, and so would prove
+        nothing about the thing M10 changed.
+
+        `stream_error_after` raises once that many events are out --
+        which is how the commit point gets tested, since failing before
+        the first event and failing after it must do opposite things.
+        """
+        self.calls.append(request)
+        if self.generate_error is not None:
+            raise self.generate_error
+        text = self.responses.pop(0) if self.responses else f"<{self.name} default response>"
+        pieces = [w + " " for w in text.split(" ")]
+        if pieces:
+            pieces[-1] = pieces[-1].rstrip()
+        for index, piece in enumerate(pieces):
+            if self.stream_error_after is not None and index >= self.stream_error_after:
+                raise self.stream_error
+            yield StreamEvent(text=piece)
+        yield StreamEvent(
+            done=True,
+            result=GenerateResponse(
+                content=text,
+                finishReason=FinishReason.stop,
+                backend=self.backend,
+                modelId=self.model_id,
+                usage=self.usage,
+                latencyMs=1,
+            ),
         )
 
     async def aclose(self) -> None:

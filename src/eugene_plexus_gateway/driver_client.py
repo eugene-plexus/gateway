@@ -15,8 +15,11 @@ the one-tier case, kept under its old name.
 
 from __future__ import annotations
 
+import json
 import logging
 import time
+from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
@@ -71,6 +74,39 @@ class DriverError(Exception):
         return f"{prefix} (no problem+json body): {snippet}"
 
 
+@dataclass(frozen=True)
+class StreamEvent:
+    """One event from a driver's token stream, as the gateway sees it.
+
+    The gateway's own shape rather than the driver's `Chunk`: the two
+    components share schemas, not code, so this is assembled from the
+    parsed SSE rather than imported.
+    """
+
+    text: str = ""
+    done: bool = False
+    result: GenerateResponse | None = None
+
+
+def _problem_from_bytes(raw: bytes) -> Problem | None:
+    """`_problem_from_response`, for a body already read off a stream."""
+    try:
+        body: Any = json.loads(raw)
+    except ValueError:
+        return None
+    candidates: list[Any] = []
+    if isinstance(body, dict):
+        if isinstance(body.get("detail"), dict):
+            candidates.append(body["detail"])
+        candidates.append(body)
+    for candidate in candidates:
+        try:
+            return Problem.model_validate(candidate)
+        except ValidationError:
+            continue
+    return None
+
+
 def _problem_from_response(response: httpx.Response) -> Problem | None:
     """Best-effort extraction of a Problem from a driver's error response.
 
@@ -106,6 +142,7 @@ class DriverClient(Protocol):
 
     async def info(self) -> DriverInfo: ...
     async def generate(self, request: GenerateRequest) -> GenerateResponse: ...
+    def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]: ...
     async def aclose(self) -> None: ...
 
 
@@ -185,6 +222,73 @@ class HttpDriverClient:
                 raw_body=response.text,
             )
         return GenerateResponse.model_validate(response.json())
+
+    async def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]:
+        """Consume one driver's `/v1/generate/stream`.
+
+        Parses the three contracted event types -- `token`, `done`,
+        `error` -- and nothing else. This is deliberately not a general
+        SSE client: both ends of this wire are our own contract, single
+        JSON payload per event, and the gateway already hand-*frames*
+        SSE on its way out. If we ever consume a third party's SSE, use
+        a library rather than reaching for this.
+
+        An `error` event becomes a `DriverError`, so it flows into the
+        same cascade taxonomy as a failed POST -- which is what lets a
+        driver that dies *before* its first token still fail over.
+
+        A non-200 raises `DriverError` before anything is yielded, for
+        the same reason: nothing has been forwarded, so it is still an
+        ordinary failure.
+        """
+        payload = request.model_dump(mode="json", exclude_none=True)
+        async with self._client.stream(
+            "POST",
+            "/v1/generate/stream",
+            json=payload,
+            headers={"Accept": "text/event-stream"},
+        ) as response:
+            if response.status_code >= 400:
+                body = await response.aread()
+                raise DriverError(
+                    driver_name=self.name,
+                    driver_url=self.base_url,
+                    status_code=response.status_code,
+                    problem=_problem_from_bytes(body),
+                    raw_body=body.decode("utf-8", "replace"),
+                )
+            event_name: str | None = None
+            async for line in response.aiter_lines():
+                if not line.strip():
+                    event_name = None
+                    continue
+                if line.startswith("event:"):
+                    event_name = line[6:].strip()
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                try:
+                    parsed = json.loads(data)
+                except ValueError:
+                    log.debug("driver %r sent an unparseable SSE payload", self.name)
+                    continue
+                if event_name == "error":
+                    raise DriverError(
+                        driver_name=self.name,
+                        driver_url=self.base_url,
+                        status_code=int(parsed.get("status") or 502),
+                        problem=Problem.model_validate(parsed)
+                        if isinstance(parsed, dict)
+                        else None,
+                        raw_body=data,
+                    )
+                if event_name == "done":
+                    yield StreamEvent(done=True, result=GenerateResponse.model_validate(parsed))
+                    return
+                text = parsed.get("text") if isinstance(parsed, dict) else None
+                if isinstance(text, str) and text:
+                    yield StreamEvent(text=text)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -329,6 +433,90 @@ class TieredClient:
         # last failure so the chat route's existing DriverError
         # / httpx.HTTPError handlers surface it as they would for a
         # single-backend slot — no new error path to maintain.
+        assert last_exc is not None  # candidates is non-empty (checked in __init__)
+        raise last_exc
+
+    async def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]:
+        """`generate()`'s cascade, with a commit point.
+
+        **The rule this method exists for:** failover is possible until
+        the first token is emitted, and impossible after it.
+
+        `generate()` can walk the whole list freely because nothing has
+        reached the client until it returns. Once a token has been
+        forwarded, retrying on another backend would splice two models'
+        output into one answer with no marker at the seam -- a wrong
+        answer that looks like a right one, which is worse than a
+        truncated one. So a failure after the first token propagates and
+        the route turns it into an OpenAI `error` frame.
+
+        The practical consequence, contracted in `gateway.yaml`: a
+        streamed request can be truncated where a non-streamed one would
+        have cascaded. A caller that needs the failover guarantee should
+        not stream.
+
+        Attempt accounting follows `generate()` exactly, with one
+        deliberate difference: an attempt that emitted tokens and then
+        broke is recorded `served=False`. It did not serve the request,
+        and calling it served would hide truncation from the one surface
+        that could show it.
+        """
+        last_exc: Exception | None = None
+        total = len(self.candidates)
+        index = 0
+        for tier_index, tier in enumerate(self._tiers):
+            for candidate in tier:
+                self.attempts = index + 1
+                driver = getattr(candidate, "name", None)
+                if self._hooks is not None and driver:
+                    self._hooks.on_attempt_start(driver)
+                started = time.monotonic()
+                committed = False
+                stream = candidate.stream(request)
+                try:
+                    async for event in stream:
+                        committed = True
+                        yield event
+                except Exception as exc:
+                    if self._hooks is not None and driver:
+                        self._hooks.on_attempt_end(
+                            driver,
+                            served=False,
+                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                            error=type(exc).__name__,
+                        )
+                    if committed:
+                        # Past the commit point. The client already holds
+                        # part of this answer; another backend's tokens
+                        # cannot be appended to it.
+                        log.warning(
+                            "driver slot %r lost %s mid-stream after emitting tokens; "
+                            "truncating rather than failing over: %s",
+                            self.name,
+                            driver,
+                            exc,
+                        )
+                        raise
+                    if not _is_cascade_eligible(exc):
+                        raise
+                    last_exc = exc
+                    self._log_cascade("stream", index, candidate, exc, total=total)
+                    index += 1
+                else:
+                    if self._hooks is not None and driver:
+                        self._hooks.on_attempt_end(
+                            driver,
+                            served=True,
+                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                        )
+                    self.served_by = driver
+                    self.tier = tier_index + 1
+                    return
+                finally:
+                    # Runs on every path, including the consumer
+                    # abandoning this generator: that is what releases
+                    # the driver's response and, through it, the engine.
+                    await stream.aclose()
         assert last_exc is not None  # candidates is non-empty (checked in __init__)
         raise last_exc
 

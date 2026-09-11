@@ -196,3 +196,82 @@ async def test_retry_walks_from_top_each_call() -> None:
 
     assert first.content == "backup reply"  # primary down -> failover
     assert second.content == "primary recovered"  # primary back -> used again
+
+
+# --------------------------------------------------------------------------- #
+# The commit point (M10)
+# --------------------------------------------------------------------------- #
+#
+# Streaming breaks the assumption every test above rests on. `generate()`
+# may retry freely because nothing has reached the client until it
+# returns; a stream that has emitted a token has already sent part of an
+# answer, and appending another model's output to it would splice two
+# models together with no marker at the seam -- a wrong answer that looks
+# like a right one. So the rule is: cascade until the first token, never
+# after it. These two tests are the rule.
+
+
+async def test_a_stream_that_fails_before_the_first_token_still_cascades() -> None:
+    """Nothing has been forwarded, so this is an ordinary failure."""
+    primary = FakeDriverClient(name="left")
+    primary.generate_error = httpx.ConnectError("connection refused")
+    backup = FakeDriverClient(name="left")
+    backup.responses = ["backup reply"]
+
+    slot = _slot(primary, backup)
+    events = [event async for event in slot.stream(_request())]
+
+    assert "".join(e.text for e in events if not e.done) == "backup reply"
+    assert events[-1].done
+    assert slot.served_by == "left"
+
+
+async def test_a_stream_that_fails_after_the_first_token_truncates() -> None:
+    """The commit point. The backup must not be reached, and the tokens
+    already emitted must survive -- truncating is honest, discarding what
+    the user has already seen is not."""
+    primary = FakeDriverClient(name="left")
+    primary.responses = ["one two three"]
+    primary.stream_error_after = 1  # a token is out, then it dies
+    backup = FakeDriverClient(name="left")
+    backup.responses = ["backup reply"]
+
+    slot = _slot(primary, backup)
+    seen: list[str] = []
+    with pytest.raises(RuntimeError):
+        async for event in slot.stream(_request()):
+            if not event.done:
+                seen.append(event.text)
+
+    assert seen == ["one "]
+    # The whole point: no second backend was tried.
+    assert backup.calls == []
+
+
+async def test_a_stream_failing_before_the_first_token_is_not_the_same_as_after() -> None:
+    """Same backend, same error, opposite outcomes -- decided only by
+    whether a token had been emitted. Pinned as one test because the two
+    behaviours are one rule, and a change that broke the pairing would
+    otherwise still pass one of them."""
+    for error_after, expect_cascade in ((0, True), (1, False)):
+        primary = FakeDriverClient(name="left")
+        primary.responses = ["one two"]
+        primary.stream_error_after = error_after
+        # A *cascade-eligible* error in both runs, so position is the
+        # only variable. With a plain RuntimeError the first run would
+        # not cascade either -- for an unrelated and correct reason --
+        # and the test would prove nothing about the commit point.
+        primary.stream_error = httpx.ConnectError("connection refused")
+        backup = FakeDriverClient(name="left")
+        backup.responses = ["backup reply"]
+        slot = _slot(primary, backup)
+
+        if expect_cascade:
+            events = [e async for e in slot.stream(_request())]
+            assert "".join(e.text for e in events if not e.done) == "backup reply"
+            assert backup.calls != []
+        else:
+            with pytest.raises(httpx.ConnectError):
+                async for _ in slot.stream(_request()):
+                    pass
+            assert backup.calls == []
