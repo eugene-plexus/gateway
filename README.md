@@ -28,11 +28,18 @@ See the [M6 design](https://github.com/eugene-plexus/specs/blob/main/docs/design
 
 ## Verification Status
 
-M6 passed a live six-process run with two llama.cpp replicas on one GPU. M7 passed
-with two agents on one host. A short post-unload routing window remains open;
-real two-machine and two-GPU runs remain unverified. See the
-[current project status](https://github.com/eugene-plexus/specs#current-status)
-and [M7 acceptance record](https://github.com/eugene-plexus/specs/blob/main/docs/acceptance/m7-two-agent-run.md).
+M6 passed a live six-process run with two llama.cpp replicas on one GPU. **M7 passed
+on two real machines**, with a completion served on the remote host, an idle unload
+decided here and executed there, and a wake on demand
+([record](https://github.com/eugene-plexus/specs/blob/main/docs/acceptance/m7-two-host-run.md)). M8 retains what it serves, and
+measured this control plane's own cost at **~116 ms a request** — HTTP-driver-path
+specific, since a subprocess backend shows 6 ms
+([record](https://github.com/eugene-plexus/specs/blob/main/docs/acceptance/m8-metrics-run.md)).
+
+Still open: the short post-unload routing window, never diagnosed; the ~116 ms
+itself, measured but not explained; two-GPU placement; and rolling engine upgrades,
+which are now a two-engine problem. See the
+[current project status](https://github.com/eugene-plexus/specs#current-status).
 
 ## Wire contract
 

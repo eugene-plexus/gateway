@@ -963,7 +963,7 @@ class MetricAttempt(BaseModel):
     )
     backendMs: int | None = Field(
         None,
-        description='The **driver\'s** own measurement of its backend call\n(`GenerateResponse.latencyMs`), when it reported one.\n\n`elapsedMs - backendMs` is therefore the cost of the\ngateway-to-driver hop plus the driver\'s own work: the\ncontrol plane\'s overhead on this request. This document has\nasserted since M0 that the extra local hop is\n"sub-millisecond against a multi-second generation" and "not\na cost worth optimising away" - an architectural\njustification nobody had measured. Both numbers were already\nbeing produced; subtracting them makes the claim checkable\non any install.\n',
+        description='The **driver\'s** own measurement of its backend call\n(`GenerateResponse.latencyMs`), when it reported one.\n\n`elapsedMs - backendMs` is therefore the cost of the\ngateway-to-driver hop plus the driver\'s own work: the\ncontrol plane\'s overhead on this request. This document\nasserted from M0 to M8 that the extra local hop was\n"sub-millisecond against a multi-second generation" and "not\na cost worth optimising away" - an architectural\njustification nobody had measured. Both numbers were already\nbeing produced; subtracting them made the claim checkable,\nand **the first time it ran it came back 114-120 ms**. See\nthis document\'s overview.\n',
         ge=0,
     )
     served: bool
