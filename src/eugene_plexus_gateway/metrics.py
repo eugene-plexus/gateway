@@ -620,8 +620,27 @@ class MetricsStore:
                    served.driver, served.runtime, served.node, served.backend,
                    served.elapsed_ms, r.routing_ms, served.backend_ms
             FROM request r
+            -- The attempt a request is ATTRIBUTED to: the one that served
+            -- it, or, when none did, the last one tried.
+            --
+            -- Joining on `served = 1` alone loses a failed request
+            -- entirely: it lands in a group with a null driver and a null
+            -- backend, so "is anything failing" - the question this is
+            -- most for - can be answered with a count but not with a
+            -- name. Found live the first time a backend really failed,
+            -- with a Codex CLI whose token needed refreshing: the row was
+            -- there, correct, and attributed to nobody.
+            --
+            -- `ORDER BY served DESC` puts the serving attempt first when
+            -- there is one; `seq DESC` otherwise takes the last backend
+            -- tried, which is the one whose failure ended the request.
             LEFT JOIN attempt served
-                   ON served.request_id = r.id AND served.served = 1
+                   ON served.id = (
+                       SELECT a2.id FROM attempt a2
+                       WHERE a2.request_id = r.id
+                       ORDER BY a2.served DESC, a2.seq DESC
+                       LIMIT 1
+                   )
             WHERE {" AND ".join(where)}
             """,
                 params,

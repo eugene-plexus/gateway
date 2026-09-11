@@ -210,7 +210,15 @@ def test_a_request_that_no_backend_served_is_still_recorded(settings: Settings) 
         assert page["requests"][0]["outcome"] == "error"
         assert page["requests"][0]["servedModel"] is None
         body = client.get("/v1/metrics").json()
-        assert body["groups"][0]["errors"] == 1
+        group = body["groups"][0]
+        assert group["errors"] == 1
+        # And attributed to the backend that failed, not to nobody.
+        # Joining the summary on the SERVING attempt alone put every
+        # failed request in a null-driver group, so "is anything
+        # failing" could be answered with a count but not with a name -
+        # found live the first time a real backend failed.
+        assert group["driver"] == "dead"
+        assert group["model"] == "qwen"
 
 
 def test_metrics_off_is_reported_as_off_not_as_empty(settings: Settings) -> None:
