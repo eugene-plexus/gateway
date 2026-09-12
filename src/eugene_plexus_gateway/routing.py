@@ -258,10 +258,21 @@ class RoutingTable:
         refresh_seconds: float = 15.0,
         slots: Callable[[], Any] | None = None,
         strategy: Callable[[], Any] | None = None,
-        control_url: str | None = None,
+        control_url: str | Callable[[], Any] | None = None,
     ) -> None:
         self._agent_url = agent_url.rstrip("/")
-        self._control_url = control_url.rstrip("/") if control_url else None
+        # Read live on every refresh, for the same reason `slots` and
+        # `strategy` are: `controlUrl` is a config field whose own
+        # description promises it "takes effect on the next routing
+        # refresh", and whose `requiresRestart` is false. Captured as a
+        # string it did neither -- setting it on a running gateway
+        # changed nothing until someone restarted the process, which is
+        # how a two-machine install came up with its worker enrolled,
+        # reachable, and invisible to routing (2026-09-11). A plain
+        # string is still accepted, because most callers have one.
+        self._control_url_source: Callable[[], Any] = (
+            control_url if callable(control_url) else (lambda: control_url)
+        )
         self._service_token = service_token
         self._request_timeout = request_timeout_seconds
         self._refresh_seconds = refresh_seconds
@@ -295,6 +306,19 @@ class RoutingTable:
         self._runtime_last_request: dict[str, float] = {}
         self._ready_since: dict[str, float] = {}
         self._cursor: dict[str, int] = {}
+
+    @property
+    def _control_url(self) -> str | None:
+        """The control root's address as configured *right now*.
+
+        Normalized on every read rather than at construction, so a
+        `PATCH /v1/config` reaches the next refresh. An empty string and
+        a whitespace-only value both mean "single host", which is what a
+        UI that clears the field sends.
+        """
+        value = self._control_url_source()
+        text = str(value).strip() if value is not None else ""
+        return text.rstrip("/") or None
 
     # --- lifecycle --------------------------------------------------------
 
@@ -386,14 +410,15 @@ class RoutingTable:
         answer leaves the previous agent map in place: management being
         down must not empty the routing table.
         """
-        if self._control_url is None:
+        control_url = self._control_url
+        if control_url is None:
             return {None: self._agent_url}
-        body = await self._get_json(f"{self._control_url}/v1/nodes")
+        body = await self._get_json(f"{control_url}/v1/nodes")
         nodes = body.get("nodes") if isinstance(body, dict) else None
         if not isinstance(nodes, list):
             log.warning(
                 "control root at %s did not answer /v1/nodes; keeping the previous agent map",
-                self._control_url,
+                control_url,
             )
             return dict(self._snapshot.agents) or {None: self._agent_url}
         agents: dict[str | None, str] = {}

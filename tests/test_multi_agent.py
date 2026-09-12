@@ -321,3 +321,57 @@ async def test_a_wake_goes_to_the_agent_that_owns_the_runtime(two: TwoAgents) ->
     assert [b.name for b in table.resolve(MODEL).eligible_backends()] == ["qwen-b-driver"]
     await manager.aclose()
     await table.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# the control root's address is read live
+# --------------------------------------------------------------------------- #
+
+
+async def test_control_url_is_read_on_every_refresh_not_captured(two: TwoAgents) -> None:
+    """`controlUrl` set on a *running* gateway must reach the next refresh.
+
+    Found on a real two-machine install, 2026-09-11. The field's own
+    description says it "takes effect on the next routing refresh" and
+    its `requiresRestart` is false, but the constructor captured the
+    string, so a `PATCH /v1/config` changed nothing until the process was
+    restarted. The symptom is the worst kind: the worker node was
+    enrolled, reachable, its driver `running` in the control root's own
+    union view -- and invisible to routing, with an empty
+    `unreachable_drivers` list saying nothing was wrong.
+
+    Nothing sets `controlUrl` automatically -- not the installers, not
+    the container, not the agent's first-boot topology -- so every
+    multi-host install passes through exactly this path.
+    """
+    configured: str | None = None
+    table = RoutingTable(agent_url=AGENT_A, control_url=lambda: configured, refresh_seconds=3600)
+
+    # Single-host until told otherwise: only agent A, so only its driver.
+    await table.refresh()
+    assert sorted(b.name for b in table.backends_for(MODEL)) == ["qwen-a-driver"]
+
+    # The operator sets it on the running gateway. No restart.
+    configured = CONTROL
+    await table.refresh()
+    assert sorted(b.name for b in table.backends_for(MODEL)) == [
+        "qwen-a-driver",
+        "qwen-b-driver",
+    ]
+
+    # And clearing it collapses back, because a UI that empties the field
+    # sends "" rather than removing the key.
+    configured = "   "
+    await table.refresh()
+    assert sorted(b.name for b in table.backends_for(MODEL)) == ["qwen-a-driver"]
+
+
+async def test_a_plain_control_url_string_still_works(two: TwoAgents) -> None:
+    """The callable is an addition, not a replacement: most callers have
+    a string and the two existing tests above pass one."""
+    table = RoutingTable(agent_url=AGENT_A, control_url=CONTROL + "/", refresh_seconds=3600)
+    await table.refresh()
+    assert sorted(b.name for b in table.backends_for(MODEL)) == [
+        "qwen-a-driver",
+        "qwen-b-driver",
+    ]

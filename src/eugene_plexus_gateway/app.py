@@ -110,7 +110,6 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             # different answers, and the inference route says so.
             app.state.routing = None
         else:
-            control_url = str(store.get("controlUrl") or "").strip() or None
             table = RoutingTable(
                 agent_url=settings.agent_url,
                 service_token=auth_state.service_token,
@@ -119,7 +118,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 # Read live, so a PATCH takes effect on the next request.
                 slots=lambda: store.get("modelSlots"),
                 strategy=lambda: store.get("loadBalancing"),
-                control_url=control_url,
+                # Live, like the two above it: `controlUrl` is documented
+                # as taking effect on the next routing refresh.
+                control_url=lambda: store.get("controlUrl"),
             )
             app.state.routing = table
             owns_routing = True
