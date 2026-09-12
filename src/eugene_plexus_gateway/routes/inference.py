@@ -10,11 +10,13 @@ consistency would break the entire audience.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import struct
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from dataclasses import field as dc_field
 from datetime import UTC, datetime
@@ -25,6 +27,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .._generated.driver_models import (
+    EmbedRequest,
     GenerateRequest,
     GenerateResponse,
     Message,
@@ -45,9 +48,15 @@ from .._generated.models import (
     CompletionRoutingInfo,
     CompletionUsage,
     Delta,
+    EmbeddingData,
+    EmbeddingRequest,
+    EmbeddingResponse,
+    EmbeddingUsage,
     FinishReason,
     FunctionCall,
     ModelList,
+    Object,
+    Object1,
     ResponseFormat,
     Role1,
     Role2,
@@ -257,6 +266,45 @@ def _tools_unsupported(model: str) -> JSONResponse:
     )
 
 
+def _wrong_surface(
+    model: str, surfaces: Sequence[str], *, wanted: str, instead: str
+) -> JSONResponse:
+    """400 when a model was sent to a surface it does not serve.
+
+    Named rather than generic, because the alternative is what happened
+    before this existed: the request went down to the backend and came
+    back as `"nomic-embed-text" does not support chat` or, worse, an
+    embedding-shaped nothing. The caller could not tell whether they had
+    picked the wrong model or hit a broken install.
+    """
+    return _error(
+        code=400,
+        message=(
+            f"The model {model!r} serves {', '.join(surfaces)} and not {wanted}. "
+            f"Send this request to {instead} instead. "
+            "GET /v1/models reports x_eugene_plexus.surfaces per model."
+        ),
+        error_type="invalid_request_error",
+        param="model",
+    )
+
+
+def _encode_embedding(vector: list[float], encoding_format: str | None) -> list[float] | str:
+    """Floats, or the base64 the OpenAI SDKs ask for by default.
+
+    **Done here rather than passed to the backend**, because backends
+    differ on whether they implement `encoding_format` and a caller
+    should not be able to tell which one answered. Little-endian
+    `float32` then base64 -- verified byte-for-byte against a real
+    backend's own base64 output rather than inferred from OpenAI's
+    documentation, so an SDK that decodes it gets the same numbers it
+    would get from OpenAI.
+    """
+    if encoding_format != "base64":
+        return vector
+    return base64.b64encode(struct.pack(f"<{len(vector)}f", *vector)).decode("ascii")
+
+
 def _not_ready(resolution: Resolution, wake: WakeResult | None) -> JSONResponse:
     """503: something serves this model and none of it can take a request
     right now. Retryable, so deliberately not a 502."""
@@ -318,6 +366,15 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
     resolution = table.resolve(body.model)
     if not resolution.has_backends():
         return _no_such_model(body.model, table)
+
+    # An embeddings-only model, named on the chat surface. Refused by
+    # name here rather than passed down to fail as whatever the backend
+    # happens to say -- the library will happily discover, download and
+    # launch a dedicated embedding model, so this is a mistake an
+    # operator can make entirely inside our own UI.
+    surfaces = table.surfaces_for(body.model)
+    if surfaces and "chat" not in surfaces:
+        return _wrong_surface(body.model, surfaces, wanted="chat", instead="/v1/embeddings")
 
     # **Refused here, never stripped.** Checked before a backend is
     # picked, because the answer must not depend on which replica the
@@ -417,6 +474,107 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
             backend_ms=response.latencyMs,
         )
         return result
+
+
+# --------------------------------------------------------------------------- #
+# /v1/embeddings
+# --------------------------------------------------------------------------- #
+
+
+@router.post("/v1/embeddings", dependencies=_auth)
+async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
+    """Text in, vectors out.
+
+    **The one place in this gateway where a slot does not cascade.**
+    `pick_embedding` hands back a client over replicas of the requested
+    model and nothing else, so a `modelSlots` fallback to a different
+    target cannot run here. Vectors from two models occupy different
+    spaces; substituting one for the other writes noise into the
+    caller's vector store with a 200 and no marker, and the damage
+    outlives the request. Same trade as M10's commit point: give up a
+    retry rather than return a wrong answer that looks right.
+    """
+    table = _routing(request)
+    if table is None:
+        return _error(
+            code=503,
+            message="The gateway is starting up or in safe mode; no routing table exists yet.",
+            error_type="service_unavailable",
+        )
+
+    resolution = table.resolve(body.model)
+    if not resolution.has_backends():
+        return _no_such_model(body.model, table)
+
+    surfaces = table.surfaces_for(body.model)
+    if surfaces and "embeddings" not in surfaces:
+        return _wrong_surface(
+            body.model, surfaces, wanted="embeddings", instead="/v1/chat/completions"
+        )
+
+    # `oneOf: [string, array]` generates `str | Input`, where `Input` is
+    # a RootModel wrapping the list -- so the array case needs `.root`
+    # rather than iterating the model, which yields its fields.
+    #
+    # **No validation here, deliberately.** A hand-written check for
+    # "non-empty list of strings" was written, then measured to be
+    # unreachable: the schema types `input` as string-or-array-of-string
+    # with `minItems: 1`, so a token array and an empty batch are both
+    # rejected as 422 before this function runs. Keeping the check would
+    # have meant shipping a branch that cannot fire, with a test
+    # asserting that it does -- which is this project's most familiar
+    # mistake, one layer in.
+    inputs: list[str] = (
+        [body.input] if isinstance(body.input, str) else list(getattr(body.input, "root", []))
+    )
+
+    client = table.pick_embedding(resolution)
+    if client is None and await table.refresh_if_stale():
+        resolution = table.resolve(body.model)
+        client = table.pick_embedding(resolution)
+    if client is None:
+        # Deliberately NOT a wake. Idle-unload and start-on-demand are
+        # chat-path lifecycle; an embeddings request that woke a runtime
+        # would be the first thing in this gateway to do so, and doing
+        # it silently here rather than designing it is how surfaces
+        # drift apart.
+        return _not_ready(resolution, None)
+
+    started = time.monotonic()
+    try:
+        result = await client.embed(EmbedRequest(input=inputs))
+    except DriverError as e:
+        return _driver_error_response(e)
+    except httpx.HTTPError as e:
+        return _error(
+            code=502,
+            message=(
+                f"Every backend serving {body.model!r} failed. Last error: {e}. "
+                f"The cascade never reached a different model -- see the contract."
+            ),
+            error_type="upstream_error",
+        )
+
+    # The generated default is the literal string "float", not the enum
+    # member -- datamodel-code-generator emits the schema default
+    # verbatim -- so an unset field has no `.value`.
+    fmt = getattr(body.encoding_format, "value", body.encoding_format) or "float"
+    usage = None
+    if result.usage is not None:
+        usage = EmbeddingUsage(
+            prompt_tokens=result.usage.promptTokens,
+            total_tokens=result.usage.totalTokens,
+        )
+    return EmbeddingResponse(
+        object=Object.list,
+        data=[
+            EmbeddingData(object=Object1.embedding, index=i, embedding=_encode_embedding(v, fmt))
+            for i, v in enumerate(result.embeddings)
+        ],
+        model=result.modelId or body.model,
+        usage=usage,
+        x_eugene_plexus=_routing_info(client, table, body.model, started),
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -71,6 +71,7 @@ from ._generated.models import (
     RoutingSlotView,
     RoutingTableView,
     RoutingTierView,
+    Surface,
 )
 from .driver_client import DriverClient, HttpDriverClient, TieredClient
 from .metrics import AttemptRow, CandidateRow
@@ -167,6 +168,29 @@ class _Backend:
             return None
         assert self.runtime is not None
         return f"runtime {self.runtime.name!r} is {self.runtime.status or 'unknown'}"
+
+    @property
+    def embeds(self) -> bool:
+        """Whether this backend serves the embeddings surface.
+
+        The driver determines it from the backend and reports it on
+        `/v1/info`; absent reads as False, which is the honest default
+        for a capability nobody has confirmed."""
+        caps = self.info.capabilities
+        return caps is not None and bool(caps.embeddings)
+
+    @property
+    def chats(self) -> bool:
+        """Whether this backend serves chat completions.
+
+        **Not simply `not embeds`.** Measured: an Ollama runner is one
+        or the other, but `llama-server` given `--embedding` still
+        serves chat perfectly well. A backend that says nothing about
+        embeddings is a chat backend, which is every driver that existed
+        before this surface did -- so the default has to be True or
+        re-pinning would silently unroute every model in the install.
+        """
+        return not self.embeds or self.info.capabilities is None
 
     @property
     def parallel_slots(self) -> int:
@@ -864,6 +888,50 @@ class RoutingTable:
             return None
         return TieredClient(name=resolution.model, tiers=tiers, hooks=self)
 
+    def pick_embedding(self, resolution: Resolution) -> TieredClient | None:
+        """A client that can only ever reach ONE model.
+
+        **This is where the no-cross-model rule is enforced**, and it is
+        enforced structurally rather than by a check at the end: the
+        returned client is handed a single tier containing only the
+        eligible backends whose driver reports serving `resolution.model`
+        AND reports an embeddings surface. There is no second tier for a
+        cascade to walk into, so the rule cannot be lost later by
+        someone editing the cascade logic.
+
+        Replicas of one model still balance and fail over exactly as
+        they do for chat -- those are interchangeable by definition.
+        """
+        eligible = [
+            b
+            for b in resolution.eligible_backends()
+            if b.embeds and b.info.modelId == resolution.model
+        ]
+        if not eligible:
+            return None
+        ordered = [b.client for b in self._order(resolution.model, eligible)]
+        return TieredClient(name=resolution.model, tiers=[ordered], hooks=self)
+
+    def surfaces_for(self, model: str) -> list[Surface]:
+        """Which OpenAI surfaces this model can be sent to.
+
+        A list because the two are not always disjoint: an Ollama runner
+        is one or the other, but `llama-server` in `--embedding` mode
+        still chats. Derived from every backend serving the name, so a
+        surface appears when at least one of them offers it -- the
+        opposite of `tool_calling`, which is the weakest-backend answer.
+        That difference is deliberate: `tool_calling` promises a request
+        will be carried whichever replica takes it, while `surfaces`
+        answers "is there any point sending this here at all".
+        """
+        backends = self.resolve(model).backends()
+        out: list[Surface] = []
+        if any(b.chats for b in backends):
+            out.append(Surface.chat)
+        if any(b.embeds for b in backends):
+            out.append(Surface.embeddings)
+        return out
+
     def candidates_considered(self, resolution: Resolution) -> list[CandidateRow]:
         """What the balancer saw for each candidate, in tier order.
 
@@ -978,6 +1046,7 @@ class RoutingTable:
                     x_eugene_plexus=ModelRoutingInfo(
                         drivers=[b.name for b in backends],
                         backends=sorted({_backend_kind(b) for b in backends}),
+                        surfaces=self.surfaces_for(model_id),
                         context_length=_smallest_context(backends),
                         tool_calling=_all_carry_tools(backends),
                         tiers=[[b.name for b in t.backends] for t in resolution.tiers],

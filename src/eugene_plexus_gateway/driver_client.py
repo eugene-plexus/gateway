@@ -27,6 +27,8 @@ from pydantic import ValidationError
 
 from ._generated.driver_models import (
     DriverInfo,
+    EmbedRequest,
+    EmbedResponse,
     GenerateRequest,
     GenerateResponse,
     Problem,
@@ -149,6 +151,7 @@ class DriverClient(Protocol):
 
     async def info(self) -> DriverInfo: ...
     async def generate(self, request: GenerateRequest) -> GenerateResponse: ...
+    async def embed(self, request: EmbedRequest) -> EmbedResponse: ...
     def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]: ...
     async def aclose(self) -> None: ...
 
@@ -229,6 +232,19 @@ class HttpDriverClient:
                 raw_body=response.text,
             )
         return GenerateResponse.model_validate(response.json())
+
+    async def embed(self, request: EmbedRequest) -> EmbedResponse:
+        payload = request.model_dump(mode="json", exclude_none=True)
+        response = await self._client.post("/v1/embed", json=payload)
+        if response.status_code >= 400:
+            raise DriverError(
+                driver_name=self.name,
+                driver_url=self.base_url,
+                status_code=response.status_code,
+                problem=_problem_from_response(response),
+                raw_body=response.text,
+            )
+        return EmbedResponse.model_validate(response.json())
 
     async def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]:
         """Consume one driver's `/v1/generate/stream`.
@@ -451,6 +467,57 @@ class TieredClient:
         # / httpx.HTTPError handlers surface it as they would for a
         # single-backend slot — no new error path to maintain.
         assert last_exc is not None  # candidates is non-empty (checked in __init__)
+        raise last_exc
+
+    async def embed(self, request: EmbedRequest) -> EmbedResponse:
+        """`generate()`'s cascade, over replicas of ONE model.
+
+        The failure taxonomy is identical -- transport and 5xx cascade,
+        4xx fails hard. What differs is what it is allowed to cascade
+        *to*, and that is enforced upstream rather than here:
+        `RoutingTable.pick_embedding` builds a single tier containing
+        only backends serving the requested model id, so there is
+        structurally no other model to reach. Replicas of one model are
+        interchangeable; two models are not, and a fallback between them
+        would write vectors from a different space into the caller's
+        store with a 200 and no marker.
+        """
+        last_exc: Exception | None = None
+        total = len(self.candidates)
+        index = 0
+        for tier_index, tier in enumerate(self._tiers):
+            for candidate in tier:
+                self.attempts = index + 1
+                driver = getattr(candidate, "name", None)
+                if self._hooks is not None and driver:
+                    self._hooks.on_attempt_start(driver)
+                started = time.monotonic()
+                try:
+                    result = await candidate.embed(request)
+                except Exception as exc:
+                    if self._hooks is not None and driver:
+                        self._hooks.on_attempt_end(
+                            driver,
+                            served=False,
+                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                            error=type(exc).__name__,
+                        )
+                    if not _is_cascade_eligible(exc):
+                        raise
+                    last_exc = exc
+                    self._log_cascade("embed", index, candidate, exc, total=total)
+                    index += 1
+                else:
+                    if self._hooks is not None and driver:
+                        self._hooks.on_attempt_end(
+                            driver,
+                            served=True,
+                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                        )
+                    self.served_by = driver
+                    self.tier = tier_index + 1
+                    return result
+        assert last_exc is not None
         raise last_exc
 
     async def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]:

@@ -664,6 +664,40 @@ class Usage(BaseModel):
     totalTokens: int | None = Field(None, ge=0)
 
 
+class EmbedRequest(BaseModel):
+    """
+    Text to embed. Batched because every backend that does this
+    accepts a batch, and a per-item round trip would multiply the
+    control plane's own overhead by the size of a document set.
+
+    """
+
+    input: list[str] = Field(
+        ...,
+        description='One entry per vector to produce. Order is preserved: the\nn-th vector in the response is the n-th input, which is the\nonly thing that lets a caller match them up, since an\nembedding carries no identity of its own.\n',
+        min_length=1,
+    )
+    requestId: str | None = Field(
+        None,
+        description='Correlation id, echoed back. Same role as on `GenerateRequest`.',
+    )
+
+
+class EmbedResponse(BaseModel):
+    embeddings: list[list[float]] = Field(
+        ...,
+        description='One vector per input, in the order the inputs arrived.\nFloats, always — see the operation description for why this\nsurface does not carry base64.\n',
+    )
+    modelId: str | None = Field(
+        None,
+        description="The model that produced these vectors, as the backend named\nit. **Load-bearing beyond attribution:** vectors from two\nmodels are not comparable, so a caller storing them needs to\nknow which model's space they belong to.\n",
+    )
+    backend: BackendKind | None = None
+    usage: Usage | None = None
+    latencyMs: int | None = Field(None, ge=0)
+    requestId: str | None = None
+
+
 class Capabilities(BaseModel):
     """
     Backend capabilities the gateway keys off when routing.
@@ -675,6 +709,10 @@ class Capabilities(BaseModel):
     toolCalling: bool | None = Field(
         None,
         description='Whether this driver can carry `tools` to its backend and\nreport `toolCalls` back.\n\nThe gateway reads it to answer a question a harness\ncannot otherwise ask: a plain answer where a tool call\nwas expected looks identical whether the model declined\nor the backend never saw the tools. A driver that says\n`false` here is failed at the front door with a reason\ninstead.\n',
+    )
+    embeddings: bool | None = Field(
+        None,
+        description='Whether this driver can serve `POST /v1/embed`.\n\n**A property of the running backend, not of the model**,\nand not readable from anything: `llama-server`\'s\n`/props` carries no pooling or embedding field, and an\nOllama runner started for chat refuses with "This server\ndoes not support embeddings". So it is determined by\ntrying once and cached for the driver\'s lifetime — which\nis the right lifetime, since it cannot change without\nthe backend restarting.\n\nThe gateway reads it to mark which surface each model\nserves on `GET /v1/models`, and to refuse a chat request\nagainst an embeddings-only model with a reason instead\nof passing it down to fail obscurely.\n',
     )
     maxContextTokens: int | None = Field(
         None,

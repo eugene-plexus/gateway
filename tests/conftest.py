@@ -51,6 +51,7 @@ class FakeDriverClient:
         max_context_tokens: int | None = None,
         runtime: str | None = None,
         supports_tools: bool = False,
+        supports_embeddings: bool = False,
     ) -> None:
         self.name = name
         self.base_url = base_url
@@ -60,6 +61,7 @@ class FakeDriverClient:
         self.max_context_tokens = max_context_tokens
         self.runtime = runtime
         self.supports_tools = supports_tools
+        self.supports_embeddings = supports_embeddings
         self.tool_calls: list[ToolCall] | None = None
         """When set, `generate`/`stream` answer with these instead of
         text -- the tool-call-only turn, whose `content` is None."""
@@ -81,6 +83,9 @@ class FakeDriverClient:
         token" (still cascadable) and 1 means "fail after it" (not)."""
         self.stream_error: Exception = RuntimeError("stream died")
         self.usage: Usage | None = None
+        self.embed_error: Exception | None = None
+        """If set, `embed()` raises this instead of returning."""
+        self.embed_calls = 0
 
     def describe(self) -> DriverInfo:
         """The same answer `info()` gives, without needing a loop."""
@@ -88,8 +93,11 @@ class FakeDriverClient:
             Capabilities(
                 maxContextTokens=self.max_context_tokens,
                 toolCalling=self.supports_tools,
+                embeddings=self.supports_embeddings or None,
             )
-            if self.max_context_tokens is not None or self.supports_tools
+            if self.max_context_tokens is not None
+            or self.supports_tools
+            or self.supports_embeddings
             else None
         )
         return DriverInfo(
@@ -126,6 +134,25 @@ class FakeDriverClient:
             finishReason=FinishReason.stop,
             backend=self.backend,
             modelId=self.model_id,
+            usage=self.usage,
+            latencyMs=1,
+        )
+
+    async def embed(self, request: Any) -> Any:
+        """Vectors, or the scripted failure. Values derive from the
+        driver name so a test can tell WHICH backend answered from the
+        numbers alone -- which is the only way to catch a cascade that
+        crossed models."""
+        from eugene_plexus_gateway._generated.driver_models import EmbedResponse
+
+        self.embed_calls += 1
+        if self.embed_error is not None:
+            raise self.embed_error
+        seed = float(len(self.name))
+        return EmbedResponse(
+            embeddings=[[seed + i for i in range(4)] for _ in request.input],
+            modelId=self.model_id,
+            backend=self.backend,
             usage=self.usage,
             latencyMs=1,
         )

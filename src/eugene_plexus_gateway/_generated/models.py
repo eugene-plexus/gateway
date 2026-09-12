@@ -6,7 +6,7 @@ from __future__ import annotations
 from enum import Enum, StrEnum
 from typing import Any, Literal
 
-from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field, RootModel
 
 
 class DriverProbeRequest(BaseModel):
@@ -600,6 +600,11 @@ class RestartResult(BaseModel):
     )
 
 
+class Surface(StrEnum):
+    chat = 'chat'
+    embeddings = 'embeddings'
+
+
 class ModelRoutingInfo(BaseModel):
     """
     Namespaced extension: how this install serves the model. Present
@@ -618,6 +623,10 @@ class ModelRoutingInfo(BaseModel):
     context_length: int | None = Field(
         None,
         description='Smallest context window among the serving backends — the\nhonest number, since a request may land on any of them.\n',
+    )
+    surfaces: list[Surface] | None = Field(
+        None,
+        description="Which OpenAI surfaces this model can be sent to.\n\nOpenAI's own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Measured, not assumed, and the two are not always\ndisjoint**: an Ollama runner started for chat refuses to\nembed, `nomic-embed-text` refuses to chat -- but\n`llama-server` given `--embedding` still serves chat\nperfectly well. Hence a list.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n",
     )
     tool_calling: bool | None = Field(
         None,
@@ -843,6 +852,81 @@ class CompletionRoutingInfo(BaseModel):
         None,
         description="**The backend silently dropped input.** True when the prompt\nwe sent was far larger than the token count the backend\nreported consuming — the signature of a server that fits an\nover-long prompt into the window by discarding the middle of\nthe conversation and answering anyway, with a 200 and no\nflag of its own.\n\nThis is the failure that makes a coding harness loop: it\nsends file contents, the model never receives them, and the\nconfident answer that comes back is about code nobody read.\nMeasured on this project's own hardware: 66,389 characters\nacross six messages came back as `prompt_tokens: 86`, HTTP\n200, nothing anywhere saying so.\n\nDetected, not predicted. It is computed from\n`usage.prompt_tokens` **after** the answer, by a ratio\nchosen to be far below any real tokenizer's — so it cannot\nfire on a merely token-dense prompt, and it needs no\ntokenizer of ours.\n\n**Three states, and the difference matters.** `null` means\nnot evaluated — the backend reported no usage, or the prompt\nwas too small for the test to mean anything — and must not\nbe read as reassurance. `false` means it was checked and the\ninput arrived. `true` means it did not. Null and not absent:\nthis envelope serializes its unset fields, as `runtime` has\nsince M0.\n\n**Why a flag and not an error.** The answer has already been\ngenerated, and on a streamed request it has already been\ndelivered — M10's rule is that a stream cannot be unsent.\nFailing one path and flagging the other would make the same\ncondition report two different ways, so both flag. A backend\nthat refuses instead of truncating needs none of this: its\nrefusal is exact and is passed straight through as a 400.\n",
     )
+
+
+class Input(RootModel[list[str]]):
+    root: list[str] = Field(
+        ...,
+        description='One string, or a batch of them. Order is preserved and is\nthe only way a caller can match vectors to inputs.\n\n**Token-array inputs are not accepted**, which OpenAI does\nallow. Supporting them would mean tokenizing on this side to\nvalidate, and this install deliberately owns no tokenizer --\nsee the context-window decision. A caller sending one gets a\n400 rather than a silently different answer.\n',
+        min_length=1,
+    )
+
+
+class EncodingFormat(StrEnum):
+    """
+    `base64` is what the OpenAI SDKs ask for by default, so it
+    is supported and is handled **here** rather than passed to
+    the backend: little-endian `float32`, then base64.
+
+    """
+
+    float = 'float'
+    base64 = 'base64'
+
+
+class EmbeddingRequest(BaseModel):
+    model: str = Field(
+        ...,
+        description='Must name a model that serves the embeddings surface.\n`GET /v1/models` reports `x_eugene_plexus.surfaces` per\nmodel; a chat-only model is refused here with a 400 rather\nthan sent down to fail as an obscure backend error.\n',
+    )
+    input: str | Input = Field(
+        ...,
+        description='One string, or a batch of them. Order is preserved and is\nthe only way a caller can match vectors to inputs.\n\n**Token-array inputs are not accepted**, which OpenAI does\nallow. Supporting them would mean tokenizing on this side to\nvalidate, and this install deliberately owns no tokenizer --\nsee the context-window decision. A caller sending one gets a\n400 rather than a silently different answer.\n',
+    )
+    encoding_format: EncodingFormat | None = Field(
+        'float',
+        description='`base64` is what the OpenAI SDKs ask for by default, so it\nis supported and is handled **here** rather than passed to\nthe backend: little-endian `float32`, then base64.\n',
+    )
+    user: str | None = Field(
+        None,
+        description='Opaque end-user id, as OpenAI defines it. Recorded, not routed on.',
+    )
+    dimensions: int | None = Field(
+        None,
+        description='Passed through to the backend unchanged. Most local backends\nignore it; this layer does not emulate truncation, because a\nsilently-truncated vector is a wrong answer that looks like\na right one.\n',
+        ge=1,
+    )
+
+
+class Object(StrEnum):
+    list = 'list'
+
+
+class Object1(StrEnum):
+    embedding = 'embedding'
+
+
+class EmbeddingData(BaseModel):
+    object: Object1
+    index: int = Field(
+        ..., description='Position of the input this vector came from.', ge=0
+    )
+    embedding: list[float] | str = Field(
+        ...,
+        description='An array of floats, or a base64 string when the caller asked\nfor `base64` -- little-endian `float32`.\n',
+    )
+
+
+class EmbeddingUsage(BaseModel):
+    """
+    Separate from `CompletionUsage` because there is no completion:
+    OpenAI omits `completion_tokens` here, and inventing a zero
+    would assert something the backend never said.
+
+    """
+
+    prompt_tokens: int | None = Field(None, ge=0)
+    total_tokens: int | None = Field(None, ge=0)
 
 
 class RoutingBackendView(BaseModel):
@@ -1328,6 +1412,17 @@ class ResponseFormat(BaseModel):
     json_schema: ResponseJsonSchema | None = Field(
         None, description='Required when `type` is `json_schema`.'
     )
+
+
+class EmbeddingResponse(BaseModel):
+    object: Object
+    data: list[EmbeddingData]
+    model: str = Field(
+        ...,
+        description='The model that actually produced these vectors. After a\nsame-model failover this still names that model -- by the\nrule above, it can never name a different one.\n',
+    )
+    usage: EmbeddingUsage | None = None
+    x_eugene_plexus: CompletionRoutingInfo | None = None
 
 
 class RoutingTierView(BaseModel):
