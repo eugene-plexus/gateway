@@ -60,6 +60,7 @@ class Role(StrEnum):
     system = 'system'
     user = 'user'
     assistant = 'assistant'
+    tool = 'tool'
 
 
 class Message(BaseModel):
@@ -71,9 +72,17 @@ class Message(BaseModel):
     """
 
     role: Role
-    content: str = Field(
-        ...,
-        description='Message text. Text-only for now; multimodal extensions deferred.',
+    content: str | None = Field(
+        None,
+        description='Message text. Text-only for now; multimodal extensions\ndeferred. **Nullable, and no longer required:** an assistant\nturn that only calls a tool has no text to carry, and the\nalternative — an empty string — would assert the model said\nnothing when in fact it said something that was not text.\n',
+    )
+    toolCalls: list[dict[str, Any]] | None = Field(
+        None,
+        description="On an **assistant** message: the tool calls the model made,\nin OpenAI's `{id, type, function: {name, arguments}}` shape.\n\nDeliberately loose here. This is the *shared* schema, so a\ntightly-typed copy would be a third definition of the same\nobject alongside the gateway's and the driver's, and the one\nplace all three must agree is the wire format, which is\nOpenAI's and not ours to restate. The two API documents\ncarry the strict shapes.\n",
+    )
+    toolCallId: str | None = Field(
+        None,
+        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
     )
     timestamp: AwareDatetime | None = Field(
         None, description='When the message was produced. Server-assigned if omitted.'
@@ -610,6 +619,10 @@ class ModelRoutingInfo(BaseModel):
         None,
         description='Smallest context window among the serving backends — the\nhonest number, since a request may land on any of them.\n',
     )
+    tool_calling: bool | None = Field(
+        None,
+        description='Whether a request for this model may carry `tools`.\n\n**True only when every backend serving it can**, by the same\nreasoning as `context_length` above: a request may land on\nany of them, so the honest answer is the weakest one. A\nharness can read this and pick a model rather than discover\nthe limit as a 400 halfway through a task.\n',
+    )
     tiers: list[list[str]] | None = Field(
         None,
         description="The slot's tiers in priority order, each the driver names\nin it. One tier for an unconfigured model; more when a\n`modelSlots` entry adds targets. Empty tiers are omitted.\n",
@@ -625,61 +638,50 @@ class ModelRoutingInfo(BaseModel):
     )
 
 
+class ToolChoice(StrEnum):
+    """
+    How the model should use `tools`. `auto` is the default when
+    tools are present, `none` forbids calling one, `required`
+    forces at least one call, and an object names a specific
+    function. Passed through; the gateway does not enforce it.
+
+    """
+
+    none = 'none'
+    auto = 'auto'
+    required = 'required'
+
+
 class Role1(StrEnum):
     system = 'system'
     user = 'user'
     assistant = 'assistant'
-
-
-class ChatCompletionMessage(BaseModel):
-    """
-    OpenAI-shaped chat message. Intentionally *not* the shared
-    `Message` schema: this one is on a wire contract we do not own,
-    so it carries exactly OpenAI's fields and nothing of ours.
-    Leaking a house field like `timestamp` into a payload an OpenAI
-    SDK parses is how "compatible" quietly stops being true.
-
-    """
-
-    role: Role1
-    content: str
-    name: str | None = Field(None, description='Optional participant name, per OpenAI.')
+    tool = 'tool'
 
 
 class FinishReason(StrEnum):
     """
     `stop` for a natural end or a matched stop sequence,
-    `length` for hitting the token cap — OpenAI's two values for
-    a completion without tool calls.
+    `length` for hitting the token cap, `tool_calls` when the
+    model stopped because it wants one or more tools run.
+
+    Until 2026-09-11 this enum was `stop` and `length` only, and
+    its description said so in as many words — "OpenAI's two
+    values for a completion **without** tool calls". That
+    sentence was the single occurrence of the string "tool"
+    anywhere in this contract or the driver's, and it was an
+    accurate description of a control plane no agent harness
+    could use.
 
     """
 
     stop = 'stop'
     length = 'length'
-
-
-class ChatCompletionChoice(BaseModel):
-    index: int
-    message: ChatCompletionMessage
-    finish_reason: FinishReason = Field(
-        ...,
-        description="`stop` for a natural end or a matched stop sequence,\n`length` for hitting the token cap — OpenAI's two values for\na completion without tool calls.\n",
-    )
+    tool_calls = 'tool_calls'
 
 
 class Role2(StrEnum):
     assistant = 'assistant'
-
-
-class Delta(BaseModel):
-    """
-    Incremental payload. The first chunk carries `role`;
-    subsequent chunks carry `content` fragments.
-
-    """
-
-    role: Role2 | None = None
-    content: str | None = None
 
 
 class FinishReason1(Enum):
@@ -689,18 +691,85 @@ class FinishReason1(Enum):
 
     stop = 'stop'
     length = 'length'
+    tool_calls = 'tool_calls'
     NoneType_None = None
 
 
-class ChatCompletionChunkChoice(BaseModel):
-    index: int
-    delta: Delta = Field(
+class FunctionDefinition(BaseModel):
+    name: str = Field(..., description='The name the model calls, e.g. `read_file`.')
+    description: str | None = Field(
+        None,
+        description='What the tool does. Load bearing rather than decorative —\nit is the only thing the model has to decide *whether* to\ncall this tool.\n',
+    )
+    parameters: dict[str, Any] | None = Field(
+        None,
+        description='A JSON Schema object describing the arguments. Passed\nthrough verbatim: we do not validate it, rewrite it, or\ntranslate dialects. A backend that rejects a construct\nrejects it in its own words, which is more useful than a\nguess of ours made one hop earlier.\n',
+    )
+    strict: bool | None = Field(
+        None,
+        description='Ask the backend to constrain generation to `parameters`.\nPassed through; backends that do not support it ignore it.\n',
+    )
+
+
+class Function(BaseModel):
+    name: str
+
+
+class NamedToolChoice(BaseModel):
+    """
+    Force one specific function.
+    """
+
+    type: Literal['function']
+    function: Function
+
+
+class FunctionCall(BaseModel):
+    name: str
+    arguments: str = Field(
         ...,
-        description='Incremental payload. The first chunk carries `role`;\nsubsequent chunks carry `content` fragments.\n',
+        description="The arguments as a **JSON string**, not an object. That is\nOpenAI's shape and it is deliberate on their part: a model\ncan emit invalid JSON, and a string preserves what it\nactually said instead of failing the whole response. The\ncaller parses it and handles the failure. We do not parse\nit, so we cannot lose it.\n",
     )
-    finish_reason: FinishReason1 | None = Field(
-        None, description='Null until the terminal chunk.'
+
+
+class Function1(BaseModel):
+    name: str | None = None
+    arguments: str | None = Field(
+        None, description='A fragment of the arguments string, to be concatenated.'
     )
+
+
+class ToolCallDelta(BaseModel):
+    """
+    A fragment of a `ToolCall` in a streaming response. Accumulate
+    by `index`.
+
+    """
+
+    index: int = Field(
+        ...,
+        description='Which call in the assistant turn this fragment belongs to.\nPresent on every fragment, because a model can interleave\nfragments of two calls.\n',
+    )
+    id: str | None = None
+    type: Literal['function'] = 'function'
+    function: Function1 | None = None
+
+
+class Type(StrEnum):
+    text = 'text'
+    json_object = 'json_object'
+    json_schema = 'json_schema'
+
+
+class ResponseJsonSchema(BaseModel):
+    name: str
+    description: str | None = None
+    schema_: dict[str, Any] = Field(
+        ...,
+        alias='schema',
+        description='A JSON Schema object. Passed through verbatim.',
+    )
+    strict: bool | None = None
 
 
 class CompletionUsage(BaseModel):
@@ -1187,64 +1256,68 @@ class Model(BaseModel):
     x_eugene_plexus: ModelRoutingInfo | None = None
 
 
-class ChatCompletionRequest(BaseModel):
-    model: str = Field(
+class Delta(BaseModel):
+    """
+    Incremental payload. The first chunk carries `role`;
+    subsequent chunks carry `content` fragments, `tool_calls`
+    fragments, or neither on the terminal chunk.
+
+    """
+
+    role: Role2 | None = None
+    content: str | None = None
+    tool_calls: list[ToolCallDelta] | None = Field(
+        None,
+        description='Tool-call fragments. Each carries an `index` and the\ncaller accumulates by it: `id` and `function.name`\narrive once, `function.arguments` arrives as a string\nsplit across any number of frames. A single frame is\n**not** parseable JSON and was never meant to be.\n',
+    )
+
+
+class ChatCompletionChunkChoice(BaseModel):
+    index: int
+    delta: Delta = Field(
         ...,
-        description='A model id from `GET /v1/models`. The gateway resolves it to\na backend; the client does not choose a backend.\n',
+        description='Incremental payload. The first chunk carries `role`;\nsubsequent chunks carry `content` fragments, `tool_calls`\nfragments, or neither on the terminal chunk.\n',
     )
-    messages: list[ChatCompletionMessage] = Field(..., min_length=1)
-    max_tokens: int | None = Field(
-        None,
-        description="Maximum output tokens. Filled from the model's settings\nprofile when omitted, then always sent downstream\nexplicitly.\n",
-        ge=1,
-    )
-    temperature: float | None = Field(None, ge=0.0, le=2.0)
-    top_p: float | None = Field(None, ge=0.0, le=1.0)
-    stop: list[str] | None = Field(None, description='Stop sequences.', max_length=4)
-    seed: int | None = Field(
-        None,
-        description='Passed through to backends that support deterministic\nsampling; dropped with a warning where they do not.\n',
-    )
-    stream: bool | None = Field(
-        False,
-        description='When true the response is an SSE stream of\n`ChatCompletionChunk` objects terminated by `data: [DONE]`.\n',
-    )
-    user: str | None = Field(
-        None, description='Opaque client-supplied identifier, echoed into logs only.'
+    finish_reason: FinishReason1 | None = Field(
+        None, description='Null until the terminal chunk.'
     )
 
 
-class ChatCompletionResponse(BaseModel):
+class Tool(BaseModel):
+    """
+    One tool offered to the model. OpenAI has only ever defined
+    `function`, and the wrapper exists so other kinds can be added
+    without reshaping the field.
+
+    """
+
+    type: Literal['function']
+    function: FunctionDefinition
+
+
+class ToolCall(BaseModel):
+    """
+    One tool call the model chose to make.
+    """
+
     id: str = Field(
-        ..., description='Completion id, `chatcmpl-` prefixed as clients expect.'
-    )
-    object: Literal['chat.completion']
-    created: int
-    model: str = Field(
         ...,
-        description='The model that actually served the request. Equal to the\nrequested id in the normal case; after a cascade it names\nwhat answered, which may differ.\n',
+        description='Correlation id. The caller echoes it as `tool_call_id` on\nthe message carrying the result.\n',
     )
-    choices: list[ChatCompletionChoice]
-    usage: CompletionUsage | None = Field(
-        None, description='Present on the final chunk only.'
-    )
-    x_eugene_plexus: CompletionRoutingInfo | None = None
+    type: Literal['function']
+    function: FunctionCall
 
 
-class ChatCompletionChunk(BaseModel):
+class ResponseFormat(BaseModel):
     """
-    One SSE frame of a streaming completion.
+    Constrain the shape of the reply. Passed through to the backend;
+    the gateway does not enforce or post-validate it.
+
     """
 
-    id: str
-    object: Literal['chat.completion.chunk']
-    created: int
-    model: str
-    choices: list[ChatCompletionChunkChoice]
-    usage: CompletionUsage | None = None
-    x_eugene_plexus: CompletionRoutingInfo | None = Field(
-        None,
-        description='Set on the **final frame only**, alongside `usage` — the\nsame place OpenAI puts its own end-of-stream extras.\nAbsent on every earlier frame, because the values are not\nknown until the completion is done.\n\nAdded at M8. Until then a streaming client could see no\nrouting information at all: the non-streaming response\ncarried this and the stream did not, so exactly the clients\nthat stream — the UI playground among them — were the ones\nthat could not tell which backend answered. Retained\nmetrics do not depend on this (they are recorded at the\nrouting hooks, which fire on both paths); this closes the\nmatching gap in what a caller can see.\n',
+    type: Type
+    json_schema: ResponseJsonSchema | None = Field(
+        None, description='Required when `type` is `json_schema`.'
     )
 
 
@@ -1315,6 +1388,58 @@ class ModelList(BaseModel):
     data: list[Model]
 
 
+class ChatCompletionMessage(BaseModel):
+    """
+    OpenAI-shaped chat message. Intentionally *not* the shared
+    `Message` schema: this one is on a wire contract we do not own,
+    so it carries exactly OpenAI's fields and nothing of ours.
+    Leaking a house field like `timestamp` into a payload an OpenAI
+    SDK parses is how "compatible" quietly stops being true.
+
+    """
+
+    role: Role1
+    content: str | None = Field(
+        None,
+        description='The message text. **Nullable, and that is not laxity:** an\nassistant message that only calls a tool has no text, and\nOpenAI sends `content: null` alongside `tool_calls` for it.\nA schema that required a string here would reject the\nsingle most common assistant turn in an agent loop.\n',
+    )
+    name: str | None = Field(None, description='Optional participant name, per OpenAI.')
+    tool_calls: list[ToolCall] | None = Field(
+        None,
+        description='Set on an **assistant** message, naming the tools the model\nchose to call. The caller executes them and replies with one\n`tool` message per call, each carrying the matching\n`tool_call_id`.\n',
+    )
+    tool_call_id: str | None = Field(
+        None,
+        description='Required on a **tool** message: which call in the preceding\nassistant turn this is the result of. `content` is the\nresult, as a string — the caller serializes it.\n',
+    )
+
+
+class ChatCompletionChoice(BaseModel):
+    index: int
+    message: ChatCompletionMessage
+    finish_reason: FinishReason = Field(
+        ...,
+        description='`stop` for a natural end or a matched stop sequence,\n`length` for hitting the token cap, `tool_calls` when the\nmodel stopped because it wants one or more tools run.\n\nUntil 2026-09-11 this enum was `stop` and `length` only, and\nits description said so in as many words — "OpenAI\'s two\nvalues for a completion **without** tool calls". That\nsentence was the single occurrence of the string "tool"\nanywhere in this contract or the driver\'s, and it was an\naccurate description of a control plane no agent harness\ncould use.\n',
+    )
+
+
+class ChatCompletionChunk(BaseModel):
+    """
+    One SSE frame of a streaming completion.
+    """
+
+    id: str
+    object: Literal['chat.completion.chunk']
+    created: int
+    model: str
+    choices: list[ChatCompletionChunkChoice]
+    usage: CompletionUsage | None = None
+    x_eugene_plexus: CompletionRoutingInfo | None = Field(
+        None,
+        description='Set on the **final frame only**, alongside `usage` — the\nsame place OpenAI puts its own end-of-stream extras.\nAbsent on every earlier frame, because the values are not\nknown until the completion is done.\n\nAdded at M8. Until then a streaming client could see no\nrouting information at all: the non-streaming response\ncarried this and the stream did not, so exactly the clients\nthat stream — the UI playground among them — were the ones\nthat could not tell which backend answered. Retained\nmetrics do not depend on this (they are recorded at the\nrouting hooks, which fire on both paths); this closes the\nmatching gap in what a caller can see.\n',
+    )
+
+
 class RoutingSlotView(BaseModel):
     model: str = Field(..., description='What a client asks for.')
     configured: bool | None = Field(
@@ -1322,6 +1447,59 @@ class RoutingSlotView(BaseModel):
         description='True when a `modelSlots` entry exists for this model; false\nfor the implicit one-tier slot every served model id gets.\n',
     )
     tiers: list[RoutingTierView]
+
+
+class ChatCompletionRequest(BaseModel):
+    model: str = Field(
+        ...,
+        description='A model id from `GET /v1/models`. The gateway resolves it to\na backend; the client does not choose a backend.\n',
+    )
+    messages: list[ChatCompletionMessage] = Field(..., min_length=1)
+    max_tokens: int | None = Field(
+        None,
+        description="Maximum output tokens. Filled from the model's settings\nprofile when omitted, then always sent downstream\nexplicitly.\n",
+        ge=1,
+    )
+    temperature: float | None = Field(None, ge=0.0, le=2.0)
+    top_p: float | None = Field(None, ge=0.0, le=1.0)
+    stop: list[str] | None = Field(None, description='Stop sequences.', max_length=4)
+    seed: int | None = Field(
+        None,
+        description='Passed through to backends that support deterministic\nsampling; dropped with a warning where they do not.\n',
+    )
+    stream: bool | None = Field(
+        False,
+        description='When true the response is an SSE stream of\n`ChatCompletionChunk` objects terminated by `data: [DONE]`.\n',
+    )
+    user: str | None = Field(
+        None, description='Opaque client-supplied identifier, echoed into logs only.'
+    )
+    tools: list[Tool] | None = Field(
+        None,
+        description='Tools the model may call. Passed through to the backend\nunchanged; the gateway never invents, filters or reorders\nthem.\n\n**The gateway does not execute tools.** It carries the\ndefinitions down and the model\'s chosen calls back up, and\nthe caller runs them and sends the results as `tool` role\nmessages. That is OpenAI\'s contract and it is the one an\nagent harness implements.\n\nA backend that cannot carry tools is not silently stripped:\nthe request fails with a 400 naming the backend, because a\nharness that receives a plain answer where it expected a\ntool call has no way to tell "the model chose not to" from\n"nobody ever offered it the tools" — and the second is a\nbug that looks exactly like the first. `GET /v1/models`\nreports which models can.\n',
+    )
+    tool_choice: ToolChoice | NamedToolChoice | None = Field(
+        None,
+        description='How the model should use `tools`. `auto` is the default when\ntools are present, `none` forbids calling one, `required`\nforces at least one call, and an object names a specific\nfunction. Passed through; the gateway does not enforce it.\n',
+    )
+    response_format: ResponseFormat | None = None
+
+
+class ChatCompletionResponse(BaseModel):
+    id: str = Field(
+        ..., description='Completion id, `chatcmpl-` prefixed as clients expect.'
+    )
+    object: Literal['chat.completion']
+    created: int
+    model: str = Field(
+        ...,
+        description='The model that actually served the request. Equal to the\nrequested id in the normal case; after a cascade it names\nwhat answered, which may differ.\n',
+    )
+    choices: list[ChatCompletionChoice]
+    usage: CompletionUsage | None = Field(
+        None, description='Present on the final chunk only.'
+    )
+    x_eugene_plexus: CompletionRoutingInfo | None = None
 
 
 class RoutingTableView(BaseModel):

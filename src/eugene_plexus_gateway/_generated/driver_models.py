@@ -4,10 +4,22 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+
+
+class ToolChoice(StrEnum):
+    """
+    `none`, `auto`, `required`, or an object naming one
+    function. Passed through.
+
+    """
+
+    none = 'none'
+    auto = 'auto'
+    required = 'required'
 
 
 class Role(StrEnum):
@@ -20,6 +32,7 @@ class Role(StrEnum):
     system = 'system'
     user = 'user'
     assistant = 'assistant'
+    tool = 'tool'
 
 
 class Message(BaseModel):
@@ -31,9 +44,17 @@ class Message(BaseModel):
     """
 
     role: Role
-    content: str = Field(
-        ...,
-        description='Message text. Text-only for now; multimodal extensions deferred.',
+    content: str | None = Field(
+        None,
+        description='Message text. Text-only for now; multimodal extensions\ndeferred. **Nullable, and no longer required:** an assistant\nturn that only calls a tool has no text to carry, and the\nalternative — an empty string — would assert the model said\nnothing when in fact it said something that was not text.\n',
+    )
+    toolCalls: list[dict[str, Any]] | None = Field(
+        None,
+        description="On an **assistant** message: the tool calls the model made,\nin OpenAI's `{id, type, function: {name, arguments}}` shape.\n\nDeliberately loose here. This is the *shared* schema, so a\ntightly-typed copy would be a third definition of the same\nobject alongside the gateway's and the driver's, and the one\nplace all three must agree is the wire format, which is\nOpenAI's and not ours to restate. The two API documents\ncarry the strict shapes.\n",
+    )
+    toolCallId: str | None = Field(
+        None,
+        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
     )
     timestamp: AwareDatetime | None = Field(
         None, description='When the message was produced. Server-assigned if omitted.'
@@ -578,7 +599,59 @@ class FinishReason(StrEnum):
     stop = 'stop'
     length = 'length'
     stop_sequence = 'stop_sequence'
+    tool_calls = 'tool_calls'
     error = 'error'
+
+
+class FunctionDefinition(BaseModel):
+    name: str
+    description: str | None = None
+    parameters: dict[str, Any] | None = Field(
+        None, description='A JSON Schema object, passed through verbatim.'
+    )
+    strict: bool | None = None
+
+
+class Function(BaseModel):
+    name: str
+
+
+class NamedToolChoice(BaseModel):
+    type: Literal['function']
+    function: Function
+
+
+class FunctionCall(BaseModel):
+    name: str
+    arguments: str = Field(
+        ...,
+        description='Arguments as a JSON **string**, not an object — a model can\nemit invalid JSON and the string preserves what it actually\nsaid. Not parsed here.\n',
+    )
+
+
+class Function1(BaseModel):
+    name: str | None = None
+    arguments: str | None = None
+
+
+class ToolCallDelta(BaseModel):
+    index: int
+    id: str | None = None
+    type: Literal['function'] = 'function'
+    function: Function1 | None = None
+
+
+class Type(StrEnum):
+    text = 'text'
+    json_object = 'json_object'
+    json_schema = 'json_schema'
+
+
+class ResponseJsonSchema(BaseModel):
+    name: str
+    description: str | None = None
+    schema_: dict[str, Any] = Field(..., alias='schema')
+    strict: bool | None = None
 
 
 class Usage(BaseModel):
@@ -598,6 +671,10 @@ class Capabilities(BaseModel):
 
     streaming: bool | None = Field(
         None, description='Whether `/v1/generate/stream` emits true incremental tokens.'
+    )
+    toolCalling: bool | None = Field(
+        None,
+        description='Whether this driver can carry `tools` to its backend and\nreport `toolCalls` back.\n\nThe gateway reads it to answer a question a harness\ncannot otherwise ask: a plain answer where a tool call\nwas expected looks identical whether the model declined\nor the backend never saw the tools. A driver that says\n`false` here is failed at the front door with a reason\ninstead.\n',
     )
     maxContextTokens: int | None = Field(None, ge=0)
 
@@ -628,29 +705,6 @@ class DriverInfo(BaseModel):
         None, description='Backend capabilities the gateway keys off when routing.'
     )
     version: str | None = Field(None, description='inference-driver semver.')
-
-
-class GenerateRequest(BaseModel):
-    messages: list[Message] = Field(
-        ...,
-        description='Full prompt as an ordered conversation. Whatever system\nmessage the caller wants is already in here; the driver does\nnot modify, prepend to, or reorder it.\n',
-    )
-    maxTokens: int | None = Field(
-        None,
-        description="Maximum output tokens. Backend-clamped. Owned by the caller\n(the gateway) — the driver applies no local default. Adapters\nwhose backends don't expose this knob (agentic CLIs) ignore\nit silently.\n",
-        ge=1,
-    )
-    temperature: float | None = Field(
-        None,
-        description="Sampling temperature. Backend-clamped. Owned by the caller\n(the gateway, which resolves it from the model's settings\nprofile) — the driver applies no local default. Backends that\nreject the parameter outright, as some reasoning models do,\nhave it dropped with a warning rather than erroring.\n",
-        ge=0.0,
-        le=2.0,
-    )
-    stop: list[str] | None = Field(None, description='Optional stop sequences.')
-    requestId: UUID | None = Field(
-        None,
-        description='Caller-supplied id for log correlation. Echoed in the response.',
-    )
 
 
 class ComputeDevice(BaseModel):
@@ -775,8 +829,77 @@ class ConfigSchema(BaseModel):
     )
 
 
+class StreamToken(BaseModel):
+    """
+    One `event: token` payload. Exactly one of `text` or `toolCalls`
+    is set.
+
+    """
+
+    text: str | None = Field(None, description="A fragment of the assistant's text.")
+    toolCalls: list[ToolCallDelta] | None = Field(
+        None,
+        description='Fragments of one or more tool calls, accumulated by `index`.\n',
+    )
+
+
+class Tool(BaseModel):
+    type: Literal['function']
+    function: FunctionDefinition
+
+
+class ToolCall(BaseModel):
+    id: str
+    type: Literal['function']
+    function: FunctionCall
+
+
+class ResponseFormat(BaseModel):
+    type: Type
+    json_schema: ResponseJsonSchema | None = None
+
+
+class GenerateRequest(BaseModel):
+    messages: list[Message] = Field(
+        ...,
+        description='Full prompt as an ordered conversation. Whatever system\nmessage the caller wants is already in here; the driver does\nnot modify, prepend to, or reorder it.\n',
+    )
+    maxTokens: int | None = Field(
+        None,
+        description="Maximum output tokens. Backend-clamped. Owned by the caller\n(the gateway) — the driver applies no local default. Adapters\nwhose backends don't expose this knob (agentic CLIs) ignore\nit silently.\n",
+        ge=1,
+    )
+    temperature: float | None = Field(
+        None,
+        description="Sampling temperature. Backend-clamped. Owned by the caller\n(the gateway, which resolves it from the model's settings\nprofile) — the driver applies no local default. Backends that\nreject the parameter outright, as some reasoning models do,\nhave it dropped with a warning rather than erroring.\n",
+        ge=0.0,
+        le=2.0,
+    )
+    stop: list[str] | None = Field(None, description='Optional stop sequences.')
+    requestId: UUID | None = Field(
+        None,
+        description='Caller-supplied id for log correlation. Echoed in the response.',
+    )
+    tools: list[Tool] | None = Field(
+        None,
+        description="Tools the model may call, in OpenAI's shape. Carried down to\nthe backend unchanged and never executed here — the driver\nis a protocol adapter, and running a tool is the caller's\njob by the same reasoning that keeps output-affecting\nparameters on the gateway.\n\nAn adapter whose backend cannot carry tools MUST fail the\nrequest rather than drop the field. Dropping it yields a\nplain answer that a harness cannot distinguish from the\nmodel declining to call anything.\n",
+    )
+    toolChoice: ToolChoice | NamedToolChoice | None = Field(
+        None,
+        description='`none`, `auto`, `required`, or an object naming one\nfunction. Passed through.\n',
+    )
+    responseFormat: ResponseFormat | None = None
+
+
 class GenerateResponse(BaseModel):
-    content: str = Field(..., description='The generated assistant text.')
+    content: str | None = Field(
+        None,
+        description='The generated assistant text. **Nullable since tool calling\nlanded:** a turn that only calls a tool produces no text,\nand an empty string would be a lie about what the model\nsaid. Was required; a response with `toolCalls` and no\n`content` is the common agent-loop case.\n',
+    )
+    toolCalls: list[ToolCall] | None = Field(
+        None,
+        description='Tools the model chose to call. Present when `finishReason`\nis `tool_calls`.\n',
+    )
     finishReason: FinishReason
     usage: Usage | None = None
     requestId: UUID | None = None

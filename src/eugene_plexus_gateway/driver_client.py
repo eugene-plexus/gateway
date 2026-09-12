@@ -84,6 +84,13 @@ class StreamEvent:
     """
 
     text: str = ""
+    tool_calls: list[dict[str, Any]] | None = None
+    """Tool-call fragments on this event, when the driver is streaming a
+    call rather than text. Kept as parsed JSON rather than a model: the
+    gateway's only job with a fragment is to re-frame it as an OpenAI
+    delta, and validating a *fragment* against the whole-call shape
+    would reject the normal case -- `id` and `name` arrive once, and
+    `arguments` arrives split at arbitrary points."""
     done: bool = False
     result: GenerateResponse | None = None
 
@@ -286,7 +293,17 @@ class HttpDriverClient:
                 if event_name == "done":
                     yield StreamEvent(done=True, result=GenerateResponse.model_validate(parsed))
                     return
-                text = parsed.get("text") if isinstance(parsed, dict) else None
+                if not isinstance(parsed, dict):
+                    continue
+                # A token frame carries text or tool-call fragments,
+                # never both. Both count as output, which is what makes
+                # the commit point in `TieredClient.stream` cover tool
+                # calls without knowing anything about them.
+                calls = parsed.get("toolCalls")
+                if isinstance(calls, list) and calls:
+                    yield StreamEvent(tool_calls=[c for c in calls if isinstance(c, dict)])
+                    continue
+                text = parsed.get("text")
                 if isinstance(text, str) and text:
                     yield StreamEvent(text=text)
 

@@ -22,6 +22,7 @@ from eugene_plexus_gateway._generated.driver_models import (
     FinishReason,
     GenerateRequest,
     GenerateResponse,
+    ToolCall,
     Usage,
 )
 from eugene_plexus_gateway.app import create_app
@@ -49,6 +50,7 @@ class FakeDriverClient:
         provider: str | None = None,
         max_context_tokens: int | None = None,
         runtime: str | None = None,
+        supports_tools: bool = False,
     ) -> None:
         self.name = name
         self.base_url = base_url
@@ -57,6 +59,10 @@ class FakeDriverClient:
         self.provider = provider
         self.max_context_tokens = max_context_tokens
         self.runtime = runtime
+        self.supports_tools = supports_tools
+        self.tool_calls: list[ToolCall] | None = None
+        """When set, `generate`/`stream` answer with these instead of
+        text -- the tool-call-only turn, whose `content` is None."""
 
         # Mirrors the real clients' surface so the route can read these
         # off either without asking which kind it holds.
@@ -79,8 +85,11 @@ class FakeDriverClient:
     def describe(self) -> DriverInfo:
         """The same answer `info()` gives, without needing a loop."""
         capabilities = (
-            Capabilities(maxContextTokens=self.max_context_tokens)
-            if self.max_context_tokens is not None
+            Capabilities(
+                maxContextTokens=self.max_context_tokens,
+                toolCalling=self.supports_tools,
+            )
+            if self.max_context_tokens is not None or self.supports_tools
             else None
         )
         return DriverInfo(
@@ -101,6 +110,16 @@ class FakeDriverClient:
         self.calls.append(request)
         if self.generate_error is not None:
             raise self.generate_error
+        if self.tool_calls is not None:
+            return GenerateResponse(
+                content=None,
+                toolCalls=self.tool_calls,
+                finishReason=FinishReason.tool_calls,
+                backend=self.backend,
+                modelId=self.model_id,
+                usage=self.usage,
+                latencyMs=1,
+            )
         text = self.responses.pop(0) if self.responses else f"<{self.name} default response>"
         return GenerateResponse(
             content=text,
@@ -126,6 +145,41 @@ class FakeDriverClient:
         self.calls.append(request)
         if self.generate_error is not None:
             raise self.generate_error
+        if self.tool_calls is not None:
+            # Split `arguments` in half so the test double reproduces
+            # the property that actually breaks readers: no single
+            # fragment is parseable JSON.
+            for index, call in enumerate(self.tool_calls):
+                args = call.function.arguments
+                half = len(args) // 2
+                if self.stream_error_after is not None and index >= self.stream_error_after:
+                    raise self.stream_error
+                yield StreamEvent(
+                    tool_calls=[
+                        {
+                            "index": index,
+                            "id": call.id,
+                            "type": "function",
+                            "function": {"name": call.function.name, "arguments": args[:half]},
+                        }
+                    ]
+                )
+                yield StreamEvent(
+                    tool_calls=[{"index": index, "function": {"arguments": args[half:]}}]
+                )
+            yield StreamEvent(
+                done=True,
+                result=GenerateResponse(
+                    content=None,
+                    toolCalls=self.tool_calls,
+                    finishReason=FinishReason.tool_calls,
+                    backend=self.backend,
+                    modelId=self.model_id,
+                    usage=self.usage,
+                    latencyMs=1,
+                ),
+            )
+            return
         text = self.responses.pop(0) if self.responses else f"<{self.name} default response>"
         pieces = [w + " " for w in text.split(" ")]
         if pieces:

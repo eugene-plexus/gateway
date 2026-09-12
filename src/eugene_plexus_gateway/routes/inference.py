@@ -30,6 +30,10 @@ from .._generated.driver_models import (
     Message,
     Role,
 )
+from .._generated.driver_models import NamedToolChoice as DriverNamedToolChoice
+from .._generated.driver_models import ResponseFormat as DriverResponseFormat
+from .._generated.driver_models import Tool as DriverTool
+from .._generated.driver_models import ToolChoice as DriverToolChoice
 from .._generated.models import (
     BackendKind,
     ChatCompletionChoice,
@@ -42,9 +46,14 @@ from .._generated.models import (
     CompletionUsage,
     Delta,
     FinishReason,
+    FunctionCall,
     ModelList,
+    ResponseFormat,
     Role1,
     Role2,
+    Tool,
+    ToolCall,
+    ToolCallDelta,
 )
 from ..config import ConfigStore
 from ..dependencies import require_authorized
@@ -210,6 +219,44 @@ def _no_such_model(model: str, table: RoutingTable | None) -> JSONResponse:
     )
 
 
+def _any_backend_carries_tools(resolution: Resolution) -> bool:
+    """Whether anything serving this model can carry tool definitions.
+
+    Deliberately `any` and not the `all` that `GET /v1/models` reports.
+    The two answer different questions: `/v1/models` advertises what a
+    caller can *rely* on across every replica, and this decides whether
+    to refuse a request outright. Refusing when one capable backend
+    exists would fail a request that would have worked.
+    """
+    return any(
+        b.info.capabilities is not None and bool(b.info.capabilities.toolCalling)
+        for b in resolution.backends()
+    )
+
+
+def _tools_unsupported(model: str) -> JSONResponse:
+    """400, in OpenAI's envelope so a harness's SDK raises properly.
+
+    The alternative -- dropping `tools` and answering -- is the failure
+    this whole milestone exists to prevent: a harness cannot tell "the
+    model chose not to call anything" from "nobody ever offered it the
+    tools", so it retries, re-prompts, and loops. That is the reported
+    symptom this project set out to fix, and producing it ourselves
+    while claiming to route around it would be worse than not shipping
+    tools at all.
+    """
+    return _error(
+        code=400,
+        message=(
+            f"No backend serving {model!r} can carry tool definitions, so the request "
+            "was refused rather than answered without them. "
+            "GET /v1/models reports x_eugene_plexus.tool_calling per model."
+        ),
+        error_type="invalid_request_error",
+        param="tools",
+    )
+
+
 def _not_ready(resolution: Resolution, wake: WakeResult | None) -> JSONResponse:
     """503: something serves this model and none of it can take a request
     right now. Retryable, so deliberately not a 502."""
@@ -271,6 +318,14 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
     resolution = table.resolve(body.model)
     if not resolution.has_backends():
         return _no_such_model(body.model, table)
+
+    # **Refused here, never stripped.** Checked before a backend is
+    # picked, because the answer must not depend on which replica the
+    # balancer happens to choose: a model that is tool-capable on two of
+    # three backends would otherwise work twice and fail once, which is
+    # the worst possible way to learn about it.
+    if body.tools and not _any_backend_carries_tools(resolution):
+        return _tools_unsupported(body.model)
 
     # Nothing eligible: first make sure that is still true — the snapshot
     # can be a refresh interval behind the agent about readiness, and the
@@ -388,18 +443,117 @@ def _to_generate_request(body: ChatCompletionRequest, store: ConfigStore | None)
             temperature = store.get("defaultTemperature")
 
     return GenerateRequest(
-        messages=[Message(role=Role(m.role.value), content=m.content) for m in body.messages],
+        messages=[_to_driver_message(m) for m in body.messages],
         maxTokens=max_tokens,
         temperature=temperature,
         stop=body.stop,
         requestId=None,
+        # Tools are the caller's, not ours. Unlike every parameter above
+        # them, there is no install default to fall back to and nothing
+        # sensible to invent: a tool the caller did not offer is one it
+        # cannot execute, so an absent field stays absent.
+        tools=_to_driver_tools(body.tools),
+        toolChoice=_to_driver_tool_choice(body.tool_choice),
+        responseFormat=_to_driver_response_format(body.response_format),
     )
+
+
+def _to_driver_message(message: ChatCompletionMessage) -> Message:
+    """One OpenAI message as the driver's shared `Message`.
+
+    `toolCalls` is typed loosely in `common.yaml` on purpose -- the
+    shared schema declines to be a third definition of OpenAI's object
+    -- so the calls go across as plain dicts and the driver re-shapes
+    them for its backend.
+    """
+    return Message(
+        role=Role(message.role.value),
+        content=message.content,
+        toolCalls=[c.model_dump(mode="json", exclude_none=True) for c in message.tool_calls]
+        if message.tool_calls
+        else None,
+        toolCallId=message.tool_call_id,
+    )
+
+
+def _to_driver_tools(tools: list[Tool] | None) -> list[DriverTool] | None:
+    """Re-shape rather than re-import.
+
+    The two documents define the same OpenAI object and codegen gives us
+    two unrelated classes for it; components share schemas, not code, so
+    crossing the boundary is a dump and a validate. `parameters` is a
+    free-form JSON Schema and rides through untouched.
+    """
+    if not tools:
+        return None
+    return [DriverTool.model_validate(t.model_dump(mode="json", exclude_none=True)) for t in tools]
+
+
+def _to_driver_tool_choice(choice: Any) -> Any:
+    """`none` / `auto` / `required`, or an object naming one function.
+
+    The enum members are distinct classes on the two sides even though
+    they carry identical values, which is what "share schemas, not code"
+    costs at every boundary and buys in not coupling two repos'
+    releases.
+    """
+    if choice is None:
+        return None
+    if hasattr(choice, "model_dump"):
+        return DriverNamedToolChoice.model_validate(
+            choice.model_dump(mode="json", exclude_none=True)
+        )
+    return DriverToolChoice(str(getattr(choice, "value", choice)))
+
+
+def _to_driver_response_format(fmt: ResponseFormat | None) -> DriverResponseFormat | None:
+    if fmt is None:
+        return None
+    return DriverResponseFormat.model_validate(fmt.model_dump(mode="json", exclude_none=True))
+
+
+def _to_openai_tool_calls(calls: Any) -> list[ToolCall] | None:
+    """The driver's tool calls in OpenAI's shape, for a client SDK."""
+    if not calls:
+        return None
+    return [
+        ToolCall(
+            id=c.id,
+            type="function",
+            function=FunctionCall(name=c.function.name, arguments=c.function.arguments),
+        )
+        for c in calls
+    ]
+
+
+def _to_openai_tool_call_deltas(fragments: list[dict[str, Any]]) -> list[ToolCallDelta]:
+    """Driver fragments re-framed as OpenAI deltas.
+
+    The two wires use the same field names here, so this is a validate
+    rather than a translation -- but it stays explicit, because the one
+    field the gateway must not lose is `index`: it is what lets a client
+    reassemble two interleaved calls, and a fragment that arrived
+    without one would silently merge them into a third call that was
+    never made.
+    """
+    out: list[ToolCallDelta] = []
+    for position, fragment in enumerate(fragments):
+        data = dict(fragment)
+        if not isinstance(data.get("index"), int):
+            data["index"] = position
+        out.append(ToolCallDelta.model_validate(data))
+    return out
 
 
 _FINISH_BY_DRIVER_REASON = {
     "stop": FinishReason.stop,
     "stop_sequence": FinishReason.stop,
     "length": FinishReason.length,
+    # The value that makes an agent loop terminate correctly. A caller
+    # that sees `stop` here stops; one that sees `tool_calls` dispatches
+    # and comes back. Getting this wrong does not look like an error --
+    # it looks like a model that answered instead of using its tools.
+    "tool_calls": FinishReason.tool_calls,
     # A truncated-by-error generation is reported as `stop` with the text
     # that did arrive, matching what OpenAI does — there is no OpenAI
     # finish reason for "the backend broke mid-stream", and inventing one
@@ -487,7 +641,11 @@ def _to_chat_completion(
         choices=[
             ChatCompletionChoice(
                 index=0,
-                message=ChatCompletionMessage(role=Role1.assistant, content=response.content),
+                message=ChatCompletionMessage(
+                    role=Role1.assistant,
+                    content=response.content,
+                    tool_calls=_to_openai_tool_calls(response.toolCalls),
+                ),
                 finish_reason=_finish_reason(response),
             )
         ],
@@ -590,6 +748,24 @@ async def _stream_completion(
                             model=body.model,
                         )
                     )
+                if event.tool_calls:
+                    # Forwarded as they land rather than accumulated to
+                    # the terminal frame: a harness wants to start
+                    # dispatching, and holding fragments back would make
+                    # a streamed tool call strictly worse than a
+                    # non-streamed one. Note this is past the commit
+                    # point -- `TieredClient.stream` set `committed` on
+                    # the first event of any kind, so a backend that
+                    # dies here truncates rather than splicing half a
+                    # call onto another model's.
+                    yield frame(
+                        envelope(
+                            delta=Delta(tool_calls=_to_openai_tool_call_deltas(event.tool_calls)),
+                            finish=None,
+                            model=body.model,
+                        )
+                    )
+                    continue
                 yield frame(
                     envelope(delta=Delta(content=event.text), finish=None, model=body.model)
                 )

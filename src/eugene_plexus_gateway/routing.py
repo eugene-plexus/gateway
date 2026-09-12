@@ -954,6 +954,7 @@ class RoutingTable:
                         drivers=[b.name for b in backends],
                         backends=sorted({_backend_kind(b) for b in backends}),
                         context_length=_smallest_context(backends),
+                        tool_calling=_all_carry_tools(backends),
                         tiers=[[b.name for b in t.backends] for t in resolution.tiers],
                         ready_backends=len(eligible),
                         on_demand=not eligible and bool(resolution.startable()),
@@ -1045,6 +1046,26 @@ def _backend_kind(backend: _Backend) -> BackendKind:
     explicit instead of hiding it behind a cast.
     """
     return BackendKind(backend.info.backend.value)
+
+
+def _all_carry_tools(backends: list[_Backend]) -> bool:
+    """Whether a request for this model may carry `tools`.
+
+    True only when **every** backend serving it can, by the same
+    reasoning `_smallest_context` follows: a request may land on any of
+    them, so the honest answer is the weakest one. A model that is
+    tool-capable on two replicas and not on a third is not tool-capable,
+    because the third will refuse and which one answers is our choice,
+    not the caller's.
+
+    False for a model with no backends at all -- nothing serves it, so
+    nothing about it can be promised.
+    """
+    if not backends:
+        return False
+    return all(
+        b.info.capabilities is not None and bool(b.info.capabilities.toolCalling) for b in backends
+    )
 
 
 def _smallest_context(backends: list[_Backend]) -> int | None:
