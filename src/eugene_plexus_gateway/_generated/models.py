@@ -834,6 +834,15 @@ class CompletionRoutingInfo(BaseModel):
         description='How long the request waited for a runtime to reach `ready`\nbefore being sent. Zero when nothing had to be woken.\n',
         ge=0,
     )
+    context_length: int | None = Field(
+        None,
+        description='The context window of the backend that actually answered, as\nthat backend resolved it. **Null** when it does not expose\none — a hosted provider, a CLI subscription, or a local\nengine that was not reachable to ask. Null and not absent:\nthis envelope serializes its unset fields, as `runtime` has\nsince M0.\n\nPer-request, and therefore not the same number as\n`x_eugene_plexus.context_length` on `GET /v1/models`: that\none is the smallest across every backend serving the name,\nbecause a request may land on any of them. This one is the\nwindow that applied to *this* request, which is what makes a\ntruncated answer explicable after the fact.\n',
+        ge=1,
+    )
+    prompt_truncated: bool | None = Field(
+        None,
+        description="**The backend silently dropped input.** True when the prompt\nwe sent was far larger than the token count the backend\nreported consuming — the signature of a server that fits an\nover-long prompt into the window by discarding the middle of\nthe conversation and answering anyway, with a 200 and no\nflag of its own.\n\nThis is the failure that makes a coding harness loop: it\nsends file contents, the model never receives them, and the\nconfident answer that comes back is about code nobody read.\nMeasured on this project's own hardware: 66,389 characters\nacross six messages came back as `prompt_tokens: 86`, HTTP\n200, nothing anywhere saying so.\n\nDetected, not predicted. It is computed from\n`usage.prompt_tokens` **after** the answer, by a ratio\nchosen to be far below any real tokenizer's — so it cannot\nfire on a merely token-dense prompt, and it needs no\ntokenizer of ours.\n\n**Three states, and the difference matters.** `null` means\nnot evaluated — the backend reported no usage, or the prompt\nwas too small for the test to mean anything — and must not\nbe read as reassurance. `false` means it was checked and the\ninput arrived. `true` means it did not. Null and not absent:\nthis envelope serializes its unset fields, as `runtime` has\nsince M0.\n\n**Why a flag and not an error.** The answer has already been\ngenerated, and on a streamed request it has already been\ndelivered — M10's rule is that a stream cannot be unsent.\nFailing one path and flagging the other would make the same\ncondition report two different ways, so both flag. A backend\nthat refuses instead of truncating needs none of this: its\nrefusal is exact and is passed straight through as a 400.\n",
+    )
 
 
 class RoutingBackendView(BaseModel):

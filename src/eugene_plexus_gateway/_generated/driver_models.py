@@ -676,7 +676,11 @@ class Capabilities(BaseModel):
         None,
         description='Whether this driver can carry `tools` to its backend and\nreport `toolCalls` back.\n\nThe gateway reads it to answer a question a harness\ncannot otherwise ask: a plain answer where a tool call\nwas expected looks identical whether the model declined\nor the backend never saw the tools. A driver that says\n`false` here is failed at the front door with a reason\ninstead.\n',
     )
-    maxContextTokens: int | None = Field(None, ge=0)
+    maxContextTokens: int | None = Field(
+        None,
+        description="The context window the backend **resolved**, read back\nfrom the backend itself — not the model's trained\nmaximum, and never an estimate.\n\nNull means unknown, and unknown is a real answer: a\nhosted provider exposes nothing to read, and a CLI\nsubscription has no window of its own to report. The\ngateway's `_smallest_context` folds this together with\nthe window a supervised runtime reports and publishes\nthe smallest as `x_eugene_plexus.context_length` on\n`GET /v1/models`, so a harness can size a prompt\nagainst the number that will actually apply.\n\n**Populated by a probe of the backend, which is why it\nexists at all.** A supervised runtime already tells the\nagent its window; this field is for the backend nobody\nsupervises — an Ollama or an LM Studio the operator\npoints us at — which until now reported no window\nanywhere. Contracted since M0 and populated by nothing\nuntil then, exactly as `streaming` was until M10.\n\n**Advertising, not enforcement.** Nothing here counts a\nprompt: the window is published so a caller can respect\nit, and a caller that does not is refused by the engine\nitself, whose count is exact. A backend that truncates\nsilently instead of refusing is caught after the fact —\nsee `x_eugene_plexus.prompt_truncated` in\n`gateway.yaml`.\n",
+        ge=0,
+    )
 
 
 class DriverInfo(BaseModel):

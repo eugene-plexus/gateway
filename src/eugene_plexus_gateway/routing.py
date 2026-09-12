@@ -892,6 +892,31 @@ class RoutingTable:
     def backends_for(self, model: str) -> list[_Backend]:
         return self.resolve(model).backends()
 
+    def context_length_for(self, model: str, driver: str | None) -> int | None:
+        """The window of the one backend that answered, not the smallest.
+
+        `_smallest_context` is the right number for `GET /v1/models`,
+        where a caller is choosing a model and a request may land on any
+        replica. It is the wrong number once a request has landed: what
+        explains a truncated answer is the window that actually applied.
+
+        Absent when the backend does not expose one. A supervised
+        runtime's reading wins over the driver's own, since the agent
+        reads it back from the engine after it loads.
+        """
+        if driver is None:
+            return None
+        for backend in self.resolve(model).backends():
+            if backend.name != driver:
+                continue
+            if backend.runtime is not None and backend.runtime.context_length:
+                return backend.runtime.context_length
+            caps = backend.info.capabilities
+            if caps is not None and caps.maxContextTokens:
+                return caps.maxContextTokens
+            return None
+        return None
+
     def runtime_for(self, model: str, driver: str | None = None) -> str | None:
         """Name of the engine runtime behind `driver` — or, without one,
         behind the only runtime serving `model`. Absent for a hosted or

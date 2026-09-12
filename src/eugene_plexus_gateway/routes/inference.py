@@ -566,6 +566,96 @@ def _finish_reason(response: GenerateResponse) -> FinishReason:
     return _FINISH_BY_DRIVER_REASON.get(response.finishReason.value, FinishReason.stop)
 
 
+# A prompt whose reported token count falls below one token per this
+# many characters did not arrive intact. **Chosen to be far below any
+# real tokenizer**, because the cost of the two errors is not
+# symmetrical: a false positive accuses a healthy backend, while the
+# condition itself is so gross when it happens that no tight bound is
+# needed to see it. Measured on this hardware: 66,389 characters came
+# back as 86 prompt tokens -- one token per 772 characters. English
+# prose runs about 4, and the most token-efficient real input anyone
+# sends (long runs of whitespace) does not reach 20.
+#
+# Note this is NOT the inverse of an estimator. `chars/4` was measured
+# to underestimate a real prompt by 19.4% (16,568 against 20,560), which
+# makes it unsafe for deciding whether something will *fit*. Deciding
+# whether something *arrived* is a different question with a much wider
+# margin, and it is the only one asked here.
+_TRUNCATION_CHARS_PER_TOKEN = 20
+
+# Below this the ratio stops meaning anything: no context window in use
+# anywhere is small enough for a prompt this size to be truncated, and
+# short inputs are where token density varies most.
+_TRUNCATION_MIN_CHARS = 1000
+
+
+def _prompt_chars(body: ChatCompletionRequest) -> int:
+    """How much text we handed the backend.
+
+    Counts message content only. Tool definitions and the chat template
+    add tokens we do not count here, which makes this an **under**count
+    of what was really sent -- and therefore biases the detector toward
+    silence rather than toward false accusation, which is the direction
+    to be wrong in.
+    """
+    total = 0
+    for message in body.messages or []:
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            total += len(content)
+    return total
+
+
+def _prompt_truncated(body: ChatCompletionRequest, usage: Any) -> bool | None:
+    """Did the backend silently drop most of the input?
+
+    The failure this catches: a server that fits an over-long prompt into
+    its window by discarding the middle of the conversation and answering
+    anyway, with a 200 and no flag of its own. Ollama does this --
+    verified with canaries, where the system message and the last turn
+    survived and the first and middle did not. A coding harness sends
+    file contents and gets a confident answer about code the model never
+    received, which is indistinguishable from the model being wrong.
+
+    `None` means not evaluated, and is a different claim from `False`:
+    a backend that reports no usage cannot be checked at all, and a
+    prompt below the floor is too small for the ratio to mean anything.
+
+    Detected after the fact on purpose. Predicting it would need a
+    tokenizer we do not have for the backends that do it -- Ollama
+    exposes none -- while this needs nothing but the number the backend
+    already returns.
+    """
+    reported = getattr(usage, "promptTokens", None)
+    if not isinstance(reported, int) or reported <= 0:
+        return None
+    chars = _prompt_chars(body)
+    if chars < _TRUNCATION_MIN_CHARS:
+        return None
+    return reported * _TRUNCATION_CHARS_PER_TOKEN < chars
+
+
+def _warn_if_truncated(
+    truncated: bool | None,
+    body: ChatCompletionRequest,
+    usage: Any,
+    driver: str | None,
+) -> None:
+    """Say it in the log too, because the flag rides a field most clients
+    drop. An operator chasing "the model keeps ignoring my files" needs
+    this line to exist somewhere they will look."""
+    if not truncated:
+        return
+    log.warning(
+        "backend %r reported consuming only %s prompt tokens for %d characters of input: "
+        "it discarded most of the prompt and answered anyway. The answer is about what "
+        "survived. Raise the backend's context window, or send less.",
+        driver,
+        getattr(usage, "promptTokens", None),
+        _prompt_chars(body),
+    )
+
+
 def _routing_info(
     client: DriverClient,
     table: RoutingTable,
@@ -574,6 +664,7 @@ def _routing_info(
     *,
     waited_ms: int = 0,
     swapped_in: bool = False,
+    prompt_truncated: bool | None = None,
 ) -> CompletionRoutingInfo:
     """Which backend actually served this, and whether failover fired.
 
@@ -611,6 +702,12 @@ def _routing_info(
         tier=tier if isinstance(tier, int) and tier >= 1 else 1,
         swapped_in=swapped_in,
         waited_ms=waited_ms,
+        # The window that applied to *this* request, which is not the
+        # smallest across every backend serving the name -- that is what
+        # `GET /v1/models` reports, and it is the right number there and
+        # the wrong one here.
+        context_length=table.context_length_for(model, served_by),
+        prompt_truncated=prompt_truncated,
     )
 
 
@@ -631,6 +728,8 @@ def _to_chat_completion(
             completion_tokens=response.usage.completionTokens,
             total_tokens=response.usage.totalTokens,
         )
+    truncated = _prompt_truncated(body, response.usage)
+    _warn_if_truncated(truncated, body, response.usage, getattr(client, "served_by", None))
     return ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex}",
         object="chat.completion",
@@ -651,7 +750,13 @@ def _to_chat_completion(
         ],
         usage=usage,
         x_eugene_plexus=_routing_info(
-            client, table, body.model, started, waited_ms=waited_ms, swapped_in=swapped_in
+            client,
+            table,
+            body.model,
+            started,
+            waited_ms=waited_ms,
+            swapped_in=swapped_in,
+            prompt_truncated=truncated,
         ),
     )
 
@@ -831,6 +936,14 @@ async def _stream_completion(
             usage=response.usage,
             backend_ms=response.latencyMs,
         )
+        # A truncated prompt is reported on the streamed path too, and it
+        # can only be a flag here: the answer has already been delivered
+        # and M10's rule is that a stream cannot be unsent. Flagging one
+        # path while failing the other would report one condition two
+        # different ways depending on a parameter the caller chose for
+        # unrelated reasons.
+        truncated = _prompt_truncated(body, response.usage)
+        _warn_if_truncated(truncated, body, response.usage, getattr(client, "served_by", None))
         # The routing extension rides the final frame, beside `usage` —
         # the same place OpenAI puts its end-of-stream extras, and the
         # earliest point at which any of it is known.
@@ -847,6 +960,7 @@ async def _stream_completion(
                     started,
                     waited_ms=rec.waited_ms,
                     swapped_in=rec.swapped_in,
+                    prompt_truncated=truncated,
                 ),
             )
         )
