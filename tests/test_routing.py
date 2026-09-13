@@ -153,6 +153,10 @@ async def test_non_driver_components_are_ignored(route_http: Any) -> None:
     Probing those for `/v1/info` would be nonsense."""
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/node":
+            # The gateway asks its own agent where the control root is
+            # (2026-09-13). A read of the agent, not a probe of a component.
+            return httpx.Response(200, json={"enrolled": False})
         if request.url.path == "/v1/components":
             return httpx.Response(
                 200,

@@ -64,6 +64,7 @@ import httpx
 from ._generated.driver_models import DriverInfo
 from ._generated.models import (
     BackendKind,
+    ControlRootView,
     DriverHealth,
     Model,
     ModelRoutingInfo,
@@ -208,6 +209,23 @@ class _Unreachable:
     error: str
 
 
+@dataclass(frozen=True)
+class ControlRootFacts:
+    """Where the node list came from on the last refresh, and whether it
+    answered. `source` is `config` (the `controlUrl` field, used as
+    given), `agent` (derived from this gateway's own agent) or `none`
+    (a single-host install). `derived_from` is which of the agent's two
+    answers it was -- `node` for the root the node is enrolled to,
+    `components` for a `control` component it declares -- for the log."""
+
+    source: str = "none"
+    url: str | None = None
+    reachable: bool = False
+    error: str | None = None
+    nodes: int | None = None
+    derived_from: str | None = None
+
+
 @dataclass
 class _Snapshot:
     """One resolved view of the world. Replaced wholesale on refresh so a
@@ -222,6 +240,7 @@ class _Snapshot:
     # node name -> that node's agent URL. `None` is the default agent,
     # which is the only agent when no control root is configured.
     agents: dict[str | None, str] = field(default_factory=dict)
+    control_root: ControlRootFacts = field(default_factory=ControlRootFacts)
     refreshed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -330,15 +349,21 @@ class RoutingTable:
         self._runtime_last_request: dict[str, float] = {}
         self._ready_since: dict[str, float] = {}
         self._cursor: dict[str, int] = {}
+        # `(url, source)` last written to the log, so the control root is
+        # announced when it is first found and when it changes -- not on
+        # every refresh.
+        self._announced_control_root: tuple[str | None, str] | None = None
 
     @property
     def _control_url(self) -> str | None:
-        """The control root's address as configured *right now*.
+        """The control root's address as *configured* right now -- the
+        `controlUrl` field, which is the operator's override. `None` means
+        the gateway works it out itself; see `_derive_control_url`.
 
         Normalized on every read rather than at construction, so a
         `PATCH /v1/config` reaches the next refresh. An empty string and
-        a whitespace-only value both mean "single host", which is what a
-        UI that clears the field sends.
+        a whitespace-only value both mean "not set", which is what a UI
+        that clears the field sends.
         """
         value = self._control_url_source()
         text = str(value).strip() if value is not None else ""
@@ -413,38 +438,148 @@ class RoutingTable:
         return {"Authorization": f"Bearer {self._service_token}"} if self._service_token else {}
 
     async def _get_json(self, url: str) -> Any | None:
+        body, error = await self._get_json_or_error(url)
+        if error is not None:
+            log.debug("could not read %s: %s", url, error)
+        return body
+
+    async def _get_json_or_error(self, url: str) -> tuple[Any | None, str | None]:
+        """The body, or why there is none.
+
+        The reason is the HTTP status plus the problem's title when the
+        far side sent one -- `503 Locked` is what a sealed control root
+        says -- else the transport error. Kept short, because it ends up
+        in a 404 an operator reads.
+        """
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.get(url, headers=self._headers())
-            if response.status_code >= 400:
-                log.debug("%s returned %d", url, response.status_code)
-                return None
-            return response.json()
-        except (httpx.HTTPError, ValueError) as e:
-            log.debug("could not read %s: %s", url, e)
-            return None
+        except httpx.HTTPError as e:
+            return None, str(e) or type(e).__name__
+        if response.status_code >= 400:
+            title: str | None = None
+            try:
+                problem = response.json()
+                detail = problem.get("detail") if isinstance(problem, dict) else None
+                inner = detail if isinstance(detail, dict) else problem
+                title = inner.get("title") if isinstance(inner, dict) else None
+            except ValueError:
+                title = None
+            code = str(response.status_code)
+            return None, f"{code} {title}" if isinstance(title, str) and title else f"HTTP {code}"
+        try:
+            return response.json(), None
+        except ValueError as e:
+            return None, f"not JSON: {e}"
+
+    async def _derive_control_url(self) -> tuple[str | None, str | None]:
+        """Ask this gateway's own agent where the install's control root is.
+
+        Two places a host already knows it: `GET /v1/node` names the root
+        this node is enrolled to, which is the answer on a control host
+        (its agent enrolls too, since M9) and on a worker; failing that,
+        `GET /v1/components` names the `control` component the agent
+        declares, which is the answer on a control host nobody has
+        enrolled yet -- first boot seeds control, gateway and library
+        before the wizard's Start. Neither means a single-host install.
+
+        Returns `(url, "node" | "components")`, or `(None, None)`. Read
+        on every refresh, like `controlUrl` itself, so an enrollment or a
+        promotion reaches the next refresh with no restart.
+        """
+        node = await self._get_json(f"{self._agent_url}/v1/node")
+        if isinstance(node, dict) and node.get("enrolled"):
+            url = node.get("controlUrl")
+            if isinstance(url, str) and url.strip():
+                return url.strip().rstrip("/"), "node"
+        body = await self._get_json(f"{self._agent_url}/v1/components")
+        components = body.get("components") if isinstance(body, dict) else None
+        for entry in components if isinstance(components, list) else []:
+            if isinstance(entry, dict) and entry.get("kind") == "control":
+                url = entry.get("url")
+                if isinstance(url, str) and url.strip():
+                    return url.strip().rstrip("/"), "components"
+        return None, None
+
+    def _announce_control_root(self, url: str | None, source: str, via: str | None) -> None:
+        """One log line when the control root is first found or changes."""
+        key = (url, source)
+        if key == self._announced_control_root:
+            return
+        self._announced_control_root = key
+        if url is None:
+            log.info(
+                "no control root: the agent at %s is neither enrolled nor declares one, so this "
+                "is a single-host install (set controlUrl to override)",
+                self._agent_url,
+            )
+        elif source == "config":
+            log.info("control root %s, from the controlUrl config field (used as given)", url)
+        else:
+            what = (
+                "the root this node is enrolled to"
+                if via == "node"
+                else "the control component its agent declares"
+            )
+            log.info(
+                "control root %s, derived from the agent at %s: %s", url, self._agent_url, what
+            )
 
     async def discover_agents(self) -> dict[str | None, str]:
-        """Which agents to read topology from.
+        """Which agents to read topology from. See `_discover`."""
+        agents, _facts = await self._discover()
+        return agents
+
+    async def _discover(self) -> tuple[dict[str | None, str], ControlRootFacts]:
+        """Which agents to read topology from, and where that answer came from.
+
+        The control root is the `controlUrl` field when an operator set
+        one -- used as given, even when it is wrong, because an expert
+        naming an address gets that address -- and otherwise whatever
+        this gateway's own agent knows (`_derive_control_url`). Until
+        2026-09-13 nothing set the field at all and nothing derived it,
+        so every multi-host install came up with its workers enrolled,
+        reachable, and invisible to routing.
 
         Without a control root: the one configured agent. With one: the
         node list it reports, each with its agent URL — the lookup that
         closes the loopback:8079 assumption for anything that has to
         reach a runtime on another host. A control root that does not
         answer leaves the previous agent map in place: management being
-        down must not empty the routing table.
+        down must not empty the routing table -- and the facts say it
+        did not answer, so the admin view and the no-models 404 can.
         """
-        control_url = self._control_url
+        configured = self._control_url
+        via: str | None = None
+        if configured is not None:
+            control_url: str | None = configured
+            source = "config"
+        else:
+            control_url, via = await self._derive_control_url()
+            source = "agent" if control_url is not None else "none"
+        self._announce_control_root(control_url, source, via)
         if control_url is None:
-            return {None: self._agent_url}
-        body = await self._get_json(f"{control_url}/v1/nodes")
+            return {None: self._agent_url}, ControlRootFacts()
+
+        body, error = await self._get_json_or_error(f"{control_url}/v1/nodes")
         nodes = body.get("nodes") if isinstance(body, dict) else None
         if not isinstance(nodes, list):
+            reason = error or "the response carried no node list"
             log.warning(
-                "control root at %s did not answer /v1/nodes; keeping the previous agent map",
+                "control root at %s did not answer /v1/nodes (%s); keeping the previous agent map",
                 control_url,
+                reason,
             )
-            return dict(self._snapshot.agents) or {None: self._agent_url}
+            previous = dict(self._snapshot.agents) or {None: self._agent_url}
+            facts = ControlRootFacts(
+                source=source,
+                url=control_url,
+                reachable=False,
+                error=reason,
+                nodes=self._snapshot.control_root.nodes,
+                derived_from=via,
+            )
+            return previous, facts
         agents: dict[str | None, str] = {}
         for node in nodes:
             if not isinstance(node, dict):
@@ -452,18 +587,22 @@ class RoutingTable:
             name, url = node.get("name"), node.get("url")
             if isinstance(name, str) and name and isinstance(url, str) and url:
                 agents[name] = url.rstrip("/")
+        listed = len(agents)
         if not agents:
             # An enrolled-nothing control root: fall back to the agent we
             # were told about, which is the single-host case anyway.
             agents = {None: self._agent_url}
-        return agents
+        facts = ControlRootFacts(
+            source=source, url=control_url, reachable=True, nodes=listed, derived_from=via
+        )
+        return agents, facts
 
     async def refresh(self) -> None:
         async with self._refresh_lock:
             await self._refresh_locked()
 
     async def _refresh_locked(self) -> None:
-        agents = await self.discover_agents()
+        agents, control_root = await self._discover()
 
         # Every agent, concurrently: its drivers and its runtimes.
         fetched = await asyncio.gather(
@@ -494,7 +633,7 @@ class RoutingTable:
             return_exceptions=True,
         )
 
-        snapshot = _Snapshot(runtimes=runtimes, agents=agents)
+        snapshot = _Snapshot(runtimes=runtimes, agents=agents, control_root=control_root)
         for probe in results:
             if isinstance(probe, BaseException):
                 log.warning("driver probe raised unexpectedly: %s", probe)
@@ -1110,6 +1249,25 @@ class RoutingTable:
             load_balancing=str(self._strategy() or LEAST_BUSY),
             slots=slots,
             unreachable_drivers=sorted(u.name for u in self._snapshot.unreachable),
+            control_root=self._control_root_view(),
+        )
+
+    def control_root(self) -> ControlRootFacts:
+        """Where the last refresh got its node list, and whether it
+        answered -- for the no-models 404, which used to name two
+        healthy places and never this."""
+        return self._snapshot.control_root
+
+    def _control_root_view(self) -> ControlRootView:
+        facts = self._snapshot.control_root
+        return ControlRootView.model_validate(
+            {
+                "source": facts.source,
+                "url": facts.url,
+                "reachable": facts.reachable,
+                "error": facts.error,
+                "nodes": facts.nodes,
+            }
         )
 
     def _backend_view(self, backend: _Backend) -> RoutingBackendView:

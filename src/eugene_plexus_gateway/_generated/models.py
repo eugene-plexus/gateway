@@ -985,6 +985,56 @@ class EmbeddingUsage(BaseModel):
     total_tokens: int | None = Field(None, ge=0)
 
 
+class Source(StrEnum):
+    """
+    `config` — the `controlUrl` config field, set by an operator
+    and used as given, even when wrong. `agent` — derived on
+    this refresh from the gateway's own agent: `GET /v1/node`
+    (`controlUrl`, when the node is enrolled), else the
+    `control` component the agent declares. `none` — neither
+    knew of one; the table is built from the one configured
+    agent, which is a single-host install.
+
+    """
+
+    config = 'config'
+    agent = 'agent'
+    none = 'none'
+
+
+class ControlRootView(BaseModel):
+    """
+    Where the routing table's node list comes from, and whether that
+    source answered on the last refresh. The control root is the one
+    thing routing needs from management — which agents exist and
+    where — and the one thing that, until 2026-09-13, nothing told
+    the gateway. It reads it from its own agent now; this says what
+    it found.
+
+    """
+
+    source: Source = Field(
+        ...,
+        description="`config` — the `controlUrl` config field, set by an operator\nand used as given, even when wrong. `agent` — derived on\nthis refresh from the gateway's own agent: `GET /v1/node`\n(`controlUrl`, when the node is enrolled), else the\n`control` component the agent declares. `none` — neither\nknew of one; the table is built from the one configured\nagent, which is a single-host install.\n",
+    )
+    url: AnyUrl | None = Field(
+        None,
+        description='The control root read, or tried. Absent when `source` is `none`.',
+    )
+    reachable: bool = Field(
+        ...,
+        description="Whether `GET /v1/nodes` answered on the last refresh. False\nkeeps the previous node list in force — management being\ndown must not empty the routing table — and is the state a\ncontainer's sealed root leaves every gateway in after a\nrestart. Always false when `source` is `none`.\n",
+    )
+    error: str | None = Field(
+        None,
+        description="Why it did not answer, when it did not: the HTTP status and\nthe problem's title when it sent one (`503 Locked`), else\nthe transport error.\n",
+    )
+    nodes: int | None = Field(
+        None,
+        description='How many nodes the control root listed on the last read that answered.',
+    )
+
+
 class RoutingBackendView(BaseModel):
     driver: str
     url: AnyUrl | None = None
@@ -1727,3 +1777,4 @@ class RoutingTableView(BaseModel):
     unreachable_drivers: list[str] | None = Field(
         None, description='Drivers in the topology that did not answer `/v1/info`.'
     )
+    control_root: ControlRootView | None = None

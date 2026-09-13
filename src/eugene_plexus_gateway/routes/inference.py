@@ -210,6 +210,32 @@ def _error(
     return JSONResponse(status_code=code, content=body)
 
 
+def _control_root_hint(table: RoutingTable | None) -> str:
+    """The sentence this 404 never said: whether the gateway could see
+    past this host at all.
+
+    A control root sealed after a container restart left every surface
+    reporting healthy and this response naming two healthy places
+    (2026-09-12). The routing table knows where it looked and what it
+    got; say it. Nothing to add when the root answered -- then the
+    problem really is on the agents.
+    """
+    if table is None:
+        return ""
+    root = table.control_root()
+    if root.source == "none":
+        return (
+            " Only this host's agent was read: it is not enrolled and runs no control "
+            "root, so there is no other node to look at (set controlUrl to override)."
+        )
+    if not root.reachable:
+        return (
+            f" The control root at {root.url} did not answer on the last refresh"
+            f" ({root.error or 'no node list'}), so only the previously known agents were read."
+        )
+    return ""
+
+
 def _no_such_model(model: str, table: RoutingTable | None) -> JSONResponse:
     known = table.known_models() if table is not None else []
     if known:
@@ -219,7 +245,7 @@ def _no_such_model(model: str, table: RoutingTable | None) -> JSONResponse:
             " No models are currently routable. Check the agent's "
             "GET /v1/runtimes for an engine in `ready` state, and that an "
             "inference-driver in GET /v1/components is pointed at its url."
-        )
+        ) + _control_root_hint(table)
     return _error(
         code=404,
         message=f"The model {model!r} does not exist.{hint}",

@@ -20,6 +20,7 @@ two real agents on two ports.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import httpx
@@ -58,6 +59,13 @@ class TwoAgents:
         self.lifecycle: list[tuple[str, str, str, Any]] = []
         """`(agent host, action, runtime, body)` for every stop/start."""
         self.control_status = 200
+        # What agent A's own `/v1/node` says: enrolled to this root, or not
+        # enrolled. And whether A's topology declares a `control` component.
+        # Both off by default so every test written before the gateway
+        # derived its control root still sees the single-host world it
+        # was written for.
+        self.enrolled_to: str | None = None
+        self.declares_control = False
         self.runtimes: dict[str, dict[str, Any]] = {
             "qwen-a": {
                 "name": "qwen-a",
@@ -107,7 +115,19 @@ class TwoAgents:
         if host == "control":
             if path == "/v1/nodes":
                 if self.control_status != 200:
-                    return httpx.Response(self.control_status, text="control is having a moment")
+                    # The shape a sealed control root really sends: FastAPI
+                    # wraps the Problem under `detail`.
+                    return httpx.Response(
+                        self.control_status,
+                        json={
+                            "detail": {
+                                "type": "https://github.com/eugene-plexus/control#locked",
+                                "title": "Locked",
+                                "status": self.control_status,
+                                "detail": "control is having a moment",
+                            }
+                        },
+                    )
                 return httpx.Response(
                     200,
                     json={
@@ -127,8 +147,23 @@ class TwoAgents:
 
         if host in ("agent-a", "agent-b") and port == 8079:
             node = "node-a" if host == "agent-a" else "node-b"
+            if path == "/v1/node":
+                enrolled = host == "agent-a" and self.enrolled_to is not None
+                return httpx.Response(
+                    200,
+                    json={
+                        "enrolled": enrolled,
+                        "name": node if enrolled else None,
+                        "controlUrl": self.enrolled_to if enrolled else None,
+                    },
+                )
             if path == "/v1/components":
-                return httpx.Response(200, json={"components": self.components[host]})
+                components = list(self.components[host])
+                if host == "agent-a" and self.declares_control:
+                    components.append(
+                        {"name": "control", "kind": "control", "url": CONTROL, "status": "running"}
+                    )
+                return httpx.Response(200, json={"components": components})
             if path == "/v1/runtimes":
                 mine = [r for r in self.runtimes.values() if r["node"] == node]
                 return httpx.Response(200, json={"runtimes": mine})
@@ -340,9 +375,12 @@ async def test_control_url_is_read_on_every_refresh_not_captured(two: TwoAgents)
     union view -- and invisible to routing, with an empty
     `unreachable_drivers` list saying nothing was wrong.
 
-    Nothing sets `controlUrl` automatically -- not the installers, not
-    the container, not the agent's first-boot topology -- so every
-    multi-host install passes through exactly this path.
+    Until 2026-09-13 nothing set `controlUrl` automatically -- not the
+    installers, not the container, not the agent's first-boot topology
+    -- so every multi-host install passed through exactly this path. The
+    gateway derives it from its own agent now (the tests at the bottom of
+    this file); this one keeps the override live and the fake agent here
+    knows of no control root, so unset still means single host.
     """
     configured: str | None = None
     table = RoutingTable(agent_url=AGENT_A, control_url=lambda: configured, refresh_seconds=3600)
@@ -375,3 +413,157 @@ async def test_a_plain_control_url_string_still_works(two: TwoAgents) -> None:
         "qwen-a-driver",
         "qwen-b-driver",
     ]
+
+
+# --------------------------------------------------------------------------- #
+# the control root is derived from the gateway's own agent
+# --------------------------------------------------------------------------- #
+
+
+def _root(table: RoutingTable) -> dict[str, Any]:
+    view = table.as_routing_view().control_root
+    assert view is not None
+    return {
+        "source": str(view.source.value if hasattr(view.source, "value") else view.source),
+        "url": str(view.url).rstrip("/") if view.url is not None else None,
+        "reachable": view.reachable,
+        "error": view.error,
+        "nodes": view.nodes,
+    }
+
+
+async def test_the_control_root_is_derived_from_the_enrolled_agent(two: TwoAgents) -> None:
+    """Nothing set `controlUrl` -- not the installers, not the container,
+    not the agent's first boot -- so every multi-host install came up with
+    its workers enrolled, reachable and invisible to routing (2026-09-11).
+    The gateway asks its own agent now, and an enrolled node knows its
+    root."""
+    two.enrolled_to = CONTROL
+    table = RoutingTable(agent_url=AGENT_A, refresh_seconds=3600)
+
+    await table.refresh()
+
+    assert sorted(b.name for b in table.backends_for(MODEL)) == ["qwen-a-driver", "qwen-b-driver"]
+    assert _root(table) == {
+        "source": "agent",
+        "url": CONTROL,
+        "reachable": True,
+        "error": None,
+        "nodes": 2,
+    }
+
+
+async def test_an_unenrolled_agent_that_runs_the_control_root_still_names_it(
+    two: TwoAgents,
+) -> None:
+    """First boot seeds control, gateway and library before anybody has
+    enrolled anything. The gateway finds the root in the topology."""
+    two.declares_control = True
+    table = RoutingTable(agent_url=AGENT_A, refresh_seconds=3600)
+
+    await table.refresh()
+
+    assert sorted(b.name for b in table.backends_for(MODEL)) == ["qwen-a-driver", "qwen-b-driver"]
+    assert _root(table)["source"] == "agent"
+    assert _root(table)["url"] == CONTROL
+
+
+async def test_no_control_root_anywhere_is_a_single_host_install(two: TwoAgents) -> None:
+    table = RoutingTable(agent_url=AGENT_A, refresh_seconds=3600)
+
+    await table.refresh()
+
+    assert sorted(b.name for b in table.backends_for(MODEL)) == ["qwen-a-driver"]
+    assert _root(table) == {
+        "source": "none",
+        "url": None,
+        "reachable": False,
+        "error": None,
+        "nodes": None,
+    }
+
+
+async def test_a_configured_control_url_wins_even_when_it_is_wrong(two: TwoAgents) -> None:
+    """The override is topmost: set, it is used as given and the agent's
+    better answer is not consulted. An expert naming an address gets that
+    address."""
+    two.enrolled_to = CONTROL
+    table = RoutingTable(agent_url=AGENT_A, control_url="http://nowhere:1", refresh_seconds=3600)
+
+    await table.refresh()
+
+    assert sorted(b.name for b in table.backends_for(MODEL)) == ["qwen-a-driver"]
+    root = _root(table)
+    assert root["source"] == "config"
+    assert root["url"] == "http://nowhere:1"
+    assert root["reachable"] is False
+    assert root["error"]
+
+
+async def test_the_derived_root_is_read_on_every_refresh(two: TwoAgents) -> None:
+    """Enrollment happens after the gateway is up -- the wizard's Start
+    enrolls the control host's own agent -- so the answer has to be
+    re-asked, not captured."""
+    table = RoutingTable(agent_url=AGENT_A, refresh_seconds=3600)
+    await table.refresh()
+    assert _root(table)["source"] == "none"
+
+    two.enrolled_to = CONTROL
+    await table.refresh()
+
+    assert _root(table)["source"] == "agent"
+    assert sorted(b.name for b in table.backends_for(MODEL)) == ["qwen-a-driver", "qwen-b-driver"]
+
+
+async def test_a_sealed_control_root_is_reported_not_hidden(two: TwoAgents) -> None:
+    """A container's root comes back locked after every restart while
+    every health check says ok. The routing view says what the gateway
+    got, the previous node list stays in force, and the no-models 404
+    says where the gateway looked."""
+    two.enrolled_to = CONTROL
+    two.components = {"agent-a": [], "agent-b": []}  # nothing routable, so the 404 explains
+    table = RoutingTable(agent_url=AGENT_A, refresh_seconds=3600)
+    await table.refresh()
+    assert _root(table)["nodes"] == 2
+
+    two.control_status = 503
+    await table.refresh()
+
+    root = _root(table)
+    assert root["reachable"] is False
+    assert root["error"] == "503 Locked"
+    assert root["nodes"] == 2, "the count is from the last read that answered"
+    assert sorted(table._snapshot.agents) == ["node-a", "node-b"], "the previous list stays"
+
+    from eugene_plexus_gateway.routes.inference import _no_such_model
+
+    message = json.loads(_no_such_model("x", table).body)["error"]["message"]
+    assert "did not answer on the last refresh (503 Locked)" in message
+    assert CONTROL in message
+
+
+async def test_a_single_host_404_says_only_this_host_was_read(two: TwoAgents) -> None:
+    two.components = {"agent-a": [], "agent-b": []}
+    table = RoutingTable(agent_url=AGENT_A, refresh_seconds=3600)
+    await table.refresh()
+
+    from eugene_plexus_gateway.routes.inference import _no_such_model
+
+    message = json.loads(_no_such_model("x", table).body)["error"]["message"]
+    assert "Only this host's agent was read" in message
+
+
+async def test_the_control_root_is_announced_once_not_every_refresh(
+    two: TwoAgents, caplog: pytest.LogCaptureFixture
+) -> None:
+    two.enrolled_to = CONTROL
+    caplog.set_level(logging.INFO, logger="eugene_plexus_gateway.routing")
+    table = RoutingTable(agent_url=AGENT_A, refresh_seconds=3600)
+
+    await table.refresh()
+    await table.refresh()
+    await table.refresh()
+
+    announcements = [r for r in caplog.records if "derived from the agent" in r.getMessage()]
+    assert len(announcements) == 1
+    assert "the root this node is enrolled to" in announcements[0].getMessage()

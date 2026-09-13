@@ -184,12 +184,17 @@ FIELDS: list[ConfigField] = [
         key="controlUrl",
         label="Control root",
         description=(
-            "The control root's address, for a multi-host install. When set, "
-            "the gateway reads the node list from it and talks to each "
-            "node's own agent for that node's drivers and runtimes, and "
-            "sends stop/start for a runtime to the agent that owns it. "
-            "Leave empty on a single-host install: the one configured agent "
-            "is both. Takes effect on the next routing refresh."
+            "Where the control root is, when this gateway should not work it "
+            "out itself. Leave it empty and the gateway asks its own agent on "
+            "every refresh: the control root this node is enrolled to, else "
+            "the control component the agent runs, else this host alone. Set "
+            "it to override that -- for a gateway whose agent is neither "
+            "enrolled nor running a control root, or to force an address -- "
+            "and it is used as given, even when wrong. Either way the gateway "
+            "reads the node list from the root and talks to each node's own "
+            "agent for that node's drivers and runtimes. Takes effect on the "
+            "next routing refresh; the Inference screen's routing table says "
+            "which address is in use and whether it answered."
         ),
         category="routing",
         valueType=ConfigValueType.url,
