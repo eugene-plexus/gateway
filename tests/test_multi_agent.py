@@ -567,3 +567,33 @@ async def test_the_control_root_is_announced_once_not_every_refresh(
     announcements = [r for r in caplog.records if "derived from the agent" in r.getMessage()]
     assert len(announcements) == 1
     assert "the root this node is enrolled to" in announcements[0].getMessage()
+
+
+async def test_a_root_that_stays_sealed_is_warned_about_once(
+    two: TwoAgents, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An uninitialized root before the wizard, or a sealed one after a
+    container restart, is that way for minutes to hours; a warning every
+    refresh is a log nobody reads. One line when it stops answering, one
+    when it answers again."""
+    two.enrolled_to = CONTROL
+    caplog.set_level(logging.DEBUG, logger="eugene_plexus_gateway.routing")
+    table = RoutingTable(agent_url=AGENT_A, refresh_seconds=3600)
+    await table.refresh()
+
+    two.control_status = 503
+    for _ in range(4):
+        await table.refresh()
+    two.control_status = 200
+    await table.refresh()
+
+    warnings = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "did not answer" in r.getMessage()
+    ]
+    recoveries = [r for r in caplog.records if "answers again" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "503 Locked" in warnings[0].getMessage()
+    assert len(recoveries) == 1
+    assert _root(table)["reachable"] is True

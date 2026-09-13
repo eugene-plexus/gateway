@@ -353,6 +353,10 @@ class RoutingTable:
         # announced when it is first found and when it changes -- not on
         # every refresh.
         self._announced_control_root: tuple[str | None, str] | None = None
+        # The last "did not answer" reason written to the log at WARNING,
+        # so a root that is sealed for an hour costs one line, not one
+        # every refresh -- and its recovery costs one more.
+        self._announced_unreachable: str | None = None
 
     @property
     def _control_url(self) -> str | None:
@@ -565,11 +569,16 @@ class RoutingTable:
         nodes = body.get("nodes") if isinstance(body, dict) else None
         if not isinstance(nodes, list):
             reason = error or "the response carried no node list"
-            log.warning(
-                "control root at %s did not answer /v1/nodes (%s); keeping the previous agent map",
-                control_url,
-                reason,
-            )
+            if reason != self._announced_unreachable:
+                log.warning(
+                    "control root at %s did not answer /v1/nodes (%s); keeping the previous "
+                    "agent map until it does",
+                    control_url,
+                    reason,
+                )
+                self._announced_unreachable = reason
+            else:
+                log.debug("control root at %s still not answering (%s)", control_url, reason)
             previous = dict(self._snapshot.agents) or {None: self._agent_url}
             facts = ControlRootFacts(
                 source=source,
@@ -588,6 +597,9 @@ class RoutingTable:
             if isinstance(name, str) and name and isinstance(url, str) and url:
                 agents[name] = url.rstrip("/")
         listed = len(agents)
+        if self._announced_unreachable is not None:
+            log.info("control root at %s answers again: %d node(s)", control_url, listed)
+            self._announced_unreachable = None
         if not agents:
             # An enrolled-nothing control root: fall back to the agent we
             # were told about, which is the single-host case anyway.
