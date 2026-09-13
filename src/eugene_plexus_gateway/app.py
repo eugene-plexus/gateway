@@ -23,6 +23,7 @@ from fastapi import Depends, FastAPI
 from . import __version__
 from .auth_state import AuthState, load_auth_state
 from .config import ConfigStore
+from .cors import FrontDoorCors
 from .dependencies import require_operator
 from .lifecycle import AgentLifecycleClient, LifecycleManager
 from .metrics import MetricsStore
@@ -184,5 +185,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # and another component are both legitimate callers. Declared on the
     # router's own routes, so this is just the mount.
     app.include_router(inference_routes.router)
+
+    # CORS on the three OpenAI-compatible paths, and on nothing else, so a
+    # browser-based client -- the playground's direct mode among them --
+    # can use the front door the way a non-browser client always could.
+    # Configured live from the store; see `cors.py`.
+    app.add_middleware(FrontDoorCors)
 
     return app

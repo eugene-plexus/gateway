@@ -40,6 +40,7 @@ CATEGORY_LABELS: dict[str, str] = {
     "lifecycle": "Lifecycle policy",
     "metrics": "Request metrics",
     "logging": "Logging",
+    "clients": "Browser clients",
 }
 
 LOAD_BALANCING_VALUES = ["least_busy", "round_robin"]
@@ -269,6 +270,44 @@ FIELDS: list[ConfigField] = [
         default=True,
         requiresRestart=True,
     ),
+    # --- Browser clients ---------------------------------------------------
+    #
+    # CORS on the OpenAI-compatible paths and nothing else. See `cors.py`
+    # for why any origin is the safe default here: the front door
+    # authenticates by an explicit bearer and never by a cookie, so a
+    # page cannot spend a token it was not given. Both fields are read on
+    # every request, so `requiresRestart` is false and true in fact.
+    ConfigField(
+        key="corsEnabled",
+        label="Answer browser clients (CORS)",
+        description=(
+            "Let a web page on another origin call this gateway's OpenAI-compatible "
+            "paths (/v1/models, /v1/chat/completions, /v1/embeddings) directly -- the "
+            "playground's direct mode, Open WebUI in a tab, a web app built on the "
+            "OpenAI SDK. Operator paths (/v1/config, /v1/admin, /v1/metrics) never "
+            "answer browsers from another origin regardless. Off, a browser gets "
+            "'Failed to fetch' and a curl of the same preflight gets a 403 that says "
+            "why. Takes effect on the next request."
+        ),
+        category="clients",
+        valueType=ConfigValueType.boolean,
+        default=True,
+    ),
+    ConfigField(
+        key="corsAllowedOrigins",
+        label="Allowed browser origins",
+        description=(
+            "Which origins may call the OpenAI-compatible paths from a browser, as "
+            "the browser spells them: scheme, host and port, no path -- "
+            "http://192.168.1.20:8079, for example. Empty means any origin, which is "
+            "safe because every request still needs a bearer token the page must "
+            "hold; list origins to admit only your own UI's. Takes effect on the "
+            "next request."
+        ),
+        category="clients",
+        valueType=ConfigValueType.url_list,
+        default=[],
+    ),
 ]
 
 _FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in FIELDS}
@@ -344,6 +383,24 @@ def _validate_value(field: ConfigField, value: Any) -> str | None:
         allowed = field.enumValues or []
         if value not in allowed:
             return f"must be one of {allowed}"
+        return None
+
+    if vt == ConfigValueType.url_list:
+        # Same rule as the control root's standby list: a list of
+        # non-empty strings, each named once. What an entry means is the
+        # field's business -- for `corsAllowedOrigins` it is an origin,
+        # which is a URL with no path.
+        if not isinstance(value, list):
+            return f"expected a list of URLs, got {type(value).__name__}"
+        seen: dict[str, int] = {}
+        for position, item in enumerate(value):
+            if not isinstance(item, str):
+                return f"entry {position} is {type(item).__name__}, expected a string"
+            if not item.strip():
+                return f"entry {position} is empty"
+            if item in seen:
+                return f"entry {position} duplicates entry {seen[item]} ({item!r})"
+            seen[item] = position
         return None
 
     if vt == ConfigValueType.model_slots:
