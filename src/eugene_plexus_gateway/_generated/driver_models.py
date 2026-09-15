@@ -337,6 +337,22 @@ class ConfigValueType(StrEnum):
     the agent's field description, not here — the type promises a
     list of pairs and nothing about what they mean.
 
+    `library_folders` (2026-09-14) is an ordered JSON array of
+    `LibraryFolder` — `{"path": <a directory on the library's
+    host>, "mounts": [<where other machines find the same
+    directory>, ...]}`. Its one user is the library's `modelRoots`,
+    which was a `path_list` until the reach of a folder moved onto
+    the folder: a folder is one exported share, mounted the same
+    way on every node of one OS, so the library says where once and
+    every node inherits it rather than each node carrying a row per
+    folder. A bare string is accepted wherever a `LibraryFolder` is
+    expected and means a folder with no mounts — so a config file,
+    a PATCH body or a default written for `path_list` still works,
+    and `GET /v1/config` always answers in the object form. UIs
+    render it as rows of one browsable directory (the library's
+    host) plus its mounts; the per-node grid over it is the
+    Library's Folders page, not this field.
+
     """
 
     string = 'string'
@@ -354,6 +370,7 @@ class ConfigValueType(StrEnum):
     node_name = 'node_name'
     model_slots = 'model_slots'
     path_mappings = 'path_mappings'
+    library_folders = 'library_folders'
 
 
 class ConfigFieldShowWhen(BaseModel):
@@ -636,6 +653,41 @@ class PathMapping(BaseModel):
     to: str = Field(
         ...,
         description="The same directory on the host holding this config. Used\nverbatim, `~` expanded; the remainder of a matched path is\nre-joined onto it with this host's own separator.\n",
+    )
+
+
+class LibraryFolder(BaseModel):
+    """
+    One directory the library catalogues, and where other machines
+    find it (2026-09-14).
+
+    `path` is the directory as the library's own host spells it —
+    what the scanner walks, what a `ModelSummary.path` starts with,
+    the left-hand side of every rule that reaches it. `mounts` is
+    the same directory as **other** machines see it: a POSIX-shaped
+    entry is for Linux and macOS nodes, a Windows-shaped one (drive
+    letter or UNC) for Windows nodes, and a node takes the first
+    entry of its own shape. That is the whole of "how does node X
+    reach folder Y" for every node that mounts the share where the
+    folder says; a node that mounts it elsewhere carries one
+    override in its agent's `pathMappings`, and a node with no
+    mount of its shape opens `path` as written — the identical-mount
+    convention, and every single-host install.
+
+    The rule this replaces was per node per folder, on each node's
+    agent, and grew as nodes × folders with every row typed by hand.
+    This is per folder, stated once. Nothing is copied or cached:
+    the operator mounts the share, this says where.
+
+    """
+
+    path: str = Field(
+        ...,
+        description="Absolute, as the library's host spells it. Immutable in the\nsense that changing it is a different folder: models are\nidentified by their path under it.\n",
+    )
+    mounts: list[str] | None = Field(
+        [],
+        description='Absolute paths, each Windows- or POSIX-shaped; the shape\nsays which nodes it is for. Order matters only among entries\nof one shape, where the first wins. Empty means "reached at\n`path`, or not at all".\n',
     )
 
 
