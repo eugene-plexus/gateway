@@ -158,7 +158,7 @@ def test_expired_token_rejects(authed_client: TestClient, signing_key: bytes) ->
         signing_key=signing_key,
         sub="operator",
         aud="operator",
-        ttl_seconds=-60,
+        ttl_seconds=-600,  # past the 300 s clock-skew leeway, not merely past exp
         iat=int(time.time()) - 120,
     )
     response = authed_client.get("/v1/config", headers={"Authorization": f"Bearer {expired}"})
