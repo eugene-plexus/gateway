@@ -22,6 +22,7 @@ from fastapi import Depends, FastAPI
 
 from . import __version__
 from .auth_state import AuthState, load_auth_state
+from .client_keys import ClientKeyGuard
 from .config import ConfigStore
 from .cors import FrontDoorCors
 from .dependencies import require_operator
@@ -100,6 +101,24 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 metrics = candidate
                 app.state.metrics = candidate
 
+    # Which client keys have been turned off (S4). Asks this gateway's
+    # OWN node's agent -- the one that minted them, and the one the
+    # contract tells an operator to mint against. Consulted only for a
+    # token that carries `aud: client`, so an install with no client
+    # keys never makes the call.
+    guard: ClientKeyGuard | None = None
+    if not hasattr(app.state, "client_key_guard"):
+        if auth_state.auth_disabled:
+            # Nothing verifies here, so nothing can be revoked here.
+            app.state.client_key_guard = None
+        else:
+            guard = ClientKeyGuard(
+                agent_url=settings.agent_url,
+                service_token=auth_state.service_token,
+                ttl_seconds=float(store.get("routingRefreshSeconds") or 15),
+            )
+            app.state.client_key_guard = guard
+
     # Tests inject `app.state.routing` with a pre-populated table; the
     # lifespan otherwise builds the real one and owns its teardown.
     owns_routing = False
@@ -145,6 +164,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await lifecycle.aclose()
         if owns_routing and app.state.routing is not None:
             await app.state.routing.aclose()
+        if guard is not None:
+            await guard.aclose()
         # Last, so rows queued by requests still in flight during
         # shutdown are flushed rather than dropped.
         if metrics is not None:

@@ -30,6 +30,17 @@ _JWT_ALG = "HS256"
 AUDIENCE_OPERATOR = "operator"
 SERVICE_AUDIENCE_PREFIX = "service:"
 
+AUDIENCE_CLIENT = "client"
+"""A long-lived key an app outside the install holds (S4, 2026-09-15).
+
+Accepted here on the three OpenAI-compatible paths and refused
+everywhere else in the install -- not by a rule anyone maintains, but
+because `client` is neither `operator` nor a `service:` audience, and
+every other check in every other component tests for one of those two.
+This module is the single place that opts in, and `require_authorized`
+is the single caller that passes `accept_client=True`.
+"""
+
 
 @dataclass(frozen=True)
 class TokenPayload:
@@ -39,6 +50,14 @@ class TokenPayload:
     aud: str
     iat: int
     exp: int
+    jti: str | None = None
+    """The client key's id, on a client key; None on every other token.
+
+    Not in the `require` list, because operator sessions and service
+    tokens have never carried one and demanding it would refuse every
+    token minted before 2026-09-15 -- including the one the operator is
+    holding while the gateway is upgraded under them.
+    """
 
 
 CLOCK_SKEW_LEEWAY_SECONDS = 300
@@ -92,6 +111,7 @@ def decode_token(
     signing_key: bytes,
     accept_operator: bool = True,
     accept_any_service: bool = True,
+    accept_client: bool = False,
 ) -> TokenPayload:
     """Verify a bearer token's signature + expiry and return its claims.
 
@@ -104,12 +124,17 @@ def decode_token(
       * `accept_operator=True, accept_any_service=False` — operator-only
         endpoints (config edits, admin/restart).
 
+    `accept_client` is off by default and turned on in exactly one
+    place: the three OpenAI-compatible paths. A client key must never
+    reach an operator surface, and the default being `False` is what
+    makes a new endpoint safe by omission rather than by vigilance.
+
     Raises:
       jwt.InvalidTokenError — signature mismatch, malformed, expired,
         or audience not in the accept-set. All auth failures collapse
         into this base class so the dependency layer can `except` once.
     """
-    if not (accept_operator or accept_any_service):
+    if not (accept_operator or accept_any_service or accept_client):
         raise ValueError("must accept at least one audience class")
 
     # Decode without strict audience match — pyjwt's `audience` kwarg
@@ -131,12 +156,15 @@ def decode_token(
     aud = str(claims["aud"])
     is_operator = accept_operator and aud == AUDIENCE_OPERATOR
     is_service = accept_any_service and aud.startswith(SERVICE_AUDIENCE_PREFIX)
-    if not (is_operator or is_service):
+    is_client = accept_client and aud == AUDIENCE_CLIENT
+    if not (is_operator or is_service or is_client):
         raise jwt.InvalidAudienceError(f"audience {aud!r} not accepted")
 
+    raw_jti = claims.get("jti")
     return TokenPayload(
         sub=str(claims["sub"]),
         aud=aud,
         iat=int(claims["iat"]),
         exp=int(claims["exp"]),
+        jti=str(raw_jti) if raw_jti is not None else None,
     )
