@@ -410,3 +410,57 @@ async def test_eviction_never_touches_a_runtime_without_a_timeout_or_with_traffi
     assert result.evicted == []
     assert [c for c in agent.calls if c[0] == "stop"] == []
     assert "could not start runtime 'big'" in result.message
+
+
+@pytest.mark.anyio
+async def test_a_copying_runtime_is_coming_up_rather_than_nobody_asked_to_start(
+    agent: FakeAgent, table: RoutingTable, manager: LifecycleManager
+) -> None:
+    """A node making its own local copy of a model is not stopped.
+
+    `copying` (node-local-model-copy.md) is emitted for the minutes a
+    node spends copying a 25 GB model to its own disk, with no process
+    spawned yet. It is neither `stopped` — so nothing is startable —
+    nor, before this, in the set `waking()` matched, so a request for
+    that model fell through to "none of its runtimes asked to be started
+    on demand": false, and unactionable for someone whose model is four
+    minutes away.
+
+    This is the gateway learning the status BEFORE any agent emits it:
+    the gateway re-pins independently, so a newer agent against an older
+    gateway is the ordinary case rather than the exotic one.
+    """
+    for name in ("qwen3-a", "qwen3-b"):
+        agent.runtimes[name]["status"] = "copying"
+    await table.refresh()
+
+    result = await manager.wake(table.resolve(LOCAL))
+
+    assert result.ok is False
+    assert "still coming up" in result.message
+    assert "(copying)" in result.message
+    assert [c for c in agent.calls if c[0] == "start"] == []
+
+
+@pytest.mark.anyio
+async def test_a_status_this_build_has_never_heard_of_is_carried_through(
+    agent: FakeAgent, table: RoutingTable, manager: LifecycleManager
+) -> None:
+    """Version skew is the normal state of a pinned polyrepo.
+
+    The gateway does not codegen `agent.yaml`, so it parses `status` as
+    text on purpose. An unknown value must not raise, must not make a
+    runtime look ready, and must be reported as itself — the operator
+    reading "is invented-state" learns more than one reading "unknown".
+    """
+    agent.runtimes["qwen3-a"]["status"] = "invented-state"
+    agent.runtimes["qwen3-b"]["status"] = "invented-state"
+    await table.refresh()
+
+    resolution = table.resolve(LOCAL)
+    assert [b for b in resolution.backends() if b.eligible] == []
+    assert any("is invented-state" in (b.ineligible_reason or "") for b in resolution.backends())
+
+    result = await manager.wake(resolution)
+    assert result.ok is False
+    assert "asked to be started on demand" in result.message

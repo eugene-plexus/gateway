@@ -106,6 +106,21 @@ STOPPED = "stopped"
 LEAST_BUSY = "least_busy"
 ROUND_ROBIN = "round_robin"
 
+# Statuses that mean "this runtime is on its way to `ready`, wait rather
+# than despair". Deliberately a set of strings and not a generated enum:
+# the gateway reads another node's `/v1/runtimes` over HTTP and does not
+# codegen `agent.yaml`, so a newer agent can and does report statuses
+# this build has never heard of. An unknown one is carried through as
+# text everywhere else here, which is what keeps that safe.
+#
+# `copying` joined at node-local-model-copy.md step 2, BEFORE any agent
+# could emit it: a node making its own copy of a 25 GB model sits there
+# for minutes with no process spawned, and without this it is neither
+# `startable()` (not stopped) nor `waking()` — so a request for that
+# model would have been told "none of its runtimes asked to be started
+# on demand", which is both false and unactionable.
+COMING_UP = frozenset({"copying", "starting", "loading"})
+
 # The fields of the agent's `Runtime` that are also its `RuntimeSpec`.
 # Carried so a wake can ask the agent's admission dry run about exactly
 # the declaration it would start.
@@ -286,7 +301,8 @@ class Resolution:
         return [r for r in self.runtimes() if r.status == STOPPED and r.start_on_demand]
 
     def waking(self) -> list[_RuntimeFacts]:
-        return [r for r in self.runtimes() if r.status in ("starting", "loading")]
+        """Runtimes coming up on their own, so a caller should wait."""
+        return [r for r in self.runtimes() if r.status in COMING_UP]
 
 
 class RoutingTable:
