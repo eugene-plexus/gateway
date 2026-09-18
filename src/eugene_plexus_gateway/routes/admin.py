@@ -49,6 +49,29 @@ async def _driver_health(client: DriverClient) -> DriverHealth:
             runtime=info.runtime,
             version=info.version,
         )
+    except httpx.HTTPStatusError as e:
+        # **Answering is reachable.** The probe is anonymous (see
+        # `probe_driver`), so a driver that requires a credential says
+        # 401 -- and reporting that as `reachable: false` sends an
+        # operator to check cables and firewalls when their backend is
+        # up and wants a key. It is the more diagnostic answer, which is
+        # what made dropping the credential cheap.
+        code = e.response.status_code
+        log.info("driver %r at %s answered %d to an anonymous probe", client.name, base_url, code)
+        if code in (401, 403):
+            detail = (
+                f"{base_url} answered HTTP {code}: it is reachable and wants a credential. "
+                "The gateway probes without one, so a URL typed into a form never collects "
+                "this install's service token. Save the backend with its own key."
+            )
+        else:
+            detail = f"{base_url} answered HTTP {code} to GET /v1/info: {e}"
+        return DriverHealth(
+            name=client.name,
+            reachable=True,
+            url=base_url,  # type: ignore[arg-type]
+            error=detail,
+        )
     except httpx.HTTPError as e:
         log.warning("driver %r at %s unreachable: %s", client.name, base_url, e)
         return DriverHealth(
@@ -150,16 +173,30 @@ async def probe_driver(request: Request, body: DriverProbeRequest) -> DriverHeal
     reachable before saving the topology. Builds a one-shot HTTP
     client, hits the URL's `/v1/info`, and returns the same
     `DriverHealth` shape the list endpoint uses.
+
+    **Anonymously.** The behaviour is unchanged and the credential is
+    gone: a URL typed into a form no longer collects this install's
+    `service:gateway` token. A backend that wants one answers 401, and
+    that is reported as *reachable, and it refused an unauthenticated
+    probe* — which is a better answer than the `reachable: false` a
+    credentialled probe would have turned it into anyway.
     """
     url = str(body.url).rstrip("/")
-    service_token = request.app.state.auth_state.service_token
     client = HttpDriverClient(
         # `name` is optional on a probe (the operator may be testing a
         # URL before naming the slot); fall back to a diagnostic label.
         name=body.name or "(probe)",
         base_url=url,
         timeout_seconds=_PROBE_TIMEOUT_SECONDS,
-        service_token=service_token,
+        # **No credential, deliberately** (R2.4 / review §6.3 #33). This
+        # dials whatever the operator typed, which is the feature; it
+        # used to dial it holding this install's `service:gateway`
+        # token, which every component here accepts, so a URL in a form
+        # was enough to collect one. The route is operator-gated, so
+        # this is not an open relay -- but an operator typing a URL is
+        # not an operator deciding to hand out a credential, and those
+        # are different acts.
+        service_token=None,
     )
     try:
         return await _driver_health(client)

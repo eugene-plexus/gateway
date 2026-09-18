@@ -9,9 +9,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from eugene_plexus_gateway.app import create_app
+from eugene_plexus_gateway.auth_state import AuthState
 from eugene_plexus_gateway.settings import Settings
 
 from .conftest import FakeDriverClient, make_routing_table
+from .test_auth import _issue
 
 
 def _app_with(settings: Settings, table: object) -> FastAPI:
@@ -237,3 +239,73 @@ def test_healthz_is_ok_and_unauthenticated(client: TestClient) -> None:
     assert body["status"] == "ok"
     assert body["component"] == "gateway"
     assert body["safeMode"] is False
+
+
+# --------------------------------------------------------------------------- #
+# What the probe spends (R2.4, review §6.3 #33)
+# --------------------------------------------------------------------------- #
+
+
+def test_the_probe_does_not_hand_a_service_token_to_a_typed_url(app: FastAPI) -> None:
+    """The Test button dials whatever the operator typed.
+
+    That is the feature and it stays -- an operator checking a backend
+    before saving it is the whole point of the button. What has to go is
+    the **credential**: the probe attached this install's
+    `service:gateway` token, so a URL in a form was enough to collect a
+    token that every component in the install accepts. A real listener,
+    because the header is what is under test.
+    """
+    import http.server
+    import threading
+
+    seen: list[str | None] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            seen.append(self.headers.get("authorization"))
+            self.send_response(401)
+            self.send_header("content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"detail":"nope"}')
+
+        def log_message(self, *args: object) -> None:
+            return
+
+    signing_key = b"k" * 32
+    # A real install's posture: a real signing key and a real
+    # `service:gateway` token, set before the lifespan so it is left
+    # alone -- the question is what the probe does with it.
+    app.state.auth_state = AuthState(
+        signing_key=signing_key,
+        service_token=_issue(
+            signing_key=signing_key, sub="gateway", aud="service:gateway", ttl_seconds=3600
+        ),
+        master_key=None,
+    )
+    operator = _issue(signing_key=signing_key, sub="operator", aud="operator")
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with TestClient(app) as c:
+            response = c.post(
+                "/v1/admin/drivers/probe",
+                json={"url": f"http://127.0.0.1:{server.server_port}/", "name": "candidate"},
+                headers={"Authorization": f"Bearer {operator}"},
+            )
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+    assert seen == [None], f"the probe sent a credential: {seen}"
+
+    # And the answer is more diagnostic for it: a 401 means the address
+    # answered. Reporting that as `reachable: false` would send an
+    # operator to check their network when their backend is fine and
+    # wants a key.
+    assert response.status_code == 200
+    body = response.json()
+    assert body["reachable"] is True
+    assert "401" in body["error"]
