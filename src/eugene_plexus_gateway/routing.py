@@ -52,7 +52,7 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -176,12 +176,27 @@ class _Backend:
     client: DriverClient
     info: DriverInfo
     runtime: _RuntimeFacts | None = None
+    stopping: Mapping[str, int] = field(default_factory=dict)
+    """The routing table's own reservation counter, shared by reference
+    with every backend in the snapshot — so a runtime the lifecycle
+    manager is *in the middle of stopping* stops being routable at the
+    moment the decision is taken rather than at the next refresh. See
+    `RoutingTable.stopping`."""
 
     @property
     def eligible(self) -> bool:
         """Routable right now. A driver following a runtime is eligible
         only when that runtime is `ready`; one following nothing of ours
-        is eligible whenever it is reachable, which it is by being here."""
+        is eligible whenever it is reachable, which it is by being here.
+
+        And not while a stop for it is in flight: `idle_pass` and
+        `_evict_for` decide on a runtime with nothing in flight and then
+        *await* an HTTP call to the agent, and a request arriving inside
+        that await used to be routed to an engine that was going away.
+        On the streamed path M10's commit-point rule turns that from a
+        retry into a visible truncation."""
+        if self.runtime is not None and self.stopping.get(self.runtime.name, 0) > 0:
+            return False
         return self.runtime is None or self.runtime.status == READY
 
     @property
@@ -189,6 +204,8 @@ class _Backend:
         if self.eligible:
             return None
         assert self.runtime is not None
+        if self.stopping.get(self.runtime.name, 0) > 0:
+            return f"runtime {self.runtime.name!r} is being stopped"
         return f"runtime {self.runtime.name!r} is {self.runtime.status or 'unknown'}"
 
     @property
@@ -383,6 +400,17 @@ class RoutingTable:
         self._runtime_last_request: dict[str, float] = {}
         self._ready_since: dict[str, float] = {}
         self._cursor: dict[str, int] = {}
+        # Runtimes with a stop in flight, by name, counted rather than
+        # flagged because `idle_pass` and `_evict_for` can both be
+        # stopping one. Shared by reference with every `_Backend` in the
+        # snapshot; see `stopping()`.
+        self._stopping: dict[str, int] = {}
+        # The last SUCCESSFUL read from each node, by node name. An agent
+        # that does not answer is not an agent with nothing on it: its
+        # entry here is what the refresh uses instead of an empty list,
+        # which is the whole of review §6.1 #9 and §6.2 #18.
+        self._last_entries: dict[str | None, list[tuple[str, str]]] = {}
+        self._last_facts: dict[str | None, dict[str, _RuntimeFacts]] = {}
         # `(url, source)` last written to the log, so the control root is
         # announced when it is first found and when it changes -- not on
         # every refresh.
@@ -651,6 +679,16 @@ class RoutingTable:
     async def _refresh_locked(self) -> None:
         agents, control_root = await self._discover()
 
+        # A node that has left the install keeps nothing. The per-node
+        # caches exist so a missed READ does not erase a node; a node
+        # the control root no longer lists really is gone.
+        for known in list(self._last_entries):
+            if known not in agents:
+                self._last_entries.pop(known, None)
+        for known in list(self._last_facts):
+            if known not in agents:
+                self._last_facts.pop(known, None)
+
         # Every agent, concurrently: its drivers and its runtimes.
         fetched = await asyncio.gather(
             *(self._fetch_agent(node, url) for node, url in agents.items()),
@@ -754,10 +792,35 @@ class RoutingTable:
     async def _fetch_agent(
         self, node: str | None, url: str
     ) -> tuple[list[tuple[str, str]], dict[str, _RuntimeFacts]]:
-        entries, runtimes = await asyncio.gather(
+        """One node's two reads, with the last successful answer kept.
+
+        **A node that did not answer is not a node with nothing on it.**
+        Both reads report whether they got an answer, and a failure
+        reuses what that node last said rather than the empty value —
+        which the rest of the refresh would otherwise act on as fact
+        (review §6.1 #9 and §6.2 #18). The control root's own read has
+        worked this way since the day it was written, eighty lines
+        above; these two did not.
+
+        Stale facts are bounded by the thing that actually checks
+        liveness: every entry is probed at its own `/v1/info` below, so
+        a driver on a node whose agent is down lands in `unreachable`
+        and is not routed to. What survives is the *shape* of that node
+        — which engines exist and what state they were last in — which
+        is exactly what a missed read should not be allowed to erase.
+        """
+        (entries, entries_ok), (runtimes, runtimes_ok) = await asyncio.gather(
             self._fetch_driver_entries(url),
             self._fetch_runtime_facts(url, node),
         )
+        if entries_ok:
+            self._last_entries[node] = entries
+        else:
+            entries = list(self._last_entries.get(node, []))
+        if runtimes_ok:
+            self._last_facts[node] = runtimes
+        else:
+            runtimes = dict(self._last_facts.get(node, {}))
         return entries, runtimes
 
     async def fetch_driver_entries(self) -> list[tuple[str, str]]:
@@ -765,29 +828,41 @@ class RoutingTable:
 
         Public because `POST /v1/config/test` reads the topology fresh
         rather than off the last refresh — the point of a Test button is
-        the world as it is now.
+        the world as it is now. Which is also why this one does **not**
+        fall back to the last successful read: a Test button that
+        answers from a cache is answering the wrong question.
         """
         agents = await self.discover_agents()
         out: list[tuple[str, str]] = []
         for url in agents.values():
-            out.extend(await self._fetch_driver_entries(url))
+            entries, _ = await self._fetch_driver_entries(url)
+            out.extend(entries)
         return out
 
-    async def _fetch_driver_entries(self, agent_url: str) -> list[tuple[str, str]]:
-        """`(name, url)` for each inference-driver one agent declares, at
-        the address a peer reaches it — `Component.advertiseUrl` when the
-        agent stamps one, else `url`.
+    async def _fetch_driver_entries(self, agent_url: str) -> tuple[list[tuple[str, str]], bool]:
+        """`(entries, answered)`. Entries are `(name, url)` for each
+        inference-driver one agent declares, at the address a peer
+        reaches it — `Component.advertiseUrl` when the agent stamps one,
+        else `url`.
 
-        An unreachable agent yields an empty list, which degrades to
-        "nothing is routable from it" rather than crashing — the config
-        endpoints stay up so the operator can fix whatever is wrong."""
+        **The flag is the point.** An empty list used to mean both "this
+        agent supervises no drivers" and "this agent did not answer", and
+        the refresh acts on the difference: it closes the HTTP clients of
+        drivers it believes have left, *under whatever requests are using
+        them*, and un-routes their models. One 401 from clock skew, one
+        5 s timeout, or the agent restart the Reach switch performs on
+        purpose was enough (review §6.1 #9). The caller keeps the last
+        successful answer for a node that did not answer this time; the
+        per-driver `/v1/info` probe below is the real liveness check and
+        still runs.
+        """
         body = await self._get_json(f"{agent_url}/v1/components")
         if body is None:
-            log.warning("could not read %s/v1/components; nothing from it is routable", agent_url)
-            return []
+            log.warning("could not read %s/v1/components; keeping what it last declared", agent_url)
+            return [], False
         components = body.get("components") if isinstance(body, dict) else None
         if not isinstance(components, list):
-            return []
+            return [], False
         out: list[tuple[str, str]] = []
         for entry in components:
             if not isinstance(entry, dict) or entry.get("kind") != "inference-driver":
@@ -803,26 +878,35 @@ class RoutingTable:
             url = entry.get("advertiseUrl") or entry.get("url")
             if isinstance(name, str) and name and isinstance(url, str) and url:
                 out.append((name, url.rstrip("/")))
-        return out
+        return out, True
 
     async def _fetch_runtime_facts(
         self, agent_url: str, node: str | None
-    ) -> dict[str, _RuntimeFacts]:
-        """Runtime name -> what the agent knows about it.
+    ) -> tuple[dict[str, _RuntimeFacts], bool]:
+        """`(facts, answered)`. Facts are runtime name -> what the agent
+        knows about it: where the `ready` gate, attribution, context,
+        capacity and the lifecycle policy fields all come from.
 
-        Where the `ready` gate, attribution, context, capacity and the
-        lifecycle policy fields all come from. An unreachable agent
-        yields an empty map, so its drivers are routed to on faith and
-        the cascade sorts out the dead ones — nothing stops routing over
-        a missing runtime list.
+        **The flag is the point, and this is the wider of the two.** An
+        empty map leaves every driver on that node with `runtime is
+        None`, which the eligibility rule reads as "follows nothing of
+        ours, route to it whenever it is reachable" — so a stopped, a
+        loading and a crashed engine all become routable, from one
+        missed read (review §6.2 #18). Its widest trigger is not the
+        post-unload window this project diagnosed in 2026-09-11 but a
+        401 from clock skew, a 5 s timeout, or the agent restart the
+        Reach switch performs on purpose. A failed read means **keep the
+        previous facts**, not keep the faith.
         """
         body = await self._get_json(f"{agent_url}/v1/runtimes")
         if body is None:
-            log.debug("could not read %s/v1/runtimes; no runtime facts from it", agent_url)
-            return {}
+            log.warning(
+                "could not read %s/v1/runtimes; keeping the facts from its last answer", agent_url
+            )
+            return {}, False
         runtimes = body.get("runtimes") if isinstance(body, dict) else None
         if not isinstance(runtimes, list):
-            return {}
+            return {}, False
         facts: dict[str, _RuntimeFacts] = {}
         for entry in runtimes:
             if not isinstance(entry, dict):
@@ -851,7 +935,7 @@ class RoutingTable:
                 stop_reason=str(entry["stopReason"]) if entry.get("stopReason") else None,
                 spec={k: entry[k] for k in _SPEC_FIELDS if entry.get(k) is not None},
             )
-        return facts
+        return facts, True
 
     async def _probe(self, name: str, url: str) -> _Backend | _Unreachable:
         client = self._clients.get((name, url))
@@ -867,7 +951,10 @@ class RoutingTable:
             info = await client.info()
         except (httpx.HTTPError, ValueError) as e:
             return _Unreachable(name=name, url=url, error=str(e))
-        return _Backend(name=name, url=url, client=client, info=info)
+        # The reservation map is passed BY REFERENCE: every backend in
+        # every snapshot reads the one the table owns, so a stop taken
+        # after this refresh is visible to a backend built before it.
+        return _Backend(name=name, url=url, client=client, info=info, stopping=self._stopping)
 
     # --- demand -------------------------------------------------------------
     #
@@ -952,6 +1039,44 @@ class RoutingTable:
                 kind = getattr(backend.info, "backend", None)
                 return getattr(kind, "value", None) if kind is not None else None
         return None
+
+    # --- stop reservations --------------------------------------------------
+
+    @contextmanager
+    def stopping(self, runtime: str) -> Iterator[None]:
+        """Hold a runtime out of routing while a stop for it is in flight.
+
+        `idle_pass` and `_evict_for` are check-await-act: they establish
+        that nothing is in flight, then **await** an HTTP call to the
+        agent. A request arriving inside that await is routed to an
+        engine that is being shut down — a 502 on the non-streamed path
+        and, because M10's commit point forbids failover once a token is
+        out, a visibly truncated answer on the streamed one.
+
+        A context manager rather than a pair of calls because the one
+        property that matters is that it is always released: a
+        reservation left behind removes a healthy runtime from the
+        install for the life of the process. Counted rather than
+        flagged because an idle pass and an eviction can be stopping the
+        same runtime, and the inner span finishing must not un-reserve
+        it for the outer one.
+
+        The span is the stop call and nothing longer. Afterwards the
+        runtime's own `status` carries the ineligibility, which is the
+        honest source for it.
+        """
+        self._stopping[runtime] = self._stopping.get(runtime, 0) + 1
+        try:
+            yield
+        finally:
+            remaining = self._stopping.get(runtime, 1) - 1
+            if remaining > 0:
+                self._stopping[runtime] = remaining
+            else:
+                self._stopping.pop(runtime, None)
+
+    def is_stopping(self, runtime: str) -> bool:
+        return self._stopping.get(runtime, 0) > 0
 
     def inflight(self, driver: str) -> int:
         return self._inflight.get(driver, 0)

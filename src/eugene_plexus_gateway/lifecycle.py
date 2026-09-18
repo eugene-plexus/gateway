@@ -230,7 +230,14 @@ class LifecycleManager:
                 facts.idle_unload_seconds,
                 agent_url,
             )
-            if await self._client.stop(agent_url, facts.name, reason="idle"):
+            # The check above and the stop below are separated by an HTTP
+            # round trip, and a request arriving inside it would be routed
+            # to an engine that is going away. The reservation holds it
+            # out of routing for exactly that span; afterwards the
+            # runtime's own status carries it.
+            with self._table.stopping(facts.name):
+                unloaded = await self._client.stop(agent_url, facts.name, reason="idle")
+            if unloaded:
                 stopped.append(facts.name)
                 self.stopped_idle.append(facts.name)
         if stopped:
@@ -374,7 +381,12 @@ class LifecycleManager:
             log.info(
                 "evicting idle runtime %r to make room for %r on %s", victim, facts.name, agent_url
             )
-            if not await self._client.stop(agent_url, victim, reason="idle"):
+            # Same window as `idle_pass`, reopened up to eight times by
+            # the loop above — and on a path a user is actively waiting
+            # on, so the request that lands in it is likelier.
+            with self._table.stopping(victim):
+                evicted_ok = await self._client.stop(agent_url, victim, reason="idle")
+            if not evicted_ok:
                 break
             evicted.append(victim)
             self.stopped_idle.append(victim)
