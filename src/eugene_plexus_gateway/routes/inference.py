@@ -1089,10 +1089,30 @@ async def _stream_completion(
 
         if response is None:
             # The driver ended without a `done` event. Nothing to
-            # summarise, and pretending otherwise would invent a usage
-            # and a finish reason nobody reported.
+            # summarise: no usage, no served model, no finish reason of
+            # its own, and inventing any of them would report a
+            # truncation as a completion. The attempt is already
+            # recorded `served=False` by the slot, which is where that
+            # belongs.
+            #
+            # What the client is still owed is a well-formed stream. An
+            # OpenAI client reads an answer as finished when the
+            # terminal chunk carries a `finish_reason`; until 2026-09-18
+            # this path emitted `[DONE]` with no terminal chunk at all,
+            # so a client switching on that field never saw one and a
+            # truncated answer was indistinguishable from a complete
+            # one. `stop` rather than an invented value, for the reason
+            # `_FINISH_BY_DRIVER_REASON` already gives: there is no
+            # OpenAI finish reason for "the backend broke mid-stream",
+            # and the truncation is reported where it can be acted on --
+            # the log line above and the metrics row.
             log.warning("driver stream for %r ended without a done event", body.model)
             _record(rec, body, tries)
+            if not emitted_role:
+                yield frame(
+                    envelope(delta=Delta(role=Role2.assistant), finish=None, model=body.model)
+                )
+            yield frame(envelope(delta=Delta(), finish=FinishReason.stop, model=body.model))
             yield "data: [DONE]\n\n"
             return
 

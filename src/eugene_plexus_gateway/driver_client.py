@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import time
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -176,11 +177,28 @@ class RoutingHooks(Protocol):
     covers streams; recording off the response would not.
     """
 
-    def on_attempt_start(self, driver: str) -> None: ...
+    def on_attempt_start(self, driver: str) -> str | None: ...
+
+    """Open an attempt, and answer with the runtime it was counted
+    against -- which the caller hands straight back to
+    `on_attempt_end`.
+
+    The return value exists because the two ends of one attempt used to
+    resolve the runtime independently, each by scanning whatever
+    snapshot was installed at the time, and a refresh landing mid-request
+    made them disagree. A node that failed its read answers `None` on
+    the way out, so the increment is never undone and that runtime never
+    idle-unloads again; the mirror case decrements a counter it never
+    raised, `max(0, ...)` swallows it, and a live request reads as zero
+    in flight -- after which the idle pass unloads an engine mid-answer.
+    An attempt is one thing and is counted once, against one runtime.
+    """
+
     def on_attempt_end(
         self,
         driver: str,
         *,
+        runtime: str | None,
         served: bool,
         elapsed_ms: int = 0,
         error: str | None = None,
@@ -433,8 +451,9 @@ class TieredClient:
             for candidate in tier:
                 self.attempts = index + 1
                 driver = getattr(candidate, "name", None)
+                runtime: str | None = None
                 if self._hooks is not None and driver:
-                    self._hooks.on_attempt_start(driver)
+                    runtime = self._hooks.on_attempt_start(driver)
                 started = time.perf_counter()
                 try:
                     result = await candidate.generate(request)
@@ -442,6 +461,7 @@ class TieredClient:
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
+                            runtime=runtime,
                             served=False,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                             # The exception CLASS, never its message: a
@@ -462,6 +482,7 @@ class TieredClient:
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
+                            runtime=runtime,
                             served=True,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                         )
@@ -495,8 +516,9 @@ class TieredClient:
             for candidate in tier:
                 self.attempts = index + 1
                 driver = getattr(candidate, "name", None)
+                runtime: str | None = None
                 if self._hooks is not None and driver:
-                    self._hooks.on_attempt_start(driver)
+                    runtime = self._hooks.on_attempt_start(driver)
                 started = time.perf_counter()
                 try:
                     result = await candidate.embed(request)
@@ -504,6 +526,7 @@ class TieredClient:
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
+                            runtime=runtime,
                             served=False,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                             error=type(exc).__name__,
@@ -517,6 +540,7 @@ class TieredClient:
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
+                            runtime=runtime,
                             served=True,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                         )
@@ -558,19 +582,32 @@ class TieredClient:
             for candidate in tier:
                 self.attempts = index + 1
                 driver = getattr(candidate, "name", None)
+                runtime: str | None = None
                 if self._hooks is not None and driver:
-                    self._hooks.on_attempt_start(driver)
+                    runtime = self._hooks.on_attempt_start(driver)
                 started = time.perf_counter()
                 committed = False
+                # Whether the driver ever said the answer was finished.
+                # An SSE stream that simply stops is indistinguishable
+                # from one that ended, at the transport layer -- the
+                # `done` event is the only thing that tells them apart,
+                # and M10's own rule is that the absence of it is a
+                # truncation rather than a completion.
+                saw_done = False
+                reported = False
                 stream = candidate.stream(request)
                 try:
                     async for event in stream:
                         committed = True
+                        if event.done:
+                            saw_done = True
                         yield event
                 except Exception as exc:
+                    reported = True
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
+                            runtime=runtime,
                             served=False,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                             error=type(exc).__name__,
@@ -593,11 +630,23 @@ class TieredClient:
                     self._log_cascade("stream", index, candidate, exc, total=total)
                     index += 1
                 else:
+                    reported = True
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
-                            served=True,
+                            runtime=runtime,
+                            # A stream that stopped without a `done`
+                            # event did not serve this request, however
+                            # tidily it ended. It is NOT cascaded past
+                            # -- tokens are already out, so M10's commit
+                            # point forbids it -- but calling it served
+                            # would put a truncation in the metrics as a
+                            # completion and refresh this backend's
+                            # "last served" mark, which is what the
+                            # balancer and the idle pass read.
+                            served=saw_done,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
+                            error=None if saw_done else "IncompleteStream",
                         )
                     self.served_by = driver
                     self.tier = tier_index + 1
@@ -606,6 +655,29 @@ class TieredClient:
                     # Runs on every path, including the consumer
                     # abandoning this generator: that is what releases
                     # the driver's response and, through it, the engine.
+                    #
+                    # And it is the only arm that sees the two ways this
+                    # attempt ends WITHOUT reaching either branch above.
+                    # A consumer that closes this generator -- the
+                    # playground's Stop button, a tab shut mid-answer --
+                    # gets `GeneratorExit` raised at the `yield`, and a
+                    # cancelled request task gets `CancelledError`
+                    # (starlette cancels the response task group on
+                    # `http.disconnect`). Both are `BaseException`, so
+                    # neither `except Exception` nor `else` runs, the
+                    # attempt is never closed, and the runtime's
+                    # in-flight counter stays above zero for the life of
+                    # the process -- after which it never idle-unloads
+                    # and can never be evicted to make room for a wake.
+                    if not reported and self._hooks is not None and driver:
+                        ending = sys.exc_info()[1]
+                        self._hooks.on_attempt_end(
+                            driver,
+                            runtime=runtime,
+                            served=False,
+                            elapsed_ms=int((time.perf_counter() - started) * 1000),
+                            error=type(ending).__name__ if ending is not None else "Abandoned",
+                        )
                     await stream.aclose()
         assert last_exc is not None  # candidates is non-empty (checked in __init__)
         raise last_exc

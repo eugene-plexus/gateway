@@ -879,22 +879,30 @@ class RoutingTable:
                 return backend.runtime.name if backend.runtime is not None else None
         return None
 
-    def on_attempt_start(self, driver: str) -> None:
+    def on_attempt_start(self, driver: str) -> str | None:
+        """Count this attempt, and answer with the runtime it counted
+        against so the other end undoes exactly this.
+
+        Resolving the runtime again at the end would resolve it against
+        whatever snapshot has since been installed, and the two answers
+        need not agree -- see `RoutingHooks.on_attempt_start`.
+        """
         self._inflight[driver] = self._inflight.get(driver, 0) + 1
         runtime = self._runtime_name_for_driver(driver)
         if runtime is not None:
             self._runtime_inflight[runtime] = self._runtime_inflight.get(runtime, 0) + 1
+        return runtime
 
     def on_attempt_end(
         self,
         driver: str,
         *,
+        runtime: str | None,
         served: bool,
         elapsed_ms: int = 0,
         error: str | None = None,
     ) -> None:
         self._inflight[driver] = max(0, self._inflight.get(driver, 0) - 1)
-        runtime = self._runtime_name_for_driver(driver)
         if runtime is not None:
             self._runtime_inflight[runtime] = max(0, self._runtime_inflight.get(runtime, 0) - 1)
         if served:
