@@ -235,7 +235,10 @@ async def test_a_runtime_within_its_timeout_or_with_no_timeout_is_left_alone(
 ) -> None:
     agent.runtimes["qwen3-b"].pop("idleUnloadSeconds")
     await table.refresh()
-    monkeypatch.setattr(table, "idle_seconds", lambda name: 10.0 if name == "qwen3-a" else 10_000.0)
+    # `idle_seconds` takes a `(node, name)` key since R1.6.
+    monkeypatch.setattr(
+        table, "idle_seconds", lambda key: 10.0 if key[1] == "qwen3-a" else 10_000.0
+    )
     assert await manager.idle_pass() == []
     assert agent.calls == []
 
@@ -260,10 +263,10 @@ async def test_a_runtime_that_never_served_counts_idle_from_when_it_became_ready
     # refresh would.
     import time
 
-    table._ready_since["qwen3-a"] = time.perf_counter() - 50
-    idle = table.idle_seconds("qwen3-a")
+    table._ready_since[(None, "qwen3-a")] = time.perf_counter() - 50
+    idle = table.idle_seconds((None, "qwen3-a"))
     assert idle is not None and 49 <= idle <= 60
-    assert table.idle_seconds("never-seen") is None
+    assert table.idle_seconds((None, "never-seen")) is None
 
 
 # --- start on demand --------------------------------------------------------------
@@ -381,7 +384,7 @@ async def test_a_refused_wake_evicts_idle_opted_in_runtimes_then_starts(
     agent.too_big["big"] = 1  # fits once one of the two replicas is gone
     # b has been idle longer than a; both opted in via idleUnloadSeconds.
     monkeypatch.setattr(
-        table, "idle_seconds", lambda name: {"qwen3-a": 30.0, "qwen3-b": 300.0}.get(name, 0.0)
+        table, "idle_seconds", lambda key: {"qwen3-a": 30.0, "qwen3-b": 300.0}.get(key[1], 0.0)
     )
     result = await manager.wake(table.resolve(BIG))
     assert result.ok, result.message

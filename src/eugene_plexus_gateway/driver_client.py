@@ -145,11 +145,24 @@ def _problem_from_response(response: httpx.Response) -> Problem | None:
     return None
 
 
+#: How the routing table identifies a driver and a runtime:
+#: `(node, name)`. Defined in this module because `routing.py` imports
+#: it and not the reverse; `RoutingHooks` is the protocol that carries
+#: the value, so the type belongs beside it. See `routing.Key`, which is
+#: an alias of this, for why a bare name is not an identity.
+type Key = tuple[str | None, str]
+
+
 class DriverClient(Protocol):
     """Contract every driver client implements (real or fake-for-tests)."""
 
     name: str
     base_url: str
+    #: Which machine's agent reported this driver, when the table knows.
+    #: On the protocol because `TieredClient` has to pass it to the hooks
+    #: and a driver NAME is not unique across machines (R1.6, review
+    #: §6.1 #8). Optional, so a fake in a single-host test needs nothing.
+    node: str | None
 
     async def info(self) -> DriverInfo: ...
     async def generate(self, request: GenerateRequest) -> GenerateResponse: ...
@@ -177,7 +190,7 @@ class RoutingHooks(Protocol):
     covers streams; recording off the response would not.
     """
 
-    def on_attempt_start(self, driver: str) -> str | None: ...
+    def on_attempt_start(self, driver: str, *, node: str | None = None) -> Key | None: ...
 
     """Open an attempt, and answer with the runtime it was counted
     against -- which the caller hands straight back to
@@ -192,13 +205,21 @@ class RoutingHooks(Protocol):
     raised, `max(0, ...)` swallows it, and a live request reads as zero
     in flight -- after which the idle pass unloads an engine mid-answer.
     An attempt is one thing and is counted once, against one runtime.
+
+    **And `runtime` is a `(node, name)` pair, not a name** (R1.6).
+    `RuntimeSpec.name` is unique per agent, not per install, so one model
+    on two machines is one name twice; counted by name, two replicas
+    shared every counter. The value stays an opaque handle from this
+    side: it is whatever `on_attempt_start` answered, handed straight
+    back.
     """
 
     def on_attempt_end(
         self,
         driver: str,
         *,
-        runtime: str | None,
+        node: str | None = None,
+        runtime: Key | None,
         served: bool,
         elapsed_ms: int = 0,
         error: str | None = None,
@@ -215,13 +236,20 @@ class HttpDriverClient:
         base_url: str,
         timeout_seconds: float = 180.0,
         service_token: str | None = None,
+        node: str | None = None,
     ) -> None:
         self.name = name
         self.base_url = base_url.rstrip("/")
+        #: Which machine's agent reported this driver. Carried so
+        #: `TieredClient` can hand it to the routing hooks, whose
+        #: counters are keyed by `(node, name)` -- a driver name is
+        #: unique per agent, not per install (R1.6).
+        self.node = node
         # Mirrors TieredClient's surface so the route can read these off
         # either without asking which kind it holds.
         self.attempts = 1
         self.served_by: str | None = name
+        self.served_by_node: str | None = node
         self.tier = 1
         # When the agent threaded a service token in, attach it to
         # every outbound call. The driver validates against the shared
@@ -418,7 +446,17 @@ class TieredClient:
         # a fresh wrapper around the shared, long-lived HttpDriverClients
         # on every call. Do not cache one of these.
         self.attempts = 0
+        #: `TieredClient` is passed where a `DriverClient` is expected,
+        #: so it carries the protocol's `node` too. It is a slot over
+        #: several machines' backends and has no one node of its own;
+        #: `served_by_node` is the meaningful answer and is set once a
+        #: backend has answered.
+        self.node: str | None = None
         self.served_by: str | None = None
+        #: Which machine's driver answered. Beside `served_by` because
+        #: the name alone no longer identifies one: two machines running
+        #: one model give two drivers with one name (R1.6).
+        self.served_by_node: str | None = None
         self.tier = 0
 
     @property
@@ -451,9 +489,10 @@ class TieredClient:
             for candidate in tier:
                 self.attempts = index + 1
                 driver = getattr(candidate, "name", None)
-                runtime: str | None = None
+                node = getattr(candidate, "node", None)
+                runtime: Key | None = None
                 if self._hooks is not None and driver:
-                    runtime = self._hooks.on_attempt_start(driver)
+                    runtime = self._hooks.on_attempt_start(driver, node=node)
                 started = time.perf_counter()
                 try:
                     result = await candidate.generate(request)
@@ -461,6 +500,7 @@ class TieredClient:
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
+                            node=node,
                             runtime=runtime,
                             served=False,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
@@ -482,11 +522,13 @@ class TieredClient:
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
+                            node=node,
                             runtime=runtime,
                             served=True,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                         )
                     self.served_by = driver
+                    self.served_by_node = node
                     self.tier = tier_index + 1
                     return result
         # Every backend failed in a cascade-eligible way. Re-raise the
@@ -516,9 +558,10 @@ class TieredClient:
             for candidate in tier:
                 self.attempts = index + 1
                 driver = getattr(candidate, "name", None)
-                runtime: str | None = None
+                node = getattr(candidate, "node", None)
+                runtime: Key | None = None
                 if self._hooks is not None and driver:
-                    runtime = self._hooks.on_attempt_start(driver)
+                    runtime = self._hooks.on_attempt_start(driver, node=node)
                 started = time.perf_counter()
                 try:
                     result = await candidate.embed(request)
@@ -526,6 +569,7 @@ class TieredClient:
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
+                            node=node,
                             runtime=runtime,
                             served=False,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
@@ -540,11 +584,13 @@ class TieredClient:
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
+                            node=node,
                             runtime=runtime,
                             served=True,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                         )
                     self.served_by = driver
+                    self.served_by_node = node
                     self.tier = tier_index + 1
                     return result
         assert last_exc is not None
@@ -582,9 +628,10 @@ class TieredClient:
             for candidate in tier:
                 self.attempts = index + 1
                 driver = getattr(candidate, "name", None)
-                runtime: str | None = None
+                node = getattr(candidate, "node", None)
+                runtime: Key | None = None
                 if self._hooks is not None and driver:
-                    runtime = self._hooks.on_attempt_start(driver)
+                    runtime = self._hooks.on_attempt_start(driver, node=node)
                 started = time.perf_counter()
                 committed = False
                 # Whether the driver ever said the answer was finished.
@@ -607,6 +654,7 @@ class TieredClient:
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
+                            node=node,
                             runtime=runtime,
                             served=False,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
@@ -634,6 +682,7 @@ class TieredClient:
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
+                            node=node,
                             runtime=runtime,
                             # A stream that stopped without a `done`
                             # event did not serve this request, however
@@ -649,6 +698,7 @@ class TieredClient:
                             error=None if saw_done else "IncompleteStream",
                         )
                     self.served_by = driver
+                    self.served_by_node = node
                     self.tier = tier_index + 1
                     return
                 finally:
@@ -673,6 +723,7 @@ class TieredClient:
                         ending = sys.exc_info()[1]
                         self._hooks.on_attempt_end(
                             driver,
+                            node=node,
                             runtime=runtime,
                             served=False,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),

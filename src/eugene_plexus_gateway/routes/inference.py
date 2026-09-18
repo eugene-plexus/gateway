@@ -863,6 +863,10 @@ def _routing_info(
     # `served_by` is the backend that actually answered, which after a
     # cascade is not the primary. Both client kinds expose it.
     served_by = getattr(client, "served_by", None) or getattr(client, "name", model)
+    # Which machine's driver answered. Two machines running one model
+    # give two drivers with one name, so a lookup by name alone answered
+    # about whichever sorted first (R1.6, review §6.1 #8).
+    served_node = getattr(client, "served_by_node", None)
     attempts = getattr(client, "attempts", 1)
     tier = getattr(client, "tier", 1)
     # inference-driver.yaml and gateway.yaml each generate their own
@@ -871,7 +875,7 @@ def _routing_info(
         (
             BackendKind(b.info.backend.value)
             for b in table.backends_for(model)
-            if b.name == served_by
+            if b.name == served_by and (served_node is None or b.node == served_node)
         ),
         None,
     )
@@ -879,7 +883,7 @@ def _routing_info(
         driver=served_by,
         # The engine process behind the driver that answered, when the
         # agent supervises one — by name, so replicas are attributed too.
-        runtime=table.runtime_for(model, served_by),
+        runtime=table.runtime_for(model, served_by, served_node),
         backend=backend_kind,
         latency_ms=int((time.perf_counter() - started) * 1000),
         attempts=attempts if isinstance(attempts, int) and attempts >= 1 else 1,
@@ -890,7 +894,7 @@ def _routing_info(
         # smallest across every backend serving the name -- that is what
         # `GET /v1/models` reports, and it is the right number there and
         # the wrong one here.
-        context_length=table.context_length_for(model, served_by),
+        context_length=table.context_length_for(model, served_by, served_node),
         prompt_truncated=prompt_truncated,
     )
 

@@ -43,6 +43,11 @@ DRIVER_URL = "http://127.0.0.1:8090"
 MODEL = "qwen3-1.7b"
 DRIVER = "qwen-driver"
 RUNTIME = "qwen"
+#: Every demand counter is keyed by `(node, name)` since R1.6: a
+#: driver or runtime NAME is unique per agent, not per install. These
+#: fixtures are single-host, so the node half is `None`.
+DRIVER_KEY = (None, DRIVER)
+RUNTIME_KEY = (None, RUNTIME)
 
 
 class OneAgent:
@@ -214,7 +219,8 @@ async def test_a_successful_read_that_drops_a_driver_still_closes_its_client(
     turn into keeping them forever: an agent that answers, and no longer
     declares this driver, has really removed it."""
     table = await _table()
-    key = (DRIVER, DRIVER_URL)
+    # `(node, name, url)` since R1.6; single-host, so the node is None.
+    key = (None, DRIVER, DRIVER_URL)
     assert key in table._clients
 
     agent.declared = []
@@ -443,7 +449,7 @@ async def test_a_runtime_being_stopped_is_not_routed_to(agent: OneAgent) -> None
     table = await _table()
     assert table.backends_for(MODEL)[0].eligible is True
 
-    with table.stopping(RUNTIME):
+    with table.stopping(RUNTIME_KEY):
         backend = table.backends_for(MODEL)[0]
         assert backend.eligible is False
         assert backend.ineligible_reason is not None
@@ -457,11 +463,11 @@ async def test_two_overlapping_stops_do_not_release_each_other(agent: OneAgent) 
     stopping the same runtime, and the inner span finishing must not
     un-reserve it for the outer one."""
     table = await _table()
-    with table.stopping(RUNTIME):
-        with table.stopping(RUNTIME):
-            assert table.is_stopping(RUNTIME)
-        assert table.is_stopping(RUNTIME)
-    assert not table.is_stopping(RUNTIME)
+    with table.stopping(RUNTIME_KEY):
+        with table.stopping(RUNTIME_KEY):
+            assert table.is_stopping(RUNTIME_KEY)
+        assert table.is_stopping(RUNTIME_KEY)
+    assert not table.is_stopping(RUNTIME_KEY)
 
 
 async def test_the_idle_pass_reserves_the_runtime_across_the_stop_call(
@@ -474,7 +480,7 @@ async def test_the_idle_pass_reserves_the_runtime_across_the_stop_call(
     truncation."""
     table = await _table()
     # Idle since it became ready, and past its timeout.
-    table._ready_since[RUNTIME] = table._ready_since[RUNTIME] - 3600
+    table._ready_since[RUNTIME_KEY] = table._ready_since[RUNTIME_KEY] - 3600
 
     eligible_during: list[bool] = []
     agent.on_stop = lambda: eligible_during.append(
@@ -519,13 +525,13 @@ async def test_a_stop_that_fails_releases_the_reservation(agent: OneAgent) -> No
     agent refusing means it is not, and the runtime has to go back to
     being routable — otherwise one 500 removes it from the install."""
     table = await _table()
-    table._ready_since[RUNTIME] = table._ready_since[RUNTIME] - 3600
+    table._ready_since[RUNTIME_KEY] = table._ready_since[RUNTIME_KEY] - 3600
     agent.stop_status = 500
 
     stopped = await _manager(table).idle_pass()
 
     assert stopped == []
-    assert not table.is_stopping(RUNTIME)
+    assert not table.is_stopping(RUNTIME_KEY)
     assert table.backends_for(MODEL)[0].eligible is True
 
 
@@ -541,7 +547,7 @@ async def test_a_stop_that_raises_releases_the_reservation(agent: OneAgent) -> N
     The real trigger is the idle loop's task being cancelled mid-stop at
     shutdown — a `BaseException`, caught by nothing on the way out."""
     table = await _table()
-    table._ready_since[RUNTIME] = table._ready_since[RUNTIME] - 3600
+    table._ready_since[RUNTIME_KEY] = table._ready_since[RUNTIME_KEY] - 3600
 
     def boom() -> None:
         raise asyncio.CancelledError
@@ -550,7 +556,7 @@ async def test_a_stop_that_raises_releases_the_reservation(agent: OneAgent) -> N
     with contextlib.suppress(asyncio.CancelledError):
         await _manager(table).idle_pass()
 
-    assert not table.is_stopping(RUNTIME)
+    assert not table.is_stopping(RUNTIME_KEY)
 
 
 async def test_a_stop_whose_transport_fails_also_releases_it(agent: OneAgent) -> None:
@@ -558,7 +564,7 @@ async def test_a_stop_whose_transport_fails_also_releases_it(agent: OneAgent) ->
     `stop()` turns an `httpx.HTTPError` into `False` and the `with`
     block exits normally."""
     table = await _table()
-    table._ready_since[RUNTIME] = table._ready_since[RUNTIME] - 3600
+    table._ready_since[RUNTIME_KEY] = table._ready_since[RUNTIME_KEY] - 3600
 
     def refused() -> None:
         raise httpx.ConnectError("the agent went away mid-stop")
@@ -566,7 +572,7 @@ async def test_a_stop_whose_transport_fails_also_releases_it(agent: OneAgent) ->
     agent.on_stop = refused
     assert await _manager(table).idle_pass() == []
 
-    assert not table.is_stopping(RUNTIME)
+    assert not table.is_stopping(RUNTIME_KEY)
     assert table.backends_for(MODEL)[0].eligible is True
 
 
@@ -575,11 +581,11 @@ async def test_the_idle_pass_leaves_no_reservation_behind(agent: OneAgent) -> No
     is ineligible for the honest reason — its status — not because a flag
     was left set."""
     table = await _table()
-    table._ready_since[RUNTIME] = table._ready_since[RUNTIME] - 3600
+    table._ready_since[RUNTIME_KEY] = table._ready_since[RUNTIME_KEY] - 3600
 
     assert await _manager(table).idle_pass() == [RUNTIME]
 
-    assert not table.is_stopping(RUNTIME)
+    assert not table.is_stopping(RUNTIME_KEY)
     backend = table.backends_for(MODEL)[0]
     assert backend.eligible is False
     assert backend.runtime is not None

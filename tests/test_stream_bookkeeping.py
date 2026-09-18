@@ -50,6 +50,11 @@ from .conftest import FakeDriverClient, install_snapshot, make_routing_table, ru
 
 DRIVER = "qwen-box"
 RUNTIME = "engine-a"
+#: Every demand counter is keyed by `(node, name)` since R1.6: a
+#: driver or runtime NAME is unique per agent, not per install. These
+#: fixtures are single-host, so the node half is `None`.
+DRIVER_KEY = (None, DRIVER)
+RUNTIME_KEY = (None, RUNTIME)
 MODEL = "Qwen3-30B-A3B-Q4_K_M"
 
 
@@ -124,8 +129,8 @@ async def test_a_stream_consumed_to_the_end_leaves_the_counters_at_zero() -> Non
 
     assert any(event.done for event in events)
     assert [row.served for row in rows] == [True]
-    assert table.inflight(DRIVER) == 0
-    assert table.runtime_inflight(RUNTIME) == 0
+    assert table.inflight(DRIVER_KEY) == 0
+    assert table.runtime_inflight(RUNTIME_KEY) == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -145,13 +150,13 @@ async def test_a_consumer_that_closes_the_stream_returns_the_counters_to_zero() 
         assert first.text == "one "
         # The attempt really is open -- otherwise the assertions below
         # pass against an implementation that never counted at all.
-        assert table.inflight(DRIVER) == 1
-        assert table.runtime_inflight(RUNTIME) == 1
+        assert table.inflight(DRIVER_KEY) == 1
+        assert table.runtime_inflight(RUNTIME_KEY) == 1
 
         await stream.aclose()
 
-    assert table.inflight(DRIVER) == 0
-    assert table.runtime_inflight(RUNTIME) == 0
+    assert table.inflight(DRIVER_KEY) == 0
+    assert table.runtime_inflight(RUNTIME_KEY) == 0
     # Closed is not served: the row says what happened, and the
     # backend's "last served" mark is not refreshed by an abandonment.
     assert [row.served for row in rows] == [False]
@@ -172,14 +177,14 @@ async def test_a_cancelled_request_returns_the_counters_to_zero() -> None:
 
     task = asyncio.create_task(consume())
     await fake.parked.wait()
-    assert table.runtime_inflight(RUNTIME) == 1
+    assert table.runtime_inflight(RUNTIME_KEY) == 1
 
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await task
 
-    assert table.inflight(DRIVER) == 0
-    assert table.runtime_inflight(RUNTIME) == 0
+    assert table.inflight(DRIVER_KEY) == 0
+    assert table.runtime_inflight(RUNTIME_KEY) == 0
 
 
 async def test_a_leaked_counter_would_keep_a_runtime_out_of_the_idle_pass() -> None:
@@ -196,7 +201,7 @@ async def test_a_leaked_counter_would_keep_a_runtime_out_of_the_idle_pass() -> N
         await stream.__anext__()
         await stream.aclose()
 
-    assert table.runtime_inflight(RUNTIME) == 0
+    assert table.runtime_inflight(RUNTIME_KEY) == 0
 
 
 async def test_a_cascade_records_one_row_per_attempt() -> None:
@@ -219,7 +224,7 @@ async def test_a_cascade_records_one_row_per_attempt() -> None:
         ("dead-box", False),
         (DRIVER, True),
     ]
-    assert table.runtime_inflight(RUNTIME) == 0
+    assert table.runtime_inflight(RUNTIME_KEY) == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -240,7 +245,7 @@ async def test_a_stream_that_never_says_done_is_not_recorded_served() -> None:
         "the one surface that could show it"
     )
     assert rows[0].error is not None
-    assert table.runtime_inflight(RUNTIME) == 0
+    assert table.runtime_inflight(RUNTIME_KEY) == 0
 
 
 async def test_a_truncated_stream_does_not_mark_the_backend_as_having_served() -> None:
@@ -253,7 +258,7 @@ async def test_a_truncated_stream_does_not_mark_the_backend_as_having_served() -
         pass
 
     assert table._last_request.get(DRIVER) is None
-    assert table._runtime_last_request.get(RUNTIME) is None
+    assert table._runtime_last_request.get(RUNTIME_KEY) is None
 
 
 def test_a_stream_that_never_says_done_still_gets_a_terminal_frame(
@@ -293,13 +298,13 @@ async def test_an_attempt_decrements_the_runtime_it_incremented() -> None:
 
     stream = _slot(fake, table=table).stream(_request())
     await stream.__anext__()
-    assert table.runtime_inflight(RUNTIME) == 1
+    assert table.runtime_inflight(RUNTIME_KEY) == 1
 
     # The node did not answer this refresh, so its runtime facts are gone.
     install_snapshot(table, fake)
     await stream.aclose()
 
-    assert table.runtime_inflight(RUNTIME) == 0
+    assert table.runtime_inflight(RUNTIME_KEY) == 0
 
 
 async def test_a_finished_request_does_not_zero_a_counter_it_never_raised() -> None:
@@ -319,7 +324,7 @@ async def test_a_finished_request_does_not_zero_a_counter_it_never_raised() -> N
     # A is under way and counted.
     a = _slot(live, table=table).stream(_request())
     await a.__anext__()
-    assert table.runtime_inflight(RUNTIME) == 1
+    assert table.runtime_inflight(RUNTIME_KEY) == 1
 
     # The node's read fails; B starts against a snapshot with no facts.
     install_snapshot(table, live)
@@ -331,7 +336,7 @@ async def test_a_finished_request_does_not_zero_a_counter_it_never_raised() -> N
     async for _ in b:
         pass
 
-    assert table.runtime_inflight(RUNTIME) >= 1, (
+    assert table.runtime_inflight(RUNTIME_KEY) >= 1, (
         "request A is still streaming; reporting the runtime idle here is "
         "what unloads an engine mid-answer"
     )
@@ -358,8 +363,8 @@ async def test_embed_pairs_its_counter_the_same_way() -> None:
 
     await _slot(swapping, table=table).embed(EmbedRequest(input=["one"]))
 
-    assert table.runtime_inflight(RUNTIME) == 0
-    assert table._runtime_last_request.get(RUNTIME) is not None
+    assert table.runtime_inflight(RUNTIME_KEY) == 0
+    assert table._runtime_last_request.get(RUNTIME_KEY) is not None
 
 
 async def test_generate_pairs_its_counter_the_same_way() -> None:
@@ -379,8 +384,8 @@ async def test_generate_pairs_its_counter_the_same_way() -> None:
 
     await _slot(swapping, table=table).generate(_request())
 
-    assert table.runtime_inflight(RUNTIME) == 0
-    assert table._runtime_last_request.get(RUNTIME) is not None, (
+    assert table.runtime_inflight(RUNTIME_KEY) == 0
+    assert table._runtime_last_request.get(RUNTIME_KEY) is not None, (
         "the attempt served; the runtime that served it is the one it started on"
     )
 
@@ -399,7 +404,7 @@ async def test_a_completed_stream_is_still_recorded_served() -> None:
 
     assert [row.served for row in rows] == [True]
     assert slot.served_by == DRIVER
-    assert table._runtime_last_request.get(RUNTIME) is not None
+    assert table._runtime_last_request.get(RUNTIME_KEY) is not None
 
 
 def test_a_normal_streamed_completion_still_reports_stop(

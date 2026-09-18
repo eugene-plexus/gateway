@@ -153,8 +153,9 @@ async def test_in_flight_counts_rise_and_fall_around_a_request() -> None:
     assert client is not None
     served = client.candidates[0].name
     await client.generate(_generate())
-    assert table.inflight(served) == 0
-    runtime = "qwen3-a" if served == "qwen3-a-driver" else "qwen3-b"
+    # Keyed by `(node, name)` since R1.6; single-host here, so `None`.
+    assert table.inflight((None, served)) == 0
+    runtime = (None, "qwen3-a" if served == "qwen3-a-driver" else "qwen3-b")
     assert table.runtime_inflight(runtime) == 0
     assert table.idle_seconds(runtime) is not None
     assert table.idle_seconds(runtime) < 5  # type: ignore[operator]

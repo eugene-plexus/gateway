@@ -45,7 +45,7 @@ from urllib.parse import quote
 import httpx
 
 from ._http import internal_client
-from .routing import READY, Resolution, RoutingTable, _RuntimeFacts
+from .routing import READY, Key, Resolution, RoutingTable, _RuntimeFacts
 
 log = logging.getLogger(__name__)
 
@@ -175,7 +175,10 @@ class LifecycleManager:
         self._poll = poll_seconds
         self._task: asyncio.Task[None] | None = None
         # One wake per runtime at a time; concurrent requesters await it.
-        self._waking: dict[str, asyncio.Task[WakeResult]] = {}
+        # Keyed by `(node, name)`: two machines' replicas of one model
+        # share a name, and a wake in flight for one of them must not be
+        # returned as the wake for the other (R1.6).
+        self._waking: dict[Key, asyncio.Task[WakeResult]] = {}
         self.stopped_idle: list[str] = []
         """Runtimes this gateway unloaded for idleness, most recent last.
         For the admin view and the acceptance run; not authoritative."""
@@ -217,9 +220,9 @@ class LifecycleManager:
         for facts in self._table.runtimes():
             if facts.status != READY or not facts.idle_unload_seconds:
                 continue
-            if self._table.runtime_inflight(facts.name) > 0:
+            if self._table.runtime_inflight(facts.key) > 0:
                 continue
-            idle = self._table.idle_seconds(facts.name)
+            idle = self._table.idle_seconds(facts.key)
             if idle is None or idle < facts.idle_unload_seconds:
                 continue
             agent_url = self._table.agent_url_for(facts)
@@ -235,7 +238,7 @@ class LifecycleManager:
             # to an engine that is going away. The reservation holds it
             # out of routing for exactly that span; afterwards the
             # runtime's own status carries it.
-            with self._table.stopping(facts.name):
+            with self._table.stopping(facts.key):
                 unloaded = await self._client.stop(agent_url, facts.name, reason="idle")
             if unloaded:
                 stopped.append(facts.name)
@@ -276,13 +279,13 @@ class LifecycleManager:
                 "be started on demand",
             )
         facts = candidates[0]
-        task = self._waking.get(facts.name)
+        task = self._waking.get(facts.key)
         if task is None:
             task = asyncio.create_task(self._wake_runtime(facts), name=f"wake:{facts.name}")
-            self._waking[facts.name] = task
+            self._waking[facts.key] = task
 
-            def forget(_task: asyncio.Task[WakeResult], name: str = facts.name) -> None:
-                self._waking.pop(name, None)
+            def forget(_task: asyncio.Task[WakeResult], key: Key = facts.key) -> None:
+                self._waking.pop(key, None)
 
             task.add_done_callback(forget)
         return await asyncio.shield(task)
@@ -366,15 +369,20 @@ class LifecycleManager:
                 and b.get("evictable")
                 and isinstance(b.get("name"), str)
                 and b["name"] not in evicted
-                and self._table.runtime_inflight(b["name"]) == 0
+                and self._table.runtime_inflight((facts.node, b["name"])) == 0
             ]
             if not blockers:
                 break
 
             # Most idle first, by this gateway's own knowledge; the agent
             # cannot know idleness and did not try to order by it.
+            #
+            # **On `facts.node`**: a blocker is a runtime the agent we
+            # just asked named, so it is on that agent's machine. Keyed
+            # by the bare name, the idle clock consulted here could be
+            # another node's replica of the same model (R1.6).
             def most_idle_first(blocker: dict[str, Any]) -> float:
-                return -(self._table.idle_seconds(str(blocker["name"])) or 0.0)
+                return -(self._table.idle_seconds((facts.node, str(blocker["name"]))) or 0.0)
 
             blockers.sort(key=most_idle_first)
             victim = blockers[0]["name"]
@@ -384,7 +392,7 @@ class LifecycleManager:
             # Same window as `idle_pass`, reopened up to eight times by
             # the loop above — and on a path a user is actively waiting
             # on, so the request that lands in it is likelier.
-            with self._table.stopping(victim):
+            with self._table.stopping((facts.node, victim)):
                 evicted_ok = await self._client.stop(agent_url, victim, reason="idle")
             if not evicted_ok:
                 break

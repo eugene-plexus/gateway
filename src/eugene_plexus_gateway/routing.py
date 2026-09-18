@@ -76,6 +76,7 @@ from ._generated.models import (
 )
 from ._http import internal_client
 from .driver_client import DriverClient, HttpDriverClient, TieredClient
+from .driver_client import Key as DriverKey
 from .metrics import AttemptRow, CandidateRow
 
 # Deadline for one topology read (an agent's `/v1/components`, a control
@@ -149,6 +150,30 @@ _SPEC_FIELDS = (
 )
 
 
+#: How this table identifies a runtime, and a driver.
+#:
+#: **`name` alone is not an identity** (R1.6, review §6.1 #8).
+#: `RuntimeSpec.name` is unique per agent, not per install, and the UI
+#: names a runtime after the model and a companion driver after the
+#: runtime -- so one model launched on two machines is `qwen` and
+#: `qwen-driver` on both. Merged by name, the last agent read won: the
+#: surviving entry carried the wrong node, so an idle unload decided for
+#: A was sent to B's agent; B `ready` masked A `stopped`, so A's driver
+#: stayed eligible and 502'd; and both replicas shared one in-flight
+#: counter and one idle clock, which means B's traffic kept A looking
+#: recently used and the idle pass, iterating the merged map, never
+#: considered one of the two at all.
+#:
+#: `None` is the unenrolled single-host case, where there is no node
+#: name anywhere and one bare name really is unique.
+#:
+#: The rest of the system is already written this way: control keys
+#: placements by `(node, name)` and sorts by it, and the metrics rollup's
+#: primary key already carries `node` -- only the value was wrong,
+#: because it came from the merged survivor.
+Key = DriverKey
+
+
 @dataclass(frozen=True)
 class _RuntimeFacts:
     """What the agent knows about one engine runtime."""
@@ -165,6 +190,11 @@ class _RuntimeFacts:
     stop_reason: str | None
     spec: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def key(self) -> Key:
+        """`(node, name)` — how every map in this module keys it."""
+        return (self.node, self.name)
+
 
 @dataclass
 class _Backend:
@@ -175,8 +205,12 @@ class _Backend:
     url: str
     client: DriverClient
     info: DriverInfo
+    #: Which machine's agent reported this driver. `None` on an
+    #: unenrolled single-host install. Part of its identity for the same
+    #: reason a runtime's node is part of that runtime's -- see `Key`.
+    node: str | None = None
     runtime: _RuntimeFacts | None = None
-    stopping: Mapping[str, int] = field(default_factory=dict)
+    stopping: Mapping[Key, int] = field(default_factory=dict)
     """The routing table's own reservation counter, shared by reference
     with every backend in the snapshot — so a runtime the lifecycle
     manager is *in the middle of stopping* stops being routable at the
@@ -195,16 +229,22 @@ class _Backend:
         that await used to be routed to an engine that was going away.
         On the streamed path M10's commit-point rule turns that from a
         retry into a visible truncation."""
-        if self.runtime is not None and self.stopping.get(self.runtime.name, 0) > 0:
+        if self.runtime is not None and self.stopping.get(self.runtime.key, 0) > 0:
             return False
         return self.runtime is None or self.runtime.status == READY
+
+    @property
+    def key(self) -> Key:
+        """`(node, name)`. Two machines running one model produce two
+        drivers with one name; the counters must not share a bucket."""
+        return (self.node, self.name)
 
     @property
     def ineligible_reason(self) -> str | None:
         if self.eligible:
             return None
         assert self.runtime is not None
-        if self.stopping.get(self.runtime.name, 0) > 0:
+        if self.stopping.get(self.runtime.key, 0) > 0:
             return f"runtime {self.runtime.name!r} is being stopped"
         return f"runtime {self.runtime.name!r} is {self.runtime.status or 'unknown'}"
 
@@ -272,9 +312,10 @@ class _Snapshot:
     by_model: dict[str, list[_Backend]] = field(default_factory=dict)
     reachable: list[_Backend] = field(default_factory=list)
     unreachable: list[_Unreachable] = field(default_factory=list)
-    # Keyed by runtime NAME. Aliases are not unique — two runtimes under
-    # one alias are replicas — so the alias is a field, not the key.
-    runtimes: dict[str, _RuntimeFacts] = field(default_factory=dict)
+    # Keyed by `(node, runtime name)`. Neither half is unique on its
+    # own: an alias is shared by every replica of a model, and a NAME is
+    # shared by the same model launched on two machines -- see `Key`.
+    runtimes: dict[Key, _RuntimeFacts] = field(default_factory=dict)
     # node name -> that node's agent URL. `None` is the default agent,
     # which is the only agent when no control root is configured.
     agents: dict[str | None, str] = field(default_factory=dict)
@@ -309,13 +350,18 @@ class Resolution:
         return [b for t in self.tiers for b in t.eligible()]
 
     def runtimes(self) -> list[_RuntimeFacts]:
-        """Distinct runtimes behind this slot, in tier order."""
-        seen: set[str] = set()
+        """Distinct runtimes behind this slot, in tier order.
+
+        By `(node, name)`: deduplicating on the name alone dropped one
+        of two replicas of one model on two machines, so `startable()`
+        below could only ever wake whichever of them came first.
+        """
+        seen: set[Key] = set()
         out: list[_RuntimeFacts] = []
         for backend in self.backends():
             facts = backend.runtime
-            if facts is not None and facts.name not in seen:
-                seen.add(facts.name)
+            if facts is not None and facts.key not in seen:
+                seen.add(facts.key)
                 out.append(facts)
         return out
 
@@ -363,10 +409,11 @@ class RoutingTable:
         self._slots = slots or (lambda: [])
         self._strategy = strategy or (lambda: LEAST_BUSY)
         self._snapshot = _Snapshot(agents={None: self._agent_url})
-        # Clients are cached by (name, url) and reused across refreshes.
-        # Rebuilding an httpx.AsyncClient every 15s would throw away the
-        # connection pool and leak sockets.
-        self._clients: dict[tuple[str, str], HttpDriverClient] = {}
+        # Clients are cached by (node, name, url) and reused across
+        # refreshes. Rebuilding an httpx.AsyncClient every 15s would
+        # throw away the connection pool and leak sockets. The node is in
+        # the key because the name is not unique across machines.
+        self._clients: dict[tuple[str | None, str, str], HttpDriverClient] = {}
         #: The one client this table reads topology with -- five to seven
         #: GETs per refresh, every 15 s, and again inside whatever request
         #: triggered `refresh_if_stale`. Built once here rather than per
@@ -394,23 +441,26 @@ class RoutingTable:
         # Demand, by driver and by runtime. Monotonic seconds; never
         # persisted, never replicated — a promoted control root re-reads
         # what is loaded from the agents, not from here.
-        self._inflight: dict[str, int] = {}
-        self._last_request: dict[str, float] = {}
-        self._runtime_inflight: dict[str, int] = {}
-        self._runtime_last_request: dict[str, float] = {}
-        self._ready_since: dict[str, float] = {}
+        # Every one of these is keyed by `(node, name)` -- see `Key`.
+        self._inflight: dict[Key, int] = {}
+        self._last_request: dict[Key, float] = {}
+        self._runtime_inflight: dict[Key, int] = {}
+        self._runtime_last_request: dict[Key, float] = {}
+        self._ready_since: dict[Key, float] = {}
+        # By model, which really is install-wide: the balancer's rotation
+        # cursor for one slot.
         self._cursor: dict[str, int] = {}
-        # Runtimes with a stop in flight, by name, counted rather than
-        # flagged because `idle_pass` and `_evict_for` can both be
-        # stopping one. Shared by reference with every `_Backend` in the
-        # snapshot; see `stopping()`.
-        self._stopping: dict[str, int] = {}
+        # Runtimes with a stop in flight, counted rather than flagged
+        # because `idle_pass` and `_evict_for` can both be stopping one.
+        # Shared by reference with every `_Backend` in the snapshot; see
+        # `stopping()`.
+        self._stopping: dict[Key, int] = {}
         # The last SUCCESSFUL read from each node, by node name. An agent
         # that does not answer is not an agent with nothing on it: its
         # entry here is what the refresh uses instead of an empty list,
         # which is the whole of review §6.1 #9 and §6.2 #18.
         self._last_entries: dict[str | None, list[tuple[str, str]]] = {}
-        self._last_facts: dict[str | None, dict[str, _RuntimeFacts]] = {}
+        self._last_facts: dict[str | None, dict[Key, _RuntimeFacts]] = {}
         # `(url, source)` last written to the log, so the control root is
         # announced when it is first found and when it changes -- not on
         # every refresh.
@@ -694,27 +744,30 @@ class RoutingTable:
             *(self._fetch_agent(node, url) for node, url in agents.items()),
             return_exceptions=True,
         )
-        entries: list[tuple[str, str]] = []
-        runtimes: dict[str, _RuntimeFacts] = {}
-        for result in fetched:
+        # `(node, name, url)` per driver, so two machines running one
+        # model produce two entries rather than one that overwrites the
+        # other.
+        entries: list[tuple[str | None, str, str]] = []
+        runtimes: dict[Key, _RuntimeFacts] = {}
+        for node, result in zip(agents, fetched, strict=True):
             if isinstance(result, BaseException):
                 log.warning("reading an agent raised unexpectedly: %s", result)
                 continue
             agent_entries, agent_runtimes = result
-            entries.extend(agent_entries)
+            entries.extend((node, name, url) for name, url in agent_entries)
             runtimes.update(agent_runtimes)
 
         # Drop clients for drivers that left the topology.
-        live_keys = {(name, url) for name, url in entries}
-        for key in list(self._clients):
-            if key not in live_keys:
-                client = self._clients.pop(key)
-                log.info("driver %r left the topology; closing its client", key[0])
+        live_keys = set(entries)
+        for client_key in list(self._clients):
+            if client_key not in live_keys:
+                client = self._clients.pop(client_key)
+                log.info("driver %r left the topology; closing its client", client_key[1])
                 with contextlib.suppress(BaseException):
                     await client.aclose()
 
         results = await asyncio.gather(
-            *(self._probe(name, url) for name, url in entries),
+            *(self._probe(node, name, url) for node, name, url in entries),
             return_exceptions=True,
         )
 
@@ -733,10 +786,14 @@ class RoutingTable:
         # driver older than M4). By name is the rule; this is the
         # fallback, and it is deliberately silent on a replica pair
         # because naming one of them would be a coin flip.
-        by_alias: dict[str, _RuntimeFacts | None] = {}
+        # Per NODE, so a driver on node A cannot be joined to a runtime
+        # on node B by an alias they both carry -- which is the normal
+        # state of a replica pair.
+        by_alias: dict[Key, _RuntimeFacts | None] = {}
         for facts in runtimes.values():
             if facts.alias:
-                by_alias[facts.alias] = None if facts.alias in by_alias else facts
+                alias_key = (facts.node, facts.alias)
+                by_alias[alias_key] = None if alias_key in by_alias else facts
 
         for backend in snapshot.reachable:
             model_id = backend.info.modelId
@@ -750,33 +807,45 @@ class RoutingTable:
                 )
                 continue
             if backend.info.runtime:
-                backend.runtime = runtimes.get(backend.info.runtime)
+                # **On this driver's own node.** `/v1/info` reports a
+                # bare name, and a bare name matches a replica on another
+                # machine just as well -- which is how a driver on node A
+                # came to follow node B's runtime and read its status.
+                backend.runtime = runtimes.get((backend.node, backend.info.runtime))
                 if backend.runtime is None:
-                    log.debug(
-                        "driver %r follows runtime %r, which no agent reports; treating it as "
-                        "routable on faith",
+                    # Raised from DEBUG (M7's record asked for this):
+                    # "routable on faith" is the eligibility rule saying
+                    # yes to an engine whose state it does not know, and
+                    # it is worth a line an operator will see.
+                    log.warning(
+                        "driver %r on node %r follows runtime %r, which that node does not "
+                        "report; treating it as routable on faith",
                         backend.name,
+                        backend.node,
                         backend.info.runtime,
                     )
             else:
-                backend.runtime = by_alias.get(model_id)
+                backend.runtime = by_alias.get((backend.node, model_id))
             snapshot.by_model.setdefault(model_id, []).append(backend)
 
         # Stable base order per model; the balancer rotates from here.
+        # By `(node, name)`, because the names of two replicas of one
+        # model on two machines are equal and `sort` would then leave
+        # their order to whichever agent answered first.
         for backends in snapshot.by_model.values():
-            backends.sort(key=lambda b: b.name)
+            backends.sort(key=lambda b: (b.node or "", b.name))
 
         # Ready-since, so a runtime that loaded and was never asked for
         # anything still counts as idle from the moment it became ready.
         now = time.perf_counter()
-        for name, facts in runtimes.items():
+        for key, facts in runtimes.items():
             if facts.status == READY:
-                self._ready_since.setdefault(name, now)
+                self._ready_since.setdefault(key, now)
             else:
-                self._ready_since.pop(name, None)
-        for name in list(self._ready_since):
-            if name not in runtimes:
-                self._ready_since.pop(name, None)
+                self._ready_since.pop(key, None)
+        for key in list(self._ready_since):
+            if key not in runtimes:
+                self._ready_since.pop(key, None)
 
         self._snapshot = snapshot
         log.debug(
@@ -791,7 +860,7 @@ class RoutingTable:
 
     async def _fetch_agent(
         self, node: str | None, url: str
-    ) -> tuple[list[tuple[str, str]], dict[str, _RuntimeFacts]]:
+    ) -> tuple[list[tuple[str, str]], dict[Key, _RuntimeFacts]]:
         """One node's two reads, with the last successful answer kept.
 
         **A node that did not answer is not a node with nothing on it.**
@@ -882,8 +951,8 @@ class RoutingTable:
 
     async def _fetch_runtime_facts(
         self, agent_url: str, node: str | None
-    ) -> tuple[dict[str, _RuntimeFacts], bool]:
-        """`(facts, answered)`. Facts are runtime name -> what the agent
+    ) -> tuple[dict[Key, _RuntimeFacts], bool]:
+        """`(facts, answered)`. Facts are `(node, runtime name)` -> what the agent
         knows about it: where the `ready` gate, attribution, context,
         capacity and the lifecycle policy fields all come from.
 
@@ -907,7 +976,7 @@ class RoutingTable:
         runtimes = body.get("runtimes") if isinstance(body, dict) else None
         if not isinstance(runtimes, list):
             return {}, False
-        facts: dict[str, _RuntimeFacts] = {}
+        facts: dict[Key, _RuntimeFacts] = {}
         for entry in runtimes:
             if not isinstance(entry, dict):
                 continue
@@ -922,11 +991,12 @@ class RoutingTable:
             # node we asked — which is the same thing, and fills it in
             # for an unenrolled agent.
             reported_node = entry.get("node")
-            facts[name] = _RuntimeFacts(
+            owner = reported_node if isinstance(reported_node, str) and reported_node else node
+            facts[(owner, name)] = _RuntimeFacts(
                 name=name,
                 alias=entry.get("modelAlias") if isinstance(entry.get("modelAlias"), str) else None,
                 status=str(entry["status"]) if entry.get("status") else None,
-                node=reported_node if isinstance(reported_node, str) and reported_node else node,
+                node=owner,
                 url=entry.get("url") if isinstance(entry.get("url"), str) else None,
                 context_length=context if isinstance(context, int) and context > 0 else None,
                 parallel_slots=slots if isinstance(slots, int) and slots > 0 else None,
@@ -937,16 +1007,17 @@ class RoutingTable:
             )
         return facts, True
 
-    async def _probe(self, name: str, url: str) -> _Backend | _Unreachable:
-        client = self._clients.get((name, url))
+    async def _probe(self, node: str | None, name: str, url: str) -> _Backend | _Unreachable:
+        client = self._clients.get((node, name, url))
         if client is None:
             client = HttpDriverClient(
                 name=name,
                 base_url=url,
                 timeout_seconds=self._request_timeout,
                 service_token=self._service_token,
+                node=node,
             )
-            self._clients[(name, url)] = client
+            self._clients[(node, name, url)] = client
         try:
             info = await client.info()
         except (httpx.HTTPError, ValueError) as e:
@@ -954,28 +1025,42 @@ class RoutingTable:
         # The reservation map is passed BY REFERENCE: every backend in
         # every snapshot reads the one the table owns, so a stop taken
         # after this refresh is visible to a backend built before it.
-        return _Backend(name=name, url=url, client=client, info=info, stopping=self._stopping)
+        return _Backend(
+            name=name, url=url, client=client, info=info, node=node, stopping=self._stopping
+        )
 
     # --- demand -------------------------------------------------------------
     #
     # The `RoutingHooks` protocol `TieredClient` calls around every attempt.
 
-    def _runtime_name_for_driver(self, driver: str) -> str | None:
+    def _runtime_key_for_driver(self, key: Key) -> Key | None:
+        """The runtime behind this driver, by `(node, name)` both ways.
+
+        Scanning by bare driver name returned the FIRST backend with
+        that name, which on a two-machine replica pair is a coin flip --
+        so an attempt against node B's driver could be counted against
+        node A's runtime, and undone against it too.
+        """
         for backend in self._snapshot.reachable:
-            if backend.name == driver:
-                return backend.runtime.name if backend.runtime is not None else None
+            if backend.key == key:
+                return backend.runtime.key if backend.runtime is not None else None
         return None
 
-    def on_attempt_start(self, driver: str) -> str | None:
+    def on_attempt_start(self, driver: str, *, node: str | None = None) -> Key | None:
         """Count this attempt, and answer with the runtime it counted
         against so the other end undoes exactly this.
 
         Resolving the runtime again at the end would resolve it against
         whatever snapshot has since been installed, and the two answers
         need not agree -- see `RoutingHooks.on_attempt_start`.
+
+        `node` arrives from the client, which got it from the agent that
+        reported the driver; without it two machines' replicas of one
+        model share every counter here.
         """
-        self._inflight[driver] = self._inflight.get(driver, 0) + 1
-        runtime = self._runtime_name_for_driver(driver)
+        key: Key = (node, driver)
+        self._inflight[key] = self._inflight.get(key, 0) + 1
+        runtime = self._runtime_key_for_driver(key)
         if runtime is not None:
             self._runtime_inflight[runtime] = self._runtime_inflight.get(runtime, 0) + 1
         return runtime
@@ -984,17 +1069,19 @@ class RoutingTable:
         self,
         driver: str,
         *,
-        runtime: str | None,
+        node: str | None = None,
+        runtime: Key | None,
         served: bool,
         elapsed_ms: int = 0,
         error: str | None = None,
     ) -> None:
-        self._inflight[driver] = max(0, self._inflight.get(driver, 0) - 1)
+        key: Key = (node, driver)
+        self._inflight[key] = max(0, self._inflight.get(key, 0) - 1)
         if runtime is not None:
             self._runtime_inflight[runtime] = max(0, self._runtime_inflight.get(runtime, 0) - 1)
         if served:
             now = time.perf_counter()
-            self._last_request[driver] = now
+            self._last_request[key] = now
             if runtime is not None:
                 self._runtime_last_request[runtime] = now
         self._note_attempt(
@@ -1002,9 +1089,13 @@ class RoutingTable:
                 driver=driver,
                 elapsed_ms=elapsed_ms,
                 served=served,
-                runtime=runtime,
-                node=self._node_for_driver(driver),
-                backend=self._backend_for_driver(driver),
+                # The row keeps the NAMES, which is what the contract and
+                # every UI render -- but taken from the key the attempt
+                # was actually counted against rather than from a second,
+                # independent scan that could disagree with it.
+                runtime=runtime[1] if runtime is not None else None,
+                node=runtime[0] if runtime is not None else node,
+                backend=self._backend_for_driver(key),
                 error=error,
             )
         )
@@ -1027,15 +1118,9 @@ class RoutingTable:
         if collected is not None:
             collected.append(row)
 
-    def _node_for_driver(self, driver: str) -> str | None:
+    def _backend_for_driver(self, key: Key) -> str | None:
         for backend in self._snapshot.reachable:
-            if backend.name == driver:
-                return backend.runtime.node if backend.runtime is not None else None
-        return None
-
-    def _backend_for_driver(self, driver: str) -> str | None:
-        for backend in self._snapshot.reachable:
-            if backend.name == driver:
+            if backend.key == key:
                 kind = getattr(backend.info, "backend", None)
                 return getattr(kind, "value", None) if kind is not None else None
         return None
@@ -1043,7 +1128,7 @@ class RoutingTable:
     # --- stop reservations --------------------------------------------------
 
     @contextmanager
-    def stopping(self, runtime: str) -> Iterator[None]:
+    def stopping(self, runtime: Key) -> Iterator[None]:
         """Hold a runtime out of routing while a stop for it is in flight.
 
         `idle_pass` and `_evict_for` are check-await-act: they establish
@@ -1075,16 +1160,16 @@ class RoutingTable:
             else:
                 self._stopping.pop(runtime, None)
 
-    def is_stopping(self, runtime: str) -> bool:
+    def is_stopping(self, runtime: Key) -> bool:
         return self._stopping.get(runtime, 0) > 0
 
-    def inflight(self, driver: str) -> int:
+    def inflight(self, driver: Key) -> int:
         return self._inflight.get(driver, 0)
 
-    def runtime_inflight(self, runtime: str) -> int:
+    def runtime_inflight(self, runtime: Key) -> int:
         return self._runtime_inflight.get(runtime, 0)
 
-    def idle_seconds(self, runtime: str) -> float | None:
+    def idle_seconds(self, runtime: Key) -> float | None:
         """How long since this runtime last served a request through the
         gateway — or, for one that never has, since it became ready.
         None when it is not ready and never served."""
@@ -1095,7 +1180,7 @@ class RoutingTable:
             return None
         return time.perf_counter() - max(marks)
 
-    def driver_idle_seconds(self, driver: str) -> int | None:
+    def driver_idle_seconds(self, driver: Key) -> int | None:
         last = self._last_request.get(driver)
         return int(time.perf_counter() - last) if last is not None else None
 
@@ -1187,7 +1272,7 @@ class RoutingTable:
         rotated = backends[cursor % len(backends) :] + backends[: cursor % len(backends)]
         if self._strategy() == ROUND_ROBIN:
             return rotated
-        return sorted(rotated, key=lambda b: self.inflight(b.name) / b.parallel_slots)
+        return sorted(rotated, key=lambda b: self.inflight(b.key) / b.parallel_slots)
 
     def pick(self, resolution: Resolution) -> TieredClient | None:
         """The client to send a request through, or None when nothing in
@@ -1270,7 +1355,7 @@ class RoutingTable:
                         tier=index,
                         eligible=backend.eligible,
                         reason=backend.ineligible_reason,
-                        in_flight=self.inflight(backend.name),
+                        in_flight=self.inflight(backend.key),
                         slots=backend.parallel_slots,
                     )
                 )
@@ -1279,7 +1364,9 @@ class RoutingTable:
     def backends_for(self, model: str) -> list[_Backend]:
         return self.resolve(model).backends()
 
-    def context_length_for(self, model: str, driver: str | None) -> int | None:
+    def context_length_for(
+        self, model: str, driver: str | None, node: str | None = None
+    ) -> int | None:
         """The window of the one backend that answered, not the smallest.
 
         `_smallest_context` is the right number for `GET /v1/models`,
@@ -1293,9 +1380,7 @@ class RoutingTable:
         """
         if driver is None:
             return None
-        for backend in self.resolve(model).backends():
-            if backend.name != driver:
-                continue
+        for backend in self._matching(model, driver, node):
             if backend.runtime is not None and backend.runtime.context_length:
                 return backend.runtime.context_length
             caps = backend.info.capabilities
@@ -1304,12 +1389,33 @@ class RoutingTable:
             return None
         return None
 
-    def runtime_for(self, model: str, driver: str | None = None) -> str | None:
+    def _matching(self, model: str, driver: str, node: str | None) -> list[_Backend]:
+        """Backends serving `model` under this driver name, the one on
+        `node` first.
+
+        Two machines running one model give two backends with one name,
+        so a first-match scan answered about whichever sorted first.
+        `node` is what the client that answered reported; absent, the
+        old behaviour stands and the answer is the first match.
+        """
+        named = [b for b in self.resolve(model).backends() if b.name == driver]
+        if node is None:
+            return named
+        return sorted(named, key=lambda b: b.node != node)
+
+    def runtime_for(
+        self, model: str, driver: str | None = None, node: str | None = None
+    ) -> str | None:
         """Name of the engine runtime behind `driver` — or, without one,
         behind the only runtime serving `model`. Absent for a hosted or
         CLI backend, which has no runtime of ours."""
-        for backend in self.resolve(model).backends():
-            if (driver is None or backend.name == driver) and backend.runtime is not None:
+        candidates = (
+            self.resolve(model).backends()
+            if driver is None
+            else self._matching(model, driver, node)
+        )
+        for backend in candidates:
+            if backend.runtime is not None:
                 return backend.runtime.name
         return None
 
@@ -1457,7 +1563,7 @@ class RoutingTable:
             url=backend.url,  # type: ignore[arg-type]
             eligible=backend.eligible,
             ineligible_reason=backend.ineligible_reason,
-            in_flight=self.inflight(backend.name),
+            in_flight=self.inflight(backend.key),
             parallel_slots=backend.parallel_slots,
             runtime=facts.name if facts else None,
             runtime_status=facts.status if facts else None,
@@ -1465,7 +1571,7 @@ class RoutingTable:
             stop_reason=facts.stop_reason if facts else None,
             idle_unload_seconds=facts.idle_unload_seconds if facts else None,
             start_on_demand=facts.start_on_demand if facts else None,
-            idle_seconds=self.driver_idle_seconds(backend.name),
+            idle_seconds=self.driver_idle_seconds(backend.key),
         )
 
 
