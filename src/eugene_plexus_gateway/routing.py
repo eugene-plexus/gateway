@@ -74,8 +74,14 @@ from ._generated.models import (
     RoutingTierView,
     Surface,
 )
+from ._http import internal_client
 from .driver_client import DriverClient, HttpDriverClient, TieredClient
 from .metrics import AttemptRow, CandidateRow
+
+# Deadline for one topology read (an agent's `/v1/components`, a control
+# root's `/v1/nodes`). Short because a refresh can run inside a request
+# that found nothing eligible, so this is latency a user feels.
+_TOPOLOGY_TIMEOUT = 5.0
 
 log = logging.getLogger(__name__)
 
@@ -344,6 +350,18 @@ class RoutingTable:
         # Rebuilding an httpx.AsyncClient every 15s would throw away the
         # connection pool and leak sockets.
         self._clients: dict[tuple[str, str], HttpDriverClient] = {}
+        #: The one client this table reads topology with -- five to seven
+        #: GETs per refresh, every 15 s, and again inside whatever request
+        #: triggered `refresh_if_stale`. Built once here rather than per
+        #: GET: `httpx.AsyncClient()` with no `verify=` parses certifi's
+        #: PEM bundle, ~104 ms of synchronous CPU on the event loop, so a
+        #: refresh used to spend ~0.6 s blocking the loop that serves
+        #: every in-flight completion. `trust_env=False` because every
+        #: URL it dials is this install's own agent or control root, and
+        #: a user's `HTTP_PROXY` -- which the Windows logon task
+        #: inherits -- would otherwise swallow the lot and leave the
+        #: install at `starting` while actually serving.
+        self._json_client = internal_client(timeout=_TOPOLOGY_TIMEOUT)
         self._task: asyncio.Task[None] | None = None
         # One refresh at a time; on-demand callers share it.
         self._refreshing: asyncio.Task[None] | None = None
@@ -411,6 +429,8 @@ class RoutingTable:
             with contextlib.suppress(BaseException):
                 await client.aclose()
         self._clients.clear()
+        with contextlib.suppress(BaseException):
+            await self._json_client.aclose()
         self._snapshot = _Snapshot(agents={None: self._agent_url})
 
     async def _refresh_loop(self) -> None:
@@ -472,8 +492,7 @@ class RoutingTable:
         in a 404 an operator reads.
         """
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
-                response = await client.get(url, headers=self._headers())
+            response = await self._json_client.get(url, headers=self._headers())
         except httpx.HTTPError as e:
             return None, str(e) or type(e).__name__
         if response.status_code >= 400:
@@ -711,7 +730,7 @@ class RoutingTable:
 
         # Ready-since, so a runtime that loaded and was never asked for
         # anything still counts as idle from the moment it became ready.
-        now = time.monotonic()
+        now = time.perf_counter()
         for name, facts in runtimes.items():
             if facts.status == READY:
                 self._ready_since.setdefault(name, now)
@@ -879,7 +898,7 @@ class RoutingTable:
         if runtime is not None:
             self._runtime_inflight[runtime] = max(0, self._runtime_inflight.get(runtime, 0) - 1)
         if served:
-            now = time.monotonic()
+            now = time.perf_counter()
             self._last_request[driver] = now
             if runtime is not None:
                 self._runtime_last_request[runtime] = now
@@ -941,11 +960,11 @@ class RoutingTable:
         marks = [m for m in (last, since) if m is not None]
         if not marks:
             return None
-        return time.monotonic() - max(marks)
+        return time.perf_counter() - max(marks)
 
     def driver_idle_seconds(self, driver: str) -> int | None:
         last = self._last_request.get(driver)
-        return int(time.monotonic() - last) if last is not None else None
+        return int(time.perf_counter() - last) if last is not None else None
 
     # --- resolution -------------------------------------------------------
 

@@ -17,6 +17,7 @@ from .._generated.models import (
     ConfigUpdateRequest,
     ConfigUpdateResult,
 )
+from .._http import internal_client
 from ..config import ConfigStore, as_schema
 from ..routing import RoutingTable
 
@@ -96,19 +97,25 @@ async def test_config(
             ),
         )
 
-    async def probe(name: str, base_url: str) -> tuple[str, str | None, str | None]:
+    async def probe(
+        client: httpx.AsyncClient, name: str, base_url: str
+    ) -> tuple[str, str | None, str | None]:
         """Returns (name, error-or-None, modelId-or-None)."""
         try:
-            async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-                response = await client.get(base_url.rstrip("/") + "/v1/info")
-                response.raise_for_status()
-                info = response.json()
+            response = await client.get(base_url.rstrip("/") + "/v1/info")
+            response.raise_for_status()
+            info = response.json()
         except Exception as e:
             return name, f"{name} ({base_url}/v1/info) — {e}", None
         model_id = info.get("modelId") if isinstance(info, dict) else None
         return name, None, model_id if isinstance(model_id, str) else None
 
-    results = await asyncio.gather(*(probe(name, url) for name, url in entries))
+    # ONE client for every probe, not one each. These run concurrently
+    # under `gather`, so a per-probe client made an N-driver install pay
+    # N certifi parses (~104 ms of synchronous CPU apiece) back to back
+    # on the event loop -- inside an operator-facing request.
+    async with internal_client(timeout=timeout, headers=headers) as client:
+        results = await asyncio.gather(*(probe(client, name, url) for name, url in entries))
 
     failures = [err for _, err, _ in results if err]
     if failures:

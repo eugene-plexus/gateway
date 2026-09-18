@@ -55,6 +55,8 @@ from typing import Any
 
 import httpx
 
+from ._http import internal_client
+
 log = logging.getLogger(__name__)
 
 # How often the list is re-read, and how long a revocation may take to
@@ -117,11 +119,11 @@ class ClientKeyGuard:
         return key_id in self._revoked
 
     async def _refresh_if_stale(self) -> None:
-        if not self._stale(time.monotonic()):
+        if not self._stale(time.perf_counter()):
             return
         async with self._lock:
             # Another caller may have refreshed while this one waited.
-            if not self._stale(time.monotonic()):
+            if not self._stale(time.perf_counter()):
                 return
             await self._fetch()
 
@@ -140,7 +142,7 @@ class ClientKeyGuard:
             # Keep the previous answer, keep serving, and say so at most
             # once a minute so an agent that is down for an hour costs
             # one line rather than two hundred and forty.
-            now = time.monotonic()
+            now = time.perf_counter()
             if now - self._last_warning >= _WARN_INTERVAL_SECONDS:
                 self._last_warning = now
                 log.warning(
@@ -165,11 +167,18 @@ class ClientKeyGuard:
             )
         self._revoked = fresh
         self._revision = revision if isinstance(revision, int) else self._revision
-        self._fetched_at = time.monotonic()
+        self._fetched_at = time.perf_counter()
 
     def _ensure_client(self) -> httpx.AsyncClient:
+        # One client for the life of the guard, built on first poll.
+        # `internal_client` rather than `httpx.AsyncClient()`: the bare
+        # constructor parses certifi's PEM bundle, ~104 ms of synchronous
+        # CPU on the event loop, and this polls its own node's agent
+        # every routing-refresh interval. Each request carries its own
+        # `timeout=`, so none lives on the client. It dials this
+        # install's own agent, so it also declines the user's proxy.
         if self._client is None:
-            self._client = httpx.AsyncClient()
+            self._client = internal_client()
         return self._client
 
     async def aclose(self) -> None:

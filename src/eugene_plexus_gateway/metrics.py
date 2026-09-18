@@ -275,7 +275,7 @@ class MetricsStore:
         self._write_lock = threading.Lock()
         self._rows_dropped = 0
         self._started_at = datetime.now(UTC)
-        self._last_prune = time.monotonic()
+        self._last_prune = time.perf_counter()
 
     # --- lifecycle ----------------------------------------------------------
 
@@ -409,8 +409,8 @@ class MetricsStore:
                     log.warning("metrics write failed, dropping %d row(s): %s", len(batch), e)
                     self._rows_dropped += len(batch)
 
-            if time.monotonic() - self._last_prune >= PRUNE_INTERVAL_SECONDS:
-                self._last_prune = time.monotonic()
+            if time.perf_counter() - self._last_prune >= PRUNE_INTERVAL_SECONDS:
+                self._last_prune = time.perf_counter()
                 try:
                     await asyncio.to_thread(self.maintain)
                 except sqlite3.Error as e:

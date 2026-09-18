@@ -44,6 +44,7 @@ from urllib.parse import quote
 
 import httpx
 
+from ._http import internal_client
 from .routing import READY, Resolution, RoutingTable, _RuntimeFacts
 
 log = logging.getLogger(__name__)
@@ -60,7 +61,9 @@ class AgentLifecycleClient:
 
     def __init__(self, service_token: str | None) -> None:
         self._headers = {"Authorization": f"Bearer {service_token}"} if service_token else {}
-        self._client = httpx.AsyncClient(timeout=_AGENT_TIMEOUT_SECONDS)
+        # One client, shared SSL context, no proxy: every URL this class
+        # dials is an agent of this install. See `_http`.
+        self._client = internal_client(timeout=_AGENT_TIMEOUT_SECONDS)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -278,7 +281,7 @@ class LifecycleManager:
         return await asyncio.shield(task)
 
     async def _wake_runtime(self, facts: _RuntimeFacts) -> WakeResult:
-        started = time.monotonic()
+        started = time.perf_counter()
         agent_url = self._table.agent_url_for(facts)
         evicted: list[str] = []
 
@@ -293,7 +296,7 @@ class LifecycleManager:
             return WakeResult(
                 ok=False,
                 runtime=facts.name,
-                waited_ms=int((time.monotonic() - started) * 1000),
+                waited_ms=int((time.perf_counter() - started) * 1000),
                 message=(
                     f"could not start runtime {facts.name!r} on demand: {detail}"
                     + (f" (after unloading {', '.join(evicted)})" if evicted else "")
@@ -303,12 +306,12 @@ class LifecycleManager:
 
         deadline = started + max(1.0, float(self._swap_wait()))
         last_status: str | None = None
-        while time.monotonic() < deadline:
+        while time.perf_counter() < deadline:
             body = await self._client.runtime(agent_url, facts.name)
             last_status = str(body.get("status")) if body and body.get("status") else last_status
             if last_status == READY:
                 await self._table.refresh()
-                waited = int((time.monotonic() - started) * 1000)
+                waited = int((time.perf_counter() - started) * 1000)
                 log.info("runtime %r woke on demand in %dms", facts.name, waited)
                 return WakeResult(
                     ok=True,
@@ -321,7 +324,7 @@ class LifecycleManager:
                 return WakeResult(
                     ok=False,
                     runtime=facts.name,
-                    waited_ms=int((time.monotonic() - started) * 1000),
+                    waited_ms=int((time.perf_counter() - started) * 1000),
                     message=f"runtime {facts.name!r} crashed while starting on demand; "
                     f"GET /v1/runtimes/{facts.name} on its agent has the captured error",
                     evicted=evicted,
@@ -331,7 +334,7 @@ class LifecycleManager:
         return WakeResult(
             ok=False,
             runtime=facts.name,
-            waited_ms=int((time.monotonic() - started) * 1000),
+            waited_ms=int((time.perf_counter() - started) * 1000),
             message=(
                 f"runtime {facts.name!r} was started on demand and is still "
                 f"{last_status or 'starting'} after {int(self._swap_wait())}s; retry shortly, "

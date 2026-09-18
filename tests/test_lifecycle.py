@@ -260,7 +260,7 @@ async def test_a_runtime_that_never_served_counts_idle_from_when_it_became_ready
     # refresh would.
     import time
 
-    table._ready_since["qwen3-a"] = time.monotonic() - 50
+    table._ready_since["qwen3-a"] = time.perf_counter() - 50
     idle = table.idle_seconds("qwen3-a")
     assert idle is not None and 49 <= idle <= 60
     assert table.idle_seconds("never-seen") is None

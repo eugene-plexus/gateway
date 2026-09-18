@@ -33,6 +33,7 @@ from ._generated.driver_models import (
     GenerateResponse,
     Problem,
 )
+from ._http import internal_client
 
 log = logging.getLogger(__name__)
 
@@ -209,7 +210,12 @@ class HttpDriverClient:
         # HMAC signing key. Headers stay unset when running unauthenticated
         # (dev / standalone) so the existing test path still works.
         headers = {"Authorization": f"Bearer {service_token}"} if service_token else None
-        self._client = httpx.AsyncClient(
+        # `internal_client`: one SSL context for the process instead of a
+        # fresh certifi parse per client (~104 ms of synchronous CPU on
+        # the event loop), and no proxy, because a driver is this machine
+        # or another node of this install and a user's `HTTP_PROXY` --
+        # inherited by the Windows logon task -- would swallow every hop.
+        self._client = internal_client(
             base_url=self.base_url,
             timeout=httpx.Timeout(timeout_seconds, connect=10.0),
             headers=headers,
@@ -429,7 +435,7 @@ class TieredClient:
                 driver = getattr(candidate, "name", None)
                 if self._hooks is not None and driver:
                     self._hooks.on_attempt_start(driver)
-                started = time.monotonic()
+                started = time.perf_counter()
                 try:
                     result = await candidate.generate(request)
                 except Exception as exc:
@@ -437,7 +443,7 @@ class TieredClient:
                         self._hooks.on_attempt_end(
                             driver,
                             served=False,
-                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                            elapsed_ms=int((time.perf_counter() - started) * 1000),
                             # The exception CLASS, never its message: a
                             # driver error can carry a provider's response
                             # body, and this string is retained and
@@ -457,7 +463,7 @@ class TieredClient:
                         self._hooks.on_attempt_end(
                             driver,
                             served=True,
-                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                            elapsed_ms=int((time.perf_counter() - started) * 1000),
                         )
                     self.served_by = driver
                     self.tier = tier_index + 1
@@ -491,7 +497,7 @@ class TieredClient:
                 driver = getattr(candidate, "name", None)
                 if self._hooks is not None and driver:
                     self._hooks.on_attempt_start(driver)
-                started = time.monotonic()
+                started = time.perf_counter()
                 try:
                     result = await candidate.embed(request)
                 except Exception as exc:
@@ -499,7 +505,7 @@ class TieredClient:
                         self._hooks.on_attempt_end(
                             driver,
                             served=False,
-                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                            elapsed_ms=int((time.perf_counter() - started) * 1000),
                             error=type(exc).__name__,
                         )
                     if not _is_cascade_eligible(exc):
@@ -512,7 +518,7 @@ class TieredClient:
                         self._hooks.on_attempt_end(
                             driver,
                             served=True,
-                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                            elapsed_ms=int((time.perf_counter() - started) * 1000),
                         )
                     self.served_by = driver
                     self.tier = tier_index + 1
@@ -554,7 +560,7 @@ class TieredClient:
                 driver = getattr(candidate, "name", None)
                 if self._hooks is not None and driver:
                     self._hooks.on_attempt_start(driver)
-                started = time.monotonic()
+                started = time.perf_counter()
                 committed = False
                 stream = candidate.stream(request)
                 try:
@@ -566,7 +572,7 @@ class TieredClient:
                         self._hooks.on_attempt_end(
                             driver,
                             served=False,
-                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                            elapsed_ms=int((time.perf_counter() - started) * 1000),
                             error=type(exc).__name__,
                         )
                     if committed:
@@ -591,7 +597,7 @@ class TieredClient:
                         self._hooks.on_attempt_end(
                             driver,
                             served=True,
-                            elapsed_ms=int((time.monotonic() - started) * 1000),
+                            elapsed_ms=int((time.perf_counter() - started) * 1000),
                         )
                     self.served_by = driver
                     self.tier = tier_index + 1

@@ -167,7 +167,7 @@ def _record(
                 served_model=served_model,
                 attempts=max(1, len(tries)),
                 tier=tier if served is not None else None,
-                total_ms=int((time.monotonic() - rec.started) * 1000),
+                total_ms=int((time.perf_counter() - rec.started) * 1000),
                 waited_ms=rec.waited_ms,
                 swapped_in=rec.swapped_in,
                 streamed=rec.streamed,
@@ -378,7 +378,7 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
     # to the agent and to every driver, inside the request that
     # triggered it, so "before the clock starts" was not the same as
     # "free".
-    arrived = time.monotonic()
+    arrived = time.perf_counter()
     refreshed = False
 
     table = _routing(request)
@@ -444,10 +444,10 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
     waited_ms = wake.waited_ms if wake is not None and wake.ok else 0
     # Excludes the wake, which is `waited_ms` and already reported. The
     # two must not overlap or a swap would be counted twice.
-    routing_ms = int((time.monotonic() - arrived) * 1000) - waited_ms
+    routing_ms = int((time.perf_counter() - arrived) * 1000) - waited_ms
     swapped_in = bool(wake is not None and wake.ok)
 
-    started = time.monotonic()
+    started = time.perf_counter()
     rec = _Recording(
         metrics=_metrics(request),
         started=started,
@@ -566,7 +566,7 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
         # drift apart.
         return _not_ready(resolution, None)
 
-    started = time.monotonic()
+    started = time.perf_counter()
     try:
         result = await client.embed(EmbedRequest(input=inputs))
     except DriverError as e:
@@ -881,7 +881,7 @@ def _routing_info(
         # agent supervises one — by name, so replicas are attributed too.
         runtime=table.runtime_for(model, served_by),
         backend=backend_kind,
-        latency_ms=int((time.monotonic() - started) * 1000),
+        latency_ms=int((time.perf_counter() - started) * 1000),
         attempts=attempts if isinstance(attempts, int) and attempts >= 1 else 1,
         tier=tier if isinstance(tier, int) and tier >= 1 else 1,
         swapped_in=swapped_in,
