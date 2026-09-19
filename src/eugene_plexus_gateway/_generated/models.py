@@ -1197,6 +1197,7 @@ class RoutingBackendView(BaseModel):
 class Role3(StrEnum):
     user = 'user'
     assistant = 'assistant'
+    system = 'system'
 
 
 class AnthropicContentBlock(BaseModel):
@@ -1905,11 +1906,32 @@ class RoutingTierView(BaseModel):
 
 class AnthropicInputMessage(BaseModel):
     """
-    One turn. `role` is `user` or `assistant` only — Anthropic has
-    no `system` role and no `tool` role, which is the shape fact the
-    translation turns on: **a tool result is a `tool_result` block
-    inside a `user` message**, and a model's tool call comes back as
-    a `tool_use` block inside an `assistant` message.
+    One turn. A tool result is **a `tool_result` block inside a
+    `user` message**, and a model's tool call comes back as a
+    `tool_use` block inside an `assistant` message — Anthropic has
+    no `tool` role, and that is the shape fact the translation turns
+    on.
+
+    **`system` is in the enum because a real client sends it, and
+    the published contract says it does not.** Anthropic documents
+    `user` and `assistant` only, and the first version of this
+    schema said so. Then a real Claude Code driving a tool loop
+    against this gateway was refused with
+    `messages.1.role: Input should be 'user' or 'assistant'` on its
+    very first request: it sends the documented top-level `system`
+    (three blocks) **and, separately, a `system`-role message inside
+    `messages`** carrying several more kilobytes, positioned after
+    the first user turn.
+
+    It is carried **in place** rather than hoisted into the leading
+    system prompt. The client put it after a user turn deliberately,
+    and moving it would change what the model sees for the sake of
+    tidiness on a wire we do not own.
+
+    This one was found by the live run and not by the unit tests,
+    because the unit fixtures came from a capture of a *simple*
+    request and this shape appears only once tools are in play.
+    Recorded in `docs/acceptance/anthropic-messages-measurement.md`.
 
     """
 

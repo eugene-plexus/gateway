@@ -910,3 +910,44 @@ def test_an_operator_path_still_refuses_another_origin(settings: Settings) -> No
     with _client(_app_with(settings, fake)) as client:
         r = client.get("/v1/config", headers={"Origin": "https://example.test"})
     assert "access-control-allow-origin" not in r.headers
+
+
+def test_a_system_role_inside_messages_is_carried_in_place(settings: Settings) -> None:
+    """**The live run's finding, and the published contract says this
+    cannot happen.**
+
+    Anthropic documents `user` and `assistant` as the only message roles
+    and this schema said so, until a real Claude Code driving a tool
+    loop was refused on its first request with
+    `messages.1.role: Input should be 'user' or 'assistant'`. It sends
+    the documented top-level `system` AND a separate `system`-role
+    message inside `messages`, several kilobytes of it, after the first
+    user turn.
+
+    Carried **in place**: the client put it there deliberately, and
+    hoisting it into the leading system prompt would change what the
+    model sees for the sake of tidiness on a wire we do not own.
+
+    This shape appears only once tools are in play, which is why every
+    unit fixture above -- all built from a capture of a simple
+    request -- missed it. A live run is not a formality.
+    """
+    fake = FakeDriverClient(name="d1", model_id=MODEL, supports_tools=True)
+    fake.responses = ["ok"]
+    request = body(
+        messages=[
+            {"role": "user", "content": [{"type": "text", "text": "list the python files"}]},
+            {"role": "system", "content": "<env>cwd: /work</env>"},
+        ]
+    )
+    with _client(_app_with(settings, fake)) as client:
+        r = client.post("/v1/messages?beta=true", json=request)
+    assert r.status_code == 200, r.text
+
+    sent = [(m.role.value, m.content) for m in fake.calls[0].messages]
+    roles = [role for role, _ in sent]
+    # The fixture's own top-level system leads; the in-message one keeps
+    # its position after the user turn rather than being merged into it.
+    assert roles == ["system", "user", "system"]
+    assert sent[2][1] == "<env>cwd: /work</env>"
+    assert "x-anthropic-billing-header" in sent[0][1]
