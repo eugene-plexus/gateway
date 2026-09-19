@@ -353,6 +353,20 @@ class ConfigValueType(StrEnum):
     host) plus its mounts; the per-node grid over it is the
     Library's Folders page, not this field.
 
+    `share_credentials` (R2.6, 2026-09-18) is an ordered JSON array
+    of `ShareCredential` — `{"host": <a file server>, "username":
+    ..., "password": ...}`. Its one user is the agent's
+    `shareCredentials`, which is how a host that runs Eugene as a
+    Windows **service** reaches an authenticated share at all: a
+    service has none of the per-user credentials the person who
+    installed it collected by hand. It is the only value here whose
+    entries contain a secret, so it carries `secret`'s rule per
+    entry rather than per field — the password is redacted in `GET`,
+    accepted in `PATCH`, and an entry that omits it keeps the stored
+    one. UIs render it as rows of host / user / password, with the
+    password a password input, and must not display a redacted
+    entry as though its password were empty.
+
     """
 
     string = 'string'
@@ -371,6 +385,7 @@ class ConfigValueType(StrEnum):
     model_slots = 'model_slots'
     path_mappings = 'path_mappings'
     library_folders = 'library_folders'
+    share_credentials = 'share_credentials'
 
 
 class ConfigFieldShowWhen(BaseModel):
@@ -622,6 +637,55 @@ class RestartResult(BaseModel):
     message: str | None = Field(
         None,
         description='Optional human-readable note (e.g. "logs flushed, exiting\nnow"). UI may display this in the restart-progress dialog.\n',
+    )
+
+
+class ShareCredential(BaseModel):
+    """
+    A user name and password this host uses to reach one file server.
+
+    **The unit is the server, not the share**, and that is a Windows
+    constraint rather than a simplification: Windows refuses a second
+    set of credentials to a server it already holds a session with
+    (`ERROR_SESSION_CREDENTIAL_CONFLICT`, 1219), so a per-share
+    credential would be a field that cannot always be honoured. One
+    entry covers every share on that host.
+
+    **Why this exists at all.** An agent that runs as a Windows
+    service has no per-user credential store, so the entry a person
+    once typed into Explorer is invisible to it — and at Windows 11
+    defaults there is no guest fallback either
+    (`EnableInsecureGuestLogons` is 0), so a share that asks for
+    nobody in particular is still refused with
+    *"your organization's security policies block unauthenticated
+    guest access"* (measured 2026-09-18 against the live install's
+    own NAS). Without this the agent comes back after a reboot
+    unable to read a single model, with every health check green.
+
+    **Per node, and that is `library-folders-and-reach`'s shape
+    rather than a departure from it.** A folder states its `mounts`
+    once because a mount is a property of the share; a credential is
+    a property of *this machine's relationship to* the share, which
+    is exactly what `pathMappings` already is. Nodes do not inherit
+    credentials, and a folder never carries one.
+
+    Nothing here is required to mount anything: the agent asks the
+    OS to establish the session, and an operator who has already
+    arranged access another way leaves the list empty.
+
+    """
+
+    host: str = Field(
+        ...,
+        description="The file server, as the paths that need it spell it — a host\nname or an address, with no leading slashes and no share\nname. `192.168.16.252` covers `\\\\192.168.16.252\\downloads`\nand `\\\\192.168.16.252\\appdata` both. Matched\ncase-insensitively, because a server name is.\n\nA name and an address for the same machine are **two\ndifferent servers** to Windows, which keys a session by the\nname it was dialled with. That is a tripwire worth knowing\nrather than a rule to work around: spell it here the way the\nLibrary folder's mounts spell it.\n",
+    )
+    username: str = Field(
+        ...,
+        description='The account on the file server, not on this machine.\n`DOMAIN\\user` where the server wants one.\n',
+    )
+    password: str | None = Field(
+        None,
+        description="Redacted in `GET /v1/config` exactly as a `secret` scalar is\n— the value comes back as null and the entry keeps its `host`\nand `username`, so a UI can render the row without ever\nholding the secret. A `PATCH` that omits `password` on an\nentry whose `host` already exists **keeps the stored one**,\nso editing a user name does not silently blank the password;\nan explicit empty string clears it.\n\n**At rest it is sealed with the install's master key**, the\nsame envelope a driver's `apiKey` gets, so it is not\nreadable from the config file — and so it is readable only\nonce the agent is unlocked. On a host whose `securityMode`\nis `prompt_on_startup` that means shares are not reachable\nuntil somebody signs in, which is the same thing everything\nelse behind the master key already does and is reported the\nsame way rather than failing as a missing file.\n",
     )
 
 
