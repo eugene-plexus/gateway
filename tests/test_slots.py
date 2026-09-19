@@ -265,6 +265,105 @@ def test_a_fallback_after_a_never_launched_primary_reports_its_real_tier(
     assert info["tier"] == 2, "a fallback still reported itself as the primary"
 
 
+def test_the_self_tier_is_kept_when_the_install_declares_that_model(
+    settings: Settings,
+) -> None:
+    """R3 item 3 (review 6.2 #20): the surviving second case.
+
+    The 2026-09-10 fix carved the slot's own name out of "keep every
+    tier", and that carve-out is right for a **virtual alias** — a name
+    nothing is ever launched under, where an empty self tier would push
+    every configured target up a number. It is wrong for the shape the UI
+    actually produces, `{model: <a real local model>, targets: [cloud]}`:
+    there the self tier is the primary, and dropping it when the
+    companion driver happens to be down at refresh makes the cloud answer
+    `tier: 1` — *the primary served this*, which is the one question
+    tiered failover exists to answer, answered backwards.
+
+    **The two are distinguishable and the snapshot already holds the
+    discriminator.** `_Snapshot.runtimes` is every runtime the install
+    DECLARES, read per node from each agent, independent of whether
+    anything is advertising it right now. A name some runtime carries is
+    a real primary; a name no runtime carries is an alias.
+
+    Note what is NOT the discriminator: `by_model`. That is what is being
+    advertised at this instant, and being empty is precisely the
+    condition under test.
+    """
+    cloud = FakeDriverClient(name="claude", base_url="http://c", model_id=CLOUD)
+    table = make_routing_table(
+        cloud,
+        # Declared, ready, and its companion driver is not answering — so
+        # nothing advertises LOCAL at this refresh.
+        runtimes=[runtime_facts("qwen3-a", alias=LOCAL)],
+        unreachable={"qwen3-a-driver": "connection refused"},
+        slots=[{"model": LOCAL, "targets": [CLOUD]}],
+    )
+    resolution = table.resolve(LOCAL)
+    assert [t.target for t in resolution.tiers] == [LOCAL, CLOUD]
+    assert [[x.name for x in t.backends] for t in resolution.tiers] == [[], ["claude"]]
+
+    with _app(settings, table) as c:
+        body = c.post("/v1/chat/completions", json=_chat(LOCAL)).json()
+    info = body["x_eugene_plexus"]
+    assert info["driver"] == "claude"
+    assert info["tier"] == 2, "the fallback reported itself as the primary"
+
+
+def test_the_self_tier_is_kept_for_a_runtime_known_only_by_its_name() -> None:
+    """`modelAlias` is optional, so the name is the other half of the rule.
+
+    A runtime declared without one still produces a companion driver that
+    advertises something, and on this install that something is the
+    runtime's own name. Matching only on `alias` would drop the self tier
+    for every runtime whose operator never typed an alias, which is the
+    same defect for a different reason.
+    """
+    cloud = FakeDriverClient(name="claude", base_url="http://c", model_id=CLOUD)
+    table = make_routing_table(
+        cloud,
+        runtimes=[runtime_facts("coder-30b", alias=None)],
+        slots=[{"model": "coder-30b", "targets": [CLOUD]}],
+    )
+    assert [t.target for t in table.resolve("coder-30b").tiers] == ["coder-30b", CLOUD]
+
+
+def test_the_self_tier_is_kept_for_a_primary_on_another_machine() -> None:
+    """The question is install-wide, and a sabotage pass is what said so.
+
+    Narrowing `_declares_runtime` to this node escaped every other check
+    here, because none of them put the primary anywhere else. That is
+    precisely the install R1.6 exists for: one model, two machines. The
+    gateway routes across all of them, so a slot's primary being declared
+    on `box-b` makes it a primary — and if the console happens to be
+    talking to a gateway whose own node declares nothing, the answer must
+    not change.
+    """
+    cloud = FakeDriverClient(name="claude", base_url="http://c", model_id=CLOUD)
+    table = make_routing_table(
+        cloud,
+        runtimes=[runtime_facts("qwen3-a", alias=LOCAL, node="box-b")],
+        slots=[{"model": LOCAL, "targets": [CLOUD]}],
+    )
+    assert [t.target for t in table.resolve(LOCAL).tiers] == [LOCAL, CLOUD]
+
+
+def test_a_virtual_alias_still_has_no_self_tier() -> None:
+    """The half the 2026-09-10 carve-out got right, kept.
+
+    `chat` is not a runtime anywhere in the install, so its implicit self
+    tier is not a primary that failed — it is nothing at all, and keeping
+    it would renumber the operator's own two targets.
+    """
+    cloud = FakeDriverClient(name="claude", base_url="http://c", model_id=CLOUD)
+    table = make_routing_table(
+        cloud,
+        runtimes=[runtime_facts("qwen3-a", alias=LOCAL)],
+        slots=[{"model": "chat", "targets": ["never-launched", CLOUD]}],
+    )
+    assert [t.target for t in table.resolve("chat").tiers] == ["never-launched", CLOUD]
+
+
 def test_the_cascade_walks_the_tier_then_the_next_tier(settings: Settings) -> None:
     a, b = _replicas()
     a.generate_error = httpx.ConnectError("refused")
@@ -377,6 +476,12 @@ def test_the_model_list_reports_tiers_readiness_and_on_demand(settings: Settings
 
 def test_the_routing_view_opens_the_table_up(settings: Settings) -> None:
     a, b = _replicas()
+    # **On the same machine as its runtime, which is the only shape that
+    # exists.** Before the fixture was keyed `(node, name)` this test had
+    # the runtime on `box` and its driver nowhere, and the bare-name join
+    # married them anyway — the exact cross-node join R1.6 removed from
+    # production, still being asserted here.
+    a.node = "box"
     table = make_routing_table(
         a,
         b,
@@ -386,7 +491,10 @@ def test_the_routing_view_opens_the_table_up(settings: Settings) -> None:
         ],
         unreachable={"dead": "connection refused"},
     )
-    table.on_attempt_start("qwen3-a-driver")
+    # The node belongs here too: R1.6 keys every in-flight counter by
+    # `(node, driver)`, and a bare name counts against a different bucket
+    # than the one this backend reads.
+    table.on_attempt_start("qwen3-a-driver", node="box")
     with _app(settings, table) as c:
         view = c.get("/v1/admin/routing").json()
     assert view["load_balancing"] == "least_busy"

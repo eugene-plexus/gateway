@@ -50,6 +50,7 @@ class FakeDriverClient:
         provider: str | None = None,
         max_context_tokens: int | None = None,
         runtime: str | None = None,
+        node: str | None = None,
         supports_tools: bool = False,
         supports_embeddings: bool = False,
     ) -> None:
@@ -60,6 +61,11 @@ class FakeDriverClient:
         self.provider = provider
         self.max_context_tokens = max_context_tokens
         self.runtime = runtime
+        self.node = node
+        """Which machine's agent reported this driver. `None` is a
+        single-host install, and it is half of every key in `routing.py`
+        since R1.6 -- a driver is joined only to a runtime on its OWN
+        node, because two replicas of one model share a runtime name."""
         self.supports_tools = supports_tools
         self.supports_embeddings = supports_embeddings
         self.tool_calls: list[ToolCall] | None = None
@@ -301,8 +307,17 @@ def install_snapshot(
     unreachable: dict[str, str] | None = None,
     runtimes: list[_RuntimeFacts] | None = None,
 ) -> None:
-    """Replace a table's snapshot — what a refresh would have produced."""
-    facts = {r.name: r for r in (runtimes or [])}
+    """Replace a table's snapshot — what a refresh would have produced.
+
+    **Keyed by `(node, name)`, because that is what a refresh produces.**
+    This helper kept a bare-name map for three weeks after R1.6 moved
+    production to the tuple, and nothing failed, because no test that
+    uses this helper does a keyed lookup. That is the R1.6 lesson exactly
+    — *the test written for this scenario had been passing on a shape no
+    install can produce* — so the shape is corrected here rather than
+    left for whichever check reaches for the key next.
+    """
+    facts = {(r.node, r.name): r for r in (runtimes or [])}
     snapshot = _Snapshot(runtimes=facts, agents={None: table._agent_url})
     for fake in fakes:
         backend = _Backend(
@@ -310,15 +325,19 @@ def install_snapshot(
             url=fake.base_url,
             client=fake,  # type: ignore[arg-type]
             info=fake.describe(),
-            runtime=facts.get(fake.runtime) if fake.runtime else None,
+            node=fake.node,
+            runtime=facts.get((fake.node, fake.runtime)) if fake.runtime else None,
         )
         snapshot.reachable.append(backend)
         if fake.model_id:
             snapshot.by_model.setdefault(fake.model_id, []).append(backend)
     for name, error in (unreachable or {}).items():
         snapshot.unreachable.append(_Unreachable(name=name, url=f"http://{name}.fake", error=error))
+    # `(node, name)`, as the real refresh sorts: two replicas of one
+    # model on two machines have equal names, and sorting on the name
+    # alone would leave their order to dict insertion.
     for backends in snapshot.by_model.values():
-        backends.sort(key=lambda b: b.name)
+        backends.sort(key=lambda b: (b.node or "", b.name))
     table._snapshot = snapshot
 
 

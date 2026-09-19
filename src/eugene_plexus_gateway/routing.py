@@ -1234,13 +1234,31 @@ class RoutingTable:
         had nothing at all — two rules for one question, and the
         contract's `tier` description states this one.
 
-        **The exception is the slot's own name**, which `_slot_targets`
-        always puts first. That tier is implicit — "this model's own
-        replicas" — rather than something the operator listed, so a
-        virtual alias that nothing serves directly has no self-tier at
-        all. Keeping an empty one would push every configured target up
-        a number, which is the same defect in the other direction and is
-        how the first attempt at this fix broke five tests.
+        **The slot's own name is the one conditional tier**, and the
+        condition is *does this install declare a runtime under that
+        name*. `_slot_targets` always puts it first, and it is implicit —
+        "this model's own replicas" — rather than something the operator
+        listed. Two shapes hide behind that:
+
+        * `{model: "chat", targets: [local-8b, cloud]}`, where `chat` is
+          a **virtual alias** nothing is ever launched under. An empty
+          self tier there would push both of the operator's targets up a
+          number, which is the same defect in the other direction and is
+          how the first attempt at this fix broke five tests.
+        * `{model: "qwen3-8b", targets: [cloud]}`, where the slot's name
+          **is a real local model** — the shape the UI produces. There
+          the self tier IS the primary, and dropping it because its
+          companion driver happened to be down at this refresh made the
+          cloud answer `tier: 1`: *the primary served this*, which is
+          exactly the question tiered failover exists to answer,
+          answered backwards. Review §6.2 #20, the second case the
+          2026-09-10 carve-out left behind; fixed at R3 item 3.
+
+        `_declares_runtime` tells them apart. Note which map it reads and
+        which it does not: `runtimes` is what the install DECLARES, read
+        per node from each agent and independent of what is advertising
+        anything right now; `by_model` is the instant, and its being
+        empty is the condition under test.
 
         A slot where nothing resolves is still a 404, because
         `has_backends()` asks whether any tier has backends rather than
@@ -1250,13 +1268,44 @@ class RoutingTable:
         nothing serves it.*
         """
         configured, targets = self._slot_targets(model)
+        declared = self._declares_runtime(model)
         tiers: list[_Tier] = []
         for index, target in enumerate(targets):
             backends = list(self._snapshot.by_model.get(target, []))
-            if index == 0 and not backends:
+            if index == 0 and not backends and not declared:
                 continue
             tiers.append(_Tier(target=target, backends=backends))
         return Resolution(model=model, configured=configured, tiers=tiers)
+
+    def _declares_runtime(self, model: str) -> bool:
+        """Does any node in this install declare an engine runtime under
+        this name? — which is what separates a primary that is currently
+        down from a name that was never a primary at all.
+
+        **By alias OR by name, and both halves earn their place.** The
+        alias is what a companion driver advertises as its `modelId`
+        (M6), so it is the match that fires on the live install. But
+        `RuntimeSpec.modelAlias` is optional, and a runtime declared
+        without one still gets a companion driver advertising *something*
+        — matching only on `alias` would drop the self tier for every
+        operator who never typed one, which is this same defect reached
+        by a different route.
+
+        Over-matching is the safe direction and is worth saying why: this
+        decides a **label**, never an order. `_slot_targets` produces the
+        same sequence either way and `pick` walks it the same way, so the
+        cost of keeping a tier that should have gone is one number, while
+        the cost of dropping one is a fallback claiming to be the
+        primary.
+
+        Iterates rather than looking up, because `runtimes` is keyed by
+        `(node, name)` (R1.6) and the question is install-wide: one
+        model on two machines is two entries, and either answers it.
+        """
+        return any(
+            facts.alias == model or facts.name == model
+            for facts in self._snapshot.runtimes.values()
+        )
 
     def _order(self, target: str, backends: list[_Backend]) -> list[_Backend]:
         """Balance one tier.

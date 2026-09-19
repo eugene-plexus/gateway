@@ -806,7 +806,7 @@ class ModelRoutingInfo(BaseModel):
     )
     tiers: list[list[str]] | None = Field(
         None,
-        description="The slot's tiers in priority order, each the driver names\nin it. One tier for an unconfigured model; more when a\n`modelSlots` entry adds targets. Empty tiers are omitted.\n",
+        description='The slot\'s tiers in priority order, each the driver names\nin it. One tier for an unconfigured model; more when a\n`modelSlots` entry adds targets.\n\n**An empty tier is kept.** Its index is the `tier` a\ncompletion reports, so dropping one renumbers every tier\nafter it and a fallback comes back claiming to be the\nprimary. A configured target with nothing serving it reads\nas `[]` here, which is also the diagnosis an operator\nwants: *you asked for `local-8b` and nothing serves it*.\n(This said "empty tiers are omitted" until 2026-09-19; it\nhad been untrue since the 2026-09-10 fix that made it so.)\n\nThe one tier that can be **absent** is the slot\'s own name,\nwhich is implicit rather than something the operator listed.\nIt is there whenever any node in the install declares a\nruntime under that name — a primary that is merely down is\nstill a primary — and gone for a purely virtual alias, where\nkeeping it would renumber the operator\'s own targets.\n',
     )
     ready_backends: int | None = Field(
         None,
@@ -1003,7 +1003,7 @@ class CompletionRoutingInfo(BaseModel):
     )
     tier: int | None = Field(
         None,
-        description='Which tier of the slot answered, 1-based. Greater than 1\nmeans every backend in an earlier tier was ineligible or\nfailed — a cloud target answering for a local model, say.\n',
+        description="Which tier of the slot answered, 1-based. Greater than 1\nmeans every backend in an earlier tier was ineligible or\nfailed — a cloud target answering for a local model, say.\n\n**Positional, counted over the slot's tiers rather than over\nthe ones that had anything in them**, which is the only\nreading that answers the question this field exists for:\n*did the primary serve this?* A primary whose companion\ndriver is down is a tier with no backends, and it still\noccupies its number. See `ModelRoutingInfo.tiers` for which\ntier can be absent and why.\n",
         ge=1,
     )
     swapped_in: bool | None = Field(
