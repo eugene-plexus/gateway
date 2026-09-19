@@ -67,11 +67,17 @@ Receive = Callable[[], Awaitable[Message]]
 Send = Callable[[Message], Awaitable[None]]
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 
-# The OpenAI-compatible surface, and nothing else. Exact paths: the
-# front door has no sub-resources, and a prefix match would quietly
-# widen to whatever is added under /v1 next.
+# The front door, and nothing else. Exact paths: the front door has no
+# sub-resources, and a prefix match would quietly widen to whatever is
+# added under /v1 next.
+#
+# `/v1/messages` joined at R4 for a reason that is on the wire rather
+# than by analogy: Anthropic's own browser path announces itself with
+# `anthropic-dangerous-direct-browser-access`, which Claude Code sends
+# on every request, so a browser client of that door is a shape its
+# authors expect.
 FRONT_DOOR_PATHS: frozenset[str] = frozenset(
-    {"/v1/models", "/v1/chat/completions", "/v1/embeddings"}
+    {"/v1/models", "/v1/chat/completions", "/v1/embeddings", "/v1/messages"}
 )
 
 # What the three paths accept between them. A preflight for PATCH on
@@ -85,8 +91,14 @@ _ALLOW_METHODS = "GET, POST, OPTIONS"
 _MAX_AGE = "600"
 
 # What a preflight is asked for when it does not say: the two headers
-# every OpenAI client sends.
-_DEFAULT_ALLOW_HEADERS = "authorization, content-type"
+# every OpenAI client sends, plus the three an Anthropic one does.
+#
+# **`x-api-key` is not optional here.** It is the header
+# `ANTHROPIC_API_KEY` produces, and a default list without it answers
+# the preflight and then fails the request -- which is the least
+# diagnosable CORS failure there is, because the browser reports only
+# `Failed to fetch` and the server sees nothing at all.
+_DEFAULT_ALLOW_HEADERS = "authorization, content-type, x-api-key, anthropic-version, anthropic-beta"
 
 CONFIG_ENABLED_KEY = "corsEnabled"
 CONFIG_ORIGINS_KEY = "corsAllowedOrigins"

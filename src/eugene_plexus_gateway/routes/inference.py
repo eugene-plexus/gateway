@@ -1,11 +1,21 @@
-"""The OpenAI-compatible front door: /v1/models and /v1/chat/completions.
+"""The front doors: /v1/models, /v1/chat/completions, /v1/embeddings and,
+since R4, /v1/messages.
 
-These two operations are the only ones in Eugene Plexus that use
-snake_case field names and OpenAI's error envelope. That is deliberate:
+These are the only operations in Eugene Plexus that use snake_case field
+names and somebody else's error envelope. That is deliberate:
 "OpenAI-compatible" is worth nothing unless an unmodified OpenAI SDK can
 point its `base_url` here and work, and those SDKs parse the error shape
 to build their exceptions. Renaming `max_tokens` to `maxTokens` for house
 consistency would break the entire audience.
+
+`/v1/messages` speaks Anthropic's wire for the same reason one layer
+over: Claude Code and everything built on the Anthropic SDKs cannot read
+OpenAI's shape at all, so without that door the most capable client in
+the field can be pointed at every competing product and not at us.
+**It is a translation, not a second routing engine** -- `_prepare` is
+shared, so both doors get the same refusals, the same cascade, the same
+wake and the same recording, and `GET /v1/metrics` sees both. The
+translation itself lives in `..anthropic`.
 """
 
 from __future__ import annotations
@@ -26,6 +36,7 @@ import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from .. import anthropic
 from .._generated.driver_models import (
     EmbedRequest,
     GenerateRequest,
@@ -221,6 +232,45 @@ def _error(
     return JSONResponse(status_code=code, content=body)
 
 
+@dataclass(frozen=True)
+class _Failure:
+    """A refusal decided once and rendered per door.
+
+    R4 put a second front door on the same routing. The refusals it
+    shares -- no such model, the wrong surface, nothing ready, a
+    toolless backend -- have to *say* the same thing on both and be
+    *shaped* differently on each, because an OpenAI SDK and an Anthropic
+    SDK each parse their own envelope and report anything else as a
+    generic failure.
+
+    So the decision and its wording live here and each door renders it.
+    The alternative -- a second copy of these messages inside the
+    Anthropic translator -- is how two surfaces start disagreeing about
+    what the install is doing, which is the failure this project has
+    already had between a contract and its implementation more than
+    once.
+    """
+
+    code: int
+    message: str
+    error_type: str
+    param: str | None = None
+
+    def as_openai(self) -> JSONResponse:
+        return _error(
+            code=self.code, message=self.message, error_type=self.error_type, param=self.param
+        )
+
+    def as_anthropic(self) -> JSONResponse:
+        # `status_for` moves exactly one code, and it moves on a
+        # measurement: a 404's body is discarded by Claude Code and
+        # replaced with a generic message blaming the model, which
+        # would throw away the available-model list and the
+        # sealed-control-root diagnosis.
+        status = anthropic.status_for(self.code)
+        return anthropic.error_response(status, self.message)
+
+
 def _control_root_hint(table: RoutingTable | None) -> str:
     """The sentence this 404 never said: whether the gateway could see
     past this host at all.
@@ -247,7 +297,7 @@ def _control_root_hint(table: RoutingTable | None) -> str:
     return ""
 
 
-def _no_such_model(model: str, table: RoutingTable | None) -> JSONResponse:
+def _no_such_model(model: str, table: RoutingTable | None) -> _Failure:
     known = table.known_models() if table is not None else []
     if known:
         hint = f" Available models: {', '.join(known)}."
@@ -257,7 +307,7 @@ def _no_such_model(model: str, table: RoutingTable | None) -> JSONResponse:
             "GET /v1/runtimes for an engine in `ready` state, and that an "
             "inference-driver in GET /v1/components is pointed at its url."
         ) + _control_root_hint(table)
-    return _error(
+    return _Failure(
         code=404,
         message=f"The model {model!r} does not exist.{hint}",
         error_type="invalid_request_error",
@@ -280,7 +330,7 @@ def _any_backend_carries_tools(resolution: Resolution) -> bool:
     )
 
 
-def _tools_unsupported(model: str) -> JSONResponse:
+def _tools_unsupported(model: str) -> _Failure:
     """400, in OpenAI's envelope so a harness's SDK raises properly.
 
     The alternative -- dropping `tools` and answering -- is the failure
@@ -291,7 +341,7 @@ def _tools_unsupported(model: str) -> JSONResponse:
     while claiming to route around it would be worse than not shipping
     tools at all.
     """
-    return _error(
+    return _Failure(
         code=400,
         message=(
             f"No backend serving {model!r} can carry tool definitions, so the request "
@@ -303,9 +353,7 @@ def _tools_unsupported(model: str) -> JSONResponse:
     )
 
 
-def _wrong_surface(
-    model: str, surfaces: Sequence[str], *, wanted: str, instead: str
-) -> JSONResponse:
+def _wrong_surface(model: str, surfaces: Sequence[str], *, wanted: str, instead: str) -> _Failure:
     """400 when a model was sent to a surface it does not serve.
 
     Named rather than generic, because the alternative is what happened
@@ -314,7 +362,7 @@ def _wrong_surface(
     embedding-shaped nothing. The caller could not tell whether they had
     picked the wrong model or hit a broken install.
     """
-    return _error(
+    return _Failure(
         code=400,
         message=(
             f"The model {model!r} serves {', '.join(surfaces)} and not {wanted}. "
@@ -342,7 +390,7 @@ def _encode_embedding(vector: list[float], encoding_format: str | None) -> list[
     return base64.b64encode(struct.pack(f"<{len(vector)}f", *vector)).decode("ascii")
 
 
-def _not_ready(resolution: Resolution, wake: WakeResult | None) -> JSONResponse:
+def _not_ready(resolution: Resolution, wake: WakeResult | None) -> _Failure:
     """503: something serves this model and none of it can take a request
     right now. Retryable, so deliberately not a 502."""
     states = sorted(
@@ -353,7 +401,7 @@ def _not_ready(resolution: Resolution, wake: WakeResult | None) -> JSONResponse:
         }
     )
     detail = wake.message if wake is not None else "; ".join(states) or "no backend is ready"
-    return _error(
+    return _Failure(
         code=503,
         message=(
             f"No backend serving {resolution.model!r} is ready: {detail}. "
@@ -381,8 +429,40 @@ async def list_models(request: Request) -> ModelList:
 # --------------------------------------------------------------------------- #
 
 
-@router.post("/v1/chat/completions", dependencies=_auth)
-async def create_chat_completion(request: Request, body: ChatCompletionRequest) -> Any:
+@dataclass(slots=True)
+class _Serving:
+    """Everything a door needs once routing has decided.
+
+    R4's one real refactor. `create_chat_completion` used to hold the
+    routing phase inline, and a second front door would either have
+    duplicated it or reached past it into a driver. Duplicating it is
+    the worse of the two: it is where the surface refusal, the tools
+    refusal, the refresh-and-wake and -- crucially -- the **recording**
+    live, and a door that skipped the recording would be invisible to
+    `GET /v1/metrics`. That is M8's finding (the envelope is the wrong
+    recording point, and the streaming path was not it) arriving in a
+    new place before it could bite twice.
+    """
+
+    client: DriverClient
+    table: RoutingTable
+    generate: GenerateRequest
+    rec: _Recording
+    started: float
+    waited_ms: int
+    swapped_in: bool
+
+
+async def _prepare(
+    request: Request, body: ChatCompletionRequest, *, surface: str, instead: str
+) -> _Serving | _Failure:
+    """Resolve, refuse, refresh, wake, and start the clock.
+
+    Shared by both front doors. Returns the thing to serve with, or the
+    refusal to render -- and the refusal is a `_Failure` rather than a
+    response, because the two doors shape errors differently and must
+    not word them differently.
+    """
     # The routing phase starts here, and it used to be unmeasured: the
     # clock below is taken after the wake, so resolving, picking and any
     # refresh happened before anything was timing. A refresh does HTTP
@@ -394,7 +474,7 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
 
     table = _routing(request)
     if table is None:
-        return _error(
+        return _Failure(
             code=503,
             message="The gateway is starting up or in safe mode; no routing table exists yet.",
             error_type="service_unavailable",
@@ -410,8 +490,8 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
     # launch a dedicated embedding model, so this is a mistake an
     # operator can make entirely inside our own UI.
     surfaces = table.surfaces_for(body.model)
-    if surfaces and "chat" not in surfaces:
-        return _wrong_surface(body.model, surfaces, wanted="chat", instead="/v1/embeddings")
+    if surfaces and surface not in surfaces:
+        return _wrong_surface(body.model, surfaces, wanted=surface, instead=instead)
 
     # **Refused here, never stripped.** Checked before a backend is
     # picked, because the answer must not depend on which replica the
@@ -459,17 +539,40 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
     swapped_in = bool(wake is not None and wake.ok)
 
     started = time.perf_counter()
-    rec = _Recording(
-        metrics=_metrics(request),
+    return _Serving(
+        client=client,
+        table=table,
+        generate=generate,
         started=started,
         waited_ms=waited_ms,
         swapped_in=swapped_in,
-        routing_ms=max(0, routing_ms),
-        refreshed=refreshed,
-        strategy=str(store.get("loadBalancing")) if store is not None else None,
-        candidates=considered,
-        streamed=bool(body.stream),
+        rec=_Recording(
+            metrics=_metrics(request),
+            started=started,
+            waited_ms=waited_ms,
+            swapped_in=swapped_in,
+            routing_ms=max(0, routing_ms),
+            refreshed=refreshed,
+            strategy=str(store.get("loadBalancing")) if store is not None else None,
+            candidates=considered,
+            streamed=bool(body.stream),
+        ),
     )
+
+
+@router.post("/v1/chat/completions", dependencies=_auth)
+async def create_chat_completion(request: Request, body: ChatCompletionRequest) -> Any:
+    prepared = await _prepare(request, body, surface="chat", instead="/v1/embeddings")
+    if isinstance(prepared, _Failure):
+        return prepared.as_openai()
+    client = prepared.client
+    table = prepared.table
+    generate = prepared.generate
+    rec = prepared.rec
+    started = prepared.started
+    waited_ms = prepared.waited_ms
+    swapped_in = prepared.swapped_in
+    store = _store(request)
 
     if body.stream:
         # The generator runs AFTER this function returns, so its
@@ -501,7 +604,7 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
             )
         except DriverError as e:
             _record(rec, body, tries)
-            return _driver_error_response(e)
+            return _driver_failure(e).as_openai()
         except httpx.TimeoutException as e:
             # **Not the cascade's 502, and not a cascade at all.** This
             # is our own read deadline onto the driver: the engine is
@@ -548,6 +651,240 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
 
 
 # --------------------------------------------------------------------------- #
+# /v1/messages -- the Anthropic door
+# --------------------------------------------------------------------------- #
+
+
+def _serve_failure(
+    e: Exception, body: ChatCompletionRequest, store: ConfigStore | None
+) -> _Failure:
+    """One backend failure, classified once for both front doors.
+
+    R2.5's distinction is the load-bearing one and it is preserved here
+    rather than restated: a **deadline that fired** is 504 and is not a
+    cascade, because the engine is almost certainly still computing this
+    prompt and the next replica would take the same time on the same
+    input. A connect timeout is a dead host and cascades like any other
+    transport error, which is why it never reaches this function as a
+    `TimeoutException`.
+    """
+    if isinstance(e, ClientGone):
+        return _Failure(
+            code=499,
+            message="The client disconnected; the backend call was cancelled.",
+            error_type="client_disconnected",
+        )
+    if isinstance(e, DriverError):
+        return _driver_failure(e)
+    if isinstance(e, httpx.TimeoutException):
+        return _Failure(
+            code=504,
+            message=(
+                f"No backend serving {body.model!r} answered within the gateway's "
+                f"requestTimeoutSeconds ({_timeout_seconds(store):g}s). The backend was "
+                f"most likely still working rather than broken -- a large model on CPU, "
+                f"or a partial offload, can take minutes. Raise that setting under "
+                f"Config -> Gateway -> Routing. ({type(e).__name__})"
+            ),
+            error_type="timeout",
+        )
+    return _Failure(
+        code=502,
+        message=(
+            f"Every backend serving {body.model!r} failed. Last error: {e!r}. "
+            f"The engine may have stopped — check GET /v1/runtimes on the agent."
+        ),
+        error_type="upstream_error",
+    )
+
+
+async def _stream_anthropic(
+    body: ChatCompletionRequest,
+    prepared: _Serving,
+    *,
+    model: str,
+) -> AsyncIterator[str]:
+    """The driver's stream as Anthropic's typed events.
+
+    Deliberately a sibling of `_stream_completion` rather than a wrapper
+    around it: that one emits OpenAI SSE text, and re-parsing our own
+    output to re-frame it would put a serializer and a parser between
+    the backend and the client for no gain. What the two share is the
+    thing that matters -- the same `client.stream`, the same commit
+    point, the same `_record` -- and they share it by construction
+    because both are handed the same `_Serving`.
+    """
+    translator = anthropic.StreamTranslator(model)
+    with collect_attempts() as tries:
+        response: GenerateResponse | None = None
+        try:
+            async for event in prepared.client.stream(prepared.generate):
+                if event.done:
+                    # Captured, NOT broken out of -- see
+                    # `_stream_completion`. Abandoning the generator at
+                    # its yield loses the attempt bookkeeping entirely,
+                    # which is R1.4's finding and cost every streamed
+                    # request its metrics row.
+                    response = event.result
+                    continue
+                if not translator.started:
+                    # On the first DRIVER event, never on acceptance:
+                    # `message_start` names the model, and until the
+                    # first token the cascade can still change which
+                    # backend answers.
+                    yield translator.start()
+                if event.tool_calls:
+                    for chunk in translator.tool_fragments(event.tool_calls):
+                        yield chunk
+                    continue
+                if event.text:
+                    for chunk in translator.text(event.text):
+                        yield chunk
+        except (DriverError, httpx.HTTPError) as e:
+            log.warning("anthropic stream for %r failed: %s", body.model, e)
+            _record(prepared.rec, body, tries)
+            if not translator.started:
+                yield translator.start()
+            for chunk in translator.failed(str(e) or type(e).__name__):
+                yield chunk
+            return
+
+        if not translator.started:
+            # A backend that produced no tokens at all still owes the
+            # client a well-formed stream, or its state machine hangs
+            # waiting for a `message_start` that never comes.
+            yield translator.start(response.modelId if response is not None else None)
+
+        if response is None:
+            # The driver ended without a `done` event: a truncation, not
+            # a completion. There is no Anthropic stop reason for "the
+            # backend broke mid-stream", so the stream says so as an
+            # error event rather than inventing one -- the same call
+            # `_stream_completion` makes, in this wire's vocabulary.
+            log.warning("driver stream for %r ended without a done event", body.model)
+            _record(prepared.rec, body, tries)
+            for chunk in translator.failed(
+                "The backend stopped before it finished. What arrived above is partial."
+            ):
+                yield chunk
+            return
+
+        _record(
+            prepared.rec,
+            body,
+            tries,
+            served_model=response.modelId or body.model,
+            tier=getattr(prepared.client, "tier", 1),
+            usage=response.usage,
+            backend_ms=response.latencyMs,
+        )
+        truncated = _prompt_truncated(body, response.usage)
+        _warn_if_truncated(
+            truncated, body, response.usage, getattr(prepared.client, "served_by", None)
+        )
+        for chunk in translator.finish(
+            reason=anthropic.stop_reason(response.finishReason), usage=response.usage
+        ):
+            yield chunk
+
+
+@router.post("/v1/messages")
+async def create_anthropic_message(request: Request) -> Any:
+    """Anthropic's Messages API, translated onto the shared path.
+
+    **Auth is done in the body of this function rather than as a
+    `dependencies=` entry, and that is not an oversight.** This door
+    accepts a second header (`x-api-key`) and answers **403** where the
+    rest of the gateway answers 401, and neither is expressible through
+    the shared `HTTPBearer` dependency: it reads only `Authorization`,
+    and a raised `HTTPException` is wrapped by FastAPI in its own
+    `{"detail": ...}`, which is exactly the shape an Anthropic SDK
+    cannot read. A credential error the client cannot parse is a
+    credential error it retries.
+
+    **The body is read raw rather than declared as a parameter**, for
+    the same family of reason: a declared model hands a validation
+    failure to FastAPI, which answers 422 in its own envelope, and the
+    contract says a missing `max_tokens` is a 400 naming the field.
+    `anthropic.translate_request` validates against the generated model
+    and turns a failure into our own shape.
+    """
+    try:
+        await anthropic.authorize(request)
+    except anthropic.Refusal as refusal:
+        return refusal.response()
+
+    try:
+        raw = await request.json()
+    except Exception:
+        return anthropic.error_response(400, "The request body is not valid JSON.")
+    if not isinstance(raw, dict):
+        return anthropic.error_response(400, "The request body must be a JSON object.")
+
+    try:
+        body = anthropic.translate_request(raw)
+    except anthropic.Refusal as refusal:
+        return refusal.response()
+
+    prepared = await _prepare(request, body, surface="chat", instead="/v1/embeddings")
+    if isinstance(prepared, _Failure):
+        return prepared.as_anthropic()
+
+    if body.stream:
+        # The generator runs AFTER this function returns, so the
+        # attempt-collection scope has to live inside it.
+        return StreamingResponse(
+            _stream_anthropic(body, prepared, model=body.model),
+            media_type="text/event-stream",
+        )
+
+    store = _store(request)
+    with collect_attempts() as tries:
+        try:
+            response = await serve_while_connected(
+                request, prepared.client.generate(prepared.generate), what="an Anthropic message"
+            )
+        except (ClientGone, DriverError, httpx.HTTPError) as e:
+            _record(prepared.rec, body, tries)
+            return _serve_failure(e, body, store).as_anthropic()
+
+        served_model = response.modelId or body.model
+        truncated = _prompt_truncated(body, response.usage)
+        _warn_if_truncated(
+            truncated, body, response.usage, getattr(prepared.client, "served_by", None)
+        )
+        _record(
+            prepared.rec,
+            body,
+            tries,
+            served_model=served_model,
+            tier=getattr(prepared.client, "tier", 1),
+            usage=response.usage,
+            backend_ms=response.latencyMs,
+        )
+        return JSONResponse(
+            content=anthropic.message_response(
+                model=served_model,
+                content=response.content,
+                tool_calls=response.toolCalls,
+                finish=response.finishReason,
+                usage=response.usage,
+            ),
+            headers=anthropic.envelope_headers(
+                _routing_info(
+                    prepared.client,
+                    prepared.table,
+                    body.model,
+                    prepared.started,
+                    waited_ms=prepared.waited_ms,
+                    swapped_in=prepared.swapped_in,
+                    prompt_truncated=truncated,
+                )
+            ),
+        )
+
+
+# --------------------------------------------------------------------------- #
 # /v1/embeddings
 # --------------------------------------------------------------------------- #
 
@@ -575,13 +912,13 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
 
     resolution = table.resolve(body.model)
     if not resolution.has_backends():
-        return _no_such_model(body.model, table)
+        return _no_such_model(body.model, table).as_openai()
 
     surfaces = table.surfaces_for(body.model)
     if surfaces and "embeddings" not in surfaces:
         return _wrong_surface(
             body.model, surfaces, wanted="embeddings", instead="/v1/chat/completions"
-        )
+        ).as_openai()
 
     # `oneOf: [string, array]` generates `str | Input`, where `Input` is
     # a RootModel wrapping the list -- so the array case needs `.root`
@@ -609,7 +946,7 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
         # would be the first thing in this gateway to do so, and doing
         # it silently here rather than designing it is how surfaces
         # drift apart.
-        return _not_ready(resolution, None)
+        return _not_ready(resolution, None).as_openai()
 
     started = time.perf_counter()
     try:
@@ -623,7 +960,7 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
             error_type="client_disconnected",
         )
     except DriverError as e:
-        return _driver_error_response(e)
+        return _driver_failure(e).as_openai()
     except httpx.TimeoutException as e:
         return _error(
             code=504,
@@ -1239,7 +1576,7 @@ async def _stream_completion(
         yield "data: [DONE]\n\n"
 
 
-def _driver_error_response(e: DriverError) -> JSONResponse:
+def _driver_failure(e: DriverError) -> _Failure:
     """Map a driver failure onto the status the client should act on.
 
     The split matters operationally. A 4xx from the backend is a request
@@ -1258,7 +1595,7 @@ def _driver_error_response(e: DriverError) -> JSONResponse:
         # tried and lost -- and this one was deliberately NOT retried
         # elsewhere (R2.5): the next replica would take the same time
         # to compute the same prompt. The caller is told what to turn.
-        return _error(
+        return _Failure(
             code=504,
             message=(
                 f"A backend was still working when the deadline passed: {detail} "
@@ -1269,7 +1606,7 @@ def _driver_error_response(e: DriverError) -> JSONResponse:
             error_type="timeout",
         )
     if upstream == 503:
-        return _error(
+        return _Failure(
             code=503,
             message=(
                 f"A backend serving this model is not ready yet: {detail}. "
@@ -1278,12 +1615,12 @@ def _driver_error_response(e: DriverError) -> JSONResponse:
             error_type="service_unavailable",
         )
     if 400 <= upstream < 500:
-        return _error(
+        return _Failure(
             code=400,
             message=f"The backend rejected the request: {detail}",
             error_type="invalid_request_error",
         )
-    return _error(
+    return _Failure(
         code=502,
         message=f"Every backend serving this model failed. Last error: {detail}",
         error_type="upstream_error",

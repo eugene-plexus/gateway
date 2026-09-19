@@ -1194,7 +1194,244 @@ class RoutingBackendView(BaseModel):
     )
 
 
+class Role3(StrEnum):
+    user = 'user'
+    assistant = 'assistant'
+
+
+class AnthropicContentBlock(BaseModel):
+    """
+    One content block. **Modelled loosely on purpose**: the variants
+    differ by `type` and a strict `oneOf` here would generate a
+    union that rejects the next block type Anthropic adds, on a wire
+    we do not own.
+
+    The variants this gateway carries: `text` (`text`), `tool_use`
+    (`id`, `name`, `input`), and `tool_result` (`tool_use_id`,
+    `content`, `is_error`).
+
+    The variants it refuses with a 400: `image` and `document`. They
+    are refused rather than dropped because a model that never
+    received the image is not answering the question that was
+    asked, and a silently text-only answer to *"what is in this
+    screenshot"* is worse than a refusal that names the reason.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    type: str = Field(
+        ..., description='`text`, `tool_use`, `tool_result`, `image`, `document`, …'
+    )
+    text: str | None = None
+    id: str | None = Field(
+        None, description='On `tool_use`: the id a matching `tool_result` refers to.'
+    )
+    name: str | None = Field(None, description='On `tool_use`: the tool being called.')
+    input: dict[str, Any] | None = Field(
+        None, description='On `tool_use`: the arguments object, already parsed.'
+    )
+    tool_use_id: str | None = Field(
+        None, description='On `tool_result`: which call this answers.'
+    )
+    content: str | list[AnthropicContentBlock] | None = Field(
+        None,
+        description='On `tool_result`: the result, as a string or as a list of\nblocks. Claude Code sends a plain string; a list containing\nan image block is refused like any other image.\n',
+    )
+    is_error: bool | None = Field(
+        None,
+        description="On `tool_result`: the tool failed. Carried into the `tool`\nmessage's text rather than dropped, because a harness that\ncannot see its own tool failed will call it again.\n",
+    )
+    cache_control: dict[str, Any] | None = None
+
+
+class Type1(StrEnum):
+    text = 'text'
+
+
+class AnthropicSystemBlock(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    type: Type1
+    text: str | None = None
+    cache_control: dict[str, Any] | None = None
+
+
+class AnthropicToolDefinition(BaseModel):
+    """
+    A tool the model may call. `name` plus `input_schema` map
+    directly onto an OpenAI function's `name` and `parameters`.
+
+    A definition carrying a `type` naming a server-side tool —
+    anything this gateway would have to execute itself, rather than
+    hand back to the caller — is refused with a 400. This control
+    plane routes to local engines; it has no web search to run and
+    no sandbox to run code in, and pretending otherwise would fail
+    at the moment the model chose to use one.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    name: str
+    description: str | None = None
+    input_schema: dict[str, Any] | None = Field(
+        None, description="JSON Schema for the tool's arguments."
+    )
+    type: str | None = Field(
+        None,
+        description='Present only for server-side tools. Its presence is what the\nrefusal keys on.\n',
+    )
+    cache_control: dict[str, Any] | None = None
+
+
+class Type2(StrEnum):
+    auto = 'auto'
+    any = 'any'
+    tool = 'tool'
+    none = 'none'
+
+
+class AnthropicToolChoice(BaseModel):
+    """
+    How the model should use `tools`. `auto`, `any`, `tool` (with a
+    `name`) or `none`, mapped onto the OpenAI equivalents — `any`
+    becomes `required`, which is the closest honest reading.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    type: Type2
+    name: str | None = Field(None, description='With `type: tool`: which one.')
+
+
+class Type3(StrEnum):
+    message = 'message'
+
+
+class Role4(StrEnum):
+    assistant = 'assistant'
+
+
+class StopReason(Enum):
+    """
+    Mapped from the backend's finish reason: `stop` becomes
+    `end_turn`, `length` becomes `max_tokens`, `tool_calls`
+    becomes `tool_use`.
+
+    """
+
+    end_turn = 'end_turn'
+    max_tokens = 'max_tokens'
+    stop_sequence = 'stop_sequence'
+    tool_use = 'tool_use'
+    NoneType_None = None
+
+
+class AnthropicUsage(BaseModel):
+    """
+    Token counts, renamed from the backend's OpenAI-shaped `usage`.
+    Cache fields are reported as zero rather than omitted: a client
+    that reads them should see an honest nothing rather than an
+    absence it has to guess about.
+
+    """
+
+    input_tokens: int
+    output_tokens: int
+    cache_creation_input_tokens: int | None = 0
+    cache_read_input_tokens: int | None = 0
+
+
+class Type4(StrEnum):
+    message_start = 'message_start'
+    content_block_start = 'content_block_start'
+    content_block_delta = 'content_block_delta'
+    content_block_stop = 'content_block_stop'
+    message_delta = 'message_delta'
+    message_stop = 'message_stop'
+    ping = 'ping'
+    error = 'error'
+
+
+class AnthropicStreamEvent(BaseModel):
+    """
+    One frame of the Anthropic event stream. Each SSE frame carries
+    both an `event:` name and a `data:` object whose `type` repeats
+    it; a client may read either, so both are always sent.
+
+    The order is `message_start`, then per content block
+    `content_block_start` → `content_block_delta`* →
+    `content_block_stop`, then `message_delta` carrying
+    `stop_reason` and final `usage`, then `message_stop`. **There is
+    no `[DONE]` sentinel.**
+
+    `message_start` is emitted on the **first event from the
+    driver**, never on request acceptance — it names the model, and
+    until the first token the cascade can still change which backend
+    answers.
+
+    An `error` event is how a truncation is reported once the status
+    code is long gone: a stream that has emitted a token cannot fail
+    over, so it stops, says why, and still closes with
+    `message_stop` so a client's state machine does not hang.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    type: Type4
+    index: int | None = Field(
+        None,
+        description='Which content block, on the three `content_block_*` events.\n**Assigned by the gateway, statefully**: our internal stream\nnumbers tool-call fragments per call and gives text no index\nat all, so the translator holds the open text block and a\nmap from tool-call index to block index.\n',
+    )
+    message: dict[str, Any] | None = None
+    content_block: AnthropicContentBlock | None = None
+    delta: dict[str, Any] | None = Field(
+        None,
+        description='`{"type": "text_delta", "text": …}` for prose,\n`{"type": "input_json_delta", "partial_json": …}` for a tool\ncall\'s arguments, and on `message_delta` the `stop_reason`.\n',
+    )
+    usage: AnthropicUsage | None = None
+    error: dict[str, Any] | None = None
+
+
+class Type5(StrEnum):
+    error = 'error'
+
+
 class Error(BaseModel):
+    type: str = Field(
+        ...,
+        description='`invalid_request_error`, `authentication_error`,\n`permission_error`, `not_found_error`,\n`rate_limit_error`, `api_error`, `overloaded_error`.\n',
+    )
+    message: str = Field(
+        ...,
+        description="Human-readable, and **it has to carry the whole\nexplanation** — measured, a 400 and a 403 are shown to\nthe user verbatim while a 404's message is discarded,\nwhich is why this door answers 400 for a model nothing\nserves.\n",
+    )
+
+
+class AnthropicErrorResponse(BaseModel):
+    """
+    Anthropic's error envelope. The rest of this gateway returns RFC
+    7807 `problem+json` and the OpenAI doors return OpenAI's shape;
+    this is the third foreign convention on this component, honoured
+    exactly for the same reason as the second — a client parses it
+    to build its exception, and anything else reports as an
+    unhelpful generic failure.
+
+    """
+
+    type: Type5
+    error: Error
+
+
+class Error1(BaseModel):
     message: str = Field(
         ...,
         description='Human-readable failure. Names the model and, on a\ncascade, that every backend was tried — the operator\nreading it is usually the person who configured the\nthing.\n',
@@ -1217,7 +1454,7 @@ class OpenAIErrorResponse(BaseModel):
 
     """
 
-    error: Error
+    error: Error1
 
 
 class Percentiles(BaseModel):
@@ -1666,6 +1903,55 @@ class RoutingTierView(BaseModel):
     backends: list[RoutingBackendView]
 
 
+class AnthropicInputMessage(BaseModel):
+    """
+    One turn. `role` is `user` or `assistant` only — Anthropic has
+    no `system` role and no `tool` role, which is the shape fact the
+    translation turns on: **a tool result is a `tool_result` block
+    inside a `user` message**, and a model's tool call comes back as
+    a `tool_use` block inside an `assistant` message.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    role: Role3
+    content: str | list[AnthropicContentBlock] = Field(
+        ...,
+        description='A plain string, or a list of blocks. Both forms arrive from\nreal clients in the same conversation.\n',
+    )
+
+
+class AnthropicMessageResponse(BaseModel):
+    """
+    A completed message. The `x_eugene_plexus` envelope the OpenAI
+    door adds to its response body is **not** here — it rides on
+    response headers instead, because a strict Anthropic client is
+    exactly who this door is for and an unknown top-level key is a
+    risk with no upside.
+
+    """
+
+    id: str
+    type: Type3
+    role: Role4
+    model: str = Field(
+        ...,
+        description='The model that actually answered, which after a cascade is\nnot necessarily the one that was asked for.\n',
+    )
+    content: list[AnthropicContentBlock] = Field(
+        ...,
+        description='`text` blocks and `tool_use` blocks, in the order the\nbackend produced them.\n',
+    )
+    stop_reason: StopReason | None = Field(
+        None,
+        description="Mapped from the backend's finish reason: `stop` becomes\n`end_turn`, `length` becomes `max_tokens`, `tool_calls`\nbecomes `tool_use`.\n",
+    )
+    stop_sequence: str | None = None
+    usage: AnthropicUsage | None = None
+
+
 class MetricRequest(BaseModel):
     startedAt: AwareDatetime
     requestedModel: str
@@ -1824,6 +2110,85 @@ class RoutingSlotView(BaseModel):
     tiers: list[RoutingTierView]
 
 
+class AnthropicMessagesRequest(BaseModel):
+    """
+    Request body for `POST /v1/messages`, in Anthropic's shape.
+
+    **Deliberately permissive, and the reason is a measurement.**
+    Every field this gateway does not honour is *ignored* rather
+    than rejected, because a real Claude Code request carries
+    `thinking`, `cache_control`, `metadata` and
+    `context_management` on the very first call, and a schema that
+    refused an unknown field would refuse every request from the
+    client this endpoint exists for.
+
+    Consequently **this schema does not decide what is refused**.
+    The refusals — image and document blocks, server-side tools,
+    `mcp_servers`, more than four `stop_sequences` — are enforced
+    against the raw request body by the implementation, with a 400
+    naming the field, because a model that ignores extra keys cannot
+    see the thing it is meant to reject. Read this schema as what
+    the gateway *reads*, and the endpoint description as what it
+    refuses.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    model: str = Field(
+        ...,
+        description="A model id from `GET /v1/models`. Anthropic model names have\nno special meaning here: the id is resolved against this\ninstall's slots like any other, and a caller naming\n`claude-sonnet-4-5` gets whatever the operator mapped that\nto, or a 400.\n",
+    )
+    messages: list[AnthropicInputMessage] = Field(..., min_length=1)
+    max_tokens: int = Field(
+        ...,
+        description="**Required by Anthropic's contract, and required here.**\nUnlike the OpenAI door, a missing value is a 400 rather than\na fill from the settings profile, because a client written\nagainst this wire always sends one and its absence means the\ncaller is not speaking this protocol.\n",
+        ge=1,
+    )
+    system: str | list[AnthropicSystemBlock] | None = Field(
+        None,
+        description='A system prompt: a plain string, or a list of blocks.\n\nClaude Code sends three blocks, and the **first is not a\nprompt at all** — it is a billing header smuggled as prose\n(`x-anthropic-billing-header: …`). Any code that assumes\n`system[0]` is the instruction is wrong about the commonest\nclient. All blocks are concatenated in order into one\n`system` message.\n',
+    )
+    stream: bool | None = Field(
+        False,
+        description="When true the response is Anthropic's typed SSE stream.\n**Claude Code sets this on every request**, so the\nnon-streaming path of this endpoint is real but is not\nexercised by that client.\n",
+    )
+    temperature: float | None = Field(
+        None,
+        description="Anthropic's range is 0-1 where OpenAI's is 0-2. Passed\nthrough unscaled: the value means the same thing to a local\nengine either way, and rescaling would silently change what\na caller asked for.\n",
+        ge=0.0,
+        le=1.0,
+    )
+    top_p: float | None = Field(None, ge=0.0, le=1.0)
+    top_k: int | None = Field(
+        None,
+        description="**Read and dropped**, and this is a real loss rather than a\nno-op: both local engines accept a top-k and neither of this\nproject's internal contracts carries one, which is the same\ngap `top_p` and `seed` have on `GenerateRequest`. Documented\nhere so the omission is visible to whoever adds it.\n",
+        ge=0,
+    )
+    stop_sequences: list[str] | None = Field(
+        None,
+        description='Up to four. A fifth is a 400 rather than a silent truncation\nto the first four, because dropping a stop sequence changes\nwhere the answer ends.\n',
+    )
+    tools: list[AnthropicToolDefinition] | None = Field(
+        None,
+        description='Tool definitions. Translated into the OpenAI function shape\nand carried to the backend unchanged.\n\nA backend that cannot carry tools is refused by name rather\nthan served without them — the same rule the OpenAI door\nstates, and for the same reason: a harness cannot tell "the\nmodel chose not to call one" from "nobody offered it any".\n',
+    )
+    tool_choice: AnthropicToolChoice | None = None
+    metadata: dict[str, Any] | None = Field(
+        None,
+        description="Read and dropped. Claude Code puts a JSON *string* in\n`user_id` carrying a device id, an account uuid and a\nsession id; none of it is ours to keep, and the gateway's\nown request records already identify a request.\n",
+    )
+    thinking: dict[str, Any] | None = Field(
+        None,
+        description='**Read and dropped, never refused**, and the distinction was\nmeasured. Present on every Claude Code request, in three\nshapes: `{"budget_tokens": N, "type": "enabled"}` for a\nknown Claude id, `{"type": "adaptive"}` for an arbitrary\nlocal id, and **`null` when the caller set\n`MAX_THINKING_TOKENS=0`** — so even `"thinking" in body` is\ntrue for the one configuration asking for no thinking at\nall.\n\nDropping it is not a loss of control. A local model\'s\nreasoning output is governed by `thinkingMode` on its\nsettings profile and by the driver\'s thinking filter, which\nis the operator\'s decision rather than the caller\'s.\n',
+    )
+    cache_control: dict[str, Any] | None = Field(
+        None,
+        description='Prompt-cache hints, read and dropped wherever they appear —\non system blocks, on the last user content block, and on\n`tool_result` blocks. A local engine owns its own KV cache\nand there is nothing here to honour.\n',
+    )
+
+
 class ChatCompletionRequest(BaseModel):
     model: str = Field(
         ...,
@@ -1894,3 +2259,6 @@ class RoutingTableView(BaseModel):
         None, description='Drivers in the topology that did not answer `/v1/info`.'
     )
     control_root: ControlRootView | None = None
+
+
+AnthropicContentBlock.model_rebuild()

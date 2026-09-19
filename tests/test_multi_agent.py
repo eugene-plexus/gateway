@@ -833,7 +833,7 @@ async def test_a_sealed_control_root_is_reported_not_hidden(two: TwoAgents) -> N
 
     from eugene_plexus_gateway.routes.inference import _no_such_model
 
-    message = json.loads(_no_such_model("x", table).body)["error"]["message"]
+    message = json.loads(_no_such_model("x", table).as_openai().body)["error"]["message"]
     assert "did not answer on the last refresh (503 Locked)" in message
     assert CONTROL in message
 
@@ -845,7 +845,7 @@ async def test_a_single_host_404_says_only_this_host_was_read(two: TwoAgents) ->
 
     from eugene_plexus_gateway.routes.inference import _no_such_model
 
-    message = json.loads(_no_such_model("x", table).body)["error"]["message"]
+    message = json.loads(_no_such_model("x", table).as_openai().body)["error"]["message"]
     assert "Only this host's agent was read" in message
 
 
