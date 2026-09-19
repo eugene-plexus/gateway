@@ -93,11 +93,15 @@ _MAX_AGE = "600"
 # What a preflight is asked for when it does not say: the two headers
 # every OpenAI client sends, plus the three an Anthropic one does.
 #
-# **`x-api-key` is not optional here.** It is the header
-# `ANTHROPIC_API_KEY` produces, and a default list without it answers
-# the preflight and then fails the request -- which is the least
-# diagnosable CORS failure there is, because the browser reports only
-# `Failed to fetch` and the server sees nothing at all.
+# **This list is a fallback and not the mechanism**, which is worth
+# stating because R4's first draft claimed the opposite. The reply
+# ECHOES `access-control-request-headers` whenever a preflight sends
+# one, and a real browser always does -- so `x-api-key` is already
+# allowed by the echo and a default list without it would change
+# nothing for any browser client. It is listed anyway because the
+# fallback should describe the same door the echo does; a fallback that
+# contradicts the surface it stands in for is a trap for whoever reads
+# it next.
 _DEFAULT_ALLOW_HEADERS = "authorization, content-type, x-api-key, anthropic-version, anthropic-beta"
 
 CONFIG_ENABLED_KEY = "corsEnabled"

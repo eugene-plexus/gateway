@@ -951,3 +951,92 @@ def test_a_system_role_inside_messages_is_carried_in_place(settings: Settings) -
     assert roles == ["system", "user", "system"]
     assert sent[2][1] == "<env>cwd: /work</env>"
     assert "x-anthropic-billing-header" in sent[0][1]
+
+
+def test_text_then_a_tool_call_closes_the_text_block_first(settings: Settings) -> None:
+    """**The transition, which neither streaming test above exercised.**
+
+    One test streams only text and the other only tool calls, so the
+    nesting assertion in the first never met a second block and the
+    index assertion in the second never met an open text block. A
+    sabotage that left the text block open escaped both of them: each
+    was correct about its own case and neither covered the seam.
+
+    Anthropic allows one open content block at a time, and this is the
+    only shape where a translator can get that wrong.
+    """
+    fake = FakeDriverClient(name="d1", model_id=MODEL, supports_tools=True)
+    fake.responses = ["Looking."]
+    fake.tool_calls = [
+        ToolCall(
+            id="call_1",
+            type="function",
+            function=FunctionCall(name="Glob", arguments='{"pattern": "*.py"}'),
+        )
+    ]
+    # The fake answers with tool calls OR text, never both, so the text
+    # block has to come from a second driver in the same conversation.
+    # Drive the seam directly instead: the translator is the subject.
+    from eugene_plexus_gateway.anthropic import StreamTranslator
+
+    translator = StreamTranslator(MODEL)
+    frames = [translator.start()]
+    frames += translator.text("Looking.")
+    frames += translator.tool_fragments(
+        [
+            {
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "Glob", "arguments": "{}"},
+            }
+        ]
+    )
+    frames += translator.finish(reason="tool_use")
+
+    events = _events("".join(frames))
+    order = [(e["type"], e.get("index")) for e in events if e["type"].startswith("content_block")]
+    assert order, "no content block events at all"
+
+    # The text block opened at 0 and MUST close before the tool opens at 1.
+    assert ("content_block_start", 0) in order
+    assert order.index(("content_block_stop", 0)) < order.index(("content_block_start", 1))
+
+    depth = 0
+    for kind, _ in order:
+        if kind == "content_block_start":
+            assert depth == 0, "a block opened while another was open"
+            depth = 1
+        elif kind == "content_block_stop":
+            assert depth == 1
+            depth = 0
+    assert depth == 0, "a content block was left open"
+
+
+def test_a_preflight_that_names_no_headers_still_allows_x_api_key(settings: Settings) -> None:
+    """The fallback list, which is **not** the mechanism.
+
+    R4's first draft claimed a default list without `x-api-key` would
+    answer the preflight and then fail the request. It would not: the
+    reply echoes `access-control-request-headers` whenever a preflight
+    sends one, and a real browser always does. The sabotage pass found
+    that claim by removing `x-api-key` from the default and watching
+    every check still pass.
+
+    The fallback is still asserted, because a fallback that describes a
+    different door from the one the echo opens is a trap for the next
+    reader.
+    """
+    fake = FakeDriverClient(name="d1", model_id=MODEL)
+    with _client(_app_with(settings, fake)) as client:
+        r = client.options(
+            "/v1/messages",
+            headers={
+                "Origin": "https://example.test",
+                "Access-Control-Request-Method": "POST",
+            },
+        )
+    assert r.status_code < 400, r.text
+    allowed = r.headers["access-control-allow-headers"].lower()
+    assert "x-api-key" in allowed
+    assert "anthropic-version" in allowed
