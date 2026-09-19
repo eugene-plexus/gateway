@@ -7,7 +7,7 @@ Each test scripts its fake drivers' responses by mutating them.
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Iterator
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -86,6 +86,11 @@ class FakeDriverClient:
         self.embed_error: Exception | None = None
         """If set, `embed()` raises this instead of returning."""
         self.embed_calls = 0
+        self.generate_hook: Callable[[], Awaitable[Any]] | None = None
+        self.embed_hook: Callable[[], Awaitable[Any]] | None = None
+        """Awaited before the canned answer. The disconnect tests hand
+        in something that never returns, so the thing under test is what
+        happens to an in-flight backend call rather than to a fast one."""
 
     def describe(self) -> DriverInfo:
         """The same answer `info()` gives, without needing a loop."""
@@ -116,6 +121,8 @@ class FakeDriverClient:
 
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
         self.calls.append(request)
+        if self.generate_hook is not None:
+            await self.generate_hook()
         if self.generate_error is not None:
             raise self.generate_error
         if self.tool_calls is not None:
@@ -146,6 +153,8 @@ class FakeDriverClient:
         from eugene_plexus_gateway._generated.driver_models import EmbedResponse
 
         self.embed_calls += 1
+        if self.embed_hook is not None:
+            await self.embed_hook()
         if self.embed_error is not None:
             raise self.embed_error
         seed = float(len(self.name))

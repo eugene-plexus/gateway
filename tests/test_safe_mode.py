@@ -21,6 +21,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from eugene_plexus_gateway.app import create_app
+from eugene_plexus_gateway.config import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from eugene_plexus_gateway.settings import Settings
 
 
@@ -69,7 +70,7 @@ def test_config_get_returns_defaults_not_disk_values(safe_mode_client: TestClien
     body = response.json()
     assert body["logLevel"] == "INFO"
     assert body["defaultTemperature"] == 0.7
-    assert body["requestTimeoutSeconds"] == 180
+    assert body["requestTimeoutSeconds"] == DEFAULT_REQUEST_TIMEOUT_SECONDS
 
 
 def test_chat_returns_503_in_safe_mode(safe_mode_client: TestClient) -> None:

@@ -75,6 +75,7 @@ from ._generated.models import (
     Surface,
 )
 from ._http import internal_client
+from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from .driver_client import DriverClient, HttpDriverClient, TieredClient
 from .driver_client import Key as DriverKey
 from .metrics import AttemptRow, CandidateRow
@@ -382,7 +383,7 @@ class RoutingTable:
         *,
         agent_url: str,
         service_token: str | None = None,
-        request_timeout_seconds: float = 180.0,
+        request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         refresh_seconds: float = 15.0,
         slots: Callable[[], Any] | None = None,
         strategy: Callable[[], Any] | None = None,

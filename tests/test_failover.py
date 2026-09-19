@@ -1,9 +1,17 @@
-"""Priority-list failover for driver slots (v0.2.1).
+"""Priority-list failover for driver slots.
 
 A driver slot is an ordered list of interchangeable backends. The slot
-tries them in order and cascades to the next on a transport error / 5xx
-/ timeout, but fails HARD on a 4xx (the next backend would hit the same
-bad request). These tests pin that taxonomy.
+tries them in order and cascades to the next on a transport error or a
+5xx, but fails HARD on a 4xx (the next backend would hit the same bad
+request) and on a deadline that fired (the next backend would take the
+same time to do the same work — R2.5). These tests pin that taxonomy.
+
+**A read timeout used to be in the cascading bucket and this file
+asserted it**, which is R2.5's instance of the pattern that produced six
+of the review's findings: the defect encoded as intent, with a green
+test sitting beside it. `test_timeout_is_not_a_failure.py` is where the
+corrected rule lives, including the controls that keep a dead host
+cascading.
 """
 
 from __future__ import annotations
@@ -79,9 +87,12 @@ async def test_5xx_cascades_to_backup() -> None:
     assert resp.content == "backup reply"
 
 
-async def test_timeout_cascades_to_backup() -> None:
+async def test_a_connect_timeout_cascades_to_backup() -> None:
+    """A host that never accepted the connection took no work, so the
+    next backend is a rescue. Contrast the READ timeout, which is not:
+    see `test_timeout_is_not_a_failure.py`."""
     primary = FakeDriverClient(name="left")
-    primary.generate_error = httpx.ReadTimeout("timed out")
+    primary.generate_error = httpx.ConnectTimeout("no route to host")
     backup = FakeDriverClient(name="left")
     backup.responses = ["backup reply"]
 

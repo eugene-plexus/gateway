@@ -66,6 +66,7 @@ from .._generated.models import (
 )
 from ..config import ConfigStore
 from ..dependencies import require_authorized
+from ..disconnect import ClientGone, serve_while_connected
 from ..driver_client import DriverClient, DriverError
 from ..lifecycle import LifecycleManager, WakeResult
 from ..metrics import AttemptRow, CandidateRow, MetricsStore, RequestRow
@@ -79,6 +80,16 @@ router = APIRouter(tags=["inference"])
 # (a Discord connector, say) are both legitimate callers of the front
 # door. Config and admin stay operator-only.
 _auth = [Depends(require_authorized)]
+
+
+def _timeout_seconds(store: ConfigStore | None) -> float:
+    """What the operator's own knob says, for a message that names it."""
+    if store is None:
+        return 600.0
+    try:
+        return float(store.get("requestTimeoutSeconds") or 600)
+    except (TypeError, ValueError):
+        return 600.0
 
 
 def _routing(request: Request) -> RoutingTable | None:
@@ -472,16 +483,50 @@ async def create_chat_completion(request: Request, body: ChatCompletionRequest) 
 
     with collect_attempts() as tries:
         try:
-            response = await client.generate(generate)
+            response = await serve_while_connected(
+                request, client.generate(generate), what="a chat completion"
+            )
+        except ClientGone:
+            # The tab closed, or the SDK's own deadline fired and it is
+            # already retrying. The backend call is cancelled by now, so
+            # the engine is free rather than computing an answer into a
+            # closed socket. Still recorded: a run that nobody read is a
+            # real cost, and hiding it from /v1/metrics would hide the
+            # one signal that says "your clients are giving up on you".
+            _record(rec, body, tries)
+            return _error(
+                code=499,
+                message="The client disconnected; the backend call was cancelled.",
+                error_type="client_disconnected",
+            )
         except DriverError as e:
             _record(rec, body, tries)
             return _driver_error_response(e)
+        except httpx.TimeoutException as e:
+            # **Not the cascade's 502, and not a cascade at all.** This
+            # is our own read deadline onto the driver: the engine is
+            # almost certainly still computing. Cascading recomputes the
+            # prompt on every replica and every tier and reports a total
+            # failure at the sum of the deadlines, which is what R2.5
+            # removed. Say the one thing that helps instead.
+            _record(rec, body, tries)
+            return _error(
+                code=504,
+                message=(
+                    f"No backend serving {body.model!r} answered within the gateway's "
+                    f"requestTimeoutSeconds ({_timeout_seconds(store):g}s). The backend was "
+                    f"most likely still working rather than broken -- a large model on CPU, "
+                    f"or a partial offload, can take minutes. Raise that setting under "
+                    f"Config -> Gateway -> Routing. ({type(e).__name__})"
+                ),
+                error_type="timeout",
+            )
         except httpx.HTTPError as e:
             _record(rec, body, tries)
             return _error(
                 code=502,
                 message=(
-                    f"Every backend serving {body.model!r} failed. Last error: {e}. "
+                    f"Every backend serving {body.model!r} failed. Last error: {e!r}. "
                     f"The engine may have stopped — check GET /v1/runtimes on the agent."
                 ),
                 error_type="upstream_error",
@@ -568,14 +613,33 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
 
     started = time.perf_counter()
     try:
-        result = await client.embed(EmbedRequest(input=inputs))
+        result = await serve_while_connected(
+            request, client.embed(EmbedRequest(input=inputs)), what="an embeddings request"
+        )
+    except ClientGone:
+        return _error(
+            code=499,
+            message="The client disconnected; the backend call was cancelled.",
+            error_type="client_disconnected",
+        )
     except DriverError as e:
         return _driver_error_response(e)
+    except httpx.TimeoutException as e:
+        return _error(
+            code=504,
+            message=(
+                f"No backend serving {body.model!r} answered within the gateway's "
+                f"requestTimeoutSeconds ({_timeout_seconds(_store(request)):g}s). It was not "
+                f"retried on a replica, because a replica would take the same time on the "
+                f"same input. ({type(e).__name__})"
+            ),
+            error_type="timeout",
+        )
     except httpx.HTTPError as e:
         return _error(
             code=502,
             message=(
-                f"Every backend serving {body.model!r} failed. Last error: {e}. "
+                f"Every backend serving {body.model!r} failed. Last error: {e!r}. "
                 f"The cascade never reached a different model -- see the contract."
             ),
             error_type="upstream_error",
@@ -1188,6 +1252,22 @@ def _driver_error_response(e: DriverError) -> JSONResponse:
     upstream = e.status_code
     detail = e.problem.detail if e.problem is not None and e.problem.detail else str(e)
 
+    if upstream == 504:
+        # The driver's own deadline fired. Not folded into the 502,
+        # because 502 is what the cascade says when every backend was
+        # tried and lost -- and this one was deliberately NOT retried
+        # elsewhere (R2.5): the next replica would take the same time
+        # to compute the same prompt. The caller is told what to turn.
+        return _error(
+            code=504,
+            message=(
+                f"A backend was still working when the deadline passed: {detail} "
+                f"It was not retried on another backend, because another backend would "
+                f"take the same time on the same prompt. Raise requestTimeoutSeconds on "
+                f"the gateway (Config -> Gateway -> Routing) if this model needs longer."
+            ),
+            error_type="timeout",
+        )
     if upstream == 503:
         return _error(
             code=503,

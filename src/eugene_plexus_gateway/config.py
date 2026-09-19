@@ -32,6 +32,18 @@ from ._generated.models import (
     ConfigValueType,
 )
 
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 600.0
+"""The one place this number is written (R2.5).
+
+It was written in three -- the schema default, `app.py`'s
+``or 180`` and `RoutingTable`'s signature default -- which is how a
+number drifts. 600 s matches the OpenAI Python SDK's own default, so
+the commonest caller stops waiting at the same moment we stop serving,
+and it sits one minute BELOW the driver's own backstop so that the
+gateway's knob is the one that governs.
+"""
+
+
 REDACTED = "<redacted>"
 
 CATEGORY_LABELS: dict[str, str] = {
@@ -81,17 +93,33 @@ FIELDS: list[ConfigField] = [
         key="requestTimeoutSeconds",
         label="Backend request timeout",
         description=(
-            "How long the gateway waits on one backend before giving "
-            "up and cascading to the next. Counts the whole HTTP "
-            "request to the driver. Raise this if your slowest model "
-            "needs longer — a local 70B on partial offload can take "
-            "minutes for a long answer."
+            "How long the gateway waits for one backend to answer. "
+            "Counts the whole HTTP request to the driver. A model that "
+            "runs on the processor, or one that is only half on the "
+            "graphics card, can take several minutes for a long answer "
+            "— raise this rather than letting it be cut off. When it "
+            "does fire the request is NOT retried on another backend: "
+            "the next one would take the same time on the same prompt, "
+            "so you get one clear timeout instead of three."
         ),
         category="routing",
         valueType=ConfigValueType.duration,
-        default=180,
+        # **This is the deadline that governs, and that is deliberate
+        # (R2.5).** Two deadlines exist on the path -- this one and the
+        # driver's own `requestTimeoutSeconds` -- and until R2.5 they
+        # were ordered the wrong way round: the driver's 120 s fired
+        # first, so the knob an operator reached for here changed
+        # nothing. The driver's default is now 660 s, one minute above
+        # this, so the front door owns the answer and the driver's is a
+        # backstop. Raise this one past 600 and raise the driver's too.
+        #
+        # 600 s matches the OpenAI Python SDK's own default timeout, so
+        # a client that gives up and a gateway that gives up now agree
+        # rather than racing: the commonest caller stops waiting at the
+        # same moment we stop serving.
+        default=DEFAULT_REQUEST_TIMEOUT_SECONDS,
         minimum=5,
-        maximum=900,
+        maximum=3600,
         requiresRestart=True,
     ),
     ConfigField(

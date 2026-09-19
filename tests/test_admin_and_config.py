@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from eugene_plexus_gateway.app import create_app
 from eugene_plexus_gateway.auth_state import AuthState
+from eugene_plexus_gateway.config import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from eugene_plexus_gateway.settings import Settings
 
 from .conftest import FakeDriverClient, make_routing_table
@@ -229,7 +230,9 @@ def test_config_test_accepts_overrides_without_persisting_them(
     response = client.post("/v1/config/test", json={"overrides": {"requestTimeoutSeconds": 7}})
     assert response.status_code == 200
     # The override must not have been written.
-    assert client.get("/v1/config").json()["requestTimeoutSeconds"] == 180
+    assert (
+        client.get("/v1/config").json()["requestTimeoutSeconds"] == DEFAULT_REQUEST_TIMEOUT_SECONDS
+    )
 
 
 def test_healthz_is_ok_and_unauthenticated(client: TestClient) -> None:

@@ -23,7 +23,7 @@ from fastapi import Depends, FastAPI
 from . import __version__
 from .auth_state import AuthState, load_auth_state
 from .client_keys import ClientKeyGuard
-from .config import ConfigStore
+from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS, ConfigStore
 from .cors import FrontDoorCors
 from .dependencies import require_operator
 from .lifecycle import AgentLifecycleClient, LifecycleManager
@@ -133,7 +133,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             table = RoutingTable(
                 agent_url=settings.agent_url,
                 service_token=auth_state.service_token,
-                request_timeout_seconds=float(store.get("requestTimeoutSeconds") or 180),
+                request_timeout_seconds=float(
+                    store.get("requestTimeoutSeconds") or DEFAULT_REQUEST_TIMEOUT_SECONDS
+                ),
                 refresh_seconds=float(store.get("routingRefreshSeconds") or 15),
                 # Read live, so a PATCH takes effect on the next request.
                 slots=lambda: store.get("modelSlots"),

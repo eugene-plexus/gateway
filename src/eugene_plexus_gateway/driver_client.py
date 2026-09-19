@@ -380,25 +380,48 @@ class HttpDriverClient:
 
 
 def _is_cascade_eligible(exc: Exception) -> bool:
-    """Failure taxonomy for priority-list failover (v0.2.1).
+    """Failure taxonomy for priority-list failover.
 
     Cascade-eligible (try the next backend in the slot):
-      * transport-level errors — connection refused, DNS, read/connect
-        timeout (every `httpx.HTTPError` that isn't a clean response)
-      * upstream 5xx — the backend is reachable but broken/overloaded
+      * transport-level errors — connection refused, DNS, a connect
+        timeout: the backend never took the work, so the next one is a
+        real rescue
+      * upstream 5xx — the backend is reachable but broken or
+        overloaded. The case that motivated failover was a real
+        OpenRouter 429, which the driver maps to 502.
 
     NOT cascade-eligible (fail the slot HARD, re-raise immediately):
       * upstream 4xx — a request / auth / config bug. The next backend
         would hit the same bad request, and cascading past it would
         mask the real problem (e.g. an expired service token reading as
         "all backends down" instead of "fix your token").
+      * **a deadline that fired — a read timeout here, or a 504 from the
+        driver's own deadline (R2.5).** The v0.2.1 plan locked timeouts
+        into the transport branch, and that was wrong in the way that
+        costs the most: a backend that has not answered in time is
+        almost certainly *still computing*, holding a GPU or a CPU's
+        worth of exactly this prompt, and the next replica will take the
+        same time to do the same work. Cascading there does not rescue
+        the request, it multiplies the cost of it — measured as a 30B on
+        CPU told "Every backend serving this model failed" after 240 s
+        with both engines having computed the answer. A deadline is a
+        fact about the clock rather than about this backend, and it is
+        equally true of every other backend in the slot.
 
-    Locked taxonomy per the v0.2.1 plan: 5xx / transport / timeout
-    cascade; 4xx hard-fails. Timeouts surface as `httpx.TimeoutException`
-    (an `httpx.HTTPError`), so they fall into the transport branch.
+    **The split inside `TimeoutException` is load-bearing.**
+    `httpx.ConnectTimeout` is a `TimeoutException` and is a *dead host*:
+    nothing was ever handed to an engine, so it cascades. `ReadTimeout`,
+    `WriteTimeout` and `PoolTimeout` mean the work started — or that the
+    pool is saturated by work that started — and they do not.
     """
     if isinstance(exc, DriverError):
+        if exc.status_code == 504:
+            return False
         return exc.status_code >= 500
+    if isinstance(exc, httpx.ConnectTimeout):
+        return True
+    if isinstance(exc, httpx.TimeoutException):
+        return False
     return isinstance(exc, httpx.HTTPError)
 
 
@@ -409,8 +432,8 @@ class TieredClient:
     so the caller is oblivious to failover — it holds a client and calls
     `.generate()`. Internally this tries the first tier's candidates in
     order, then the next tier's, cascading on a cascade-eligible failure
-    (transport / 5xx / timeout) and failing hard on a 4xx. See
-    `_is_cascade_eligible`.
+    (transport / 5xx) and failing hard on a 4xx or on a deadline that
+    fired. See `_is_cascade_eligible`.
 
     Granularity is per-call: each `.generate()` independently walks the
     list from the top, so a slot that fell over to its backup recovers to
