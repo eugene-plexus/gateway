@@ -524,9 +524,10 @@ class ConfigTestResult(BaseModel):
 
 class SecurityMode(StrEnum):
     """
-    Operator's choice for how the agent handles its master key
-    between restarts. Set during the wizard's security screen; can
-    be changed later from the Config page.
+    How a host retains access to its master encryption key between
+    restarts. The component's config schema lists the supported
+    subset: the agent offers the first two modes; the control root
+    also offers `passphrase_file`.
 
     * `prompt_on_startup` — passphrase required at every agent
       start. Master key lives only in process memory. Best for
@@ -539,18 +540,24 @@ class SecurityMode(StrEnum):
       user login; Eugene auto-recovers from restarts. Best for
       home / personal-use installs and anyone who wants minimum
       friction. Anyone with the OS account can also start Eugene.
+    * `passphrase_file` — the control root reads a mounted passphrase
+      at startup from `EUGENE_PLEXUS_CONTROL_PASSPHRASE_FILE`. For
+      containers and other hosts without a keyring. An absent or
+      unreadable file leaves the root sealed, with a diagnosis in
+      its log. Access to that file permits unlocking the root.
 
     """
 
     prompt_on_startup = 'prompt_on_startup'
     os_keyring = 'os_keyring'
+    passphrase_file = 'passphrase_file'
 
 
 class AuthLoginRequest(BaseModel):
     """
     Login request body sent by the UI to `POST /v1/auth/login` on
     the agent. The passphrase is the same one the operator set
-    in the wizard. The agent bcrypt-compares it; on match,
+    in the wizard. The agent verifies its Argon2id hash; on match,
     issues a session token.
 
     """
@@ -1609,7 +1616,7 @@ class MetricAttempt(BaseModel):
     )
     backendMs: int | None = Field(
         None,
-        description='The **driver\'s** own measurement of its backend call\n(`GenerateResponse.latencyMs`), when it reported one.\n\n`elapsedMs - backendMs` is therefore the cost of the\ngateway-to-driver hop plus the driver\'s own work: the\ncontrol plane\'s overhead on this request. This document\nasserted from M0 to M8 that the extra local hop was\n"sub-millisecond against a multi-second generation" and "not\na cost worth optimising away" - an architectural\njustification nobody had measured. Both numbers were already\nbeing produced; subtracting them made the claim checkable,\nand **the first time it ran it came back 114-120 ms**. See\nthis document\'s overview.\n',
+        description="The **driver's** own measurement of its backend call\n(`GenerateResponse.latencyMs`), when it reported one.\n\n`elapsedMs - backendMs` is therefore the cost of the\ngateway-to-driver hop plus the driver's own work: the\ncontrol plane's overhead on this attempt, not a measurement\nof GPU compute alone. Both durations use `time.perf_counter()`\nand are truncated to integer milliseconds, so subtraction also\nincludes quantization error. Historical 114-120 ms overhead came\nfrom per-request HTTP-client construction, fixed in R1.1;\nsee this document's overview for the measured result.\n",
         ge=0,
     )
     served: bool
