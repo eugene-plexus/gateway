@@ -19,7 +19,7 @@ import json
 import logging
 import sys
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -458,6 +458,9 @@ class TieredClient:
         # replica was asleep is tier 2, whatever tier 1 held.
         self._tiers = [list(tier) for tier in tiers]
         self._hooks = hooks
+        self.prepare_request: (
+            Callable[[DriverClient, GenerateRequest], Awaitable[GenerateRequest]] | None
+        ) = None
         # `base_url` is the primary backend — used for labelling / logs.
         # The active backend on a given turn may differ after failover,
         # but the slot's identity is its primary.
@@ -518,8 +521,13 @@ class TieredClient:
                     runtime = self._hooks.on_attempt_start(driver, node=node)
                 started = time.perf_counter()
                 try:
-                    result = await candidate.generate(request)
-                except Exception as exc:
+                    prepared = (
+                        await self.prepare_request(candidate, request)
+                        if self.prepare_request
+                        else request
+                    )
+                    result = await candidate.generate(prepared)
+                except BaseException as exc:
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
@@ -533,7 +541,7 @@ class TieredClient:
                             # rendered in a UI.
                             error=type(exc).__name__,
                         )
-                    if not _is_cascade_eligible(exc):
+                    if not isinstance(exc, Exception) or not _is_cascade_eligible(exc):
                         # 4xx / non-HTTP error — surface it without trying
                         # the next backend. A 4xx is the same bad request
                         # everywhere.
@@ -665,8 +673,14 @@ class TieredClient:
                 # truncation rather than a completion.
                 saw_done = False
                 reported = False
-                stream = candidate.stream(request)
+                stream = None
                 try:
+                    prepared = (
+                        await self.prepare_request(candidate, request)
+                        if self.prepare_request
+                        else request
+                    )
+                    stream = candidate.stream(prepared)
                     async for event in stream:
                         committed = True
                         if event.done:
@@ -752,7 +766,8 @@ class TieredClient:
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                             error=type(ending).__name__ if ending is not None else "Abandoned",
                         )
-                    await stream.aclose()
+                    if stream is not None:
+                        await stream.aclose()
         assert last_exc is not None  # candidates is non-empty (checked in __init__)
         raise last_exc
 

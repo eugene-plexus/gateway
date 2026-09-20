@@ -62,8 +62,8 @@ FIELDS: list[ConfigField] = [
         key="defaultTemperature",
         label="Default temperature",
         description=(
-            "Sampling randomness used when a request doesn't specify "
-            "one. 0 = deterministic / always the most likely next "
+            "Sampling randomness used when neither the request nor the model's "
+            "default Library profile specifies one. 0 = deterministic / most likely next "
             "token; 1 = the model's own default randomness; higher "
             "gets more varied. The gateway owns this — whatever value "
             "reaches a backend, the gateway put it there, and a driver "
@@ -79,8 +79,8 @@ FIELDS: list[ConfigField] = [
         key="defaultMaxTokens",
         label="Default max output tokens",
         description=(
-            "Cap on a single response when a request doesn't specify "
-            "one (roughly 0.75 words per token, so 2048 is about 1,500 "
+            "Cap on a single response when neither the request nor the model's "
+            "default Library profile specifies one (roughly 0.75 words per token; 2048 is 1,500 "
             "words). Raise it for long-form work; keep it low for "
             "snappier chat."
         ),
@@ -88,6 +88,33 @@ FIELDS: list[ConfigField] = [
         valueType=ConfigValueType.integer,
         default=2048,
         minimum=1,
+    ),
+    ConfigField(
+        key="profileCacheSeconds",
+        label="Profile refresh interval",
+        description=(
+            "Seconds to reuse model generation defaults before reading Library again. "
+            "Zero reads on every request. Edits apply without restarting a model."
+        ),
+        category="generation",
+        valueType=ConfigValueType.duration,
+        default=30.0,
+        minimum=0,
+        maximum=3600,
+    ),
+    ConfigField(
+        key="profileMaxStaleSeconds",
+        label="Profile outage grace period",
+        description=(
+            "Seconds after cache expiry to keep the last profile defaults when Library "
+            "cannot answer. Then gateway defaults apply. Zero disables stale reuse. "
+            "Lookup failures and fallback choices are logged."
+        ),
+        category="generation",
+        valueType=ConfigValueType.duration,
+        default=300.0,
+        minimum=0,
+        maximum=86400,
     ),
     ConfigField(
         key="requestTimeoutSeconds",

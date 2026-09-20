@@ -78,7 +78,7 @@ from .._generated.models import (
 from ..config import ConfigStore
 from ..dependencies import require_authorized
 from ..disconnect import ClientGone, serve_while_connected
-from ..driver_client import DriverClient, DriverError
+from ..driver_client import DriverClient, DriverError, TieredClient
 from ..lifecycle import LifecycleManager, WakeResult
 from ..metrics import AttemptRow, CandidateRow, MetricsStore, RequestRow
 from ..routing import Resolution, RoutingTable, collect_attempts
@@ -532,6 +532,30 @@ async def _prepare(
 
     store = _store(request)
     generate = _to_generate_request(body, store)
+    profiles = getattr(request.app.state, "profile_defaults", None)
+    if profiles is not None and isinstance(client, TieredClient):
+        # Capture the routing snapshot that selected these candidates. A later
+        # topology refresh must not join this request to a replacement driver.
+        paths = {
+            (backend.node, backend.name): backend.runtime.spec.get("modelPath")
+            if backend.runtime is not None
+            else None
+            for backend in resolution.backends()
+        }
+
+        async def prepare_candidate(
+            candidate: DriverClient, original: GenerateRequest
+        ) -> GenerateRequest:
+            if (
+                body.max_tokens is not None
+                and body.temperature is not None
+                and body.top_p is not None
+            ):
+                return original
+            defaults = await profiles.get(paths.get((candidate.node, candidate.name)))
+            return _to_generate_request(body, store, defaults)
+
+        client.prepare_request = prepare_candidate
     waited_ms = wake.waited_ms if wake is not None and wake.ok else 0
     # Excludes the wake, which is `waited_ms` and already reported. The
     # two must not overlap or a swap would be counted twice.
@@ -1009,18 +1033,20 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
 # --------------------------------------------------------------------------- #
 
 
-def _to_generate_request(body: ChatCompletionRequest, store: ConfigStore | None) -> GenerateRequest:
+def _to_generate_request(
+    body: ChatCompletionRequest, store: ConfigStore | None, defaults: dict[str, Any] | None = None
+) -> GenerateRequest:
     """OpenAI request -> the driver's uniform surface.
 
     Every output-affecting parameter is filled in here and sent
     explicitly. A driver never substitutes a default of its own, so if a
     value reaches a backend, the gateway put it there. When the caller
-    omits one we fall back to the install default rather than leaving it
-    unset — "unset" would hand the decision to whatever the backend
-    happens to do.
+    omits one, use the selected model's default profile, then the install
+    default. Profile lookup is per actual candidate, including fallbacks.
     """
-    max_tokens = body.max_tokens
-    temperature = body.temperature
+    defaults = defaults or {}
+    max_tokens = body.max_tokens if body.max_tokens is not None else defaults.get("maxTokens")
+    temperature = body.temperature if body.temperature is not None else defaults.get("temperature")
     if store is not None:
         if max_tokens is None:
             max_tokens = store.get("defaultMaxTokens")
@@ -1034,12 +1060,9 @@ def _to_generate_request(body: ChatCompletionRequest, store: ConfigStore | None)
         # **Carried since 2026-09-19 and dropped on the floor before
         # that** -- `GenerateRequest` had no field for either, so the
         # two were accepted here, range-validated by the schema above,
-        # and then went nowhere, with nothing logged. Unlike the two
-        # parameters above them they get NO install default: a seed and
-        # a nucleus cutoff are the caller's business, there is nothing
-        # sensible to invent, and inventing one would change the answer
-        # to a request that never asked for it.
-        topP=body.top_p,
+        # and then went nowhere. R8 lets a profile supply top-p, but
+        # still invents neither an install-wide top-p nor a seed.
+        topP=body.top_p if body.top_p is not None else defaults.get("topP"),
         seed=body.seed,
         stop=body.stop,
         requestId=None,

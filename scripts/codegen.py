@@ -52,6 +52,7 @@ SPECS_LOCAL_ENV = "EUGENE_PLEXUS_SPECS_LOCAL_PATH"
 SPECS_TO_GENERATE: list[tuple[str, str, list[str] | None]] = [
     ("openapi/gateway.yaml", "models.py", None),
     ("openapi/inference-driver.yaml", "driver_models.py", None),
+    ("openapi/library.yaml", "library_models.py", None),
 ]
 
 

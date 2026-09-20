@@ -28,6 +28,7 @@ from .cors import FrontDoorCors
 from .dependencies import require_operator
 from .lifecycle import AgentLifecycleClient, LifecycleManager
 from .metrics import MetricsStore
+from .profiles import ProfileDefaults
 from .routes import admin as admin_routes
 from .routes import config as config_routes
 from .routes import health as health_routes
@@ -123,6 +124,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Tests inject `app.state.routing` with a pre-populated table; the
     # lifespan otherwise builds the real one and owns its teardown.
     owns_routing = False
+    profiles: ProfileDefaults | None = None
     lifecycle: LifecycleManager | None = None
     if not hasattr(app.state, "routing"):
         if settings.safe_mode:
@@ -147,6 +149,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             app.state.routing = table
             owns_routing = True
+            profiles = ProfileDefaults(settings.agent_url, auth_state.service_token, store.get)
+            app.state.profile_defaults = profiles
             # Awaited, so the gateway is routable the moment it serves.
             await table.start()
             # Lifecycle policy rides on the same table: idle unload and
@@ -163,6 +167,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        if profiles is not None:
+            await profiles.aclose()
         if lifecycle is not None:
             await lifecycle.aclose()
         if owns_routing and app.state.routing is not None:
