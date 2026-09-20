@@ -844,7 +844,17 @@ class FinishReason(StrEnum):
     """
     `stop` for a natural end or a matched stop sequence,
     `length` for hitting the token cap, `tool_calls` when the
-    model stopped because it wants one or more tools run.
+    model stopped because it wants one or more tools run,
+    `content_filter` when a safety classifier stopped it.
+
+    **`content_filter` is OpenAI's own value and is carried
+    since 2026-09-19.** Before that the chain was
+    `content_filter` → the driver's `error` → `stop`, so a
+    filtered answer arrived as a natural end and a caller had
+    no way to tell a refusal from a reply. The same mistake as
+    `tool_calls` → `stop` before 2026-09-11, one value along:
+    a state with no row of its own reported as its nearest
+    neighbour.
 
     Until 2026-09-11 this enum was `stop` and `length` only, and
     its description said so in as many words — "OpenAI's two
@@ -859,6 +869,7 @@ class FinishReason(StrEnum):
     stop = 'stop'
     length = 'length'
     tool_calls = 'tool_calls'
+    content_filter = 'content_filter'
 
 
 class Role2(StrEnum):
@@ -873,6 +884,7 @@ class FinishReason1(Enum):
     stop = 'stop'
     length = 'length'
     tool_calls = 'tool_calls'
+    content_filter = 'content_filter'
     NoneType_None = None
 
 
@@ -1323,7 +1335,17 @@ class StopReason(Enum):
     """
     Mapped from the backend's finish reason: `stop` becomes
     `end_turn`, `length` becomes `max_tokens`, `tool_calls`
-    becomes `tool_use`.
+    becomes `tool_use`, and **since 2026-09-19 a backend's
+    `content_filter` becomes `refusal`** — Anthropic's own name
+    for a classifier stopping the answer, so a client switching
+    on this field gets a value from the vocabulary it already
+    parses rather than one we invented. Not verified against a
+    live Anthropic SDK; the OpenAI door's `content_filter` was.
+
+    A backend error still reports `end_turn`, because there is
+    no Anthropic stop reason for *the backend broke* and the
+    truncation is reported where it can be acted on — the log
+    line and the metrics row.
 
     """
 
@@ -1331,6 +1353,7 @@ class StopReason(Enum):
     max_tokens = 'max_tokens'
     stop_sequence = 'stop_sequence'
     tool_use = 'tool_use'
+    refusal = 'refusal'
     NoneType_None = None
 
 
@@ -1438,7 +1461,8 @@ class Error1(BaseModel):
         description='Human-readable failure. Names the model and, on a\ncascade, that every backend was tried — the operator\nreading it is usually the person who configured the\nthing.\n',
     )
     type: str = Field(
-        ..., description='OpenAI-style class, e.g. `invalid_request_error`.'
+        ...,
+        description="OpenAI-style class, e.g. `invalid_request_error`. The\ngateway also emits `upstream_error`, `timeout`,\n`service_unavailable`, `client_disconnected` and —\nsince 2026-09-19 — **`upstream_auth_error`**, which is\nthe one that says the fault is ours rather than the\ncaller's: a driver refused the gateway's credential.\n",
     )
     param: str | None = None
     code: str | None = None
@@ -1968,7 +1992,7 @@ class AnthropicMessageResponse(BaseModel):
     )
     stop_reason: StopReason | None = Field(
         None,
-        description="Mapped from the backend's finish reason: `stop` becomes\n`end_turn`, `length` becomes `max_tokens`, `tool_calls`\nbecomes `tool_use`.\n",
+        description="Mapped from the backend's finish reason: `stop` becomes\n`end_turn`, `length` becomes `max_tokens`, `tool_calls`\nbecomes `tool_use`, and **since 2026-09-19 a backend's\n`content_filter` becomes `refusal`** — Anthropic's own name\nfor a classifier stopping the answer, so a client switching\non this field gets a value from the vocabulary it already\nparses rather than one we invented. Not verified against a\nlive Anthropic SDK; the OpenAI door's `content_filter` was.\n\nA backend error still reports `end_turn`, because there is\nno Anthropic stop reason for *the backend broke* and the\ntruncation is reported where it can be acted on — the log\nline and the metrics row.\n",
     )
     stop_sequence: str | None = None
     usage: AnthropicUsage | None = None
@@ -2102,7 +2126,7 @@ class ChatCompletionChoice(BaseModel):
     message: ChatCompletionMessage
     finish_reason: FinishReason = Field(
         ...,
-        description='`stop` for a natural end or a matched stop sequence,\n`length` for hitting the token cap, `tool_calls` when the\nmodel stopped because it wants one or more tools run.\n\nUntil 2026-09-11 this enum was `stop` and `length` only, and\nits description said so in as many words — "OpenAI\'s two\nvalues for a completion **without** tool calls". That\nsentence was the single occurrence of the string "tool"\nanywhere in this contract or the driver\'s, and it was an\naccurate description of a control plane no agent harness\ncould use.\n',
+        description='`stop` for a natural end or a matched stop sequence,\n`length` for hitting the token cap, `tool_calls` when the\nmodel stopped because it wants one or more tools run,\n`content_filter` when a safety classifier stopped it.\n\n**`content_filter` is OpenAI\'s own value and is carried\nsince 2026-09-19.** Before that the chain was\n`content_filter` → the driver\'s `error` → `stop`, so a\nfiltered answer arrived as a natural end and a caller had\nno way to tell a refusal from a reply. The same mistake as\n`tool_calls` → `stop` before 2026-09-11, one value along:\na state with no row of its own reported as its nearest\nneighbour.\n\nUntil 2026-09-11 this enum was `stop` and `length` only, and\nits description said so in as many words — "OpenAI\'s two\nvalues for a completion **without** tool calls". That\nsentence was the single occurrence of the string "tool"\nanywhere in this contract or the driver\'s, and it was an\naccurate description of a control plane no agent harness\ncould use.\n',
     )
 
 
@@ -2185,7 +2209,7 @@ class AnthropicMessagesRequest(BaseModel):
     top_p: float | None = Field(None, ge=0.0, le=1.0)
     top_k: int | None = Field(
         None,
-        description="**Read and dropped**, and this is a real loss rather than a\nno-op: both local engines accept a top-k and neither of this\nproject's internal contracts carries one, which is the same\ngap `top_p` and `seed` have on `GenerateRequest`. Documented\nhere so the omission is visible to whoever adds it.\n",
+        description="**Read and dropped**, and this is a real loss rather than a\nno-op: both local engines accept a top-k and neither of this\nproject's internal contracts carries one. It is now the\nonly such gap — `top_p` and `seed` had the same one until\n2026-09-19, when `GenerateRequest` grew `topP` and `seed`.\nDocumented here so the omission is visible to whoever adds\nit, and the shape of that fix is now written down one\ndocument over.\n",
         ge=0,
     )
     stop_sequences: list[str] | None = Field(
@@ -2223,11 +2247,16 @@ class ChatCompletionRequest(BaseModel):
         ge=1,
     )
     temperature: float | None = Field(None, ge=0.0, le=2.0)
-    top_p: float | None = Field(None, ge=0.0, le=1.0)
+    top_p: float | None = Field(
+        None,
+        description='Nucleus sampling cutoff, carried to the backend.\n\n**This field was accepted, validated and discarded until\n2026-09-19**: `GenerateRequest` had no `topP` to put it in,\nso the value went no further than this schema and nothing\nwas logged. It has one now.\n',
+        ge=0.0,
+        le=1.0,
+    )
     stop: list[str] | None = Field(None, description='Stop sequences.', max_length=4)
     seed: int | None = Field(
         None,
-        description='Passed through to backends that support deterministic\nsampling; dropped with a warning where they do not.\n',
+        description='Passed through to backends that support deterministic\nsampling; dropped with a warning where they do not.\n\n**True since 2026-09-19 and unfulfillable before it** —\nthere was no `seed` on `GenerateRequest`, so the value was\ndropped by every backend and the warning this sentence\npromises was logged by none of them. A caller asking for a\nseed is asking for a reproducible answer and was getting a\ndifferent one each time, with nothing in the response to\nsay so.\n',
     )
     stream: bool | None = Field(
         False,

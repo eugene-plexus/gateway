@@ -1031,6 +1031,16 @@ def _to_generate_request(body: ChatCompletionRequest, store: ConfigStore | None)
         messages=[_to_driver_message(m) for m in body.messages],
         maxTokens=max_tokens,
         temperature=temperature,
+        # **Carried since 2026-09-19 and dropped on the floor before
+        # that** -- `GenerateRequest` had no field for either, so the
+        # two were accepted here, range-validated by the schema above,
+        # and then went nowhere, with nothing logged. Unlike the two
+        # parameters above them they get NO install default: a seed and
+        # a nucleus cutoff are the caller's business, there is nothing
+        # sensible to invent, and inventing one would change the answer
+        # to a request that never asked for it.
+        topP=body.top_p,
+        seed=body.seed,
         stop=body.stop,
         requestId=None,
         # Tools are the caller's, not ours. Unlike every parameter above
@@ -1139,10 +1149,21 @@ _FINISH_BY_DRIVER_REASON = {
     # and comes back. Getting this wrong does not look like an error --
     # it looks like a model that answered instead of using its tools.
     "tool_calls": FinishReason.tool_calls,
+    # `content_filter` is OpenAI's OWN value, so this is a pass-through
+    # rather than an invention. Until 2026-09-19 the chain was
+    # `content_filter` -> the driver's `error` -> `stop`, and a refusal
+    # arrived as a natural end: the same mistake as `tool_calls` ->
+    # `stop` before step 6, one row along, and with the same shape --
+    # the map had no member for a state nobody had used yet, so the
+    # state was reported as its nearest neighbour.
+    "content_filter": FinishReason.content_filter,
     # A truncated-by-error generation is reported as `stop` with the text
     # that did arrive, matching what OpenAI does — there is no OpenAI
     # finish reason for "the backend broke mid-stream", and inventing one
-    # would break clients that switch on this field.
+    # would break clients that switch on this field. This is why
+    # `content_filter` had to become its own driver value first: folded
+    # in here it was indistinguishable from a backend that broke, and
+    # only one of the two has a name the caller already knows.
     "error": FinishReason.stop,
 }
 
@@ -1613,6 +1634,35 @@ def _driver_failure(e: DriverError) -> _Failure:
                 f"If an engine is still loading its weights this will clear on its own."
             ),
             error_type="service_unavailable",
+        )
+    if upstream in (401, 403):
+        # **Not the caller's 400, since 2026-09-19.** Everything else in
+        # the 4xx range here means the BACKEND refused the request --
+        # a prompt longer than the context window, overwhelmingly --
+        # which is the caller's to fix. These two mean the DRIVER
+        # refused us: the gateway's own `service:gateway` token was
+        # rejected, which is what a rotated signing key on one node
+        # looks like from here. The request was correct and the install
+        # is not, so reporting it as `invalid_request_error` sent a
+        # harness to re-read a prompt that never had a problem, and
+        # gave the operator no hint that a credential was involved.
+        #
+        # 502 and not 401: a 401 from this door is about the CALLER's
+        # bearer, and there is exactly one thing worse than blaming the
+        # caller's prompt, which is blaming their key. R4 measured what
+        # a 401 costs on the other door -- an unbounded silent retry
+        # loop -- and that is reason enough not to reuse the status for
+        # something the caller cannot act on either.
+        return _Failure(
+            code=502,
+            message=(
+                f"The driver {e.driver_name!r} at {e.driver_url} refused the gateway's "
+                f"credential (HTTP {upstream}): {detail} Nothing is wrong with this "
+                f"request. The gateway holds a `service:gateway` token minted by its own "
+                f"node's agent; re-check that driver's auth keys, or restart it so it "
+                f"picks up the install's current signing key."
+            ),
+            error_type="upstream_auth_error",
         )
     if 400 <= upstream < 500:
         return _Failure(

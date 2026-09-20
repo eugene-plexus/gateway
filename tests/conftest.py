@@ -71,6 +71,13 @@ class FakeDriverClient:
         self.tool_calls: list[ToolCall] | None = None
         """When set, `generate`/`stream` answer with these instead of
         text -- the tool-call-only turn, whose `content` is None."""
+        self.finish_reason: FinishReason = FinishReason.stop
+        """The terminal reason both paths report. A knob because
+        `content_filter` has to be observable on BOTH -- a filtered
+        answer that survives the batch path and is flattened on the
+        streaming one is exactly the shape of defect this project keeps
+        producing, and one path's assertion says nothing about the
+        other's."""
 
         # Mirrors the real clients' surface so the route can read these
         # off either without asking which kind it holds.
@@ -144,7 +151,7 @@ class FakeDriverClient:
         text = self.responses.pop(0) if self.responses else f"<{self.name} default response>"
         return GenerateResponse(
             content=text,
-            finishReason=FinishReason.stop,
+            finishReason=self.finish_reason,
             backend=self.backend,
             modelId=self.model_id,
             usage=self.usage,
@@ -234,7 +241,7 @@ class FakeDriverClient:
             done=True,
             result=GenerateResponse(
                 content=text,
-                finishReason=FinishReason.stop,
+                finishReason=self.finish_reason,
                 backend=self.backend,
                 modelId=self.model_id,
                 usage=self.usage,

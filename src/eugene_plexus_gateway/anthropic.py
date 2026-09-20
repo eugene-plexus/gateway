@@ -519,6 +519,13 @@ _STOP_REASON_BY_FINISH = {
     # error -- it looks like a model that answered instead of using its
     # tools.
     "tool_calls": "tool_use",
+    # Anthropic's own name for a classifier stopping the answer, so a
+    # client switching on this field gets a value from the vocabulary
+    # it already parses rather than one we invented -- the rule
+    # `tool_use` was fixed under, applied to the next value along.
+    # **Not verified against a live Anthropic SDK**; the OpenAI door's
+    # `content_filter` is OpenAI's own value and that one is measured.
+    "content_filter": "refusal",
     # There is no Anthropic stop reason for "the backend broke", and
     # inventing one would break a client switching on this field. The
     # truncation is reported where it can be acted on: the log line and

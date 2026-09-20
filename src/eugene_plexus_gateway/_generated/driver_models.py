@@ -768,10 +768,30 @@ class DirectoryEntryKind(StrEnum):
 
 
 class FinishReason(StrEnum):
+    """
+    **`content_filter` is separate from `error` since
+    2026-09-19**, and the two were one value for the same
+    reason `tool_calls` was folded into `stop` before step 6:
+    the map had a row for a state nobody had a use for yet, so
+    the state was reported as its nearest neighbour.
+
+    A filtered answer is not a backend error — nothing broke,
+    the backend did exactly what it was configured to do — and
+    it is not a natural end either, which is what the caller
+    saw. `error` means the generation was truncated because
+    something failed mid-stream; `content_filter` means a
+    classifier stopped it on purpose. OpenAI and Anthropic each
+    have their own name for this state and the gateway renders
+    it in the caller's vocabulary, so a client that switches on
+    the field gets the vendor value it already understands.
+
+    """
+
     stop = 'stop'
     length = 'length'
     stop_sequence = 'stop_sequence'
     tool_calls = 'tool_calls'
+    content_filter = 'content_filter'
     error = 'error'
 
 
@@ -1101,6 +1121,16 @@ class GenerateRequest(BaseModel):
         ge=0.0,
         le=2.0,
     )
+    topP: float | None = Field(
+        None,
+        description='Nucleus sampling cutoff. Owned by the caller (the gateway)\nexactly as `temperature` is, and for the same reason: it\nchanges what the model says, so a driver never substitutes\none of its own.\n\n**Added 2026-09-19.** `gateway.yaml` had promised since M0\nthat `top_p` was passed through to backends that support it\nand dropped with a warning where they do not, and there was\nno field here to carry it — so the gateway accepted the\nvalue from its caller and silently discarded it, with no\nwarning logged anywhere. A knob that is read, validated and\nthrown away is worse than one that is refused.\n\nAn adapter whose backend has no such knob — the agentic\nCLIs — drops it and says so in its log, once per field, and\nanswers the request.\n',
+        ge=0.0,
+        le=1.0,
+    )
+    seed: int | None = Field(
+        None,
+        description='Deterministic-sampling seed. Owned by the caller, carried to\nbackends that implement it, dropped with a logged warning by\nadapters whose backends do not.\n\n**Added 2026-09-19 for the same reason as `topP`**, and it\nis the more load-bearing of the two: a caller asking for a\nseed is asking for a reproducible answer, and silently\ndropping it returns a different answer each time while the\ncontract says otherwise. Nothing in a response says whether\nthe seed arrived, so the failure is invisible to the caller\nby construction.\n',
+    )
     stop: list[str] | None = Field(None, description='Optional stop sequences.')
     requestId: UUID | None = Field(
         None,
@@ -1163,7 +1193,10 @@ class GenerateResponse(BaseModel):
         None,
         description='Tools the model chose to call. Present when `finishReason`\nis `tool_calls`.\n',
     )
-    finishReason: FinishReason
+    finishReason: FinishReason = Field(
+        ...,
+        description="**`content_filter` is separate from `error` since\n2026-09-19**, and the two were one value for the same\nreason `tool_calls` was folded into `stop` before step 6:\nthe map had a row for a state nobody had a use for yet, so\nthe state was reported as its nearest neighbour.\n\nA filtered answer is not a backend error — nothing broke,\nthe backend did exactly what it was configured to do — and\nit is not a natural end either, which is what the caller\nsaw. `error` means the generation was truncated because\nsomething failed mid-stream; `content_filter` means a\nclassifier stopped it on purpose. OpenAI and Anthropic each\nhave their own name for this state and the gateway renders\nit in the caller's vocabulary, so a client that switches on\nthe field gets the vendor value it already understands.\n",
+    )
     usage: Usage | None = None
     requestId: UUID | None = None
     backend: BackendKind | None = None

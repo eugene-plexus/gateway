@@ -208,15 +208,27 @@ def test_a_dead_replica_cascades_to_the_next(settings: Settings) -> None:
 
 def test_a_4xx_does_not_cascade(settings: Settings) -> None:
     """A 4xx is the same bad request everywhere. Cascading past it would
-    bury the real problem — an expired token reading as "all backends
-    down" instead of "fix your token"."""
+    bury the real problem — a prompt longer than the context window
+    reading as "all backends down" instead of "shorten the prompt".
+
+    **Amended 2026-09-19 (R3 item 4), and the amendment is the point.**
+    This test used a **401** and asserted `invalid_request_error`, which
+    is how the one 4xx the caller cannot act on came to be locked in as
+    intended behaviour: a driver 401 means the gateway's own credential
+    was refused, and telling the caller their request was invalid sent a
+    harness to re-read a prompt that never had a problem. The subject
+    here has always been *a 4xx does not cascade*, so it keeps that
+    subject and takes a status that really is about the request. The
+    401's own behaviour is asserted in `test_request_path_contract.py`,
+    both halves of it -- the new 502 AND the unchanged non-cascade.
+    """
     first = FakeDriverClient(name="a", base_url="http://a", model_id=MODEL)
     first.generate_error = DriverError(
         driver_name="a",
         driver_url="http://a",
-        status_code=401,
+        status_code=400,
         problem=None,
-        raw_body="bad token",
+        raw_body="prompt is 15010 tokens, n_ctx is 512",
     )
     second = FakeDriverClient(name="b", base_url="http://b", model_id=MODEL)
     second.responses = ["should never be reached"]
