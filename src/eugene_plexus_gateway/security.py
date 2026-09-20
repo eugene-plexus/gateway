@@ -1,16 +1,7 @@
-"""v0.2 security primitives — verify-only.
-
-The gateway never issues tokens. The agent (the install's
-trust root) generates the per-restart HMAC signing key and distributes
-it to spawned children, along with a long-lived service token, via env
-vars (`EUGENE_PLEXUS_GATEWAY_AUTH_SIGNING_KEY`,
-`EUGENE_PLEXUS_GATEWAY_SERVICE_TOKEN`). This module exposes just the
-decode side so route dependencies can validate inbound bearer tokens.
-
-Mirror of the corresponding agent primitives at
-`eugene_plexus_agent.security`. Keeping the same constant names
-(`AUDIENCE_OPERATOR`, `SERVICE_AUDIENCE_PREFIX`) makes the two-sided
-contract obvious when reading either side.
+"""Token verification with public Ed25519 PEM.
+Legacy 32-byte HS256 verification is supported only while the install
+retains its old key. No algorithm is selected from the token header.
+This component receives no private signing key in Ed25519 mode.
 """
 
 from __future__ import annotations
@@ -21,10 +12,26 @@ from dataclasses import dataclass
 from typing import Any
 
 import jwt
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 log = logging.getLogger(__name__)
 
-_JWT_ALG = "HS256"
+
+def verification_key(key: bytes) -> bytes:
+    """Validate public Ed25519 PEM, or an explicitly legacy 32-byte HMAC key."""
+    if len(key) == 32:
+        return key
+    parsed = serialization.load_pem_public_key(key)
+    if not isinstance(parsed, Ed25519PublicKey):
+        raise ValueError("token verification requires an Ed25519 public key")
+    return key
+
+
+def verification_algorithm(key: bytes) -> str:
+    """Select from trusted key material, never an untrusted JWT header."""
+    return "HS256" if len(key) == 32 else "EdDSA"
+
 
 # Audience claim values — kept in sync with the agent.
 AUDIENCE_OPERATOR = "operator"
@@ -146,8 +153,8 @@ def decode_token(
     }
     claims = jwt.decode(
         token,
-        key=signing_key,
-        algorithms=[_JWT_ALG],
+        key=verification_key(signing_key),
+        algorithms=[verification_algorithm(signing_key)],
         options=options,
         leeway=CLOCK_SKEW_LEEWAY_SECONDS,
     )

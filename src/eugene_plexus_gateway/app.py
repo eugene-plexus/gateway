@@ -63,6 +63,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     if not hasattr(app.state, "auth_state"):
         app.state.auth_state = load_auth_state(
             signing_key_b64=settings.auth_signing_key,
+            verify_key_b64=settings.auth_verify_key,
             service_token=settings.service_token,
             master_key_b64=settings.master_key,
         )

@@ -571,7 +571,7 @@ class AuthLoginResponse(BaseModel):
 
     sessionToken: str = Field(
         ...,
-        description='Opaque bearer token. Signed and validated server-side; the\nUI should never inspect its contents. Lifetime is bounded\nby `expiresAt`.\n',
+        description='Opaque bearer token. Signed and validated server-side; the\nUI should never inspect its contents. Lifetime is bounded\nby `expiresAt`. New installs and key rotations use JWT\n`alg: EdDSA` with Ed25519. Existing HS256 installs retain\ntheir 32-byte key until explicit rotation. Agent and control\nhold private signing keys; gateway, library and driver hold\npublic verification keys after migration. Verifiers select\nexactly one algorithm from trusted key material, not from\ntoken headers. Rotation invalidates all prior tokens;\nthere is no simultaneous HS256/EdDSA acceptance window.\n',
     )
     expiresAt: AwareDatetime
     operatorName: str | None = Field(

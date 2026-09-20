@@ -40,11 +40,11 @@ class Settings(BaseSettings):
     the operator's repair survives the next non-safe-mode boot. Per the
     safe-mode contract in specs/openapi/gateway.yaml."""
 
+    auth_verify_key: str | None = None
+    """Base64 public Ed25519 PEM from the agent. Exclusive with auth_signing_key."""
+
     auth_signing_key: str | None = None
-    """Base64-encoded 32-byte HMAC signing key, supplied by the agent at
-    spawn time (EUGENE_PLEXUS_GATEWAY_AUTH_SIGNING_KEY). When absent the
-    gateway runs unauthenticated — dev / standalone path only;
-    production via the agent always supplies this."""
+    """Legacy base64 32-byte HS256 key; used only until install rotation."""
 
     service_token: str | None = None
     """Long-lived service JWT for outbound calls to peer components
