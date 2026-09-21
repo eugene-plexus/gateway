@@ -14,7 +14,13 @@ from tests.test_client_keys import FakeAgent
 
 
 @pytest.mark.asyncio
-async def test_persisted_revocation_and_permission_age(tmp_path: Path) -> None:
+async def test_persisted_revocation_and_permission_age(tmp_path: Path, monkeypatch) -> None:
+    # A 50 ms allowance must measure the injected clock, not the CI runner's
+    # disk/fsync speed. Advance both clocks explicitly across the age boundary.
+    wall = time.time()
+    elapsed = [0.0]
+    monkeypatch.setattr(time, "time", lambda: wall + elapsed[0])
+    monkeypatch.setattr(time, "perf_counter", lambda: elapsed[0])
     path = tmp_path / "policy.json"
     agent = FakeAgent()
     agent.revoke("key-1")
@@ -26,7 +32,7 @@ async def test_persisted_revocation_and_permission_age(tmp_path: Path) -> None:
     restarted = agent.as_guard(cache_file=path, max_age_seconds=0.05)
     assert await restarted.decision("key-1") == "revoked"
     assert await restarted.decision("key-2") == "allowed"
-    await asyncio.sleep(0.07)
+    elapsed[0] += 0.07
     assert await restarted.decision("key-2") == "unavailable"
     assert await restarted.decision("key-1") == "revoked"
     await restarted.aclose()
