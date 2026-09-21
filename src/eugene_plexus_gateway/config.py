@@ -118,16 +118,12 @@ FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="requestTimeoutSeconds",
-        label="Backend request timeout",
+        label="Total request deadline",
         description=(
-            "How long the gateway waits for one backend to answer. "
-            "Counts the whole HTTP request to the driver. A model that "
-            "runs on the processor, or one that is only half on the "
-            "graphics card, can take several minutes for a long answer "
-            "— raise this rather than letting it be cut off. When it "
-            "does fire the request is NOT retried on another backend: "
-            "the next one would take the same time on the same prompt, "
-            "so you get one clear timeout instead of three."
+            "One elapsed time budget for admission, routing, model loading, "
+            "generation and all fallback attempts. Raise it for large or "
+            "partially offloaded models. Expiry cancels owned work and stops "
+            "failover; a remote provider may still have acted."
         ),
         category="routing",
         valueType=ConfigValueType.duration,

@@ -23,11 +23,12 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import struct
 import time
 import uuid
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import field as dc_field
 from datetime import UTC, datetime
 from typing import Any
@@ -206,6 +207,8 @@ def _record(
                 candidates=considered,
                 client_key_id=context.key_id if context else None,
                 client_key_name=context.key_name if context else None,
+                request_id=context.id if context else None,
+                elapsed_ms=int((time.perf_counter() - context.started) * 1000) if context else None,
             )
         )
         if (context := admission.current.get()) is not None:
@@ -262,11 +265,15 @@ class _Failure:
     message: str
     error_type: str
     param: str | None = None
+    retry_after: str | None = None
 
     def as_openai(self) -> JSONResponse:
-        return _error(
+        response = _error(
             code=self.code, message=self.message, error_type=self.error_type, param=self.param
         )
+        if self.retry_after:
+            response.headers["Retry-After"] = self.retry_after
+        return response
 
     def as_anthropic(self) -> JSONResponse:
         # `status_for` moves exactly one code, and it moves on a
@@ -275,7 +282,10 @@ class _Failure:
         # would throw away the available-model list and the
         # sealed-control-root diagnosis.
         status = anthropic.status_for(self.code)
-        return anthropic.error_response(status, self.message)
+        response = anthropic.error_response(status, self.message)
+        if self.retry_after:
+            response.headers["Retry-After"] = self.retry_after
+        return response
 
 
 def _control_root_hint(table: RoutingTable | None) -> str:
@@ -493,6 +503,7 @@ async def _prepare(
     arrived = time.perf_counter()
     refreshed = False
 
+    constraints = _to_generate_request(body, _store(request))
     table = _routing(request)
     if table is None:
         return _Failure(
@@ -501,7 +512,7 @@ async def _prepare(
             error_type="service_unavailable",
         )
 
-    resolution = await admission.permitted(table.resolve(body.model))
+    resolution = await admission.permitted(table.resolve(body.model), requirements=constraints)
     if not resolution.has_backends():
         return _no_such_model(body.model, table)
 
@@ -533,7 +544,7 @@ async def _prepare(
     client = table.pick(resolution, images=images)
     if client is None and await table.refresh_if_stale():
         refreshed = True
-        resolution = await admission.permitted(table.resolve(body.model))
+        resolution = await admission.permitted(table.resolve(body.model), requirements=constraints)
         if not resolution.has_backends():
             return _no_such_model(body.model, table)
         client = table.pick(resolution, images=images)
@@ -546,7 +557,9 @@ async def _prepare(
         if lifecycle is not None:
             wake = await lifecycle.wake(resolution)
             if wake.ok:
-                resolution = await admission.permitted(table.resolve(body.model))
+                resolution = await admission.permitted(
+                    table.resolve(body.model), requirements=constraints
+                )
                 client = table.pick(resolution, images=images)
                 considered = table.candidates_considered(resolution)
         if client is None:
@@ -587,7 +600,10 @@ async def _prepare(
             ):
                 return original
             defaults = await profiles.get(paths.get((candidate.node, candidate.name)))
-            return _to_generate_request(body, store, defaults)
+            prepared = _to_generate_request(body, store, defaults)
+            prepared.localOnly = original.localOnly
+            prepared.requestId = original.requestId
+            return prepared
 
         client.prepare_request = prepare_candidate
     waited_ms = wake.waited_ms if wake is not None and wake.ok else 0
@@ -704,7 +720,8 @@ async def create_chat_completion(request: Request) -> Any:
             return _error(
                 code=502,
                 message=(
-                    f"Every backend serving {body.model!r} failed. Last error: {e!r}. "
+                    f"A backend serving {body.model!r} failed ({type(e).__name__}). "
+                    "Work may have occurred; an uncertain outcome is not replayed automatically. "
                     f"The engine may have stopped — check GET /v1/runtimes on the agent."
                 ),
                 error_type="upstream_error",
@@ -766,7 +783,8 @@ def _serve_failure(
     return _Failure(
         code=502,
         message=(
-            f"Every backend serving {body.model!r} failed. Last error: {e!r}. "
+            f"A backend serving {body.model!r} failed ({type(e).__name__}). "
+            "Work may have occurred; an uncertain outcome is not replayed automatically. "
             f"The engine may have stopped — check GET /v1/runtimes on the agent."
         ),
         error_type="upstream_error",
@@ -1034,7 +1052,13 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
     try:
         result = await serve_while_connected(
             request,
-            client.embed(EmbedRequest(input=inputs, localOnly=admission.local_only())),
+            client.embed(
+                EmbedRequest(
+                    input=inputs,
+                    localOnly=admission.local_only(),
+                    requestId=str(admission.request_id()) if admission.request_id() else None,
+                )
+            ),
             what="an embeddings request",
         )
     except ClientGone:
@@ -1060,7 +1084,8 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
         return _error(
             code=502,
             message=(
-                f"Every backend serving {body.model!r} failed. Last error: {e!r}. "
+                f"A backend serving {body.model!r} failed ({type(e).__name__}). "
+                "Work may have occurred; an uncertain outcome is not replayed automatically. "
                 f"The cascade never reached a different model -- see the contract."
             ),
             error_type="upstream_error",
@@ -1145,7 +1170,7 @@ def _to_generate_request(
         stop=([body.stop] if isinstance(body.stop, str) else body.stop.root)
         if body.stop is not None
         else None,
-        requestId=None,
+        requestId=admission.request_id(),
         # Tools are the caller's, not ours. Unlike every parameter above
         # them, there is no install default to fall back to and nothing
         # sensible to invent: a tool the caller did not offer is one it
@@ -1718,6 +1743,22 @@ async def _stream_completion(
 
 
 def _driver_failure(e: DriverError) -> _Failure:
+    from ..driver_client import retry_disposition
+
+    failure = _driver_failure_status(e)
+    if retry_disposition(e) == "indeterminate":
+        failure = replace(
+            failure,
+            message=failure.message
+            + " Outcome unknown: work may have occurred; no automatic replay.",
+        )
+    delay = e.problem.retryAfterSeconds if e.problem is not None else None
+    if delay is not None and math.isfinite(delay):
+        failure = replace(failure, retry_after=str(math.ceil(delay)))
+    return failure
+
+
+def _driver_failure_status(e: DriverError) -> _Failure:
     """Map a driver failure onto the status the client should act on.
 
     The split matters operationally. A 4xx from the backend is a request

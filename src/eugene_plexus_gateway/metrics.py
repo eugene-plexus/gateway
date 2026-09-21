@@ -50,7 +50,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Bounded because the alternative to dropping rows is stalling
 # completions, and that trade is never worth making. Sized so a burst
@@ -101,6 +101,10 @@ class AttemptRow:
     # local hop plus the driver's work - which the design has asserted
     # is negligible since M0 without measuring it.
     backend_ms: int | None = None
+    retry_disposition: str | None = None
+    usage_known: bool = False
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
 
 
 @dataclass(slots=True)
@@ -130,6 +134,8 @@ class RequestRow:
     candidates: list[CandidateRow] = field(default_factory=list)
     client_key_id: str | None = None
     client_key_name: str | None = None
+    request_id: str | None = None
+    elapsed_ms: int | None = None
 
 
 _DDL = """
@@ -156,7 +162,9 @@ CREATE TABLE IF NOT EXISTS request (
     refreshed         INTEGER NOT NULL DEFAULT 0,
     strategy          TEXT,
     client_key_id     TEXT,
-    client_key_name   TEXT
+    client_key_name   TEXT,
+    correlation_id    TEXT,
+    elapsed_ms        INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS request_started_at ON request (started_at);
@@ -172,7 +180,11 @@ CREATE TABLE IF NOT EXISTS attempt (
     elapsed_ms INTEGER NOT NULL,
     served     INTEGER NOT NULL,
     error      TEXT,
-    backend_ms INTEGER
+    backend_ms INTEGER,
+    retry_disposition TEXT,
+    usage_known INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS attempt_request ON attempt (request_id);
@@ -301,11 +313,24 @@ class MetricsStore:
         conn.commit()
 
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        if row is not None and int(row[0]) == 2:
+        if row is not None and int(row[0]) in (2, 3):
             columns = {r[1] for r in conn.execute("PRAGMA table_info(request)")}
             for column in ("client_key_id", "client_key_name"):
                 if column not in columns:
                     conn.execute(f"ALTER TABLE request ADD COLUMN {column} TEXT")
+            for table, additions in {
+                "request": {"correlation_id": "TEXT", "elapsed_ms": "INTEGER"},
+                "attempt": {
+                    "retry_disposition": "TEXT",
+                    "usage_known": "INTEGER NOT NULL DEFAULT 0",
+                    "prompt_tokens": "INTEGER",
+                    "completion_tokens": "INTEGER",
+                },
+            }.items():
+                existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+                for column, kind in additions.items():
+                    if column not in existing:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
             conn.execute(
                 "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),)
             )
@@ -448,8 +473,8 @@ class MetricsStore:
                     "INSERT INTO request (started_at, requested_model, served_model, attempts,"
                     " tier, total_ms, waited_ms, swapped_in, streamed, prompt_tokens,"
                     " completion_tokens, outcome, routing_ms, refreshed, strategy,"
-                    " client_key_id, client_key_name)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " client_key_id, client_key_name, correlation_id, elapsed_ms)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         _iso(row.started_at),
                         row.requested_model,
@@ -468,13 +493,16 @@ class MetricsStore:
                         row.strategy,
                         row.client_key_id,
                         row.client_key_name,
+                        row.request_id,
+                        row.elapsed_ms,
                     ),
                 )
                 request_id = cursor.lastrowid
                 conn.executemany(
                     "INSERT INTO attempt (request_id, seq, driver, runtime, node, backend,"
-                    " elapsed_ms, served, error, backend_ms)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " elapsed_ms, served, error, backend_ms, retry_disposition, usage_known,"
+                    " prompt_tokens, completion_tokens)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         (
                             request_id,
@@ -487,6 +515,10 @@ class MetricsStore:
                             int(a.served),
                             a.error,
                             a.backend_ms,
+                            a.retry_disposition,
+                            int(a.usage_known),
+                            a.prompt_tokens,
+                            a.completion_tokens,
                         )
                         for seq, a in enumerate(row.tries)
                     ],
@@ -849,7 +881,7 @@ class MetricsStore:
                 SELECT id, started_at, requested_model, served_model, attempts, tier,
                        total_ms, waited_ms, swapped_in, streamed, prompt_tokens,
                        completion_tokens, outcome, routing_ms, refreshed, strategy,
-                       client_key_id, client_key_name
+                       client_key_id, client_key_name, correlation_id, elapsed_ms
                 FROM request r {clause}
                 ORDER BY id DESC LIMIT ?
                 """,
@@ -877,10 +909,15 @@ class MetricsStore:
                 served,
                 error,
                 backend_ms,
+                retry_disposition,
+                usage_known,
+                prompt_tokens,
+                completion_tokens,
             ) in conn.execute(
                 f"""
                 SELECT request_id, driver, runtime, node, backend, elapsed_ms, served,
-                       error, backend_ms
+                       error, backend_ms, retry_disposition, usage_known,
+                       prompt_tokens, completion_tokens
                 FROM attempt WHERE request_id IN ({placeholders}) ORDER BY request_id, seq
                 """,
                 ids,
@@ -895,6 +932,10 @@ class MetricsStore:
                         "served": bool(served),
                         "error": error,
                         "backendMs": backend_ms,
+                        "retryDisposition": retry_disposition,
+                        "usageKnown": bool(usage_known),
+                        "promptTokens": prompt_tokens,
+                        "completionTokens": completion_tokens,
                     }
                 )
 
@@ -945,6 +986,8 @@ class MetricsStore:
                 "strategy": r[15],
                 "clientKeyId": r[16],
                 "clientKeyName": r[17],
+                "requestId": r[18],
+                "elapsedMs": r[19],
                 "tries": tries[r[0]],
                 "candidates": considered[r[0]],
             }

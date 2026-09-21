@@ -20,7 +20,7 @@ import struct
 import pytest
 from fastapi.testclient import TestClient
 
-from eugene_plexus_gateway._generated.driver_models import Usage
+from eugene_plexus_gateway._generated.driver_models import Problem, Usage
 from eugene_plexus_gateway.app import create_app
 from eugene_plexus_gateway.driver_client import DriverError
 
@@ -148,7 +148,9 @@ def test_a_failure_does_NOT_cascade_to_a_different_model(settings) -> None:  # t
         driver_name="primary",
         driver_url="http://primary",
         status_code=503,
-        problem=None,
+        problem=Problem(
+            type="about:blank", title="Not started", status=503, retryDisposition="safe"
+        ),
         raw_body="down",
     )
     other = _embedder("secondary", "all-minilm")
@@ -176,7 +178,9 @@ def test_replicas_of_the_SAME_model_still_fail_over(settings) -> None:  # type: 
         driver_name="replica-a",
         driver_url="http://a",
         status_code=503,
-        problem=None,
+        problem=Problem(
+            type="about:blank", title="Not started", status=503, retryDisposition="safe"
+        ),
         raw_body="down",
     )
     alive = _embedder("replica-bb", "nomic-embed-text")

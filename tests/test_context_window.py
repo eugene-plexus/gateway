@@ -19,7 +19,7 @@ import logging
 import pytest
 from fastapi.testclient import TestClient
 
-from eugene_plexus_gateway._generated.driver_models import Usage
+from eugene_plexus_gateway._generated.driver_models import Problem, Usage
 from eugene_plexus_gateway.driver_client import DriverError
 from eugene_plexus_gateway.routing import _RuntimeFacts
 
@@ -177,7 +177,9 @@ def test_the_completion_reports_the_answering_backends_window(settings_app_pair)
         driver_name=small.name,
         driver_url=small.base_url,
         status_code=500,
-        problem=None,
+        problem=Problem(
+            type="about:blank", title="Not started", status=503, retryDisposition="safe"
+        ),
         raw_body="down",
     )
 

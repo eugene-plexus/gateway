@@ -107,16 +107,20 @@ class FakeDriverClient:
 
     def describe(self) -> DriverInfo:
         """The same answer `info()` gives, without needing a loop."""
-        capabilities = (
-            Capabilities(
-                maxContextTokens=self.max_context_tokens,
-                toolCalling=self.supports_tools,
-                embeddings=self.supports_embeddings or None,
-            )
-            if self.max_context_tokens is not None
-            or self.supports_tools
-            or self.supports_embeddings
-            else None
+        capabilities = Capabilities(
+            supportedSettings=[
+                "maxTokens",
+                "temperature",
+                "topP",
+                "seed",
+                "stop",
+                "tools",
+                "toolChoice",
+                "responseFormat",
+            ],
+            maxContextTokens=self.max_context_tokens,
+            toolCalling=self.supports_tools,
+            embeddings=self.supports_embeddings or None,
         )
         return DriverInfo(
             backend=self.backend,

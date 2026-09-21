@@ -78,7 +78,20 @@ class _FakeInstall(BaseHTTPRequestHandler):
                     "backend": "openai_compat_http",
                     "provider": "local",
                     "modelId": MODEL,
-                    "capabilities": {"streaming": True, "maxContextTokens": 8192},
+                    "capabilities": {
+                        "streaming": True,
+                        "maxContextTokens": 8192,
+                        "supportedSettings": [
+                            "maxTokens",
+                            "temperature",
+                            "topP",
+                            "seed",
+                            "stop",
+                            "tools",
+                            "toolChoice",
+                            "responseFormat",
+                        ],
+                    },
                     "version": "0.1.0-fake",
                 },
             )

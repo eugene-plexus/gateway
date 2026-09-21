@@ -11,7 +11,9 @@ async def test_v2_migration_keeps_history_and_attributed_totals(tmp_path):
     conn = sqlite3.connect(path)
     old = (
         _DDL.replace("    client_key_id     TEXT,\n", "")
-        .replace("    client_key_name   TEXT\n", "")
+        .replace("    client_key_name   TEXT,\n", "")
+        .replace("    correlation_id    TEXT,\n", "")
+        .replace("    elapsed_ms        INTEGER\n", "")
         .replace("    strategy          TEXT,\n", "    strategy          TEXT\n")
     )
     conn.executescript(old)
@@ -61,6 +63,40 @@ async def test_v2_migration_keeps_history_and_attributed_totals(tmp_path):
         assert usage["a"]["promptTokens"] == 10 and usage["a"]["completionTokens"] == 4
         assert usage["a"]["incompleteUsageRequests"] == 2
         assert usage["b"]["incompleteUsageRequests"] == 0
+        assert not list(tmp_path.glob("*.bak"))
+    finally:
+        await store.aclose()
+
+
+async def test_v3_attempts_survive_migration_with_usage_explicitly_unknown(tmp_path):
+    path = tmp_path / "metrics.sqlite3"
+    conn = sqlite3.connect(path)
+    old = _DDL.replace(
+        "    client_key_name   TEXT,\n    correlation_id    TEXT,\n    elapsed_ms        INTEGER\n",
+        "    client_key_name   TEXT\n",
+    ).replace(
+        "    backend_ms INTEGER,\n    retry_disposition TEXT,\n    usage_known INTEGER NOT NULL DEFAULT 0,\n    prompt_tokens INTEGER,\n    completion_tokens INTEGER\n",
+        "    backend_ms INTEGER\n",
+    )
+    conn.executescript(old)
+    assert "usage_known" not in {row[1] for row in conn.execute("PRAGMA table_info(attempt)")}
+    conn.execute("INSERT INTO meta VALUES ('schema_version', '3')")
+    conn.execute(
+        "INSERT INTO request (started_at, requested_model, attempts, total_ms, outcome) VALUES (?, 'old', 1, 5, 'error')",
+        (datetime.now(UTC).isoformat(),),
+    )
+    conn.execute(
+        "INSERT INTO attempt (request_id, seq, driver, elapsed_ms, served) VALUES (1, 0, 'old-driver', 5, 0)"
+    )
+    conn.commit()
+    conn.close()
+    store = MetricsStore(path)
+    await store.start()
+    try:
+        rows, _ = store.requests()
+        assert len(rows) == 1 and rows[0]["requestId"] is None
+        assert rows[0]["tries"][0]["usageKnown"] is False
+        assert rows[0]["tries"][0]["promptTokens"] is None
         assert not list(tmp_path.glob("*.bak"))
     finally:
         await store.aclose()

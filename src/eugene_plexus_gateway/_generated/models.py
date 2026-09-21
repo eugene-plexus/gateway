@@ -231,6 +231,21 @@ class ModelFormat(StrEnum):
     safetensors = 'safetensors'
 
 
+class RetryDisposition(StrEnum):
+    """
+    Safe means this attempt did not accept application work and may
+    be replayed before any output. Terminal means the request must
+    be corrected. Indeterminate means work may have occurred; do not
+    replay automatically. Missing classification on a server failure
+    is indeterminate, never implicit permission to retry.
+
+    """
+
+    safe = 'safe'
+    terminal = 'terminal'
+    indeterminate = 'indeterminate'
+
+
 class Problem(BaseModel):
     """
     Error response shape, modeled on RFC 7807 (problem+json). Every
@@ -254,6 +269,15 @@ class Problem(BaseModel):
     component: str | None = Field(
         None,
         description='Eugene Plexus component name that originated the error\n(e.g. `"gateway"`, `"inference-driver:left"`).\n',
+    )
+    retryDisposition: RetryDisposition | None = Field(
+        None,
+        description='Safe means this attempt did not accept application work and may\nbe replayed before any output. Terminal means the request must\nbe corrected. Indeterminate means work may have occurred; do not\nreplay automatically. Missing classification on a server failure\nis indeterminate, never implicit permission to retry.\n',
+    )
+    retryAfterSeconds: float | None = Field(
+        None,
+        description='Parsed provider Retry-After delay; a scheduling hint, not permission to replay.',
+        ge=0.0,
     )
 
 
@@ -1638,11 +1662,31 @@ class MetricsSummary(BaseModel):
     groups: list[MetricsGroup]
 
 
+class RetryDisposition1(StrEnum):
+    """
+    Failure classification; absent for success or historical rows.
+    """
+
+    safe = 'safe'
+    terminal = 'terminal'
+    indeterminate = 'indeterminate'
+
+
 class MetricAttempt(BaseModel):
     """
     One backend touched by one request, in the order tried.
     """
 
+    retryDisposition: RetryDisposition1 | None = Field(
+        None,
+        description='Failure classification; absent for success or historical rows.',
+    )
+    usageKnown: bool | None = Field(
+        None,
+        description='Whether token usage is known for this attempt; false is not zero cost.',
+    )
+    promptTokens: int | None = Field(None, ge=0)
+    completionTokens: int | None = Field(None, ge=0)
     driver: str
     runtime: str | None = None
     node: str | None = None
@@ -2064,6 +2108,15 @@ class AnthropicMessageResponse(BaseModel):
 
 
 class MetricRequest(BaseModel):
+    requestId: str | None = Field(
+        None,
+        description='Gateway-generated correlation ID shared by every driver attempt.',
+    )
+    elapsedMs: int | None = Field(
+        None,
+        description='Entire request lifetime, including preparation, wake and every attempt.',
+        ge=0,
+    )
     clientKeyId: str | None = Field(
         None,
         description='Verified key identifier; absent for operator/service requests and pre-A5 rows.',
@@ -2077,7 +2130,7 @@ class MetricRequest(BaseModel):
         None,
         description='What actually answered. Differs from the requested id after\na cascade.\n',
     )
-    attempts: int = Field(..., ge=1)
+    attempts: int = Field(..., ge=0)
     tier: int | None = Field(None, ge=1)
     totalMs: int = Field(
         ...,
@@ -2110,7 +2163,7 @@ class MetricRequest(BaseModel):
     promptTokens: int | None = None
     completionTokens: int | None = None
     outcome: Outcome
-    tries: list[MetricAttempt] = Field(..., min_length=1)
+    tries: list[MetricAttempt] = Field(..., min_length=0)
 
 
 class MetricRequestPage(BaseModel):

@@ -226,6 +226,21 @@ class ModelFormat(StrEnum):
     safetensors = 'safetensors'
 
 
+class RetryDisposition(StrEnum):
+    """
+    Safe means this attempt did not accept application work and may
+    be replayed before any output. Terminal means the request must
+    be corrected. Indeterminate means work may have occurred; do not
+    replay automatically. Missing classification on a server failure
+    is indeterminate, never implicit permission to retry.
+
+    """
+
+    safe = 'safe'
+    terminal = 'terminal'
+    indeterminate = 'indeterminate'
+
+
 class Problem(BaseModel):
     """
     Error response shape, modeled on RFC 7807 (problem+json). Every
@@ -249,6 +264,15 @@ class Problem(BaseModel):
     component: str | None = Field(
         None,
         description='Eugene Plexus component name that originated the error\n(e.g. `"gateway"`, `"inference-driver:left"`).\n',
+    )
+    retryDisposition: RetryDisposition | None = Field(
+        None,
+        description='Safe means this attempt did not accept application work and may\nbe replayed before any output. Terminal means the request must\nbe corrected. Indeterminate means work may have occurred; do not\nreplay automatically. Missing classification on a server failure\nis indeterminate, never implicit permission to retry.\n',
+    )
+    retryAfterSeconds: float | None = Field(
+        None,
+        description='Parsed provider Retry-After delay; a scheduling hint, not permission to replay.',
+        ge=0.0,
     )
 
 
@@ -933,6 +957,10 @@ class Capabilities(BaseModel):
     Backend capabilities the gateway keys off when routing.
     """
 
+    supportedSettings: list[str] | None = Field(
+        None,
+        description='Explicit callerSettings this active adapter can carry without\ndropping them. This does not promise the provider accepts every\npossible value. Absent means unknown; ineligible for requests\nrequiring explicit settings. The driver still validates before\nexecution, including after a configuration change.\n',
+    )
     streaming: bool | None = Field(
         None, description='Whether `/v1/generate/stream` emits true incremental tokens.'
     )

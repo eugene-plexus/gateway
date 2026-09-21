@@ -29,9 +29,20 @@ def test_limit_on_driver_wire(app: FastAPI, field: str, stream: bool, fallback: 
     captured: list[tuple[str, dict[str, Any]]] = []
 
     async def wire(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            driver = first if request.url.host == "first.invalid" else second
+            return httpx.Response(200, json=driver.describe().model_dump(mode="json"))
         captured.append((request.url.host, json.loads(request.content)))
         if fallback and request.url.host == "first.invalid":
-            return httpx.Response(503, json={"error": "unavailable"})
+            return httpx.Response(
+                503,
+                json={
+                    "type": "about:blank",
+                    "title": "unavailable before execution",
+                    "status": 503,
+                    "retryDisposition": "safe",
+                },
+            )
         result = {"content": "ok", "finishReason": "stop", "backend": "openai_compat_http"}
         if request.url.path.endswith("/stream"):
             return httpx.Response(

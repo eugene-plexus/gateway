@@ -42,7 +42,12 @@ def _driver_error(status_code: int) -> DriverError:
         driver_name="slot",
         driver_url="http://backend",
         status_code=status_code,
-        problem=Problem(type="about:blank", title="boom", status=status_code),
+        problem=Problem(
+            type="about:blank",
+            title="refused before work",
+            status=status_code,
+            retryDisposition="safe" if status_code in (500, 502, 503) else None,
+        ),
         raw_body="",
     )
 
@@ -76,7 +81,7 @@ async def test_transport_error_cascades_to_backup() -> None:
     assert len(backup.calls) == 1
 
 
-async def test_5xx_cascades_to_backup() -> None:
+async def test_explicit_pre_execution_refusal_cascades_to_backup() -> None:
     primary = FakeDriverClient(name="left")
     primary.generate_error = _driver_error(503)
     backup = FakeDriverClient(name="left")

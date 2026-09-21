@@ -1111,6 +1111,8 @@ class RoutingTable:
         served: bool,
         elapsed_ms: int = 0,
         error: str | None = None,
+        retry_disposition: str | None = None,
+        usage: Any = None,
     ) -> None:
         key: Key = (node, driver)
         self._inflight[key] = max(0, self._inflight.get(key, 0) - 1)
@@ -1134,6 +1136,14 @@ class RoutingTable:
                 node=runtime[0] if runtime is not None else node,
                 backend=self._backend_for_driver(key),
                 error=error,
+                retry_disposition=retry_disposition,
+                usage_known=usage is not None
+                and getattr(usage, "promptTokens", None) is not None
+                and getattr(usage, "completionTokens", 0) is not None,
+                prompt_tokens=getattr(usage, "promptTokens", None),
+                completion_tokens=getattr(usage, "completionTokens", 0)
+                if usage is not None
+                else None,
             )
         )
 

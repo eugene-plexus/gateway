@@ -33,8 +33,10 @@ from ._generated.driver_models import (
     GenerateRequest,
     GenerateResponse,
     Problem,
+    RetryDisposition,
 )
 from ._http import internal_client
+from .circuit import Circuit
 
 log = logging.getLogger(__name__)
 
@@ -63,7 +65,10 @@ class DriverError(Exception):
         self.status_code = status_code
         self.problem = problem
         self.raw_body = raw_body
-        super().__init__(self._summary())
+        summary = self._summary()
+        if retry_disposition(self) == "indeterminate":
+            summary += " Outcome unknown: no automatic replay; work may have occurred."
+        super().__init__(summary)
 
     def _summary(self) -> str:
         prefix = f"driver {self.driver_name!r} ({self.driver_url}) returned {self.status_code}"
@@ -223,6 +228,8 @@ class RoutingHooks(Protocol):
         served: bool,
         elapsed_ms: int = 0,
         error: str | None = None,
+        retry_disposition: str | None = None,
+        usage: Any = None,
     ) -> None: ...
 
 
@@ -239,6 +246,7 @@ class HttpDriverClient:
         node: str | None = None,
     ) -> None:
         self.name = name
+        self.circuit = Circuit()
         self.base_url = base_url.rstrip("/")
         #: Which machine's agent reported this driver. Carried so
         #: `TieredClient` can hand it to the routing hooks, whose
@@ -274,7 +282,11 @@ class HttpDriverClient:
 
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
         payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
-        response = await self._client.post("/v1/generate", json=payload)
+        response = await self._client.post(
+            "/v1/generate",
+            json=payload,
+            headers={"X-Request-ID": str(request.requestId)} if request.requestId else None,
+        )
         if response.status_code >= 400:
             raise DriverError(
                 driver_name=self.name,
@@ -283,11 +295,18 @@ class HttpDriverClient:
                 problem=_problem_from_response(response),
                 raw_body=response.text,
             )
-        return GenerateResponse.model_validate(response.json())
+        try:
+            return GenerateResponse.model_validate(response.json())
+        except ValueError as exc:
+            raise self._invalid_reply() from exc
 
     async def embed(self, request: EmbedRequest) -> EmbedResponse:
         payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
-        response = await self._client.post("/v1/embed", json=payload)
+        response = await self._client.post(
+            "/v1/embed",
+            json=payload,
+            headers={"X-Request-ID": str(request.requestId)} if request.requestId else None,
+        )
         if response.status_code >= 400:
             raise DriverError(
                 driver_name=self.name,
@@ -296,7 +315,24 @@ class HttpDriverClient:
                 problem=_problem_from_response(response),
                 raw_body=response.text,
             )
-        return EmbedResponse.model_validate(response.json())
+        try:
+            return EmbedResponse.model_validate(response.json())
+        except ValueError as exc:
+            raise self._invalid_reply() from exc
+
+    def _invalid_reply(self) -> DriverError:
+        return DriverError(
+            driver_name=self.name,
+            driver_url=self.base_url,
+            status_code=502,
+            problem=Problem(
+                type="about:blank",
+                title="Driver returned an invalid response",
+                status=502,
+                retryDisposition=RetryDisposition.indeterminate,
+            ),
+            raw_body="",
+        )
 
     async def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]:
         """Consume one driver's `/v1/generate/stream`.
@@ -321,7 +357,10 @@ class HttpDriverClient:
             "POST",
             "/v1/generate/stream",
             json=payload,
-            headers={"Accept": "text/event-stream"},
+            headers={
+                "Accept": "text/event-stream",
+                **({"X-Request-ID": str(request.requestId)} if request.requestId else {}),
+            },
         ) as response:
             if response.status_code >= 400:
                 body = await response.aread()
@@ -345,21 +384,28 @@ class HttpDriverClient:
                 data = line[5:].strip()
                 try:
                     parsed = json.loads(data)
-                except ValueError:
-                    log.debug("driver %r sent an unparseable SSE payload", self.name)
-                    continue
+                except ValueError as exc:
+                    raise self._invalid_reply() from exc
+                if not isinstance(parsed, dict):
+                    raise self._invalid_reply()
                 if event_name == "error":
+                    try:
+                        problem = Problem.model_validate(parsed)
+                    except ValueError as exc:
+                        raise self._invalid_reply() from exc
                     raise DriverError(
                         driver_name=self.name,
                         driver_url=self.base_url,
-                        status_code=int(parsed.get("status") or 502),
-                        problem=Problem.model_validate(parsed)
-                        if isinstance(parsed, dict)
-                        else None,
+                        status_code=problem.status,
+                        problem=problem,
                         raw_body=data,
                     )
                 if event_name == "done":
-                    yield StreamEvent(done=True, result=GenerateResponse.model_validate(parsed))
+                    try:
+                        result = GenerateResponse.model_validate(parsed)
+                    except ValueError as exc:
+                        raise self._invalid_reply() from exc
+                    yield StreamEvent(done=True, result=result)
                     return
                 if not isinstance(parsed, dict):
                     continue
@@ -379,67 +425,47 @@ class HttpDriverClient:
         await self._client.aclose()
 
 
-def _is_cascade_eligible(exc: Exception) -> bool:
-    """Failure taxonomy for priority-list failover.
-
-    Cascade-eligible (try the next backend in the slot):
-      * transport-level errors — connection refused, DNS, a connect
-        timeout: the backend never took the work, so the next one is a
-        real rescue
-      * upstream 5xx — the backend is reachable but broken or
-        overloaded. The case that motivated failover was a real
-        OpenRouter 429, which the driver maps to 502.
-
-    NOT cascade-eligible (fail the slot HARD, re-raise immediately):
-      * upstream 4xx — a request / auth / config bug. The next backend
-        would hit the same bad request, and cascading past it would
-        mask the real problem (e.g. an expired service token reading as
-        "all backends down" instead of "fix your token").
-      * **a deadline that fired — a read timeout here, or a 504 from the
-        driver's own deadline (R2.5).** The v0.2.1 plan locked timeouts
-        into the transport branch, and that was wrong in the way that
-        costs the most: a backend that has not answered in time is
-        almost certainly *still computing*, holding a GPU or a CPU's
-        worth of exactly this prompt, and the next replica will take the
-        same time to do the same work. Cascading there does not rescue
-        the request, it multiplies the cost of it — measured as a 30B on
-        CPU told "Every backend serving this model failed" after 240 s
-        with both engines having computed the answer. A deadline is a
-        fact about the clock rather than about this backend, and it is
-        equally true of every other backend in the slot.
-
-    **The split inside `TimeoutException` is load-bearing.**
-    `httpx.ConnectTimeout` is a `TimeoutException` and is a *dead host*:
-    nothing was ever handed to an engine, so it cascades. `ReadTimeout`,
-    `WriteTimeout` and `PoolTimeout` mean the work started — or that the
-    pool is saturated by work that started — and they do not.
-    """
+def retry_disposition(exc: BaseException) -> str:
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return "safe"
     if isinstance(exc, DriverError):
         if exc.status_code == 504:
-            return False
-        return exc.status_code >= 500
-    if isinstance(exc, httpx.ConnectTimeout):
-        return True
-    if isinstance(exc, httpx.TimeoutException):
-        return False
-    return isinstance(exc, httpx.HTTPError)
+            return "indeterminate"
+        if exc.problem is not None and exc.problem.retryDisposition is not None:
+            return exc.problem.retryDisposition.value
+        if 400 <= exc.status_code < 500:
+            return "terminal"
+    return "indeterminate"
+
+
+def _is_cascade_eligible(exc: Exception) -> bool:
+    return retry_disposition(exc) == "safe"
+
+
+def _cooling_error() -> DriverError:
+    return DriverError(
+        driver_name="routing",
+        driver_url="",
+        status_code=503,
+        problem=Problem(
+            type="about:blank",
+            title="Backends cooling down",
+            status=503,
+            retryDisposition=RetryDisposition.safe,
+            retryAfterSeconds=1,
+            detail="Eligible backends are cooling down or already probing recovery. Try a new "
+            "request later.",
+        ),
+        raw_body="",
+    )
 
 
 class TieredClient:
-    """A slot: ordered tiers of ordered backends, walked on failure.
+    """Ordered tiers, retried only after a proven pre-execution failure.
 
-    Implements the same `DriverClient` protocol as `HttpDriverClient`,
-    so the caller is oblivious to failover — it holds a client and calls
-    `.generate()`. Internally this tries the first tier's candidates in
-    order, then the next tier's, cascading on a cascade-eligible failure
-    (transport / 5xx) and failing hard on a 4xx or on a deadline that
-    fired. See `_is_cascade_eligible`.
-
-    Granularity is per-call: each `.generate()` independently walks the
-    list from the top, so a slot that fell over to its backup recovers to
-    the primary as soon as the primary is healthy again — no operator
-    intervention, and no sticky state to reset. Within a tier the order
-    is the balancer's, decided when the routing table built this client.
+    Selection is per request; each HTTP client's circuit is shared across
+    requests and limits recovery probes. No replay follows uncertain work,
+    a deadline, or any output. See retry_disposition and Circuit.
     """
 
     def __init__(
@@ -516,6 +542,11 @@ class TieredClient:
             for candidate in tier:
                 if self.authorize_attempt is not None:
                     await self.authorize_attempt()
+                circuit = getattr(candidate, "circuit", None)
+                if circuit is not None and not circuit.acquire():
+                    if last_exc is None:
+                        last_exc = _cooling_error()
+                    continue
                 self.attempts = index + 1
                 driver = getattr(candidate, "name", None)
                 node = getattr(candidate, "node", None)
@@ -531,6 +562,7 @@ class TieredClient:
                     )
                     result = await candidate.generate(prepared)
                 except BaseException as exc:
+                    self._finish_circuit(candidate, exc)
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
@@ -543,6 +575,7 @@ class TieredClient:
                             # body, and this string is retained and
                             # rendered in a UI.
                             error=type(exc).__name__,
+                            retry_disposition=retry_disposition(exc),
                         )
                     if not isinstance(exc, Exception) or not _is_cascade_eligible(exc):
                         # 4xx / non-HTTP error — surface it without trying
@@ -553,12 +586,14 @@ class TieredClient:
                     self._log_cascade("generate", index, candidate, exc, total=total)
                     index += 1
                 else:
+                    self._finish_circuit(candidate)
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
                             node=node,
                             runtime=runtime,
                             served=True,
+                            usage=result.usage,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                         )
                     self.served_by = driver
@@ -575,8 +610,8 @@ class TieredClient:
     async def embed(self, request: EmbedRequest) -> EmbedResponse:
         """`generate()`'s cascade, over replicas of ONE model.
 
-        The failure taxonomy is identical -- transport and 5xx cascade,
-        4xx fails hard. What differs is what it is allowed to cascade
+        The failure taxonomy is identical: only proven pre-execution
+        failures cascade. What differs is what it is allowed to cascade
         *to*, and that is enforced upstream rather than here:
         `RoutingTable.pick_embedding` builds a single tier containing
         only backends serving the requested model id, so there is
@@ -592,6 +627,11 @@ class TieredClient:
             for candidate in tier:
                 if self.authorize_attempt is not None:
                     await self.authorize_attempt()
+                circuit = getattr(candidate, "circuit", None)
+                if circuit is not None and not circuit.acquire():
+                    if last_exc is None:
+                        last_exc = _cooling_error()
+                    continue
                 self.attempts = index + 1
                 driver = getattr(candidate, "name", None)
                 node = getattr(candidate, "node", None)
@@ -602,6 +642,7 @@ class TieredClient:
                 try:
                     result = await candidate.embed(request)
                 except BaseException as exc:
+                    self._finish_circuit(candidate, exc)
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
@@ -610,6 +651,7 @@ class TieredClient:
                             served=False,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                             error=type(exc).__name__,
+                            retry_disposition=retry_disposition(exc),
                         )
                     if not isinstance(exc, Exception) or not _is_cascade_eligible(exc):
                         raise
@@ -617,12 +659,14 @@ class TieredClient:
                     self._log_cascade("embed", index, candidate, exc, total=total)
                     index += 1
                 else:
+                    self._finish_circuit(candidate)
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
                             node=node,
                             runtime=runtime,
                             served=True,
+                            usage=result.usage,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                         )
                     self.served_by = driver
@@ -648,8 +692,8 @@ class TieredClient:
 
         The practical consequence, contracted in `gateway.yaml`: a
         streamed request can be truncated where a non-streamed one would
-        have cascaded. A caller that needs the failover guarantee should
-        not stream.
+        have cascaded after a safe refusal. Neither surface replays an
+        ambiguous attempt.
 
         Attempt accounting follows `generate()` exactly, with one
         deliberate difference: an attempt that emitted tokens and then
@@ -664,6 +708,11 @@ class TieredClient:
             for candidate in tier:
                 if self.authorize_attempt is not None:
                     await self.authorize_attempt()
+                circuit = getattr(candidate, "circuit", None)
+                if circuit is not None and not circuit.acquire():
+                    if last_exc is None:
+                        last_exc = _cooling_error()
+                    continue
                 self.attempts = index + 1
                 driver = getattr(candidate, "name", None)
                 node = getattr(candidate, "node", None)
@@ -679,6 +728,7 @@ class TieredClient:
                 # and M10's own rule is that the absence of it is a
                 # truncation rather than a completion.
                 saw_done = False
+                usage = None
                 reported = False
                 stream = None
                 try:
@@ -692,8 +742,10 @@ class TieredClient:
                         committed = True
                         if event.done:
                             saw_done = True
+                            usage = event.result.usage if event.result is not None else None
                         yield event
                 except Exception as exc:
+                    self._finish_circuit(candidate, exc)
                     reported = True
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
@@ -703,6 +755,9 @@ class TieredClient:
                             served=False,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                             error=type(exc).__name__,
+                            retry_disposition="indeterminate"
+                            if committed
+                            else retry_disposition(exc),
                         )
                     if committed:
                         # Past the commit point. The client already holds
@@ -713,7 +768,7 @@ class TieredClient:
                             "truncating rather than failing over: %s",
                             self.name,
                             driver,
-                            exc,
+                            type(exc).__name__,
                         )
                         raise
                     if not _is_cascade_eligible(exc):
@@ -722,6 +777,9 @@ class TieredClient:
                     self._log_cascade("stream", index, candidate, exc, total=total)
                     index += 1
                 else:
+                    self._finish_circuit(
+                        candidate, None if saw_done else RuntimeError("incomplete")
+                    )
                     reported = True
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
@@ -738,6 +796,8 @@ class TieredClient:
                             # "last served" mark, which is what the
                             # balancer and the idle pass read.
                             served=saw_done,
+                            usage=usage,
+                            retry_disposition=None if saw_done else "indeterminate",
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                             error=None if saw_done else "IncompleteStream",
                         )
@@ -763,6 +823,10 @@ class TieredClient:
                     # in-flight counter stays above zero for the life of
                     # the process -- after which it never idle-unloads
                     # and can never be evicted to make room for a wake.
+                    if not reported:
+                        self._finish_circuit(
+                            candidate, sys.exc_info()[1] or RuntimeError("abandoned")
+                        )
                     if not reported and self._hooks is not None and driver:
                         ending = sys.exc_info()[1]
                         self._hooks.on_attempt_end(
@@ -772,11 +836,26 @@ class TieredClient:
                             served=False,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                             error=type(ending).__name__ if ending is not None else "Abandoned",
+                            retry_disposition="indeterminate",
                         )
                     if stream is not None:
                         await stream.aclose()
         assert last_exc is not None  # candidates is non-empty (checked in __init__)
         raise last_exc
+
+    @staticmethod
+    def _finish_circuit(candidate: DriverClient, error: BaseException | None = None) -> None:
+        circuit = getattr(candidate, "circuit", None)
+        if circuit is not None:
+            delay = (
+                error.problem.retryAfterSeconds
+                if isinstance(error, DriverError) and error.problem
+                else None
+            )
+            circuit.finish(
+                failed=error is not None and retry_disposition(error) != "terminal",
+                retry_after=delay,
+            )
 
     def _log_cascade(
         self,
@@ -808,7 +887,7 @@ class TieredClient:
             index + 1,
             total,
             candidate.base_url,
-            exc,
+            type(exc).__name__,
             next_action,
         )
 

@@ -48,7 +48,12 @@ def _driver_error(status_code: int) -> DriverError:
         driver_name="slot",
         driver_url="http://backend",
         status_code=status_code,
-        problem=Problem(type="about:blank", title="boom", status=status_code),
+        problem=Problem(
+            type="about:blank",
+            title="refused before work",
+            status=status_code,
+            retryDisposition="safe" if status_code in (500, 502, 503) else None,
+        ),
         raw_body="",
     )
 
