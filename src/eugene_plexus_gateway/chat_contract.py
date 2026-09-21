@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, RootModel, ValidationError
 
 from ._generated.models import ChatCompletionRequest
+from .images import ImageRefusal, validate_messages
 
 
 class Refusal(Exception):
@@ -96,6 +97,10 @@ def parse_request(raw: Any) -> ChatCompletionRequest:
             raise Refusal("response_format.json_schema", "is required for json_schema output")
         if fmt.type.value != "json_schema" and fmt.json_schema is not None:
             raise Refusal("response_format.json_schema", "requires type json_schema")
+    try:
+        validate_messages(parsed.messages)
+    except ImageRefusal as exc:
+        raise Refusal(exc.field, exc.reason) from None
     return parsed
 
 

@@ -5,9 +5,9 @@ from __future__ import annotations
 
 from datetime import date
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, RootModel
 
 
 class LibraryFolder(BaseModel):
@@ -58,30 +58,42 @@ class Role(StrEnum):
     tool = 'tool'
 
 
-class Message(BaseModel):
-    """
-    A single message in a conversation. Deliberately close to the
-    OpenAI / Anthropic chat message format so drivers don't have to
-    re-shape on every hop.
+class TextContentPart(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    type: Literal['text']
+    text: str
 
+
+class Detail(StrEnum):
+    """
+    Explicit high/low processing modes are not supported.
     """
 
-    role: Role
-    content: str | None = Field(
-        None,
-        description='Message text. Text-only for now; multimodal extensions\ndeferred. **Nullable, and no longer required:** an assistant\nturn that only calls a tool has no text to carry, and the\nalternative — an empty string — would assert the model said\nnothing when in fact it said something that was not text.\n',
+    auto = 'auto'
+
+
+class ImageUrl(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
     )
-    toolCalls: list[dict[str, Any]] | None = Field(
-        None,
-        description="On an **assistant** message: the tool calls the model made,\nin OpenAI's `{id, type, function: {name, arguments}}` shape.\n\nDeliberately loose here. This is the *shared* schema, so a\ntightly-typed copy would be a third definition of the same\nobject alongside the gateway's and the driver's, and the one\nplace all three must agree is the wire format, which is\nOpenAI's and not ours to restate. The two API documents\ncarry the strict shapes.\n",
+    url: str = Field(
+        ...,
+        description='Inline base64 PNG or JPEG data URL. No remote references.',
+        max_length=6990531,
     )
-    toolCallId: str | None = Field(
-        None,
-        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+    detail: Detail | None = Field(
+        None, description='Explicit high/low processing modes are not supported.'
     )
-    timestamp: AwareDatetime | None = Field(
-        None, description='When the message was produced. Server-assigned if omitted.'
+
+
+class ImageContentPart(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
     )
+    type: Literal['image_url']
+    image_url: ImageUrl
 
 
 class BackendKind(StrEnum):
@@ -1944,6 +1956,14 @@ class QuantTable(BaseModel):
     )
 
 
+class MessageContent1(RootModel[list[TextContentPart | ImageContentPart]]):
+    root: list[TextContentPart | ImageContentPart] = Field(
+        ...,
+        description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
+        min_length=1,
+    )
+
+
 class DirectoryListing(BaseModel):
     """
     One directory on the component's own host, listed for a picker.
@@ -2346,6 +2366,32 @@ class Download(BaseModel):
     )
     message: str | None = Field(
         None, description='What the current phase is doing, for the progress dialog.'
+    )
+
+
+class Message(BaseModel):
+    """
+    A single message in a conversation. Deliberately close to the
+    OpenAI / Anthropic chat message format so drivers don't have to
+    re-shape on every hop.
+
+    """
+
+    role: Role
+    content: str | MessageContent1 | None = Field(
+        None,
+        description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
+    )
+    toolCalls: list[dict[str, Any]] | None = Field(
+        None,
+        description="On an **assistant** message: the tool calls the model made,\nin OpenAI's `{id, type, function: {name, arguments}}` shape.\n\nDeliberately loose here. This is the *shared* schema, so a\ntightly-typed copy would be a third definition of the same\nobject alongside the gateway's and the driver's, and the one\nplace all three must agree is the wire format, which is\nOpenAI's and not ours to restate. The two API documents\ncarry the strict shapes.\n",
+    )
+    toolCallId: str | None = Field(
+        None,
+        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+    )
+    timestamp: AwareDatetime | None = Field(
+        None, description='When the message was produced. Server-assigned if omitted.'
     )
 
 

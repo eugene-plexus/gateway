@@ -7,7 +7,7 @@ from enum import StrEnum
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, RootModel
 
 
 class ToolChoice(StrEnum):
@@ -35,30 +35,42 @@ class Role(StrEnum):
     tool = 'tool'
 
 
-class Message(BaseModel):
-    """
-    A single message in a conversation. Deliberately close to the
-    OpenAI / Anthropic chat message format so drivers don't have to
-    re-shape on every hop.
+class TextContentPart(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    type: Literal['text']
+    text: str
 
+
+class Detail(StrEnum):
+    """
+    Explicit high/low processing modes are not supported.
     """
 
-    role: Role
-    content: str | None = Field(
-        None,
-        description='Message text. Text-only for now; multimodal extensions\ndeferred. **Nullable, and no longer required:** an assistant\nturn that only calls a tool has no text to carry, and the\nalternative — an empty string — would assert the model said\nnothing when in fact it said something that was not text.\n',
+    auto = 'auto'
+
+
+class ImageUrl(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
     )
-    toolCalls: list[dict[str, Any]] | None = Field(
-        None,
-        description="On an **assistant** message: the tool calls the model made,\nin OpenAI's `{id, type, function: {name, arguments}}` shape.\n\nDeliberately loose here. This is the *shared* schema, so a\ntightly-typed copy would be a third definition of the same\nobject alongside the gateway's and the driver's, and the one\nplace all three must agree is the wire format, which is\nOpenAI's and not ours to restate. The two API documents\ncarry the strict shapes.\n",
+    url: str = Field(
+        ...,
+        description='Inline base64 PNG or JPEG data URL. No remote references.',
+        max_length=6990531,
     )
-    toolCallId: str | None = Field(
-        None,
-        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+    detail: Detail | None = Field(
+        None, description='Explicit high/low processing modes are not supported.'
     )
-    timestamp: AwareDatetime | None = Field(
-        None, description='When the message was produced. Server-assigned if omitted.'
+
+
+class ImageContentPart(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
     )
+    type: Literal['image_url']
+    image_url: ImageUrl
 
 
 class BackendKind(StrEnum):
@@ -905,6 +917,10 @@ class Capabilities(BaseModel):
     streaming: bool | None = Field(
         None, description='Whether `/v1/generate/stream` emits true incremental tokens.'
     )
+    imageInput: bool | None = Field(
+        None,
+        description='Whether the loaded model is confirmed to accept inline PNG/JPEG\nimages. Unknown or unverified backends report false. Rechecked\nbefore image generation; never inferred from the provider name.\n',
+    )
     toolCalling: bool | None = Field(
         None,
         description='Whether this driver can carry `tools` to its backend and\nreport `toolCalls` back.\n\nThe gateway reads it to answer a question a harness\ncannot otherwise ask: a plain answer where a tool call\nwas expected looks identical whether the model declined\nor the backend never saw the tools. A driver that says\n`false` here is failed at the front door with a reason\ninstead.\n',
@@ -1112,50 +1128,19 @@ class ResponseFormat(BaseModel):
     json_schema: ResponseJsonSchema | None = None
 
 
-class GenerateRequest(BaseModel):
-    callerSettings: list[str] | None = Field(
-        None,
-        description="A2 provenance: names of settings explicitly requested by the caller,\nusing this request's field names (maxTokens, temperature, topP, seed,\nstop, tools, toolChoice, responseFormat). The gateway preserves this\nlist on each fallback attempt. An adapter must refuse a known unsupported\nexplicit setting with 400, rather than silently dropping it. Settings\nsupplied only by profiles/defaults retain the adapter's default behavior.\nThis field is internal and is not forwarded to upstream providers.\n",
-    )
-    messages: list[Message] = Field(
+class MessageContent1(RootModel[list[TextContentPart | ImageContentPart]]):
+    root: list[TextContentPart | ImageContentPart] = Field(
         ...,
-        description='Full prompt as an ordered conversation. Whatever system\nmessage the caller wants is already in here; the driver does\nnot modify, prepend to, or reorder it.\n',
+        description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
+        min_length=1,
     )
-    maxTokens: int | None = Field(
-        None,
-        description="Maximum output tokens. Backend-clamped. Owned by the caller\n(the gateway) — the driver applies no local default. Adapters\nwhose backends don't expose this knob (agentic CLIs) refuse it when\ncallerSettings marks it explicit; inherited defaults remain ignored.\n",
-        ge=1,
+
+
+class MessageContent(RootModel[str | MessageContent1 | None]):
+    root: str | MessageContent1 | None = Field(
+        ...,
+        description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
     )
-    temperature: float | None = Field(
-        None,
-        description="Sampling temperature. Backend-clamped. Owned by the caller\n(the gateway, which resolves it from the model's settings\nprofile) — the driver applies no local default. Backends that\nreject the parameter outright, as some reasoning models do,\nrefuse explicit callerSettings and omit inherited defaults.\n",
-        ge=0.0,
-        le=2.0,
-    )
-    topP: float | None = Field(
-        None,
-        description='Nucleus sampling cutoff. Owned by the caller (the gateway)\nexactly as `temperature` is, and for the same reason: it\nchanges what the model says, so a driver never substitutes\none of its own.\n\n**Added 2026-09-19.** `gateway.yaml` had promised since M0\nthat `top_p` was passed through to backends that support it\nand dropped with a warning where they do not, and there was\nno field here to carry it — so the gateway accepted the\nvalue from its caller and silently discarded it, with no\nwarning logged anywhere. A knob that is read, validated and\nthrown away is worse than one that is refused.\n\nAn adapter whose backend has no such knob — the agentic\nCLIs — drops it and says so in its log, once per field, and\nanswers the request.\n',
-        ge=0.0,
-        le=1.0,
-    )
-    seed: int | None = Field(
-        None,
-        description='Deterministic-sampling seed. Owned by the caller, carried to\nbackends that implement it, dropped with a logged warning by\nadapters whose backends do not.\n\n**Added 2026-09-19 for the same reason as `topP`**, and it\nis the more load-bearing of the two: a caller asking for a\nseed is asking for a reproducible answer, and silently\ndropping it returns a different answer each time while the\ncontract says otherwise. Nothing in a response says whether\nthe seed arrived, so the failure is invisible to the caller\nby construction.\n',
-    )
-    stop: list[str] | None = Field(None, description='Optional stop sequences.')
-    requestId: UUID | None = Field(
-        None,
-        description='Caller-supplied id for log correlation. Echoed in the response.',
-    )
-    tools: list[Tool] | None = Field(
-        None,
-        description="Tools the model may call, in OpenAI's shape. Carried down to\nthe backend unchanged and never executed here — the driver\nis a protocol adapter, and running a tool is the caller's\njob by the same reasoning that keeps output-affecting\nparameters on the gateway.\n\nAn adapter whose backend cannot carry tools MUST fail the\nrequest rather than drop the field. Dropping it yields a\nplain answer that a harness cannot distinguish from the\nmodel declining to call anything.\n",
-    )
-    toolChoice: ToolChoice | NamedToolChoice | None = Field(
-        None,
-        description='`none`, `auto`, `required`, or an object naming one\nfunction. Passed through.\n',
-    )
-    responseFormat: ResponseFormat | None = None
 
 
 class DirectoryListing(BaseModel):
@@ -1218,3 +1203,75 @@ class GenerateResponse(BaseModel):
     latencyMs: int | None = Field(
         None, description='End-to-end driver-side latency in milliseconds.'
     )
+
+
+class Message(BaseModel):
+    """
+    A single message in a conversation. Deliberately close to the
+    OpenAI / Anthropic chat message format so drivers don't have to
+    re-shape on every hop.
+
+    """
+
+    role: Role
+    content: str | MessageContent1 | None = Field(
+        None,
+        description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
+    )
+    toolCalls: list[dict[str, Any]] | None = Field(
+        None,
+        description="On an **assistant** message: the tool calls the model made,\nin OpenAI's `{id, type, function: {name, arguments}}` shape.\n\nDeliberately loose here. This is the *shared* schema, so a\ntightly-typed copy would be a third definition of the same\nobject alongside the gateway's and the driver's, and the one\nplace all three must agree is the wire format, which is\nOpenAI's and not ours to restate. The two API documents\ncarry the strict shapes.\n",
+    )
+    toolCallId: str | None = Field(
+        None,
+        description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+    )
+    timestamp: AwareDatetime | None = Field(
+        None, description='When the message was produced. Server-assigned if omitted.'
+    )
+
+
+class GenerateRequest(BaseModel):
+    callerSettings: list[str] | None = Field(
+        None,
+        description="A2 provenance: names of settings explicitly requested by the caller,\nusing this request's field names (maxTokens, temperature, topP, seed,\nstop, tools, toolChoice, responseFormat). The gateway preserves this\nlist on each fallback attempt. An adapter must refuse a known unsupported\nexplicit setting with 400, rather than silently dropping it. Settings\nsupplied only by profiles/defaults retain the adapter's default behavior.\nThis field is internal and is not forwarded to upstream providers.\n",
+    )
+    messages: list[Message] = Field(
+        ...,
+        description='Full prompt as an ordered conversation. Whatever system\nmessage the caller wants is already in here; the driver does\nnot modify, prepend to, or reorder it.\n',
+    )
+    maxTokens: int | None = Field(
+        None,
+        description="Maximum output tokens. Backend-clamped. Owned by the caller\n(the gateway) — the driver applies no local default. Adapters\nwhose backends don't expose this knob (agentic CLIs) refuse it when\ncallerSettings marks it explicit; inherited defaults remain ignored.\n",
+        ge=1,
+    )
+    temperature: float | None = Field(
+        None,
+        description="Sampling temperature. Backend-clamped. Owned by the caller\n(the gateway, which resolves it from the model's settings\nprofile) — the driver applies no local default. Backends that\nreject the parameter outright, as some reasoning models do,\nrefuse explicit callerSettings and omit inherited defaults.\n",
+        ge=0.0,
+        le=2.0,
+    )
+    topP: float | None = Field(
+        None,
+        description='Nucleus sampling cutoff. Owned by the caller (the gateway)\nexactly as `temperature` is, and for the same reason: it\nchanges what the model says, so a driver never substitutes\none of its own.\n\n**Added 2026-09-19.** `gateway.yaml` had promised since M0\nthat `top_p` was passed through to backends that support it\nand dropped with a warning where they do not, and there was\nno field here to carry it — so the gateway accepted the\nvalue from its caller and silently discarded it, with no\nwarning logged anywhere. A knob that is read, validated and\nthrown away is worse than one that is refused.\n\nAn adapter whose backend has no such knob — the agentic\nCLIs — drops it and says so in its log, once per field, and\nanswers the request.\n',
+        ge=0.0,
+        le=1.0,
+    )
+    seed: int | None = Field(
+        None,
+        description='Deterministic-sampling seed. Owned by the caller, carried to\nbackends that implement it, dropped with a logged warning by\nadapters whose backends do not.\n\n**Added 2026-09-19 for the same reason as `topP`**, and it\nis the more load-bearing of the two: a caller asking for a\nseed is asking for a reproducible answer, and silently\ndropping it returns a different answer each time while the\ncontract says otherwise. Nothing in a response says whether\nthe seed arrived, so the failure is invisible to the caller\nby construction.\n',
+    )
+    stop: list[str] | None = Field(None, description='Optional stop sequences.')
+    requestId: UUID | None = Field(
+        None,
+        description='Caller-supplied id for log correlation. Echoed in the response.',
+    )
+    tools: list[Tool] | None = Field(
+        None,
+        description="Tools the model may call, in OpenAI's shape. Carried down to\nthe backend unchanged and never executed here — the driver\nis a protocol adapter, and running a tool is the caller's\njob by the same reasoning that keeps output-affecting\nparameters on the gateway.\n\nAn adapter whose backend cannot carry tools MUST fail the\nrequest rather than drop the field. Dropping it yields a\nplain answer that a harness cannot distinguish from the\nmodel declining to call anything.\n",
+    )
+    toolChoice: ToolChoice | NamedToolChoice | None = Field(
+        None,
+        description='`none`, `auto`, `required`, or an object naming one\nfunction. Passed through.\n',
+    )
+    responseFormat: ResponseFormat | None = None

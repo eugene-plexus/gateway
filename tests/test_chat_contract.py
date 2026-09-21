@@ -145,7 +145,7 @@ def test_conflicting_limits(client: TestClient, fake_driver: FakeDriverClient) -
                     }
                 ]
             },
-            "messages.0.content",
+            "messages[0].content[0].image_url",
         ),
     ],
 )

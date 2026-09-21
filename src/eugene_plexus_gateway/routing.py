@@ -1324,7 +1324,7 @@ class RoutingTable:
             return rotated
         return sorted(rotated, key=lambda b: self.inflight(b.key) / b.parallel_slots)
 
-    def pick(self, resolution: Resolution) -> TieredClient | None:
+    def pick(self, resolution: Resolution, *, images: bool = False) -> TieredClient | None:
         """The client to send a request through, or None when nothing in
         the slot is eligible right now.
 
@@ -1334,7 +1334,12 @@ class RoutingTable:
         """
         tiers: list[list[DriverClient]] = []
         for tier in resolution.tiers:
-            eligible = tier.eligible()
+            eligible = [
+                b
+                for b in tier.eligible()
+                if not images
+                or (b.info.capabilities is not None and b.info.capabilities.imageInput is True)
+            ]
             # An empty tier stays in the list, so the response's `tier`
             # counts the slot's tiers rather than the eligible ones.
             tiers.append([b.client for b in self._order(tier.target, eligible)] if eligible else [])
@@ -1524,6 +1529,11 @@ class RoutingTable:
                         surfaces=self.surfaces_for(model_id),
                         context_length=_smallest_context(backends),
                         tool_calling=_all_carry_tools(backends),
+                        image_input=any(
+                            b.info.capabilities is not None
+                            and b.info.capabilities.imageInput is True
+                            for b in backends
+                        ),
                         tiers=[[b.name for b in t.backends] for t in resolution.tiers],
                         ready_backends=len(eligible),
                         on_demand=not eligible and bool(resolution.startable()),

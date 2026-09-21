@@ -35,6 +35,7 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from .. import anthropic, chat_contract
 from .._generated.driver_models import (
@@ -79,6 +80,7 @@ from ..config import ConfigStore
 from ..dependencies import require_authorized
 from ..disconnect import ClientGone, serve_while_connected
 from ..driver_client import DriverClient, DriverError, TieredClient
+from ..images import has_images
 from ..lifecycle import LifecycleManager, WakeResult
 from ..metrics import AttemptRow, CandidateRow, MetricsStore, RequestRow
 from ..routing import Resolution, RoutingTable, collect_attempts
@@ -507,14 +509,15 @@ async def _prepare(
     # runtime if the slot has one, wait for it, and try again. A tier
     # with a startable runtime is awaited rather than skipped — see the
     # lifecycle module.
+    images = has_images(body.messages)
     wake: WakeResult | None = None
-    client = table.pick(resolution)
+    client = table.pick(resolution, images=images)
     if client is None and await table.refresh_if_stale():
         refreshed = True
         resolution = table.resolve(body.model)
         if not resolution.has_backends():
             return _no_such_model(body.model, table)
-        client = table.pick(resolution)
+        client = table.pick(resolution, images=images)
     # What the balancer saw, read before the wake so the numbers are the
     # ones the decision was made on. Read even when only one backend is
     # eligible; `_record` decides whether it is worth keeping.
@@ -525,9 +528,18 @@ async def _prepare(
             wake = await lifecycle.wake(resolution)
             if wake.ok:
                 resolution = table.resolve(body.model)
-                client = table.pick(resolution)
+                client = table.pick(resolution, images=images)
                 considered = table.candidates_considered(resolution)
         if client is None:
+            if images and resolution.eligible_backends():
+                return _Failure(
+                    code=400,
+                    error_type="invalid_request_error",
+                    param="messages",
+                    message="No ready backend serving this model confirms image input. "
+                    "Select a vision model with its projector loaded. GET /v1/models "
+                    "reports x_eugene_plexus.image_input; images were not discarded.",
+                )
             return _not_ready(resolution, wake)
 
     store = _store(request)
@@ -598,7 +610,7 @@ async def create_chat_completion(request: Request) -> Any:
             param="body",
         )
     try:
-        body = chat_contract.parse_request(raw)
+        body = await run_in_threadpool(chat_contract.parse_request, raw)
     except chat_contract.Refusal as exc:
         return _error(
             code=400, message=exc.message, error_type="invalid_request_error", param=exc.field
@@ -1124,7 +1136,7 @@ def _to_driver_message(message: ChatCompletionMessage) -> Message:
     """
     return Message(
         role=Role(message.role.value),
-        content=message.content,
+        content=message.model_dump(mode="json", exclude_none=True).get("content"),
         toolCalls=[c.model_dump(mode="json", exclude_none=True) for c in message.tool_calls]
         if message.tool_calls
         else None,
