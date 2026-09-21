@@ -348,8 +348,8 @@ class Resolution:
     configured: bool
     tiers: list[_Tier]
 
-    def restricted(self, allowed: set[str] | None) -> Resolution:
-        if allowed is None:
+    def restricted(self, allowed: set[str] | None, *, local_only: bool = False) -> Resolution:
+        if allowed is None and not local_only:
             return self
         return Resolution(
             self.model,
@@ -357,7 +357,15 @@ class Resolution:
             [
                 _Tier(
                     t.target,
-                    [b for b in t.backends if t.target in allowed and b.info.modelId in allowed],
+                    [
+                        b
+                        for b in t.backends
+                        if (allowed is None or (t.target in allowed and b.info.modelId in allowed))
+                        and (
+                            not local_only
+                            or (b.info.locality == "local" and b.info.localOnlyEnforced is True)
+                        )
+                    ],
                 )
                 for t in self.tiers
             ],
@@ -1527,7 +1535,9 @@ class RoutingTable:
 
     # --- read models ------------------------------------------------------
 
-    def as_model_list(self, allowed: set[str] | None = None) -> list[Model]:
+    def as_model_list(
+        self, allowed: set[str] | None = None, *, local_only: bool = False
+    ) -> list[Model]:
         """The OpenAI-compatible model list.
 
         Two drivers serving one model produce one entry: replicas are a
@@ -1541,7 +1551,7 @@ class RoutingTable:
         for model_id in self.known_models():
             if allowed is not None and model_id not in allowed:
                 continue
-            resolution = self.resolve(model_id).restricted(allowed)
+            resolution = self.resolve(model_id).restricted(allowed, local_only=local_only)
             if not resolution.has_backends():
                 continue
             backends = resolution.backends()

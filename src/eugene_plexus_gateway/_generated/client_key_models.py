@@ -28,6 +28,10 @@ class ClientKeyLimits(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
+    localOnly: bool | None = Field(
+        False,
+        description='Permit only backends explicitly classified local by drivers enforcing\nthe local-only request policy. External, unknown and older drivers\nare ineligible, including through aliases, fallback and wake. The\ncaller cannot relax this restriction. Local is a configured trust\nboundary, not a promise to sandbox a malicious backend.\n',
+    )
     allowedModels: list[AllowedModel] | None = Field(
         None,
         description='Null permits all. Empty permits none. Exact alias and actual target IDs must both be allowed.',

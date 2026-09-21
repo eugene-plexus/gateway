@@ -437,7 +437,10 @@ async def list_models(request: Request) -> ModelList:
     if table is None:
         return ModelList(object="list", data=[])
     return ModelList(
-        object="list", data=table.as_model_list(context.allowed_models if context else None)
+        object="list",
+        data=table.as_model_list(
+            context.allowed_models if context else None, local_only=admission.local_only()
+        ),
     )
 
 
@@ -498,7 +501,7 @@ async def _prepare(
             error_type="service_unavailable",
         )
 
-    resolution = admission.permitted(table.resolve(body.model))
+    resolution = await admission.permitted(table.resolve(body.model))
     if not resolution.has_backends():
         return _no_such_model(body.model, table)
 
@@ -530,7 +533,7 @@ async def _prepare(
     client = table.pick(resolution, images=images)
     if client is None and await table.refresh_if_stale():
         refreshed = True
-        resolution = admission.permitted(table.resolve(body.model))
+        resolution = await admission.permitted(table.resolve(body.model))
         if not resolution.has_backends():
             return _no_such_model(body.model, table)
         client = table.pick(resolution, images=images)
@@ -543,7 +546,7 @@ async def _prepare(
         if lifecycle is not None:
             wake = await lifecycle.wake(resolution)
             if wake.ok:
-                resolution = admission.permitted(table.resolve(body.model))
+                resolution = await admission.permitted(table.resolve(body.model))
                 client = table.pick(resolution, images=images)
                 considered = table.candidates_considered(resolution)
         if client is None:
@@ -562,6 +565,7 @@ async def _prepare(
     if isinstance(client, TieredClient):
         client.authorize_attempt = admission.before_attempt
     generate = _to_generate_request(body, store)
+    generate.localOnly = admission.local_only()
     profiles = getattr(request.app.state, "profile_defaults", None)
     if profiles is not None and isinstance(client, TieredClient):
         # Capture the routing snapshot that selected these candidates. A later
@@ -986,7 +990,7 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
             error_type="service_unavailable",
         )
 
-    resolution = admission.permitted(table.resolve(body.model))
+    resolution = await admission.permitted(table.resolve(body.model))
     if not resolution.has_backends():
         return _no_such_model(body.model, table).as_openai()
 
@@ -1014,7 +1018,7 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
 
     client = table.pick_embedding(resolution)
     if client is None and await table.refresh_if_stale():
-        resolution = admission.permitted(table.resolve(body.model))
+        resolution = await admission.permitted(table.resolve(body.model))
         client = table.pick_embedding(resolution)
     if client is None:
         # Deliberately NOT a wake. Idle-unload and start-on-demand are
@@ -1029,7 +1033,9 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
     started = time.perf_counter()
     try:
         result = await serve_while_connected(
-            request, client.embed(EmbedRequest(input=inputs)), what="an embeddings request"
+            request,
+            client.embed(EmbedRequest(input=inputs, localOnly=admission.local_only())),
+            what="an embeddings request",
         )
     except ClientGone:
         return _error(

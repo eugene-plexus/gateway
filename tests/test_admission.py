@@ -28,6 +28,7 @@ class Authority(FakeAgent):
         self.refuse_acquire = None
         self.refuse_renew = None
         self.lease = 30
+        self.local_only = False
 
     def _handle(self, request):
         if request.url.path.endswith("/admission"):
@@ -49,6 +50,7 @@ class Authority(FakeAgent):
                     "keyId": body["keyId"],
                     "keyName": "Verified app",
                     "limits": {
+                        **({"localOnly": True} if self.local_only else {}),
                         "allowedModels": self.allowed,
                         "maxConcurrentRequests": 1,
                         "requestsPerMinute": 2,

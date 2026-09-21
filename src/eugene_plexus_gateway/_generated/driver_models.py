@@ -883,6 +883,10 @@ class EmbedRequest(BaseModel):
 
     """
 
+    localOnly: bool | None = Field(
+        False,
+        description='Internal policy; require a local active engine before forwarding any input.',
+    )
     input: list[str] = Field(
         ...,
         description='One entry per vector to produce. Order is preserved: the\nn-th vector in the response is the n-th input, which is the\nonly thing that lets a caller match them up, since an\nembedding carries no identity of its own.\n',
@@ -907,6 +911,21 @@ class EmbedResponse(BaseModel):
     usage: Usage | None = None
     latencyMs: int | None = Field(None, ge=0)
     requestId: str | None = None
+
+
+class Locality(StrEnum):
+    """
+    Active engine's configured trust classification. Managed local
+    runtimes are local; cloud APIs and subscription CLIs are external.
+    Custom HTTP endpoints require an explicit operator assertion;
+    URLs, hostnames and loopback addresses never prove locality.
+    Unknown and absent are ineligible for local-only routing.
+
+    """
+
+    local = 'local'
+    external = 'external'
+    unknown = 'unknown'
 
 
 class Capabilities(BaseModel):
@@ -945,6 +964,14 @@ class DriverInfo(BaseModel):
 
     """
 
+    locality: Locality | None = Field(
+        'unknown',
+        description="Active engine's configured trust classification. Managed local\nruntimes are local; cloud APIs and subscription CLIs are external.\nCustom HTTP endpoints require an explicit operator assertion;\nURLs, hostnames and loopback addresses never prove locality.\nUnknown and absent are ineligible for local-only routing.\n",
+    )
+    localOnlyEnforced: bool | None = Field(
+        False,
+        description='True only when this driver enforces GenerateRequest/EmbedRequest\nlocalOnly against the active engine before invoking it. A local\nclassification alone is insufficient for a protected request.\n',
+    )
     backend: BackendKind
     provider: str | None = Field(
         None,
@@ -1232,6 +1259,10 @@ class Message(BaseModel):
 
 
 class GenerateRequest(BaseModel):
+    localOnly: bool | None = Field(
+        False,
+        description='Internal routing policy. When true the driver must refuse before\nforwarding any prompt/image unless its active engine is classified\nlocal. Never forward this field upstream. Checked on the active\nengine at execution, so stale gateway metadata cannot relax policy.\n',
+    )
     callerSettings: list[str] | None = Field(
         None,
         description="A2 provenance: names of settings explicitly requested by the caller,\nusing this request's field names (maxTokens, temperature, topP, seed,\nstop, tools, toolChoice, responseFormat). The gateway preserves this\nlist on each fallback attempt. An adapter must refuse a known unsupported\nexplicit setting with 400, rather than silently dropping it. Settings\nsupplied only by profiles/defaults retain the adapter's default behavior.\nThis field is internal and is not forwarded to upstream providers.\n",

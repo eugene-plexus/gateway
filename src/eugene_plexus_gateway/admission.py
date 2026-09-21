@@ -8,6 +8,7 @@ import json
 import time
 import uuid
 from contextvars import ContextVar
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -54,6 +55,10 @@ class ClientRequest:
         limits = (self.access or {}).get("limits")
         allowed = limits.get("allowedModels") if limits else None
         return set(allowed) if allowed is not None else None
+
+    @property
+    def local_only(self) -> bool:
+        return ((self.access or {}).get("limits") or {}).get("localOnly") is True
 
     async def contact(self, action: str) -> dict[str, Any]:
         began = time.perf_counter()
@@ -171,9 +176,44 @@ async def authorize(request: Request, model: str | None = None, *, streamed: boo
         await context.authorize(request, model, streamed)
 
 
-def permitted(resolution: Any) -> Any:
+def local_only() -> bool:
     context = current.get()
-    return resolution.restricted(context.allowed_models if context else None)
+    return context.local_only if context else False
+
+
+async def permitted(resolution: Any) -> Any:
+    context = current.get()
+    allowed = context.allowed_models if context else None
+    resolution = resolution.restricted(allowed)
+    if not local_only() or not resolution.has_backends():
+        return resolution
+
+    # No prompt accompanies this probe. Reconfirm before wake/selection, then
+    # carry localOnly to the driver to close the probe-to-execution race.
+    semaphore = asyncio.Semaphore(8)
+
+    async def confirm(backend: Any) -> Any:
+        try:
+            async with semaphore, asyncio.timeout(4):
+                info = await backend.client.info()
+            if info.runtime != backend.info.runtime:
+                return None  # cached runtime facts must not wake a replacement
+            return replace(backend, info=info)
+        except Exception:
+            return None
+
+    tiers = []
+    for tier in resolution.tiers:
+        checked = await asyncio.gather(*(confirm(b) for b in tier.backends))
+        tiers.append(replace(tier, backends=[b for b in checked if b is not None]))
+    result = replace(resolution, tiers=tiers).restricted(allowed, local_only=True)
+    if not result.has_backends():
+        raise AdmissionFailure(
+            403,
+            "This key requires local-only inference, but no permitted backend "
+            "confirms local execution and policy enforcement. Nothing was forwarded or woken.",
+        )
+    return result
 
 
 async def before_attempt() -> None:
