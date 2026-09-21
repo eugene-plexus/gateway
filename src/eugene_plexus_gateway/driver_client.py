@@ -273,7 +273,7 @@ class HttpDriverClient:
         return DriverInfo.model_validate(response.json())
 
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
-        payload = request.model_dump(mode="json", exclude_none=True)
+        payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
         response = await self._client.post("/v1/generate", json=payload)
         if response.status_code >= 400:
             raise DriverError(
@@ -286,7 +286,7 @@ class HttpDriverClient:
         return GenerateResponse.model_validate(response.json())
 
     async def embed(self, request: EmbedRequest) -> EmbedResponse:
-        payload = request.model_dump(mode="json", exclude_none=True)
+        payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
         response = await self._client.post("/v1/embed", json=payload)
         if response.status_code >= 400:
             raise DriverError(
@@ -316,7 +316,7 @@ class HttpDriverClient:
         the same reason: nothing has been forwarded, so it is still an
         ordinary failure.
         """
-        payload = request.model_dump(mode="json", exclude_none=True)
+        payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
         async with self._client.stream(
             "POST",
             "/v1/generate/stream",

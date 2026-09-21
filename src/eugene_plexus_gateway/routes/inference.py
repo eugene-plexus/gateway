@@ -36,7 +36,7 @@ import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from .. import anthropic
+from .. import anthropic, chat_contract
 from .._generated.driver_models import (
     EmbedRequest,
     GenerateRequest,
@@ -584,8 +584,25 @@ async def _prepare(
     )
 
 
-@router.post("/v1/chat/completions", dependencies=_auth)
-async def create_chat_completion(request: Request, body: ChatCompletionRequest) -> Any:
+@router.post(
+    "/v1/chat/completions", dependencies=_auth, openapi_extra=chat_contract.request_body_schema()
+)
+async def create_chat_completion(request: Request) -> Any:
+    try:
+        raw = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        return _error(
+            code=400,
+            message="body: must be valid JSON.",
+            error_type="invalid_request_error",
+            param="body",
+        )
+    try:
+        body = chat_contract.parse_request(raw)
+    except chat_contract.Refusal as exc:
+        return _error(
+            code=400, message=exc.message, error_type="invalid_request_error", param=exc.field
+        )
     prepared = await _prepare(request, body, surface="chat", instead="/v1/embeddings")
     if isinstance(prepared, _Failure):
         return prepared.as_openai()
@@ -860,6 +877,7 @@ async def create_anthropic_message(request: Request) -> Any:
         return StreamingResponse(
             _stream_anthropic(body, prepared, model=body.model),
             media_type="text/event-stream",
+            headers=anthropic.compatibility_headers(raw),
         )
 
     store = _store(request)
@@ -894,17 +912,20 @@ async def create_anthropic_message(request: Request) -> Any:
                 finish=response.finishReason,
                 usage=response.usage,
             ),
-            headers=anthropic.envelope_headers(
-                _routing_info(
-                    prepared.client,
-                    prepared.table,
-                    body.model,
-                    prepared.started,
-                    waited_ms=prepared.waited_ms,
-                    swapped_in=prepared.swapped_in,
-                    prompt_truncated=truncated,
-                )
-            ),
+            headers={
+                **anthropic.compatibility_headers(raw),
+                **anthropic.envelope_headers(
+                    _routing_info(
+                        prepared.client,
+                        prepared.table,
+                        body.model,
+                        prepared.started,
+                        waited_ms=prepared.waited_ms,
+                        swapped_in=prepared.swapped_in,
+                        prompt_truncated=truncated,
+                    )
+                ),
+            },
         )
 
 
@@ -1054,6 +1075,21 @@ def _to_generate_request(
             temperature = store.get("defaultTemperature")
 
     return GenerateRequest(
+        callerSettings=[
+            target
+            for source, target in (
+                ("max_tokens", "maxTokens"),
+                ("temperature", "temperature"),
+                ("top_p", "topP"),
+                ("seed", "seed"),
+                ("stop", "stop"),
+                ("tools", "tools"),
+                ("tool_choice", "toolChoice"),
+                ("response_format", "responseFormat"),
+            )
+            if getattr(body, source) is not None
+        ]
+        or None,
         messages=[_to_driver_message(m) for m in body.messages],
         maxTokens=max_tokens,
         temperature=temperature,
@@ -1064,7 +1100,9 @@ def _to_generate_request(
         # still invents neither an install-wide top-p nor a seed.
         topP=body.top_p if body.top_p is not None else defaults.get("topP"),
         seed=body.seed,
-        stop=body.stop,
+        stop=([body.stop] if isinstance(body.stop, str) else body.stop.root)
+        if body.stop is not None
+        else None,
         requestId=None,
         # Tools are the caller's, not ours. Unlike every parameter above
         # them, there is no install default to fall back to and nothing
@@ -1127,7 +1165,9 @@ def _to_driver_tool_choice(choice: Any) -> Any:
 def _to_driver_response_format(fmt: ResponseFormat | None) -> DriverResponseFormat | None:
     if fmt is None:
         return None
-    return DriverResponseFormat.model_validate(fmt.model_dump(mode="json", exclude_none=True))
+    return DriverResponseFormat.model_validate(
+        fmt.model_dump(mode="json", by_alias=True, exclude_none=True)
+    )
 
 
 def _to_openai_tool_calls(calls: Any) -> list[ToolCall] | None:
@@ -1605,7 +1645,7 @@ async def _stream_completion(
                 delta=Delta(),
                 finish=_finish_reason(response),
                 model=served_model,
-                usage=usage,
+                usage=usage if body.stream_options is None else None,
                 routing=_routing_info(
                     client,
                     table,
@@ -1617,6 +1657,21 @@ async def _stream_completion(
                 ),
             )
         )
+        if (
+            body.stream_options is not None
+            and body.stream_options.include_usage
+            and usage is not None
+        ):
+            yield frame(
+                ChatCompletionChunk(
+                    id=completion_id,
+                    object="chat.completion.chunk",
+                    created=created,
+                    model=served_model,
+                    choices=[],
+                    usage=usage,
+                )
+            )
         yield "data: [DONE]\n\n"
 
 

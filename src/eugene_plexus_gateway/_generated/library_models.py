@@ -1837,7 +1837,7 @@ class Fit(BaseModel):
     )
     weightsBytes: int | None = Field(
         None,
-        description='Summed over every file in the candidate, shards included.',
+        description="Summed over the candidate's files, shards included. For an\non-disk GGUF, excludes a separate vision projector whose size\nis known: guidance covers loading the main model. Unknown\nprojector sizes retain the conservative disk total.\n",
         ge=0,
     )
     kvCacheBytes: int | None = Field(

@@ -1113,18 +1113,22 @@ class ResponseFormat(BaseModel):
 
 
 class GenerateRequest(BaseModel):
+    callerSettings: list[str] | None = Field(
+        None,
+        description="A2 provenance: names of settings explicitly requested by the caller,\nusing this request's field names (maxTokens, temperature, topP, seed,\nstop, tools, toolChoice, responseFormat). The gateway preserves this\nlist on each fallback attempt. An adapter must refuse a known unsupported\nexplicit setting with 400, rather than silently dropping it. Settings\nsupplied only by profiles/defaults retain the adapter's default behavior.\nThis field is internal and is not forwarded to upstream providers.\n",
+    )
     messages: list[Message] = Field(
         ...,
         description='Full prompt as an ordered conversation. Whatever system\nmessage the caller wants is already in here; the driver does\nnot modify, prepend to, or reorder it.\n',
     )
     maxTokens: int | None = Field(
         None,
-        description="Maximum output tokens. Backend-clamped. Owned by the caller\n(the gateway) — the driver applies no local default. Adapters\nwhose backends don't expose this knob (agentic CLIs) ignore\nit silently.\n",
+        description="Maximum output tokens. Backend-clamped. Owned by the caller\n(the gateway) — the driver applies no local default. Adapters\nwhose backends don't expose this knob (agentic CLIs) refuse it when\ncallerSettings marks it explicit; inherited defaults remain ignored.\n",
         ge=1,
     )
     temperature: float | None = Field(
         None,
-        description="Sampling temperature. Backend-clamped. Owned by the caller\n(the gateway, which resolves it from the model's settings\nprofile) — the driver applies no local default. Backends that\nreject the parameter outright, as some reasoning models do,\nhave it dropped with a warning rather than erroring.\n",
+        description="Sampling temperature. Backend-clamped. Owned by the caller\n(the gateway, which resolves it from the model's settings\nprofile) — the driver applies no local default. Backends that\nreject the parameter outright, as some reasoning models do,\nrefuse explicit callerSettings and omit inherited defaults.\n",
         ge=0.0,
         le=2.0,
     )

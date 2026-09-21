@@ -307,7 +307,8 @@ def test_a_backend_still_loading_is_a_retryable_503(
 
 def test_a_malformed_request_is_rejected_before_routing(client: TestClient) -> None:
     response = client.post("/v1/chat/completions", json={"model": MODEL})
-    assert response.status_code == 422
+    assert response.status_code == 400
+    assert response.json()["error"]["param"] == "messages"
 
 
 # --------------------------------------------------------------------------- #

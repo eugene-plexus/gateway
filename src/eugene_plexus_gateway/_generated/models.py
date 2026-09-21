@@ -826,6 +826,28 @@ class ModelRoutingInfo(BaseModel):
     )
 
 
+class Stop(RootModel[list[str]]):
+    root: list[str] = Field(
+        ...,
+        description='One stop sequence or up to four sequences; forwarded as an array.',
+        max_length=4,
+    )
+
+
+class StreamOptions(BaseModel):
+    """
+    With streaming, true adds a usage-only chunk before DONE when the driver
+    reports usage. False omits usage. If absent, retains Eugene's historical
+    final choice chunk containing usage. Does not affect retained metrics.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    include_usage: bool | None = None
+
+
 class ToolChoice(StrEnum):
     """
     How the model should use `tools`. `auto` is the default when
@@ -2167,13 +2189,10 @@ class AnthropicMessagesRequest(BaseModel):
     """
     Request body for `POST /v1/messages`, in Anthropic's shape.
 
-    **Deliberately permissive, and the reason is a measurement.**
-    Every field this gateway does not honour is *ignored* rather
-    than rejected, because a real Claude Code request carries
-    `thinking`, `cache_control`, `metadata` and
-    `context_management` on the very first call, and a schema that
-    refused an unknown field would refuse every request from the
-    client this endpoint exists for.
+    Measured Claude Code hints (`thinking`, `cache_control`,
+    `context_management`) are accepted with a response header naming ignored
+    settings. Metadata is discarded. Unknown top-level settings and top_k
+    are explicitly rejected. This is a text/tool translation, not full parity.
 
     Consequently **this schema does not decide what is refused**.
     The refusals — image and document blocks, server-side tools,
@@ -2216,7 +2235,7 @@ class AnthropicMessagesRequest(BaseModel):
     top_p: float | None = Field(None, ge=0.0, le=1.0)
     top_k: int | None = Field(
         None,
-        description="**Read and dropped**, and this is a real loss rather than a\nno-op: both local engines accept a top-k and neither of this\nproject's internal contracts carries one. It is now the\nonly such gap — `top_p` and `seed` had the same one until\n2026-09-19, when `GenerateRequest` grew `topP` and `seed`.\nDocumented here so the omission is visible to whoever adds\nit, and the shape of that fix is now written down one\ndocument over.\n",
+        description='Unsupported. A non-null value returns 400 naming top_k. Before A2\nthis was silently discarded despite controlling generation.\n',
         ge=0,
     )
     stop_sequences: list[str] | None = Field(
@@ -2234,7 +2253,7 @@ class AnthropicMessagesRequest(BaseModel):
     )
     thinking: dict[str, Any] | None = Field(
         None,
-        description='**Read and dropped, never refused**, and the distinction was\nmeasured. Present on every Claude Code request, in three\nshapes: `{"budget_tokens": N, "type": "enabled"}` for a\nknown Claude id, `{"type": "adaptive"}` for an arbitrary\nlocal id, and **`null` when the caller set\n`MAX_THINKING_TOKENS=0`** — so even `"thinking" in body` is\ntrue for the one configuration asking for no thinking at\nall.\n\nDropping it is not a loss of control. A local model\'s\nreasoning output is governed by `thinkingMode` on its\nsettings profile and by the driver\'s thinking filter, which\nis the operator\'s decision rather than the caller\'s.\n',
+        description='**Read and dropped, never refused**, and the distinction was\nmeasured. Present on every Claude Code request, in three\nshapes: `{"budget_tokens": N, "type": "enabled"}` for a\nknown Claude id, `{"type": "adaptive"}` for an arbitrary\nlocal id, and **`null` when the caller set\n`MAX_THINKING_TOKENS=0`** — so even `"thinking" in body` is\ntrue for the one configuration asking for no thinking at\nall.\n\nThis is a compatibility concession, not enforcement of the caller\'s\nreasoning budget. Non-null values are disclosed on the ignored-settings\nresponse header. The operator\'s profile governs local thinking behavior.\n',
     )
     cache_control: dict[str, Any] | None = Field(
         None,
@@ -2243,6 +2262,17 @@ class AnthropicMessagesRequest(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
+    """
+    Supported chat settings only. Unknown properties, including nested message,
+    tool and response-format properties, return 400 with a field name. Arbitrary
+    JSON Schemas inside function parameters and response schemas are preserved.
+    Validation errors do not echo request values. See docs/api-compatibility.md.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
     model: str = Field(
         ...,
         description='A model id from `GET /v1/models`. The gateway resolves it to\na backend; the client does not choose a backend.\n',
@@ -2250,7 +2280,12 @@ class ChatCompletionRequest(BaseModel):
     messages: list[ChatCompletionMessage] = Field(..., min_length=1)
     max_tokens: int | None = Field(
         None,
-        description="Maximum output tokens. Filled from the model's settings\nprofile when omitted, then always sent downstream\nexplicitly.\n",
+        description="Positive JSON integer generation limit; booleans, strings and floats\nare rejected. Null or absent uses the profile then gateway default.\nNormalized before defaults and preserved on every fallback attempt.\nEngine token accounting is not guaranteed to match OpenAI's.\n",
+        ge=1,
+    )
+    max_completion_tokens: int | None = Field(
+        None,
+        description='Alias of max_tokens. If both are non-null they must be equal, otherwise\n400 names max_completion_tokens. Neither spelling takes precedence over\na conflicting value. This does not add reasoning-token support to engines.\n',
         ge=1,
     )
     temperature: float | None = Field(None, ge=0.0, le=2.0)
@@ -2260,7 +2295,10 @@ class ChatCompletionRequest(BaseModel):
         ge=0.0,
         le=1.0,
     )
-    stop: list[str] | None = Field(None, description='Stop sequences.', max_length=4)
+    stop: str | Stop | None = Field(
+        None,
+        description='One stop sequence or up to four sequences; forwarded as an array.',
+    )
     seed: int | None = Field(
         None,
         description='Passed through to backends that support deterministic\nsampling; dropped with a warning where they do not.\n\n**True since 2026-09-19 and unfulfillable before it** —\nthere was no `seed` on `GenerateRequest`, so the value was\ndropped by every backend and the warning this sentence\npromises was logged by none of them. A caller asking for a\nseed is asking for a reproducible answer and was getting a\ndifferent one each time, with nothing in the response to\nsay so.\n',
@@ -2270,7 +2308,31 @@ class ChatCompletionRequest(BaseModel):
         description='When true the response is an SSE stream of\n`ChatCompletionChunk` objects terminated by `data: [DONE]`.\n',
     )
     user: str | None = Field(
-        None, description='Opaque client-supplied identifier, echoed into logs only.'
+        None,
+        description='Ignored client annotation; not stored, forwarded or used as identity.',
+    )
+    metadata: dict[str, str] | None = Field(
+        None,
+        description='Ignored annotations; not provider storage or queryable metadata.',
+    )
+    safety_identifier: str | None = Field(
+        None, description='Ignored annotation; not an authenticated user identity.'
+    )
+    n: Literal[1] = Field(
+        1,
+        description='Only one completion is supported; any other non-null value returns 400.',
+    )
+    logprobs: Literal[False] = Field(
+        False,
+        description='Only false is supported; log probabilities are not implemented.',
+    )
+    store: Literal[False] = Field(
+        False,
+        description='Only false is supported; provider completion storage is not implemented.',
+    )
+    stream_options: StreamOptions | None = Field(
+        None,
+        description="With streaming, true adds a usage-only chunk before DONE when the driver\nreports usage. False omits usage. If absent, retains Eugene's historical\nfinal choice chunk containing usage. Does not affect retained metrics.\n",
     )
     tools: list[Tool] | None = Field(
         None,

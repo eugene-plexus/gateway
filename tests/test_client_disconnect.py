@@ -26,7 +26,7 @@ import pytest
 from fastapi import FastAPI
 from starlette.requests import Request
 
-from eugene_plexus_gateway._generated.models import ChatCompletionRequest, EmbeddingRequest
+from eugene_plexus_gateway._generated.models import EmbeddingRequest
 from eugene_plexus_gateway.disconnect import _watch
 from eugene_plexus_gateway.routes.inference import create_chat_completion, create_embedding
 
@@ -83,7 +83,11 @@ def _request(app: FastAPI, gone: asyncio.Event) -> Request:
         nonlocal sent_body
         if not sent_body:
             sent_body = True
-            return {"type": "http.request", "body": b"{}", "more_body": False}
+            return {
+                "type": "http.request",
+                "body": b'{"model":"m","messages":[{"role":"user","content":"hi"}]}',
+                "more_body": False,
+            }
         await gone.wait()
         return {"type": "http.disconnect"}
 
@@ -123,8 +127,7 @@ async def test_a_closed_tab_cancels_the_completion(app: FastAPI) -> None:
     driver.generate_hook = hang.run
     app.state.routing = make_routing_table(driver)
 
-    body = ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}])
-    answer = await _drive(app, hang, lambda r: create_chat_completion(r, body))
+    answer = await _drive(app, hang, create_chat_completion)
 
     assert hang.cancelled, "the backend was left computing for a client that had gone"
     assert not hang.finished
@@ -155,8 +158,7 @@ async def test_a_client_that_stays_gets_its_answer(app: FastAPI) -> None:
 
     gone = asyncio.Event()  # never set
     request = _request(app, gone)
-    body = ChatCompletionRequest(model="m", messages=[{"role": "user", "content": "hi"}])
-    result = await asyncio.wait_for(create_chat_completion(request, body), timeout=5)
+    result = await asyncio.wait_for(create_chat_completion(request), timeout=5)
 
     assert result.choices[0].message.content == "the answer"
 

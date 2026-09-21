@@ -31,7 +31,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from . import security
+from . import chat_contract, security
 from ._generated.models import (
     AnthropicMessagesRequest,
     ChatCompletionMessage,
@@ -40,6 +40,7 @@ from ._generated.models import (
     FunctionDefinition,
     NamedToolChoice,
     Role1,
+    Stop,
     Tool,
     ToolCall,
     ToolChoice,
@@ -236,15 +237,38 @@ async def authorize(request: Request) -> None:
 _REFUSED_BLOCK_TYPES = {"image", "document"}
 
 # Fields that arrive on every real request and have no equivalent here.
-# **Dropped in silence, and the list is measured rather than guessed.**
+# Accepted for the measured Claude Code client; A2 reports ignored controls
+# on a response header, rather than silently implying native support.
 # A blanket unknown-field refusal passes every refusal test and then
 # fails on the first real request, which is the trap this whole door was
 # scoped around.
-_DROPPED_TOP_LEVEL = ("thinking", "cache_control", "metadata", "context_management", "top_k")
+_DROPPED_TOP_LEVEL = ("thinking", "cache_control", "metadata", "context_management")
 
 # Fields whose presence means the caller wants something this control
 # plane cannot do at all, as opposed to something it can ignore.
-_REFUSED_TOP_LEVEL = ("mcp_servers",)
+_REFUSED_TOP_LEVEL = ("mcp_servers", "top_k")
+
+
+def compatibility_headers(raw: Mapping[str, Any]) -> dict[str, str]:
+    ignored = [
+        name for name in _DROPPED_TOP_LEVEL if name != "metadata" and raw.get(name) is not None
+    ]
+
+    # Cache hints also arrive on system, tool and message blocks. Do not walk
+    # tool JSON Schemas or user metadata looking for coincidental property names.
+    def has_cache(value: Any) -> bool:
+        if isinstance(value, list):
+            return any(has_cache(item) for item in value)
+        if isinstance(value, dict):
+            return value.get("cache_control") is not None or has_cache(value.get("content"))
+        return False
+
+    if "cache_control" not in ignored and any(
+        has_cache(raw.get(name)) for name in ("system", "messages", "tools")
+    ):
+        ignored.append("cache_control")
+    return {"x-eugene-plexus-ignored-settings": ", ".join(ignored)} if ignored else {}
+
 
 _MAX_STOP_SEQUENCES = 4
 
@@ -397,17 +421,25 @@ def _tools(definitions: Any) -> list[Tool] | None:
 def translate_request(raw: Mapping[str, Any]) -> ChatCompletionRequest:
     """An Anthropic body as the request the shared path already serves.
 
-    Raises `Refusal` for anything that would change the answer if it
-    were silently dropped, and drops -- in silence -- everything that
-    would not.
+    Measured Claude Code hints remain accepted, with response warnings. Unknown
+    top-level settings and unsupported top_k are refused, not discarded.
     """
+    for name in raw:
+        if name not in AnthropicMessagesRequest.model_fields and name not in (
+            *_DROPPED_TOP_LEVEL,
+            *_REFUSED_TOP_LEVEL,
+        ):
+            raise Refusal(f"{chat_contract._field_name(name)}: unsupported setting")
+    limit = raw.get("max_tokens")
+    if type(limit) is not int or limit < 1:
+        raise Refusal("max_tokens: must be a positive JSON integer")
     try:
         body = AnthropicMessagesRequest.model_validate(raw)
     except ValidationError as e:
         raise _validation_refusal(e) from e
 
     for name in _REFUSED_TOP_LEVEL:
-        if raw.get(name):
+        if raw.get(name) is not None:
             raise Refusal(
                 f"{name}: this gateway does not implement it. It routes requests to local "
                 "inference backends and has nothing to connect on your behalf."
@@ -498,7 +530,7 @@ def translate_request(raw: Mapping[str, Any]) -> ChatCompletionRequest:
         # caller asked for.
         temperature=body.temperature,
         top_p=body.top_p,
-        stop=body.stop_sequences,
+        stop=Stop(body.stop_sequences) if body.stop_sequences else None,
         stream=bool(body.stream),
         tools=_tools(body.tools),
         tool_choice=_tool_choice(body.tool_choice),
