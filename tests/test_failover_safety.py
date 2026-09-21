@@ -1,5 +1,7 @@
 """A6b: silence is not proof that a request had no effects."""
 
+import asyncio
+
 import httpx
 import pytest
 
@@ -167,3 +169,55 @@ def test_new_failure_cannot_admit_a_second_probe_until_the_old_one_finishes(monk
     c.finish(failed=False, probe_epoch=owner)
     assert c.successes == 0 and not c.probing  # stale success releases, never restores traffic
     assert c.acquire()
+
+
+@pytest.mark.parametrize("operation", ["generate", "stream", "embed", "close-stream"])
+async def test_client_cancellation_does_not_cool_a_healthy_backend(operation):
+    from eugene_plexus_gateway._generated.driver_models import EmbedRequest
+
+    first = FakeDriverClient(name="primary")
+    first.circuit = Circuit()
+    client = FailoverDriverClient(name="model", candidates=[first])
+    if operation == "close-stream":
+        stream = client.stream(GenerateRequest(messages=[]))
+        await anext(stream)
+        await stream.aclose()
+    else:
+        first.generate_error = first.embed_error = asyncio.CancelledError()
+        first.stream_error_after, first.stream_error = 0, asyncio.CancelledError()
+        with pytest.raises(asyncio.CancelledError):
+            if operation == "stream":
+                _ = [event async for event in client.stream(GenerateRequest(messages=[]))]
+            elif operation == "embed":
+                await client.embed(EmbedRequest(input=["cancel me"]))
+            else:
+                await client.generate(GenerateRequest(messages=[]))
+    assert first.circuit.failures == 0
+    first.generate_error = None
+    assert await FailoverDriverClient(name="model", candidates=[first]).generate(
+        GenerateRequest(messages=[])
+    )
+
+
+async def test_cancelled_recovery_probe_is_neither_success_nor_failure(monkeypatch):
+    from eugene_plexus_gateway import circuit as module
+
+    now = [100.0]
+    monkeypatch.setattr(module.time, "perf_counter", lambda: now[0])
+    first = FakeDriverClient(name="primary")
+    first.circuit = Circuit()
+    first.circuit.finish(failed=True, retry_after=30)
+    now[0] = 131
+    first.generate_error = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await FailoverDriverClient(name="model", candidates=[first]).generate(
+            GenerateRequest(messages=[])
+        )
+    assert not first.circuit.probing
+    assert first.circuit.failures == 1 and first.circuit.successes == 0
+    assert first.circuit.until == 130
+    first.generate_error = None
+    await FailoverDriverClient(name="model", candidates=[first]).generate(
+        GenerateRequest(messages=[])
+    )
+    assert first.circuit.failures == 1 and first.circuit.successes == 1

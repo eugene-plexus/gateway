@@ -47,3 +47,9 @@ class Circuit:
                 self.until = 0
             else:
                 self.until = time.perf_counter() + 1
+
+    def abandon(self, *, probe_epoch: int | None = None) -> None:
+        """Release a cancelled probe without inventing backend health evidence."""
+        if probe_epoch is not None and probe_epoch == self._owner:
+            self.probing = False
+            self._owner = None

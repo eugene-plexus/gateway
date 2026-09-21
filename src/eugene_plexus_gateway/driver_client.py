@@ -15,6 +15,7 @@ the one-tier case, kept under its old name.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sys
@@ -859,6 +860,12 @@ class TieredClient:
     ) -> None:
         circuit = getattr(candidate, "circuit", None)
         if circuit is not None:
+            if isinstance(error, asyncio.CancelledError | GeneratorExit):
+                # A caller's Stop/disconnect/deadline is not a failed backend.
+                # Nor is it a successful recovery probe. Keep uncertain usage
+                # in attempt metrics, but do not punish the next caller.
+                circuit.abandon(probe_epoch=probe_epoch)
+                return
             delay = (
                 error.problem.retryAfterSeconds
                 if isinstance(error, DriverError) and error.problem
