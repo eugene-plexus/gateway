@@ -103,11 +103,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 metrics = candidate
                 app.state.metrics = candidate
 
-    # Which client keys have been turned off (S4). Asks this gateway's
-    # OWN node's agent -- the one that minted them, and the one the
-    # contract tells an operator to mint against. Consulted only for a
-    # token that carries `aud: client`, so an install with no client
-    # keys never makes the call.
+    # A3: persisted, bounded-age policy from this node's agent, which relays
+    # the active install authority when enrolled. No JWT signing key is needed.
     guard: ClientKeyGuard | None = None
     if not hasattr(app.state, "client_key_guard"):
         if auth_state.auth_disabled:
@@ -117,7 +114,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             guard = ClientKeyGuard(
                 agent_url=settings.agent_url,
                 service_token=auth_state.service_token,
-                ttl_seconds=float(store.get("routingRefreshSeconds") or 15),
+                ttl_seconds=settings.client_key_refresh_seconds,
+                max_age_seconds=settings.client_key_max_age_seconds,
+                timeout_seconds=settings.client_key_timeout_seconds,
+                retry_seconds=settings.client_key_retry_seconds,
+                cache_file=settings.config_file.with_suffix(".client-keys.json"),
+                verification_key=auth_state.signing_key,
             )
             app.state.client_key_guard = guard
 

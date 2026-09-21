@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,6 +21,11 @@ class Settings(BaseSettings):
 
     config_file: Path = Path("config.yaml")
     """Where the runtime config is persisted. PATCH /v1/config writes here."""
+
+    client_key_refresh_seconds: float = Field(default=15.0, gt=0, le=60)
+    client_key_max_age_seconds: float = Field(default=60.0, gt=0, le=86400)
+    client_key_timeout_seconds: float = Field(default=4.0, gt=0, le=30)
+    client_key_retry_seconds: float = Field(default=1.0, gt=0, le=15)
 
     metrics_file: Path = Path("metrics.sqlite3")
     """Where retained request metrics live (M8).

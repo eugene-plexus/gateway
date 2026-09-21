@@ -19,6 +19,7 @@ from __future__ import annotations
 import secrets
 import time
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -85,8 +86,24 @@ class FakeAgent:
         self.tokens.append(request.headers.get("authorization"))
         if self.fail:
             raise httpx.ConnectError("connection refused", request=request)
-        assert request.url.path == "/v1/auth/client-keys/revoked", request.url
-        return httpx.Response(200, json={"ids": list(self.revoked), "revision": self.revision})
+        assert request.url.path == "/v1/auth/client-keys/policy", request.url
+        keys = [
+            {
+                "id": key,
+                "expiresAt": datetime.fromtimestamp(time.time() + 3600, UTC).isoformat(),
+                **({"revokedAt": datetime.now(UTC).isoformat()} if key in self.revoked else {}),
+            }
+            for key in set(["a", "key-1", "key-2", *self.revoked])
+        ]
+        return httpx.Response(
+            200,
+            json={
+                "authority": "control:test",
+                "generatedAt": time.time(),
+                "keys": keys,
+                "revision": self.revision,
+            },
+        )
 
     def as_guard(self, **kwargs: Any) -> ClientKeyGuard:
         guard = ClientKeyGuard(agent_url="http://agent.test", service_token="svc-token", **kwargs)
@@ -389,4 +406,43 @@ async def test_a_failed_read_does_not_make_the_copy_look_fresh() -> None:
     guard = agent.as_guard(ttl_seconds=60.0)
     await guard.is_revoked("a")
     await guard.is_revoked("a")
-    assert agent.reads == 2
+    assert agent.reads == 1
+    assert await guard.decision("a") == "unavailable"
+
+
+def test_no_policy_is_503_for_both_protocols_but_operator_can_repair(
+    authed_client, client_key, agent, signing_key
+):
+    agent.fail = True
+    assert (
+        authed_client.get(
+            "/v1/models", headers={"Authorization": f"Bearer {client_key}"}
+        ).status_code
+        == 503
+    )
+    body = {
+        "model": FAKE_MODEL,
+        "max_tokens": 10,
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    response = authed_client.post("/v1/messages", json=body, headers={"x-api-key": client_key})
+    assert response.status_code == 503 and response.json()["error"]["type"] == "api_error"
+    operator = _issue(signing_key=signing_key, sub="operator", aud="operator")
+    assert (
+        authed_client.get("/v1/config", headers={"Authorization": f"Bearer {operator}"}).status_code
+        == 200
+    )
+
+
+def test_revoked_and_unknown_anthropic_keys_are_403(authed_client, client_key, agent, signing_key):
+    agent.revoke("key-1")
+    body = {
+        "model": FAKE_MODEL,
+        "max_tokens": 10,
+        "messages": [{"role": "user", "content": "hello"}],
+    }
+    response = authed_client.post("/v1/messages", json=body, headers={"x-api-key": client_key})
+    assert response.status_code == 403 and "turned off" in response.text.lower()
+    unknown = _issue(signing_key=signing_key, sub="app", aud="client", jti="not-in-registry")
+    response = authed_client.post("/v1/messages", json=body, headers={"x-api-key": unknown})
+    assert response.status_code == 403 and "not registered" in response.text.lower()

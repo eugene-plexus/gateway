@@ -214,9 +214,22 @@ async def authorize(request: Request) -> None:
     if payload.aud != security.AUDIENCE_CLIENT:
         return
     guard = getattr(request.app.state, "client_key_guard", None)
-    if guard is None:
-        return
-    if await guard.is_revoked(payload.jti):
+    decision = await guard.decision(payload.jti) if guard is not None else "unavailable"
+    if decision == "unavailable":
+        raise Refusal(
+            "Client-key policy unavailable; check the agent/control root. "
+            "Operator sign-in remains available.",
+            status=503,
+            kind="api_error",
+        )
+    if decision == "unregistered":
+        raise Refusal(
+            "This key is not registered. Check migration on the node that made it "
+            "under Use it from your apps, or replace it.",
+            status=403,
+            kind="permission_error",
+        )
+    if decision == "revoked":
         raise Refusal(
             "This client key was turned off. Make a new one under "
             "Home -> Use it from your apps, and paste it into the app that is failing.",

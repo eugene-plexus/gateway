@@ -96,13 +96,22 @@ async def require_authorized(
     if payload is None or payload.aud != security.AUDIENCE_CLIENT:
         return payload
     guard: ClientKeyGuard | None = getattr(request.app.state, "client_key_guard", None)
-    if guard is None:
-        # No guard wired: the standalone/dev path, where there is no
-        # agent to ask. A client key there is as revocable as the
-        # process is long-lived, which is the same bargain everything
-        # else in that path already makes.
-        return payload
-    if await guard.is_revoked(payload.jti):
+    decision = await guard.decision(payload.jti) if guard is not None else "unavailable"
+    if decision == "unavailable":
+        raise _problem(
+            503,
+            "Client-key policy unavailable",
+            "Client access is paused until a fresh key policy is available. "
+            "Check the local agent and control root; operator sign-in remains available.",
+        )
+    if decision == "unregistered":
+        raise _problem(
+            401,
+            "Key not registered",
+            "This key is not registered with the current authority. Open Use it from "
+            "your apps on the node that originally made it to check migration, or replace it.",
+        )
+    if decision == "revoked":
         raise _problem(
             status.HTTP_401_UNAUTHORIZED,
             "Key revoked",

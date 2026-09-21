@@ -797,6 +797,9 @@ def authed_client(settings: Settings, signing_key: bytes) -> Iterator[TestClient
     app = create_app(settings=settings)
     app.state.routing = make_routing_table(fake)
     app.state.auth_state = AuthState(signing_key=signing_key, service_token=None, master_key=None)
+    from tests.test_client_keys import FakeAgent
+
+    app.state.client_key_guard = FakeAgent().as_guard()
     with TestClient(app) as client:
         client.fake = fake  # type: ignore[attr-defined]
         yield client
