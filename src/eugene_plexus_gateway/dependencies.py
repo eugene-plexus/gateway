@@ -26,6 +26,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from . import security
 from ._generated.models import Problem
+from .admission import current
 from .auth_state import AuthState
 from .client_keys import ClientKeyGuard
 
@@ -95,6 +96,10 @@ async def require_authorized(
     )
     if payload is None or payload.aud != security.AUDIENCE_CLIENT:
         return payload
+    context = current.get()
+    if context is not None:
+        context.key_id = payload.jti
+        context.key_name = payload.sub
     guard: ClientKeyGuard | None = getattr(request.app.state, "client_key_guard", None)
     decision = await guard.decision(payload.jti) if guard is not None else "unavailable"
     if decision == "unavailable":

@@ -222,9 +222,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # browser-based client -- the playground's direct mode among them --
     # can use the front door the way a non-browser client always could.
     # Configured live from the store; see `cors.py`.
-    app.add_middleware(FrontDoorCors)
-
+    from .admission import ClientAdmissionMiddleware
     from .body_limit import InferenceBodyLimit
+
+    app.add_middleware(ClientAdmissionMiddleware)
+    app.add_middleware(FrontDoorCors)
 
     app.add_middleware(
         InferenceBodyLimit, paths={"/v1/chat/completions", "/v1/messages"}, driver=False

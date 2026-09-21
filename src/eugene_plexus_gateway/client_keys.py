@@ -223,6 +223,15 @@ class ClientKeyGuard:
             self._client = internal_client()
         return self._client
 
+    async def admission(self, body: dict[str, object]) -> httpx.Response:
+        headers = {"Authorization": f"Bearer {self._service_token}"} if self._service_token else {}
+        return await self._ensure_client().post(
+            f"{self._agent_url}/v1/auth/client-keys/admission",
+            json=body,
+            headers=headers,
+            timeout=4.0,
+        )
+
     async def aclose(self) -> None:
         if self._task is not None and not self._task.done():
             self._task.cancel()

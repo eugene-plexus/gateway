@@ -101,6 +101,13 @@ def collect_attempts() -> Iterator[list[AttemptRow]]:
     Outside such a block the hooks record nothing, so `generate()` stays
     usable from tests and from anything that is not a served request.
     """
+    # The admission middleware owns the HTTP lifetime. Route-local collection
+    # shares its rows so cancellation before a route records its result still
+    # retains the actual attempts (including an interrupted stream).
+    existing = _attempts.get()
+    if existing is not None:
+        yield existing
+        return
     rows: list[AttemptRow] = []
     token = _attempts.set(rows)
     try:
@@ -340,6 +347,27 @@ class Resolution:
     model: str
     configured: bool
     tiers: list[_Tier]
+
+    def restricted(self, allowed: set[str] | None) -> Resolution:
+        if allowed is None:
+            return self
+        return Resolution(
+            self.model,
+            self.configured,
+            [
+                _Tier(
+                    t.target,
+                    [b for b in t.backends if t.target in allowed and b.info.modelId in allowed],
+                )
+                for t in self.tiers
+            ],
+        )
+
+    def surfaces(self) -> list[str]:
+        backends = self.backends()
+        return (["chat"] if any(b.chats for b in backends) else []) + (
+            ["embeddings"] if any(b.embeds for b in backends) else []
+        )
 
     def has_backends(self) -> bool:
         return any(t.backends for t in self.tiers)
@@ -1499,7 +1527,7 @@ class RoutingTable:
 
     # --- read models ------------------------------------------------------
 
-    def as_model_list(self) -> list[Model]:
+    def as_model_list(self, allowed: set[str] | None = None) -> list[Model]:
         """The OpenAI-compatible model list.
 
         Two drivers serving one model produce one entry: replicas are a
@@ -1511,7 +1539,11 @@ class RoutingTable:
         """
         out: list[Model] = []
         for model_id in self.known_models():
-            resolution = self.resolve(model_id)
+            if allowed is not None and model_id not in allowed:
+                continue
+            resolution = self.resolve(model_id).restricted(allowed)
+            if not resolution.has_backends():
+                continue
             backends = resolution.backends()
             providers = {b.info.provider for b in backends if b.info.provider}
             eligible = resolution.eligible_backends()
@@ -1526,7 +1558,7 @@ class RoutingTable:
                     x_eugene_plexus=ModelRoutingInfo(
                         drivers=[b.name for b in backends],
                         backends=sorted({_backend_kind(b) for b in backends}),
-                        surfaces=self.surfaces_for(model_id),
+                        surfaces=[Surface(value) for value in resolution.surfaces()],
                         context_length=_smallest_context(backends),
                         tool_calling=_all_carry_tools(backends),
                         image_input=any(

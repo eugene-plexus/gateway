@@ -37,7 +37,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
-from .. import anthropic, chat_contract
+from .. import admission, anthropic, chat_contract
 from .._generated.driver_models import (
     EmbedRequest,
     GenerateRequest,
@@ -184,6 +184,7 @@ def _record(
         considered = rec.candidates
         if len(considered) < 2 and all(c.eligible for c in considered):
             considered = []
+        context = admission.current.get()
         rec.metrics.record(
             RequestRow(
                 started_at=datetime.now(UTC),
@@ -203,8 +204,12 @@ def _record(
                 refreshed=rec.refreshed,
                 strategy=rec.strategy,
                 candidates=considered,
+                client_key_id=context.key_id if context else None,
+                client_key_name=context.key_name if context else None,
             )
         )
+        if (context := admission.current.get()) is not None:
+            context.recorded = True
     except Exception:
         log.debug("could not record request metrics", exc_info=True)
 
@@ -300,6 +305,12 @@ def _control_root_hint(table: RoutingTable | None) -> str:
 
 
 def _no_such_model(model: str, table: RoutingTable | None) -> _Failure:
+    if (context := admission.current.get()) is not None and context.key_id is not None:
+        return _Failure(
+            code=404,
+            message="The requested model is unavailable or not permitted.",
+            error_type="model_not_found",
+        )
     known = table.known_models() if table is not None else []
     if known:
         hint = f" Available models: {', '.join(known)}."
@@ -420,10 +431,14 @@ def _not_ready(resolution: Resolution, wake: WakeResult | None) -> _Failure:
 
 @router.get("/v1/models", response_model=ModelList, dependencies=_auth)
 async def list_models(request: Request) -> ModelList:
+    await admission.authorize(request)
+    context = admission.current.get()
     table = _routing(request)
     if table is None:
         return ModelList(object="list", data=[])
-    return ModelList(object="list", data=table.as_model_list())
+    return ModelList(
+        object="list", data=table.as_model_list(context.allowed_models if context else None)
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -471,6 +486,7 @@ async def _prepare(
     # to the agent and to every driver, inside the request that
     # triggered it, so "before the clock starts" was not the same as
     # "free".
+    await admission.authorize(request, body.model, streamed=bool(body.stream))
     arrived = time.perf_counter()
     refreshed = False
 
@@ -482,7 +498,7 @@ async def _prepare(
             error_type="service_unavailable",
         )
 
-    resolution = table.resolve(body.model)
+    resolution = admission.permitted(table.resolve(body.model))
     if not resolution.has_backends():
         return _no_such_model(body.model, table)
 
@@ -491,7 +507,7 @@ async def _prepare(
     # happens to say -- the library will happily discover, download and
     # launch a dedicated embedding model, so this is a mistake an
     # operator can make entirely inside our own UI.
-    surfaces = table.surfaces_for(body.model)
+    surfaces = resolution.surfaces()
     if surfaces and surface not in surfaces:
         return _wrong_surface(body.model, surfaces, wanted=surface, instead=instead)
 
@@ -514,7 +530,7 @@ async def _prepare(
     client = table.pick(resolution, images=images)
     if client is None and await table.refresh_if_stale():
         refreshed = True
-        resolution = table.resolve(body.model)
+        resolution = admission.permitted(table.resolve(body.model))
         if not resolution.has_backends():
             return _no_such_model(body.model, table)
         client = table.pick(resolution, images=images)
@@ -527,7 +543,7 @@ async def _prepare(
         if lifecycle is not None:
             wake = await lifecycle.wake(resolution)
             if wake.ok:
-                resolution = table.resolve(body.model)
+                resolution = admission.permitted(table.resolve(body.model))
                 client = table.pick(resolution, images=images)
                 considered = table.candidates_considered(resolution)
         if client is None:
@@ -543,6 +559,8 @@ async def _prepare(
             return _not_ready(resolution, wake)
 
     store = _store(request)
+    if isinstance(client, TieredClient):
+        client.authorize_attempt = admission.before_attempt
     generate = _to_generate_request(body, store)
     profiles = getattr(request.app.state, "profile_defaults", None)
     if profiles is not None and isinstance(client, TieredClient):
@@ -959,6 +977,7 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
     outlives the request. Same trade as M10's commit point: give up a
     retry rather than return a wrong answer that looks right.
     """
+    await admission.authorize(request, body.model)
     table = _routing(request)
     if table is None:
         return _error(
@@ -967,11 +986,11 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
             error_type="service_unavailable",
         )
 
-    resolution = table.resolve(body.model)
+    resolution = admission.permitted(table.resolve(body.model))
     if not resolution.has_backends():
         return _no_such_model(body.model, table).as_openai()
 
-    surfaces = table.surfaces_for(body.model)
+    surfaces = resolution.surfaces()
     if surfaces and "embeddings" not in surfaces:
         return _wrong_surface(
             body.model, surfaces, wanted="embeddings", instead="/v1/chat/completions"
@@ -995,7 +1014,7 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
 
     client = table.pick_embedding(resolution)
     if client is None and await table.refresh_if_stale():
-        resolution = table.resolve(body.model)
+        resolution = admission.permitted(table.resolve(body.model))
         client = table.pick_embedding(resolution)
     if client is None:
         # Deliberately NOT a wake. Idle-unload and start-on-demand are
@@ -1005,6 +1024,8 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
         # drift apart.
         return _not_ready(resolution, None).as_openai()
 
+    if isinstance(client, TieredClient):
+        client.authorize_attempt = admission.before_attempt
     started = time.perf_counter()
     try:
         result = await serve_while_connected(
@@ -1042,6 +1063,9 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
     # The generated default is the literal string "float", not the enum
     # member -- datamodel-code-generator emits the schema default
     # verbatim -- so an unset field has no `.value`.
+    context = admission.current.get()
+    if context is not None:
+        context.embedding_result = result
     fmt = getattr(body.encoding_format, "value", body.encoding_format) or "float"
     usage = None
     if result.usage is not None:

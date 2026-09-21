@@ -16,6 +16,7 @@ install's harnesses down -- is tested by making the agent actually fail.
 
 from __future__ import annotations
 
+import json
 import secrets
 import time
 from collections.abc import Iterator
@@ -86,6 +87,13 @@ class FakeAgent:
         self.tokens.append(request.headers.get("authorization"))
         if self.fail:
             raise httpx.ConnectError("connection refused", request=request)
+        if request.url.path == "/v1/auth/client-keys/admission":
+            body = json.loads(request.content)
+            if body["keyId"] in self.revoked and body["action"] != "release":
+                return httpx.Response(401)
+            return httpx.Response(
+                200, json={"keyId": body["keyId"], "keyName": "Continue", "leaseSeconds": 30}
+            )
         assert request.url.path == "/v1/auth/client-keys/policy", request.url
         keys = [
             {
@@ -203,6 +211,7 @@ def test_a_client_key_reaches_embeddings(authed_client: TestClient, client_key: 
         ("get", "/v1/admin/routing"),
         ("get", "/v1/metrics"),
         ("get", "/v1/metrics/requests"),
+        ("get", "/v1/metrics/clients"),
     ],
 )
 def test_a_client_key_opens_no_operator_path(
@@ -292,28 +301,13 @@ def test_a_client_token_with_no_jti_is_refused(
     assert resp.status_code == 401
 
 
-def test_the_agent_going_down_does_not_take_the_harnesses_with_it(
+def test_authority_outage_refuses_discovery_even_with_cached_authentication(
     authed_client: TestClient, client_key: str, agent: FakeAgent
 ) -> None:
-    """Fail-open on the list, and the reason it is the smaller failure.
-
-    Measured by making the agent actually fail rather than asserting
-    about a branch: an install whose local agent is restarting must keep
-    serving the keys it was already serving.
-    """
-    assert (
-        authed_client.get(
-            "/v1/models", headers={"Authorization": f"Bearer {client_key}"}
-        ).status_code
-        == 200
-    )
+    headers = {"Authorization": f"Bearer {client_key}"}
+    assert authed_client.get("/v1/models", headers=headers).status_code == 200
     agent.fail = True
-    assert (
-        authed_client.get(
-            "/v1/models", headers={"Authorization": f"Bearer {client_key}"}
-        ).status_code
-        == 200
-    )
+    assert authed_client.get("/v1/models", headers=headers).status_code == 503
 
 
 def test_a_revocation_survives_the_agent_going_down_afterwards(

@@ -5,24 +5,7 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field
-
-
-class ClientKey(BaseModel):
-    id: str = Field(..., max_length=128, min_length=1)
-    name: str = Field(..., max_length=64, min_length=1)
-    tail: str = Field(..., max_length=6)
-    createdAt: AwareDatetime
-    expiresAt: AwareDatetime
-    revokedAt: AwareDatetime | None = None
-    lastUsedAt: AwareDatetime | None = Field(
-        None, description='Reserved; not currently measured.'
-    )
-    originNode: str | None = None
-    migrated: bool | None = Field(
-        None,
-        description='True for a record imported from a pre-A3 node-local registry.',
-    )
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, RootModel
 
 
 class Scope(StrEnum):
@@ -37,26 +20,55 @@ class Migration(StrEnum):
     standalone = 'standalone'
 
 
-class ClientKeyList(BaseModel):
-    keys: list[ClientKey]
-    authority: str | None = None
-    revision: int | None = Field(None, ge=0)
-    scope: Scope | None = None
-    migration: Migration | None = None
-    detail: str | None = None
+class AllowedModel(RootModel[str]):
+    root: str = Field(..., max_length=256, min_length=1)
 
 
-class ClientKeyCreateRequest(BaseModel):
-    name: str = Field(..., max_length=64, min_length=1)
-    ttlDays: int | None = Field(365, ge=1, le=3650)
-
-
-class ClientKeyCreated(BaseModel):
-    key: ClientKey
-    token: str = Field(
-        ...,
-        description='Returned once; never persisted in the registry or gateway cache.',
+class ClientKeyLimits(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
     )
+    allowedModels: list[AllowedModel] | None = Field(
+        None,
+        description='Null permits all. Empty permits none. Exact alias and actual target IDs must both be allowed.',
+        max_length=100,
+    )
+    maxConcurrentRequests: int | None = Field(2, ge=1, le=64)
+    requestsPerMinute: int | None = Field(60, ge=1, le=10000)
+
+
+class ClientKeyUpdateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    limits: ClientKeyLimits
+
+
+class Action(StrEnum):
+    check = 'check'
+    acquire = 'acquire'
+    renew = 'renew'
+    release = 'release'
+
+
+class ClientAdmissionRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    action: Action
+    keyId: str = Field(..., max_length=128, min_length=1)
+    requestId: str = Field(..., max_length=128, min_length=1)
+    model: str | None = Field(None, max_length=256, min_length=1)
+
+
+class ClientAdmissionResult(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    keyId: str
+    keyName: str
+    limits: ClientKeyLimits | None = None
+    leaseSeconds: float | None = Field(None, gt=0.0, le=30.0)
 
 
 class ClientKeyPolicyEntry(BaseModel):
@@ -87,6 +99,53 @@ class ClientKeyPolicy(BaseModel):
         description='Authority UTC Unix timestamp. Intermediaries must not renew it.',
     )
     keys: list[ClientKeyPolicyEntry]
+
+
+class ClientKey(BaseModel):
+    id: str = Field(..., max_length=128, min_length=1)
+    name: str = Field(..., max_length=64, min_length=1)
+    tail: str = Field(..., max_length=6)
+    createdAt: AwareDatetime
+    expiresAt: AwareDatetime
+    revokedAt: AwareDatetime | None = None
+    lastUsedAt: AwareDatetime | None = Field(
+        None, description='Reserved; not currently measured.'
+    )
+    originNode: str | None = None
+    limits: ClientKeyLimits | None = Field(
+        None,
+        description='Absent on legacy keys (all models, no per-key limits); new keys receive bounded defaults.',
+    )
+    migrated: bool | None = Field(
+        None,
+        description='True for a record imported from a pre-A3 node-local registry.',
+    )
+
+
+class ClientKeyList(BaseModel):
+    keys: list[ClientKey]
+    authority: str | None = None
+    revision: int | None = Field(None, ge=0)
+    scope: Scope | None = None
+    migration: Migration | None = None
+    detail: str | None = None
+
+
+class ClientKeyCreateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(..., max_length=64, min_length=1)
+    ttlDays: int | None = Field(365, ge=1, le=3650)
+    limits: ClientKeyLimits | None = None
+
+
+class ClientKeyCreated(BaseModel):
+    key: ClientKey
+    token: str = Field(
+        ...,
+        description='Returned once; never persisted in the registry or gateway cache.',
+    )
 
 
 class ClientKeyImport(BaseModel):

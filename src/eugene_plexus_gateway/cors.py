@@ -211,6 +211,7 @@ class FrontDoorCors:
             if message["type"] == "http.response.start":
                 raw = list(message.get("headers", []))
                 raw.append((b"access-control-allow-origin", allow.encode("latin-1")))
+                raw.append((b"access-control-expose-headers", b"Retry-After"))
                 if allow != "*":
                     raw.append((b"vary", b"origin"))
                 message["headers"] = raw

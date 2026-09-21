@@ -50,7 +50,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Bounded because the alternative to dropping rows is stalling
 # completions, and that trade is never worth making. Sized so a burst
@@ -128,6 +128,8 @@ class RequestRow:
     # What the balancer saw, when there was a choice to make. Empty when
     # there was one eligible backend - that is not an audit trail.
     candidates: list[CandidateRow] = field(default_factory=list)
+    client_key_id: str | None = None
+    client_key_name: str | None = None
 
 
 _DDL = """
@@ -152,7 +154,9 @@ CREATE TABLE IF NOT EXISTS request (
     outcome           TEXT    NOT NULL,
     routing_ms        INTEGER,
     refreshed         INTEGER NOT NULL DEFAULT 0,
-    strategy          TEXT
+    strategy          TEXT,
+    client_key_id     TEXT,
+    client_key_name   TEXT
 );
 
 CREATE INDEX IF NOT EXISTS request_started_at ON request (started_at);
@@ -297,6 +301,16 @@ class MetricsStore:
         conn.commit()
 
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        if row is not None and int(row[0]) == 2:
+            columns = {r[1] for r in conn.execute("PRAGMA table_info(request)")}
+            for column in ("client_key_id", "client_key_name"):
+                if column not in columns:
+                    conn.execute(f"ALTER TABLE request ADD COLUMN {column} TEXT")
+            conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),)
+            )
+            conn.commit()
+            row = (str(SCHEMA_VERSION),)
         if row is None:
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
@@ -322,6 +336,10 @@ class MetricsStore:
             aside.unlink(missing_ok=True)
             self._path.replace(aside)
             return self._open()
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS request_client_key ON request (client_key_id, started_at)"
+        )
+        conn.commit()
         return conn
 
     async def aclose(self) -> None:
@@ -429,8 +447,9 @@ class MetricsStore:
                 cursor = conn.execute(
                     "INSERT INTO request (started_at, requested_model, served_model, attempts,"
                     " tier, total_ms, waited_ms, swapped_in, streamed, prompt_tokens,"
-                    " completion_tokens, outcome, routing_ms, refreshed, strategy)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " completion_tokens, outcome, routing_ms, refreshed, strategy,"
+                    " client_key_id, client_key_name)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         _iso(row.started_at),
                         row.requested_model,
@@ -447,6 +466,8 @@ class MetricsStore:
                         row.routing_ms,
                         int(row.refreshed),
                         row.strategy,
+                        row.client_key_id,
+                        row.client_key_name,
                     ),
                 )
                 request_id = cursor.lastrowid
@@ -756,6 +777,40 @@ class MetricsStore:
         out.sort(key=lambda x: (x["bucketStart"] or "", -x["requests"]))
         return out
 
+    def client_usage(self, *, since: datetime, until: datetime) -> list[dict[str, Any]]:
+        with self._reader() as conn:
+            if conn is None:
+                return []
+            rows = conn.execute(
+                """
+                SELECT r.client_key_id,
+                       COALESCE((SELECT n.client_key_name FROM request n
+                         WHERE n.client_key_id = r.client_key_id AND n.client_key_name IS NOT NULL
+                         ORDER BY n.id DESC LIMIT 1), 'Name unavailable'),
+                       COUNT(*), SUM(CASE WHEN outcome = 'served' THEN 1 ELSE 0 END),
+                       SUM(CASE WHEN outcome != 'served' THEN 1 ELSE 0 END), SUM(attempts),
+                       SUM(COALESCE(prompt_tokens, 0)), SUM(COALESCE(completion_tokens, 0)),
+                       SUM(CASE WHEN prompt_tokens IS NULL OR completion_tokens IS NULL
+                                OR attempts > 1 OR outcome != 'served' THEN 1 ELSE 0 END)
+                FROM request r WHERE r.client_key_id IS NOT NULL
+                  AND started_at >= ? AND started_at < ?
+                GROUP BY r.client_key_id ORDER BY r.client_key_id
+            """,
+                (_iso(since), _iso(until)),
+            ).fetchall()
+        names = (
+            "clientKeyId",
+            "clientKeyName",
+            "requests",
+            "served",
+            "failed",
+            "attempts",
+            "promptTokens",
+            "completionTokens",
+            "incompleteUsageRequests",
+        )
+        return [dict(zip(names, row, strict=True)) for row in rows]
+
     def requests(
         self,
         *,
@@ -793,7 +848,8 @@ class MetricsStore:
                 f"""
                 SELECT id, started_at, requested_model, served_model, attempts, tier,
                        total_ms, waited_ms, swapped_in, streamed, prompt_tokens,
-                       completion_tokens, outcome, routing_ms, refreshed, strategy
+                       completion_tokens, outcome, routing_ms, refreshed, strategy,
+                       client_key_id, client_key_name
                 FROM request r {clause}
                 ORDER BY id DESC LIMIT ?
                 """,
@@ -887,6 +943,8 @@ class MetricsStore:
                 "routingMs": r[13],
                 "refreshed": bool(r[14]),
                 "strategy": r[15],
+                "clientKeyId": r[16],
+                "clientKeyName": r[17],
                 "tries": tries[r[0]],
                 "candidates": considered[r[0]],
             }

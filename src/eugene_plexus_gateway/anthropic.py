@@ -213,6 +213,12 @@ async def authorize(request: Request) -> None:
 
     if payload.aud != security.AUDIENCE_CLIENT:
         return
+    from .admission import current
+
+    context = current.get()
+    if context is not None:
+        context.key_id = payload.jti
+        context.key_name = payload.sub
     guard = getattr(request.app.state, "client_key_guard", None)
     decision = await guard.decision(payload.jti) if guard is not None else "unavailable"
     if decision == "unavailable":

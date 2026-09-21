@@ -18,6 +18,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, HTTPException, Query, Request, status
 
 from .._generated.models import (
+    ClientUsageSummary,
     MetricRequest,
     MetricRequestPage,
     MetricsGroup,
@@ -97,4 +98,24 @@ async def get_metric_requests(
     return MetricRequestPage(
         requests=[MetricRequest.model_validate(r) for r in rows],
         nextCursor=next_cursor,
+    )
+
+
+@router.get("/v1/metrics/clients", response_model=ClientUsageSummary)
+async def get_client_usage(
+    request: Request,
+    since: Annotated[datetime | None, Query()] = None,
+    until: Annotated[datetime | None, Query()] = None,
+) -> ClientUsageSummary:
+    store = _store(request)
+    end = until or datetime.now(UTC)
+    start = since or (end - DEFAULT_WINDOW)
+    return ClientUsageSummary.model_validate(
+        {
+            "windowStart": start,
+            "windowEnd": end,
+            "rowsDropped": store.rows_dropped,
+            "truncated": start < store.oldest_retained(),
+            "clients": store.client_usage(since=start, until=end),
+        }
     )

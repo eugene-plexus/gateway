@@ -458,6 +458,7 @@ class TieredClient:
         # replica was asleep is tier 2, whatever tier 1 held.
         self._tiers = [list(tier) for tier in tiers]
         self._hooks = hooks
+        self.authorize_attempt: Callable[[], Awaitable[None]] | None = None
         self.prepare_request: (
             Callable[[DriverClient, GenerateRequest], Awaitable[GenerateRequest]] | None
         ) = None
@@ -513,6 +514,8 @@ class TieredClient:
         index = 0
         for tier_index, tier in enumerate(self._tiers):
             for candidate in tier:
+                if self.authorize_attempt is not None:
+                    await self.authorize_attempt()
                 self.attempts = index + 1
                 driver = getattr(candidate, "name", None)
                 node = getattr(candidate, "node", None)
@@ -587,6 +590,8 @@ class TieredClient:
         index = 0
         for tier_index, tier in enumerate(self._tiers):
             for candidate in tier:
+                if self.authorize_attempt is not None:
+                    await self.authorize_attempt()
                 self.attempts = index + 1
                 driver = getattr(candidate, "name", None)
                 node = getattr(candidate, "node", None)
@@ -596,7 +601,7 @@ class TieredClient:
                 started = time.perf_counter()
                 try:
                     result = await candidate.embed(request)
-                except Exception as exc:
+                except BaseException as exc:
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
@@ -606,7 +611,7 @@ class TieredClient:
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                             error=type(exc).__name__,
                         )
-                    if not _is_cascade_eligible(exc):
+                    if not isinstance(exc, Exception) or not _is_cascade_eligible(exc):
                         raise
                     last_exc = exc
                     self._log_cascade("embed", index, candidate, exc, total=total)
@@ -657,6 +662,8 @@ class TieredClient:
         index = 0
         for tier_index, tier in enumerate(self._tiers):
             for candidate in tier:
+                if self.authorize_attempt is not None:
+                    await self.authorize_attempt()
                 self.attempts = index + 1
                 driver = getattr(candidate, "name", None)
                 node = getattr(candidate, "node", None)

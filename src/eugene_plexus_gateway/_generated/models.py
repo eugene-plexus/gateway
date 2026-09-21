@@ -1708,6 +1708,26 @@ class MetricCandidate(BaseModel):
     )
 
 
+class ClientUsageGroup(BaseModel):
+    clientKeyId: str
+    clientKeyName: str
+    requests: int
+    served: int
+    failed: int
+    attempts: int
+    promptTokens: int
+    completionTokens: int
+    incompleteUsageRequests: int
+
+
+class ClientUsageSummary(BaseModel):
+    windowStart: AwareDatetime
+    windowEnd: AwareDatetime
+    truncated: bool
+    rowsDropped: int
+    clients: list[ClientUsageGroup]
+
+
 class DriverHealth(BaseModel):
     """
     What the gateway sees from one inference-driver's `/v1/info`,
@@ -2044,6 +2064,13 @@ class AnthropicMessageResponse(BaseModel):
 
 
 class MetricRequest(BaseModel):
+    clientKeyId: str | None = Field(
+        None,
+        description='Verified key identifier; absent for operator/service requests and pre-A5 rows.',
+    )
+    clientKeyName: str | None = Field(
+        None, description='Registry name captured for this request.'
+    )
     startedAt: AwareDatetime
     requestedModel: str
     servedModel: str | None = Field(
