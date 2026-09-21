@@ -442,7 +442,7 @@ def _is_cascade_eligible(exc: Exception) -> bool:
     return retry_disposition(exc) == "safe"
 
 
-def _cooling_error() -> DriverError:
+def _cooling_error(delay: float = 1) -> DriverError:
     return DriverError(
         driver_name="routing",
         driver_url="",
@@ -452,7 +452,7 @@ def _cooling_error() -> DriverError:
             title="Backends cooling down",
             status=503,
             retryDisposition=RetryDisposition.safe,
-            retryAfterSeconds=1,
+            retryAfterSeconds=max(1, delay),
             detail="Eligible backends are cooling down or already probing recovery. Try a new "
             "request later.",
         ),
@@ -545,8 +545,9 @@ class TieredClient:
                 circuit = getattr(candidate, "circuit", None)
                 if circuit is not None and not circuit.acquire():
                     if last_exc is None:
-                        last_exc = _cooling_error()
+                        last_exc = _cooling_error(circuit.until - time.perf_counter())
                     continue
+                probe_epoch = circuit.epoch if circuit is not None and circuit.probing else None
                 self.attempts = index + 1
                 driver = getattr(candidate, "name", None)
                 node = getattr(candidate, "node", None)
@@ -562,7 +563,7 @@ class TieredClient:
                     )
                     result = await candidate.generate(prepared)
                 except BaseException as exc:
-                    self._finish_circuit(candidate, exc)
+                    self._finish_circuit(candidate, exc, probe_epoch=probe_epoch)
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
@@ -586,7 +587,7 @@ class TieredClient:
                     self._log_cascade("generate", index, candidate, exc, total=total)
                     index += 1
                 else:
-                    self._finish_circuit(candidate)
+                    self._finish_circuit(candidate, probe_epoch=probe_epoch)
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
@@ -630,8 +631,9 @@ class TieredClient:
                 circuit = getattr(candidate, "circuit", None)
                 if circuit is not None and not circuit.acquire():
                     if last_exc is None:
-                        last_exc = _cooling_error()
+                        last_exc = _cooling_error(circuit.until - time.perf_counter())
                     continue
+                probe_epoch = circuit.epoch if circuit is not None and circuit.probing else None
                 self.attempts = index + 1
                 driver = getattr(candidate, "name", None)
                 node = getattr(candidate, "node", None)
@@ -642,7 +644,7 @@ class TieredClient:
                 try:
                     result = await candidate.embed(request)
                 except BaseException as exc:
-                    self._finish_circuit(candidate, exc)
+                    self._finish_circuit(candidate, exc, probe_epoch=probe_epoch)
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
@@ -659,7 +661,7 @@ class TieredClient:
                     self._log_cascade("embed", index, candidate, exc, total=total)
                     index += 1
                 else:
-                    self._finish_circuit(candidate)
+                    self._finish_circuit(candidate, probe_epoch=probe_epoch)
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
                             driver,
@@ -711,8 +713,9 @@ class TieredClient:
                 circuit = getattr(candidate, "circuit", None)
                 if circuit is not None and not circuit.acquire():
                     if last_exc is None:
-                        last_exc = _cooling_error()
+                        last_exc = _cooling_error(circuit.until - time.perf_counter())
                     continue
+                probe_epoch = circuit.epoch if circuit is not None and circuit.probing else None
                 self.attempts = index + 1
                 driver = getattr(candidate, "name", None)
                 node = getattr(candidate, "node", None)
@@ -745,7 +748,7 @@ class TieredClient:
                             usage = event.result.usage if event.result is not None else None
                         yield event
                 except Exception as exc:
-                    self._finish_circuit(candidate, exc)
+                    self._finish_circuit(candidate, exc, probe_epoch=probe_epoch)
                     reported = True
                     if self._hooks is not None and driver:
                         self._hooks.on_attempt_end(
@@ -778,7 +781,9 @@ class TieredClient:
                     index += 1
                 else:
                     self._finish_circuit(
-                        candidate, None if saw_done else RuntimeError("incomplete")
+                        candidate,
+                        None if saw_done else RuntimeError("incomplete"),
+                        probe_epoch=probe_epoch,
                     )
                     reported = True
                     if self._hooks is not None and driver:
@@ -825,7 +830,9 @@ class TieredClient:
                     # and can never be evicted to make room for a wake.
                     if not reported:
                         self._finish_circuit(
-                            candidate, sys.exc_info()[1] or RuntimeError("abandoned")
+                            candidate,
+                            sys.exc_info()[1] or RuntimeError("abandoned"),
+                            probe_epoch=probe_epoch,
                         )
                     if not reported and self._hooks is not None and driver:
                         ending = sys.exc_info()[1]
@@ -844,7 +851,12 @@ class TieredClient:
         raise last_exc
 
     @staticmethod
-    def _finish_circuit(candidate: DriverClient, error: BaseException | None = None) -> None:
+    def _finish_circuit(
+        candidate: DriverClient,
+        error: BaseException | None = None,
+        *,
+        probe_epoch: int | None = None,
+    ) -> None:
         circuit = getattr(candidate, "circuit", None)
         if circuit is not None:
             delay = (
@@ -855,6 +867,7 @@ class TieredClient:
             circuit.finish(
                 failed=error is not None and retry_disposition(error) != "terminal",
                 retry_after=delay,
+                probe_epoch=probe_epoch,
             )
 
     def _log_cascade(

@@ -135,4 +135,35 @@ def test_retry_hints_are_bounded_and_malformed_hints_do_not_disable_cooldown(mon
     c.finish(failed=True, retry_after=999999)
     assert c.until == 400
     c.finish(failed=True, retry_after=float("nan"))
-    assert c.until == 102
+    assert c.until == 400  # another failure cannot shorten an existing provider delay
+
+
+def test_inflight_successes_cannot_clear_a_newer_failure_cooldown(monkeypatch):
+    from eugene_plexus_gateway import circuit as module
+
+    monkeypatch.setattr(module.time, "perf_counter", lambda: 100)
+    c = Circuit()
+    assert c.acquire() and c.acquire()  # two requests already running normally
+    c.finish(failed=True, retry_after=30)
+    c.finish(failed=False)
+    c.finish(failed=False)
+    assert c.until == 130 and c.failures == 1
+    assert not c.acquire()
+
+
+def test_new_failure_cannot_admit_a_second_probe_until_the_old_one_finishes(monkeypatch):
+    from eugene_plexus_gateway import circuit as module
+
+    now = [100]
+    monkeypatch.setattr(module.time, "perf_counter", lambda: now[0])
+    c = Circuit()
+    c.finish(failed=True)
+    now[0] = 102
+    assert c.acquire()
+    owner = c.epoch
+    c.finish(failed=True, retry_after=30)  # older regular request fails during the probe
+    now[0] = 140
+    assert not c.acquire()  # even after the new cooldown, the first probe still owns the slot
+    c.finish(failed=False, probe_epoch=owner)
+    assert c.successes == 0 and not c.probing  # stale success releases, never restores traffic
+    assert c.acquire()
