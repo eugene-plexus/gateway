@@ -21,6 +21,7 @@ from typing import Any
 
 import yaml
 
+from . import _private_files
 from ._generated.models import (
     ComponentKind,
     ConfigDocument,
@@ -586,5 +587,7 @@ class ConfigStore:
 
     def _write_locked(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._path.open("w", encoding="utf-8") as f:
-            yaml.safe_dump(self._values, f, sort_keys=True, default_flow_style=False)
+        # 0600 and replaced rather than rewritten; see `_private_files`.
+        _private_files.write_private_text(
+            self._path, yaml.safe_dump(self._values, sort_keys=True, default_flow_style=False)
+        )
