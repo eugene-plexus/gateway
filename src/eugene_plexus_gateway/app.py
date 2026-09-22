@@ -228,7 +228,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.add_middleware(ClientAdmissionMiddleware)
     app.add_middleware(FrontDoorCors)
 
+    # Every body-taking door a client key can reach, not only chat: an
+    # embeddings batch or a decision's state is read and parsed whole just
+    # the same (the decision door reads it twice), so an unbounded one is
+    # the same memory exhaustion. A new body-taking front-door route
+    # belongs here.
     app.add_middleware(
-        InferenceBodyLimit, paths={"/v1/chat/completions", "/v1/messages"}, driver=False
+        InferenceBodyLimit,
+        paths={"/v1/chat/completions", "/v1/messages", "/v1/embeddings", "/v1/systemone"},
+        driver=False,
     )
     return app
