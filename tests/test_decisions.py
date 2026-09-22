@@ -293,3 +293,22 @@ def test_models_listing_marks_the_decision_surface(settings) -> None:  # type: i
         listing = client.get("/v1/models").json()
     entry = next(m for m in listing["data"] if m["id"] == "tickets")
     assert entry["x_eugene_plexus"]["surfaces"] == ["decisions"]
+
+
+def test_the_decision_door_is_under_client_admission() -> None:
+    """The B2 acceptance run's finding: a door missing from
+    CLIENT_ADMISSION_PATHS has NO client admission at all — a scoped key
+    served a model outside its allowedModels because the middleware never
+    saw /v1/systemone and every downstream check read "no client". Every
+    path that accepts a client key must be in the set."""
+    from eugene_plexus_gateway.admission import CLIENT_ADMISSION_PATHS
+
+    assert "/v1/systemone" in CLIENT_ADMISSION_PATHS
+    # The other four doors stay covered; shrinking this set is how the
+    # defect comes back.
+    assert {
+        "/v1/models",
+        "/v1/chat/completions",
+        "/v1/messages",
+        "/v1/embeddings",
+    } <= CLIENT_ADMISSION_PATHS

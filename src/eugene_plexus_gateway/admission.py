@@ -257,6 +257,24 @@ async def before_attempt() -> None:
             )
 
 
+#: Every path a client key is accepted on. **A door added without a row
+#: here is a door with no client admission at all** — no scopes, no
+#: local-only, no rate or concurrency limits, no usage attribution — and
+#: that is precisely how /v1/systemone shipped for a few hours: the B2
+#: acceptance run's scoped key served a model outside its allowedModels
+#: because this middleware never saw the path, so `current` was never
+#: set and every check downstream read "no client, nothing to limit".
+CLIENT_ADMISSION_PATHS = frozenset(
+    {
+        "/v1/models",
+        "/v1/chat/completions",
+        "/v1/messages",
+        "/v1/embeddings",
+        "/v1/systemone",
+    }
+)
+
+
 class ClientAdmissionMiddleware:
     """Own the whole ASGI lifetime; headers do not end a streamed reservation."""
 
@@ -264,12 +282,7 @@ class ClientAdmissionMiddleware:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or scope["path"] not in {
-            "/v1/models",
-            "/v1/chat/completions",
-            "/v1/messages",
-            "/v1/embeddings",
-        }:
+        if scope["type"] != "http" or scope["path"] not in CLIENT_ADMISSION_PATHS:
             await self.app(scope, receive, send)
             return
         context = ClientRequest(scope)
