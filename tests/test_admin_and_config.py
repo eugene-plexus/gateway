@@ -157,6 +157,7 @@ def test_config_schema_lists_the_gateway_fields(client: TestClient) -> None:
         "profileCacheSeconds",
         "profileMaxStaleSeconds",
         "requestTimeoutSeconds",
+        "decisionMaxQuestions",
         "routingRefreshSeconds",
         "modelSlots",
         "loadBalancing",

@@ -87,6 +87,15 @@ class BackendKind(StrEnum):
     to the respective CLIs, which is how a subscription the operator
     already pays for becomes just another backend.
 
+    `systemone_http` speaks the TypeSafe System One decision
+    protocol (`POST /v1/systemone`: a state and named typed
+    questions, answered with structured probabilities rather than
+    text) — a supervised Kev runtime, another System One-compatible
+    server, or TypeSafe's own hosted endpoint, distinguished by
+    `DriverInfo.provider` exactly as the chat protocols are. A
+    driver on this protocol serves decisions and not chat; see
+    `Capabilities.chatCapable`.
+
     """
 
     anthropic_api = 'anthropic_api'
@@ -94,6 +103,7 @@ class BackendKind(StrEnum):
     claude_code_cli = 'claude_code_cli'
     codex_cli = 'codex_cli'
     openai_compat_http = 'openai_compat_http'
+    systemone_http = 'systemone_http'
 
 
 class ComponentKind(StrEnum):
@@ -168,6 +178,19 @@ class EngineKind(StrEnum):
     and without an adapter there is nothing that knows how to start
     it or tell when it is ready.
 
+    `kev` drives upstream `python -m kev.serve` and loads Kev
+    decision checkpoints (`kev_checkpoint` format) — a decision
+    model, not a chat model: its server speaks the System One
+    protocol and its companion driver serves `POST /v1/decide`,
+    never completions. Like vLLM it loads the model *before*
+    binding its port (read off `kev/serve.py` at the pinned commit
+    and observed live 2026-09-22), so alive-and-refusing is
+    `loading`; unlike every other engine it handles one request at
+    a time, which its driver advertises as a concurrency limit.
+    Its bind is hardcoded to loopback upstream, which is the
+    posture Eugene wants: the gateway is the authenticated front
+    door.
+
     `llama_cpp` drives upstream `llama-server` and loads GGUF.
     `vllm` drives upstream `vllm serve` and loads safetensors.
     `mlx` drives upstream `mlx_lm.server` and loads MLX-format
@@ -205,14 +228,14 @@ class EngineKind(StrEnum):
     llama_cpp = 'llama_cpp'
     vllm = 'vllm'
     mlx = 'mlx'
+    kev = 'kev'
 
 
 class ModelFormat(StrEnum):
     """
     On-disk format of a model. A dimension of the data model rather
-    than an assumption (locked 2026-09-08): both are implemented at
-    v0.1, and the differences are load-bearing rather than
-    cosmetic.
+    than an assumption (locked 2026-09-08), and the differences are
+    load-bearing rather than cosmetic.
 
     * `gguf` — a single file, quantized, carrying its own metadata
       and tokenizer. Large models may be **split** into
@@ -224,6 +247,17 @@ class ModelFormat(StrEnum):
       weight files plus tokenizer files. Unquantized in practice,
       so **no quant tier** — a safetensors model is sized, not
       tiered, and the quant fields exist only on the GGUF side.
+    * `kev_checkpoint` — a directory holding a rank-limited LoRA
+      adapter (`adapter_config.json` + `adapter_model.safetensors`),
+      a pointer/decision head (`head.pt`), tokenizer files and
+      calibration/provenance artifacts (`provenance.json`), loaded
+      by Kev's own loader on top of a separately downloaded base
+      model named in the adapter config. Measured off the published
+      `jaredpalmer/kev-0.8b` checkpoint on 2026-09-22. **Not an
+      ordinary adapter**: a plain LoRA directory is skipped by the
+      scanner on purpose, and the decision head is what makes this
+      one a launchable model instead. Decision-only —
+      `ModelCapabilities.decision`, never `chat`.
 
     Shared because it appears on both sides of a join: a library
     entry declares what a model *is*, and
@@ -236,6 +270,7 @@ class ModelFormat(StrEnum):
 
     gguf = 'gguf'
     safetensors = 'safetensors'
+    kev_checkpoint = 'kev_checkpoint'
 
 
 class RetryDisposition(StrEnum):
@@ -949,6 +984,124 @@ class EmbedResponse(BaseModel):
     requestId: str | None = None
 
 
+class Type1(StrEnum):
+    noul = 'noul'
+    choice = 'choice'
+    score = 'score'
+
+
+class DecisionQuestion(BaseModel):
+    """
+    One typed question, in the pinned System One vocabulary. The
+    shape of `criteria` depends on `type` and is validated in code
+    against the pinned protocol: for `noul` an optional object
+    mapping `"true"` and `"false"` to outcome descriptions; for
+    `choice` a required map of 1-255 option names to rubric text or
+    null; for `score` a required array of 2-10 ordered level
+    descriptions, lowest first. **Fields beyond these are refused,
+    never dropped** — a knob the protocol does not define, silently
+    removed, would answer a different question than the caller
+    asked.
+
+    """
+
+    type: Type1
+    instructions: str | dict[str, Any] | list[Any] = Field(
+        ...,
+        description='What to decide — a string, or structured content the\nprovider accepts.\n',
+    )
+    criteria: Any | None = Field(
+        None, description='Shape depends on `type`; see above.'
+    )
+
+
+class DecisionAnswer(BaseModel):
+    """
+    One validated answer. `type` echoes the question's kind and
+    exactly the matching fields are present — the driver has already
+    refused a backend that answered otherwise, so a caller can
+    switch on `type` without defending against a half-shaped answer.
+
+    """
+
+    type: Type1
+    noul: float | None = Field(
+        None,
+        description='`noul` only: the probability the answer is yes.',
+        ge=0.0,
+        le=1.0,
+    )
+    choice: str | None = Field(
+        None, description='`choice` only: the highest-probability option name.'
+    )
+    score: float | None = Field(
+        None,
+        description='`score` only: the probability-weighted value across the\nordered levels, 0-indexed against `legend`.\n',
+    )
+    legend: dict[str, str] | None = Field(
+        None, description='`score` only: level indices to their descriptions.'
+    )
+    probabilities: dict[str, float] | None = Field(
+        None,
+        description='`choice` and `score`: the full distribution, validated to be\nover the legal options/levels with finite values.\n',
+    )
+    confidence: float | None = Field(
+        None,
+        description="`choice` and `score`: the provider's certainty, preserved as\nreported. Provider-specific calibration — never comparable\nacross models, and never manufactured by the driver when the\nprovider omits it.\n",
+        ge=0.0,
+        le=1.0,
+    )
+
+
+class DecisionResponse(BaseModel):
+    answers: dict[str, DecisionAnswer] = Field(
+        ..., description='One validated answer per request question, same keys.'
+    )
+    modelId: str | None = Field(
+        None,
+        description="The public model identifier, normalized exactly as\n`GenerateResponse.modelId` is — a backend's own name for\nitself is never echoed by a translating driver.\n",
+    )
+    reportedModel: str | None = Field(
+        None,
+        description="What the backend said served this request, verbatim —\nprovenance for calibration (`jev-1.13.0`, a Kev checkpoint\nid), preserved without becoming anyone's routing key.\n",
+    )
+    backend: BackendKind | None = None
+    usage: Usage | None = None
+    latencyMs: int | None = Field(None, ge=0)
+    requestId: str | None = None
+
+
+class Kind(StrEnum):
+    noul = 'noul'
+    choice = 'choice'
+    score = 'score'
+
+
+class DecisionCapability(BaseModel):
+    """
+    Present on `/v1/info` iff this driver serves `POST /v1/decide`.
+    Its absence is how the gateway knows not to route decisions
+    here; `chatCapable: false` beside it is how a decision-only
+    backend refuses chat with a reason.
+
+    """
+
+    kinds: list[Kind] = Field(..., description='Question kinds the backend supports.')
+    maxQuestions: int | None = Field(
+        None, description='Per-request question ceiling. Absent means unknown.', ge=1
+    )
+    maxOptions: int | None = Field(
+        None,
+        description="Choice option ceiling. The protocol's own ceiling is 255;\na backend may be lower.\n",
+        ge=1,
+    )
+    maxConcurrent: int | None = Field(
+        None,
+        description="How many requests the backend can hold at once. **Kev's\nserver handles exactly one** (a lock, no cross-caller\nbatching — read off `kev/serve.py` at the pinned commit), so\nits driver reports 1 and the layers above must not\nover-admit: a non-cancellable engine that is over-admitted\nholds capacity nobody can free.\n",
+        ge=1,
+    )
+
+
 class Locality(StrEnum):
     """
     Active engine's configured trust classification. Managed local
@@ -993,6 +1146,11 @@ class Capabilities(BaseModel):
         description="The context window the backend **resolved**, read back\nfrom the backend itself — not the model's trained\nmaximum, and never an estimate.\n\nNull means unknown, and unknown is a real answer: a\nhosted provider exposes nothing to read, and a CLI\nsubscription has no window of its own to report. The\ngateway's `_smallest_context` folds this together with\nthe window a supervised runtime reports and publishes\nthe smallest as `x_eugene_plexus.context_length` on\n`GET /v1/models`, so a harness can size a prompt\nagainst the number that will actually apply.\n\n**Populated by a probe of the backend, which is why it\nexists at all.** A supervised runtime already tells the\nagent its window; this field is for the backend nobody\nsupervises — an Ollama or an LM Studio the operator\npoints us at — which until now reported no window\nanywhere. Contracted since M0 and populated by nothing\nuntil then, exactly as `streaming` was until M10.\n\n**Advertising, not enforcement.** Nothing here counts a\nprompt: the window is published so a caller can respect\nit, and a caller that does not is refused by the engine\nitself, whose count is exact. A backend that truncates\nsilently instead of refusing is caught after the fact —\nsee `x_eugene_plexus.prompt_truncated` in\n`gateway.yaml`.\n",
         ge=0,
     )
+    chatCapable: bool | None = Field(
+        True,
+        description='Whether this driver serves `POST /v1/generate` at all.\nTrue for every backend that existed before decisions —\nabsent means chat-capable, so no existing driver changes\nmeaning — and **false for a System One backend**, whose\nonly surface is `POST /v1/decide`. The gateway reads it\nto refuse a chat request against a decision-only model\nwith a sentence naming `/v1/systemone`, instead of\nletting the request die as a protocol error inside a\nbackend that never spoke chat.\n',
+    )
+    decision: DecisionCapability | None = None
 
 
 class DriverInfo(BaseModel):
@@ -1197,6 +1355,30 @@ class ToolCall(BaseModel):
 class ResponseFormat(BaseModel):
     type: Type
     json_schema: ResponseJsonSchema | None = None
+
+
+class DecisionRequest(BaseModel):
+    """
+    One state, several named typed questions, answered together.
+    Question names are the caller's own keys and come back verbatim
+    on the response's `answers`. Question independence is the
+    protocol's promise: each question is answered against the state
+    alone, not against the other questions' answers.
+
+    """
+
+    state: str | dict[str, Any] | list[Any] = Field(
+        ...,
+        description='What is being judged — plain text, or structured data (an\nobject or array such as a ticket record or a chat log)\npassed through without re-serialization by the caller.\n',
+    )
+    questions: dict[str, DecisionQuestion] = Field(
+        ..., description='Caller-named questions; at least one.'
+    )
+    localOnly: bool | None = Field(
+        False,
+        description='Internal policy; require a local active engine before\nforwarding any state, exactly as on `GenerateRequest`.\n',
+    )
+    requestId: str | None = Field(None, description='Correlation id, echoed back.')
 
 
 class MessageContent1(RootModel[list[TextContentPart | ImageContentPart]]):

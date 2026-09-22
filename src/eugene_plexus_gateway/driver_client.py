@@ -28,6 +28,8 @@ import httpx
 from pydantic import ValidationError
 
 from ._generated.driver_models import (
+    DecisionRequest,
+    DecisionResponse,
     DriverInfo,
     EmbedRequest,
     EmbedResponse,
@@ -173,6 +175,8 @@ class DriverClient(Protocol):
     async def info(self) -> DriverInfo: ...
     async def generate(self, request: GenerateRequest) -> GenerateResponse: ...
     async def embed(self, request: EmbedRequest) -> EmbedResponse: ...
+
+    async def decide(self, request: DecisionRequest) -> DecisionResponse: ...
     def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]: ...
     async def aclose(self) -> None: ...
 
@@ -319,6 +323,26 @@ class HttpDriverClient:
             )
         try:
             return EmbedResponse.model_validate(response.json())
+        except ValueError as exc:
+            raise self._invalid_reply() from exc
+
+    async def decide(self, request: DecisionRequest) -> DecisionResponse:
+        payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
+        response = await self._client.post(
+            "/v1/decide",
+            json=payload,
+            headers={"X-Request-ID": str(request.requestId)} if request.requestId else None,
+        )
+        if response.status_code >= 400:
+            raise DriverError(
+                driver_name=self.name,
+                driver_url=self.base_url,
+                status_code=response.status_code,
+                problem=_problem_from_response(response),
+                raw_body=response.text,
+            )
+        try:
+            return DecisionResponse.model_validate(response.json())
         except ValueError as exc:
             raise self._invalid_reply() from exc
 
@@ -661,6 +685,74 @@ class TieredClient:
                         raise
                     last_exc = exc
                     self._log_cascade("embed", index, candidate, exc, total=total)
+                    index += 1
+                else:
+                    self._finish_circuit(candidate, probe_epoch=probe_epoch)
+                    if self._hooks is not None and driver:
+                        self._hooks.on_attempt_end(
+                            driver,
+                            node=node,
+                            runtime=runtime,
+                            served=True,
+                            usage=result.usage,
+                            elapsed_ms=int((time.perf_counter() - started) * 1000),
+                        )
+                    self.served_by = driver
+                    self.served_by_node = node
+                    self.tier = tier_index + 1
+                    return result
+        assert last_exc is not None
+        raise last_exc
+
+    async def decide(self, request: DecisionRequest) -> DecisionResponse:
+        """`embed()`'s cascade, over replicas of ONE decision model.
+
+        Identical taxonomy and identical structural guarantee: the
+        single tier `RoutingTable.pick_decision` builds contains only
+        backends serving the requested model id with a decision
+        capability, so a cascade cannot reach a different model — the
+        same decision quietly answered by a different model is a
+        different decision. A fired deadline is BackendTimeout-shaped at
+        the driver (504) and is not cascade-eligible, per R2.5.
+        """
+        last_exc: Exception | None = None
+        total = len(self.candidates)
+        index = 0
+        for tier_index, tier in enumerate(self._tiers):
+            for candidate in tier:
+                if self.authorize_attempt is not None:
+                    await self.authorize_attempt()
+                circuit = getattr(candidate, "circuit", None)
+                if circuit is not None and not circuit.acquire():
+                    if last_exc is None:
+                        last_exc = _cooling_error(circuit.until - time.perf_counter())
+                    continue
+                probe_epoch = circuit.epoch if circuit is not None and circuit.probing else None
+                self.attempts = index + 1
+                driver = getattr(candidate, "name", None)
+                node = getattr(candidate, "node", None)
+                runtime: Key | None = None
+                if self._hooks is not None and driver:
+                    runtime = self._hooks.on_attempt_start(driver, node=node)
+                started = time.perf_counter()
+                try:
+                    result = await candidate.decide(request)
+                except BaseException as exc:
+                    self._finish_circuit(candidate, exc, probe_epoch=probe_epoch)
+                    if self._hooks is not None and driver:
+                        self._hooks.on_attempt_end(
+                            driver,
+                            node=node,
+                            runtime=runtime,
+                            served=False,
+                            elapsed_ms=int((time.perf_counter() - started) * 1000),
+                            error=type(exc).__name__,
+                            retry_disposition=retry_disposition(exc),
+                        )
+                    if not isinstance(exc, Exception) or not _is_cascade_eligible(exc):
+                        raise
+                    last_exc = exc
+                    self._log_cascade("decide", index, candidate, exc, total=total)
                     index += 1
                 else:
                     self._finish_circuit(candidate, probe_epoch=probe_epoch)

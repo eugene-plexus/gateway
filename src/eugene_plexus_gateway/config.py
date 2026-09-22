@@ -162,6 +162,23 @@ FIELDS: list[ConfigField] = [
         maximum=300,
     ),
     ConfigField(
+        key="decisionMaxQuestions",
+        label="Decision questions per request",
+        description=(
+            "Ceiling on how many typed questions one POST /v1/systemone "
+            "request may carry. A bound enforced before any backend work, "
+            "because every question multiplies what a single-slot decision "
+            "backend will hold capacity for. The protocol's own per-question "
+            "bounds (255 choice options, 2-10 score levels) are fixed and "
+            "not configurable."
+        ),
+        category="routing",
+        valueType=ConfigValueType.integer,
+        default=32,
+        minimum=1,
+        maximum=256,
+    ),
+    ConfigField(
         key="modelSlots",
         label="Model slots (priority lists)",
         description=(

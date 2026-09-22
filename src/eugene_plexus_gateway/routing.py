@@ -276,8 +276,34 @@ class _Backend:
         embeddings is a chat backend, which is every driver that existed
         before this surface did -- so the default has to be True or
         re-pinning would silently unroute every model in the install.
+
+        Since B2 a backend can also say so outright: a decision driver
+        reports `chatCapable: false`, and routing a conversation to it
+        would die as a protocol error inside a backend that never spoke
+        chat. Absent still reads as chat-capable, so nothing that
+        predates the field changes meaning.
         """
-        return not self.embeds or self.info.capabilities is None
+        caps = self.info.capabilities
+        if caps is not None and caps.chatCapable is False:
+            return False
+        return not self.embeds or caps is None
+
+    @property
+    def decides(self) -> bool:
+        """Whether this backend answers typed decisions (POST /v1/decide).
+
+        Present-or-absent on `/v1/info`, exactly like `embeddings` --
+        its absence is the honest default for every backend that
+        predates the surface."""
+        caps = self.info.capabilities
+        return caps is not None and caps.decision is not None
+
+    @property
+    def decision_max_concurrent(self) -> int | None:
+        caps = self.info.capabilities
+        if caps is None or caps.decision is None:
+            return None
+        return caps.decision.maxConcurrent
 
     @property
     def parallel_slots(self) -> int:
@@ -373,8 +399,10 @@ class Resolution:
 
     def surfaces(self) -> list[str]:
         backends = self.backends()
-        return (["chat"] if any(b.chats for b in backends) else []) + (
-            ["embeddings"] if any(b.embeds for b in backends) else []
+        return (
+            (["chat"] if any(b.chats for b in backends) else [])
+            + (["embeddings"] if any(b.embeds for b in backends) else [])
+            + (["decisions"] if any(b.decides for b in backends) else [])
         )
 
     def has_backends(self) -> bool:
@@ -1419,6 +1447,39 @@ class RoutingTable:
         ordered = [b.client for b in self._order(resolution.model, eligible)]
         return TieredClient(name=resolution.model, tiers=[ordered], hooks=self)
 
+    def pick_decision(self, resolution: Resolution) -> TieredClient | None:
+        """`pick_embedding`'s single-model tier, for typed decisions.
+
+        The same structural rule for the same reason with the stakes
+        raised: a decision quietly answered by a different model is a
+        different decision, and a caller acting on it cannot tell.
+
+        Plus the one constraint decisions add: a backend advertising
+        `decision.maxConcurrent` is skipped while its in-flight count is
+        at that ceiling. Kev's server holds one request at a time and
+        cannot shed work, so admitting a second would not queue politely
+        -- it would sit on a socket the backend will not read for the
+        whole of someone else's decision, which is the over-admission a
+        non-cancellable engine cannot absorb. All-at-capacity is a None
+        the route reports as busy-retryable, never a queue.
+        """
+        eligible = [
+            b
+            for b in resolution.eligible_backends()
+            if b.decides and b.info.modelId == resolution.model
+        ]
+        if not eligible:
+            return None
+        free = [
+            b
+            for b in eligible
+            if b.decision_max_concurrent is None or self.inflight(b.key) < b.decision_max_concurrent
+        ]
+        if not free:
+            return None
+        ordered = [b.client for b in self._order(resolution.model, free)]
+        return TieredClient(name=resolution.model, tiers=[ordered], hooks=self)
+
     def surfaces_for(self, model: str) -> list[Surface]:
         """Which OpenAI surfaces this model can be sent to.
 
@@ -1437,6 +1498,8 @@ class RoutingTable:
             out.append(Surface.chat)
         if any(b.embeds for b in backends):
             out.append(Surface.embeddings)
+        if any(b.decides for b in backends):
+            out.append(Surface.decisions)
         return out
 
     def candidates_considered(self, resolution: Resolution) -> list[CandidateRow]:

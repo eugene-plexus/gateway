@@ -18,12 +18,16 @@ from fastapi.testclient import TestClient
 from eugene_plexus_gateway._generated.driver_models import (
     BackendKind,
     Capabilities,
+    DecisionCapability,
     DriverInfo,
     FinishReason,
     GenerateRequest,
     GenerateResponse,
     ToolCall,
     Usage,
+)
+from eugene_plexus_gateway._generated.driver_models import (
+    Kind as DecisionKindEnum,
 )
 from eugene_plexus_gateway.app import create_app
 from eugene_plexus_gateway.driver_client import StreamEvent
@@ -53,6 +57,8 @@ class FakeDriverClient:
         node: str | None = None,
         supports_tools: bool = False,
         supports_embeddings: bool = False,
+        supports_decisions: bool = False,
+        decision_max_concurrent: int | None = None,
     ) -> None:
         self.name = name
         self.base_url = base_url
@@ -68,6 +74,11 @@ class FakeDriverClient:
         node, because two replicas of one model share a runtime name."""
         self.supports_tools = supports_tools
         self.supports_embeddings = supports_embeddings
+        self.supports_decisions = supports_decisions
+        self.decision_max_concurrent = decision_max_concurrent
+        self.decide_calls = 0
+        self.decide_hook = None
+        self.decide_error: Exception | None = None
         self.tool_calls: list[ToolCall] | None = None
         """When set, `generate`/`stream` answer with these instead of
         text -- the tool-call-only turn, whose `content` is None."""
@@ -121,6 +132,15 @@ class FakeDriverClient:
             maxContextTokens=self.max_context_tokens,
             toolCalling=self.supports_tools,
             embeddings=self.supports_embeddings or None,
+            chatCapable=not self.supports_decisions,
+            decision=(
+                DecisionCapability(
+                    kinds=[DecisionKindEnum.noul, DecisionKindEnum.choice, DecisionKindEnum.score],
+                    maxConcurrent=self.decision_max_concurrent,
+                )
+                if self.supports_decisions
+                else None
+            ),
         )
         return DriverInfo(
             backend=self.backend,
@@ -178,6 +198,59 @@ class FakeDriverClient:
         return EmbedResponse(
             embeddings=[[seed + i for i in range(4)] for _ in request.input],
             modelId=self.model_id,
+            backend=self.backend,
+            usage=self.usage,
+            latencyMs=1,
+        )
+
+    async def decide(self, request: Any) -> Any:
+        """Canned decisions per question kind. `choice` always picks the
+        FIRST option of the request's criteria, so a test can tell the
+        answer derives from the request and not from a hardcoded body."""
+        from eugene_plexus_gateway._generated.driver_models import (
+            DecisionAnswer,
+            DecisionResponse,
+        )
+
+        self.decide_calls += 1
+        if self.decide_hook is not None:
+            await self.decide_hook()
+        if self.decide_error is not None:
+            raise self.decide_error
+        answers: dict[str, DecisionAnswer] = {}
+        for name, question in request.questions.items():
+            kind = getattr(question.type, "value", question.type)
+            if kind == "noul":
+                answers[name] = DecisionAnswer.model_validate({"type": "noul", "noul": 0.9})
+            elif kind == "choice":
+                options = list(question.criteria or {"only": None})
+                probabilities = {o: 0.0 for o in options}
+                probabilities[options[0]] = 1.0
+                answers[name] = DecisionAnswer.model_validate(
+                    {
+                        "type": "choice",
+                        "choice": options[0],
+                        "probabilities": probabilities,
+                        "confidence": 0.8,
+                    }
+                )
+            else:
+                levels = list(question.criteria or ["a", "b"])
+                answers[name] = DecisionAnswer.model_validate(
+                    {
+                        "type": "score",
+                        "score": 1.0,
+                        "legend": {str(i): level for i, level in enumerate(levels)},
+                        "probabilities": {
+                            str(i): (1.0 if i == 1 else 0.0) for i in range(len(levels))
+                        },
+                        "confidence": 0.7,
+                    }
+                )
+        return DecisionResponse(
+            answers=answers,
+            modelId=self.model_id,
+            reportedModel=f"<{self.name} reported>",
             backend=self.backend,
             usage=self.usage,
             latencyMs=1,

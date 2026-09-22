@@ -38,7 +38,13 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
-from .. import admission, anthropic, chat_contract
+from .. import admission, anthropic, chat_contract, decisions
+from .._generated.driver_models import (
+    DecisionQuestion as DriverDecisionQuestion,
+)
+from .._generated.driver_models import (
+    DecisionRequest as DriverDecisionRequest,
+)
 from .._generated.driver_models import (
     EmbedRequest,
     GenerateRequest,
@@ -73,6 +79,10 @@ from .._generated.models import (
     ResponseFormat,
     Role1,
     Role2,
+    SystemOneAnswer,
+    SystemOneRequest,
+    SystemOneResponse,
+    SystemOneUsage,
     Tool,
     ToolCall,
     ToolCallDelta,
@@ -523,6 +533,10 @@ async def _prepare(
     # operator can make entirely inside our own UI.
     surfaces = resolution.surfaces()
     if surfaces and surface not in surfaces:
+        # A decision-only model deserves the decision door's name, not
+        # the embeddings surface the caller was going to be pointed at.
+        if surfaces == ["decisions"]:
+            instead = "/v1/systemone"
         return _wrong_surface(body.model, surfaces, wanted=surface, instead=instead)
 
     # **Refused here, never stripped.** Checked before a backend is
@@ -1114,6 +1128,148 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
         usage=usage,
         x_eugene_plexus=_routing_info(client, table, body.model, started),
     )
+
+
+# --------------------------------------------------------------------------- #
+# /v1/systemone
+# --------------------------------------------------------------------------- #
+
+
+@router.post("/v1/systemone", dependencies=_auth)
+async def create_decision(request: Request, body: SystemOneRequest) -> Any:
+    """One state, named typed questions, structured answers — the pinned
+    TypeSafe shape, verbatim, so a TypeSafe client changes its base URL
+    and nothing else.
+
+    Shares the embeddings route's structural rule (a single-model tier;
+    a decision answered by a different model is a different decision)
+    and adds two of its own. **Bounds run before any backend work**, on
+    the RAW question objects, because pydantic sheds the unknown fields
+    the protocol says to refuse. And **a departed caller frees
+    nothing**: the backend cannot shed work (Kev holds one request at a
+    time), so the call deliberately runs to completion without
+    `serve_while_connected` — capacity stays occupied until the work the
+    caller abandoned actually ends, which is what stops the next request
+    from being over-admitted onto a busy single slot.
+    """
+    await admission.authorize(request, body.model)
+    table = _routing(request)
+    if table is None:
+        return _error(
+            code=503,
+            message="The gateway is starting up or in safe mode; no routing table exists yet.",
+            error_type="service_unavailable",
+        )
+
+    resolution = await admission.permitted(table.resolve(body.model))
+    if not resolution.has_backends():
+        return _no_such_model(body.model, table).as_openai()
+
+    surfaces = resolution.surfaces()
+    if surfaces and "decisions" not in surfaces:
+        return _wrong_surface(
+            body.model, surfaces, wanted="decisions", instead="/v1/chat/completions"
+        ).as_openai()
+
+    raw = await request.json()
+    store = _store(request)
+    max_questions = 32
+    if store is not None:
+        try:
+            max_questions = int(store.get("decisionMaxQuestions") or 32)
+        except (TypeError, ValueError):
+            max_questions = 32
+    violations = decisions.protocol_violations(raw.get("questions"), max_questions=max_questions)
+    if violations:
+        # TypeSafe's own status for a malformed question, so a TypeSafe
+        # client's error handling works unchanged.
+        return _error(
+            code=422,
+            message="; ".join(violations),
+            error_type="invalid_request_error",
+            param="questions",
+        )
+
+    client = table.pick_decision(resolution)
+    if client is None and await table.refresh_if_stale():
+        resolution = await admission.permitted(table.resolve(body.model))
+        client = table.pick_decision(resolution)
+    if client is None:
+        # Either nothing eligible, or everything eligible is at its
+        # advertised concurrency ceiling. The second is a 503 with
+        # retry semantics, never a queue: queued work on a single-slot
+        # backend is invisible over-admission.
+        if [b for b in resolution.eligible_backends() if b.decides]:
+            return _error(
+                code=503,
+                message=(
+                    f"Every backend serving {body.model!r} is at its decision "
+                    "concurrency ceiling right now. Retry shortly; requests are "
+                    "deliberately not queued on a backend that cannot shed work."
+                ),
+                error_type="service_unavailable",
+            )
+        return _not_ready(resolution, None).as_openai()
+
+    if isinstance(client, TieredClient):
+        client.authorize_attempt = admission.before_attempt
+    started = time.perf_counter()
+    driver_request = DriverDecisionRequest(
+        state=body.state,
+        questions={
+            name: DriverDecisionQuestion.model_validate(q.model_dump(exclude_none=True))
+            for name, q in body.questions.items()
+        },
+        localOnly=admission.local_only(),
+        requestId=str(admission.request_id()) if admission.request_id() else None,
+    )
+    try:
+        result = await client.decide(driver_request)
+    except DriverError as e:
+        return _driver_failure(e).as_openai()
+    except httpx.TimeoutException as e:
+        return _error(
+            code=504,
+            message=(
+                f"No backend serving {body.model!r} answered within the gateway's "
+                f"requestTimeoutSeconds ({_timeout_seconds(_store(request)):g}s). It was "
+                f"not retried on another backend: a timeout after possible execution "
+                f"never justifies silently sending the same decision to a different "
+                f"model, and the outcome is uncertain rather than failed. "
+                f"({type(e).__name__})"
+            ),
+            error_type="timeout",
+        )
+    except httpx.HTTPError as e:
+        return _error(
+            code=502,
+            message=(
+                f"A backend serving {body.model!r} failed ({type(e).__name__}). "
+                "Work may have occurred; an uncertain outcome is not replayed "
+                "automatically, and the cascade never reached a different model."
+            ),
+            error_type="upstream_error",
+        )
+
+    usage = None
+    if result.usage is not None:
+        usage = SystemOneUsage(
+            input_tokens=result.usage.promptTokens,
+            output_tokens=result.usage.completionTokens,
+        )
+    response = SystemOneResponse(
+        model=result.modelId or body.model,
+        answers={
+            name: SystemOneAnswer.model_validate(a.model_dump(exclude_none=True))
+            for name, a in result.answers.items()
+        },
+        usage=usage,
+        x_eugene_plexus=_routing_info(client, table, body.model, started),
+    )
+    # exclude_none: a TypeSafe answer carries exactly its kind's fields
+    # -- a noul with five nulls beside it is not the pinned shape, and an
+    # SDK that switches on the object's keys would trip over them.
+    return JSONResponse(response.model_dump(mode="json", exclude_none=True))
 
 
 # --------------------------------------------------------------------------- #
