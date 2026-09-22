@@ -169,20 +169,31 @@ class EngineKind(StrEnum):
     it or tell when it is ready.
 
     `llama_cpp` drives upstream `llama-server` and loads GGUF.
-    `vllm` drives upstream `vllm serve` and loads safetensors. MLX
-    is a third adapter later. We never ship an engine — every one of
-    them is an upstream project we wrap and track.
+    `vllm` drives upstream `vllm serve` and loads safetensors.
+    `mlx` drives upstream `mlx_lm.server` and loads MLX-format
+    safetensors, on Apple silicon only — experimental until a
+    physical Mac run is recorded. We never ship an engine — every
+    one of them is an upstream project we wrap and track.
 
-    The two differ in far more than argv, and that is why readiness
+    They differ in far more than argv, and that is why readiness
     is per-adapter rather than one shared TCP check:
     `llama-server` answers `/health` while it loads and reports that
     it is loading, whereas vLLM binds its port *before* loading the
     model and refuses connections until the model is in memory — so
     for minutes it is indistinguishable, over the network alone,
-    from a process that died. They differ in acquisition too: a
-    llama.cpp build is fetched and verified by us, while vLLM is a
-    Python package the operator installs themselves. See
-    `EngineAcquisition.policy`.
+    from a process that died. `mlx_lm.server` is a third mechanism
+    again and the most awkward: it serves HTTP immediately, and at
+    the pinned release its `/health` answers a hardcoded
+    `{"status": "ok"}` while the model is still loading on another
+    thread, so **no read-only probe can tell loading from ready**.
+    Its adapter proves residency by asking for one token, once per
+    process, and only then treats the health endpoint as evidence.
+    (Upstream `main` has since taught `/health` to answer 503
+    `unavailable` while loading; the adapter reads that as loading
+    too, so a future pin gets the cheap probe for free.) They
+    differ in acquisition too: a llama.cpp build is fetched and
+    verified by us, while vLLM and mlx-lm are Python packages the
+    operator installs themselves. See `EngineAcquisition.policy`.
 
     Lives here rather than on the agent because two components
     reference it: the agent's engines and runtimes, and a
@@ -193,6 +204,7 @@ class EngineKind(StrEnum):
 
     llama_cpp = 'llama_cpp'
     vllm = 'vllm'
+    mlx = 'mlx'
 
 
 class ModelFormat(StrEnum):
@@ -929,7 +941,7 @@ class EmbedResponse(BaseModel):
     )
     modelId: str | None = Field(
         None,
-        description="The model that produced these vectors, as the backend named\nit. **Load-bearing beyond attribution:** vectors from two\nmodels are not comparable, so a caller storing them needs to\nknow which model's space they belong to.\n",
+        description="The model that produced these vectors, as the **public**\nidentifier — normalized the same way `GenerateResponse`'s\nis when `upstreamModelId` is in play. **Load-bearing beyond\nattribution:** vectors from two models are not comparable,\nso a caller storing them needs to know which model's space\nthey belong to — and the public id is the only name that\nstays stable across replicas of one model on several nodes.\n",
     )
     backend: BackendKind | None = None
     usage: Usage | None = None
@@ -1007,7 +1019,11 @@ class DriverInfo(BaseModel):
     )
     modelId: str | None = Field(
         None,
-        description='Backend-specific model identifier (e.g. `"claude-opus-4-7"`).\nOptional — omitted when the driver is configured to use the\nadapter\'s built-in default rather than pinning a specific model.\n',
+        description='The **public** model identifier — what the gateway routes\non and what callers name (e.g. `"claude-opus-4-7"`).\nOptional — omitted when the driver is configured to use the\nadapter\'s built-in default rather than pinning a specific\nmodel. When `upstreamModelId` is unset this is also what\nthe backend is asked for, which is every install that\npredates the split.\n',
+    )
+    upstreamModelId: str | None = Field(
+        None,
+        description="What this driver actually sends to its backend, when that\ndiffers from the public `modelId`. Exists because some\nbackends' served name is not ours to choose:\n`mlx_lm.server` answers only to upstream's `default_model`\nsentinel or to the model's absolute path — the first\ncollides across every MLX runtime in an install and the\nsecond publishes the operator's directory layout — so the\nsupervised runtime's companion driver advertises the public\nalias here as `modelId` and translates to the sentinel at\nthe backend boundary, nowhere else.\n\nDiagnostic, never a routing key: the gateway routes and\nauthorizes on `modelId` alone, and this value must not\nappear in any public model list. Defaults to `modelId` when\nunset. Responses report the public id (`GenerateResponse`\nand `EmbedResponse` `modelId`), so two runtimes serving\ndifferent models behind one upstream sentinel stay\ndistinguishable everywhere a caller looks.\n",
     )
     runtime: str | None = Field(
         None,
@@ -1253,7 +1269,7 @@ class GenerateResponse(BaseModel):
     backend: BackendKind | None = None
     modelId: str | None = Field(
         None,
-        description='Backend-specific model identifier (e.g. `"claude-opus-4-7"`).',
+        description='The public model identifier this driver serves (e.g.\n`"claude-opus-4-7"`) — the same value `/v1/info` advertises,\n**normalized**: when the driver translates to an\n`upstreamModelId` at the backend boundary, the backend\'s own\nname for itself is not echoed here. A caller that asked the\npublic alias gets the public alias back, on this field and\non the terminal frame of a stream alike.\n',
     )
     latencyMs: int | None = Field(
         None, description='End-to-end driver-side latency in milliseconds.'

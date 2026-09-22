@@ -30,10 +30,17 @@ def _driver_entry(name: str, port: int) -> dict[str, Any]:
     }
 
 
-def _info(model_id: str | None, *, context: int | None = None) -> dict[str, Any]:
+def _info(
+    model_id: str | None,
+    *,
+    context: int | None = None,
+    upstream: str | None = None,
+) -> dict[str, Any]:
     body: dict[str, Any] = {"backend": "openai_compat_http", "version": "0.1.0"}
     if model_id is not None:
         body["modelId"] = model_id
+    if upstream is not None:
+        body["upstreamModelId"] = upstream
     if context is not None:
         body["capabilities"] = {"maxContextTokens": context}
     return body
@@ -102,6 +109,36 @@ async def test_refresh_groups_drivers_by_the_model_they_serve(route_http: Any) -
 
     assert table.known_models() == ["llama", "qwen"]
     assert [b.name for b in table.backends_for("qwen")] == ["a"]
+    await table.aclose()
+
+
+async def test_upstream_model_id_is_never_a_routing_key(route_http: Any) -> None:
+    """The MLX shape: two drivers whose backends both answer only to
+    upstream's `default_model` sentinel, advertising two different
+    public aliases. They must stay two models — grouping them as
+    replicas of one would load-balance across different models and
+    return the wrong model's output, silently, which is the collision
+    `upstreamModelId` exists to prevent. The gateway routes on
+    `modelId` and treats the upstream id as a diagnostic it ignores."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/components":
+            return httpx.Response(
+                200, json=_components(_driver_entry("a", 8081), _driver_entry("b", 8082))
+            )
+        if request.url.port == 8081:
+            return httpx.Response(200, json=_info("qwen3-tiny", upstream="default_model"))
+        return httpx.Response(200, json=_info("llama-tiny", upstream="default_model"))
+
+    route_http(handler)
+    table = RoutingTable(agent_url="http://agent")
+    await table.refresh()
+
+    assert table.known_models() == ["llama-tiny", "qwen3-tiny"]
+    assert [b.name for b in table.backends_for("qwen3-tiny")] == ["a"]
+    assert [b.name for b in table.backends_for("llama-tiny")] == ["b"]
+    # And the sentinel itself is not a model anyone can ask for.
+    assert table.backends_for("default_model") == []
     await table.aclose()
 
 
