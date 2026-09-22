@@ -260,21 +260,23 @@ def test_no_metrics_file_is_written_in_safe_mode(tmp_path: Path) -> None:
 def _row(
     *,
     driver: str = "d",
+    model: str = "qwen",
     tokens: int | None = 40,
     elapsed: int = 1000,
     when: datetime | None = None,
     served: bool = True,
+    first_ms: int | None = None,
 ) -> RequestRow:
     return RequestRow(
         started_at=when or datetime.now(UTC),
-        requested_model="qwen",
-        served_model="qwen" if served else None,
+        requested_model=model,
+        served_model=model if served else None,
         attempts=1,
         tier=1 if served else None,
         total_ms=elapsed,
         outcome="served" if served else "error",
         completion_tokens=tokens,
-        tries=[AttemptRow(driver=driver, elapsed_ms=elapsed, served=served)],
+        tries=[AttemptRow(driver=driver, elapsed_ms=elapsed, served=served, first_ms=first_ms)],
     )
 
 

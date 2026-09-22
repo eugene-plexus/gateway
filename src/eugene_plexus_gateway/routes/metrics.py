@@ -67,12 +67,15 @@ async def get_metrics(
     model: Annotated[str | None, Query()] = None,
     driver: Annotated[str | None, Query()] = None,
     bucket: Annotated[Literal["none", "hour"], Query()] = "none",
+    groupBy: Annotated[Literal["backend", "model", "total"], Query()] = "backend",
 ) -> MetricsSummary:
     store = _store(request)
     end = until or datetime.now(UTC)
     start = since or (end - DEFAULT_WINDOW)
 
-    groups = store.summary(since=start, until=end, model=model, driver=driver, bucket=bucket)
+    groups = store.summary(
+        since=start, until=end, model=model, driver=driver, bucket=bucket, group_by=groupBy
+    )
     return MetricsSummary(
         windowStart=start,
         windowEnd=end,

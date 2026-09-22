@@ -231,6 +231,7 @@ class RoutingHooks(Protocol):
         error: str | None = None,
         retry_disposition: str | None = None,
         usage: Any = None,
+        first_ms: int | None = None,
     ) -> None: ...
 
 
@@ -735,6 +736,13 @@ class TieredClient:
                 usage = None
                 reported = False
                 stream = None
+                # Time to first token, this attempt alone. Stamped on the
+                # first event of any kind — the commit point — because
+                # that is the moment the backend proved it was computing
+                # rather than queueing. Recorded on failures too: a
+                # stream that emitted tokens and then broke still had a
+                # first token, and its timing is evidence.
+                first_ms: int | None = None
                 try:
                     prepared = (
                         await self.prepare_request(candidate, request)
@@ -743,6 +751,8 @@ class TieredClient:
                     )
                     stream = candidate.stream(prepared)
                     async for event in stream:
+                        if first_ms is None:
+                            first_ms = int((time.perf_counter() - started) * 1000)
                         committed = True
                         if event.done:
                             saw_done = True
@@ -762,6 +772,7 @@ class TieredClient:
                             retry_disposition="indeterminate"
                             if committed
                             else retry_disposition(exc),
+                            first_ms=first_ms,
                         )
                     if committed:
                         # Past the commit point. The client already holds
@@ -806,6 +817,7 @@ class TieredClient:
                             retry_disposition=None if saw_done else "indeterminate",
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                             error=None if saw_done else "IncompleteStream",
+                            first_ms=first_ms,
                         )
                     self.served_by = driver
                     self.served_by_node = node
@@ -845,6 +857,7 @@ class TieredClient:
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                             error=type(ending).__name__ if ending is not None else "Abandoned",
                             retry_disposition="indeterminate",
+                            first_ms=first_ms,
                         )
                     if stream is not None:
                         await stream.aclose()

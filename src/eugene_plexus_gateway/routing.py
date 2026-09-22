@@ -1113,6 +1113,7 @@ class RoutingTable:
         error: str | None = None,
         retry_disposition: str | None = None,
         usage: Any = None,
+        first_ms: int | None = None,
     ) -> None:
         key: Key = (node, driver)
         self._inflight[key] = max(0, self._inflight.get(key, 0) - 1)
@@ -1144,6 +1145,7 @@ class RoutingTable:
                 completion_tokens=getattr(usage, "completionTokens", 0)
                 if usage is not None
                 else None,
+                first_ms=first_ms,
             )
         )
 

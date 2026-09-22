@@ -75,7 +75,7 @@ async def test_v3_attempts_survive_migration_with_usage_explicitly_unknown(tmp_p
         "    client_key_name   TEXT,\n    correlation_id    TEXT,\n    elapsed_ms        INTEGER\n",
         "    client_key_name   TEXT\n",
     ).replace(
-        "    backend_ms INTEGER,\n    retry_disposition TEXT,\n    usage_known INTEGER NOT NULL DEFAULT 0,\n    prompt_tokens INTEGER,\n    completion_tokens INTEGER\n",
+        "    backend_ms INTEGER,\n    retry_disposition TEXT,\n    usage_known INTEGER NOT NULL DEFAULT 0,\n    prompt_tokens INTEGER,\n    completion_tokens INTEGER,\n    first_ms   INTEGER\n",
         "    backend_ms INTEGER\n",
     )
     conn.executescript(old)

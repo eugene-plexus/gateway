@@ -1587,7 +1587,9 @@ class Throughput(BaseModel):
 class MetricsGroup(BaseModel):
     """
     One dimension tuple's numbers over the window, or over one hour
-    of it when `bucket=hour`.
+    of it when `bucket=hour`. Under `groupBy=model` the backend
+    dimensions (`driver`, `runtime`, `node`, `backend`) are absent;
+    under `groupBy=total`, `model` is too.
 
     """
 
@@ -1623,7 +1625,16 @@ class MetricsGroup(BaseModel):
     )
     latencyMs: Percentiles
     tokensPerSecond: Throughput | None = Field(
-        None, description='Null when no request in this group reported token usage.'
+        None,
+        description="Null when no request in this group reported token usage.\nWhole-attempt rate: the serving attempt's elapsed time\nincludes prefill, so this understates decode speed on long\nprompts. `decodeTokensPerSecond` beside it excludes prefill;\nthe two differing is the prefill cost made visible.\n",
+    )
+    ttftMs: Percentiles | None = Field(
+        None,
+        description="Time to first token: milliseconds from the start of the\nserving attempt to its first streamed event, over streamed\nrequests only. Null when nothing in the group streamed — a\nnon-streamed request has no first token to time, the\nresponse arrives whole. Measured gateway-side, so it\nincludes the gateway→driver hop and the driver's own\ndispatch: on a local engine it is dominated by prefill but\nis not a pure prefill measurement, and deriving a\nprompt-tokens-per-second from it would be confidently\nwrong. The benchmark is the instrument for real prefill\ncurves.\n",
+    )
+    decodeTokensPerSecond: Throughput | None = Field(
+        None,
+        description='Completion tokens over the serving attempt\'s time **after**\nits first streamed event — the decode rate an enthusiast\nmeans by "tokens per second", with prefill excluded. Only\ncomputed for streamed requests that reported usage and ran\npast a minimum window (2+ tokens and 250 ms after the first\nevent, the same guard the playground\'s badge uses), so its\n`samples` can be lower than `tokensPerSecond.samples`. Null\nwhen nothing in the group qualifies.\n',
     )
     waitedMs: Percentiles | None = Field(
         None,
@@ -1694,6 +1705,11 @@ class MetricAttempt(BaseModel):
     elapsedMs: int = Field(
         ...,
         description='This attempt alone, not the request. Gateway-side, so it\nincludes the local hop to the driver.\n',
+        ge=0,
+    )
+    firstMs: int | None = Field(
+        None,
+        description='Milliseconds from the start of this attempt to its first\nstreamed event — time to first token, gateway-side. Null\nfor non-streamed attempts (the response arrives whole, so\nthere is no first token to time) and for rows recorded\nbefore this was measured. Recorded on failures too: a\nstream that emitted tokens and then broke still had a\nfirst token, and its timing is evidence about the backend.\n',
         ge=0,
     )
     backendMs: int | None = Field(

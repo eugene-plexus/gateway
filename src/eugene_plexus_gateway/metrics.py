@@ -50,7 +50,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Bounded because the alternative to dropping rows is stalling
 # completions, and that trade is never worth making. Sized so a burst
@@ -71,6 +71,13 @@ DRAIN_INTERVAL_SECONDS = 1.0
 # Retention and rollup run on the writer's own loop rather than a second
 # timer, because a second timer is a second thing to fail silently.
 PRUNE_INTERVAL_SECONDS = 3600.0
+
+# A decode rate qualifies only past a minimum window: a two-token answer
+# reports a rate dominated by quantization, not by the GPU. The same
+# guard the playground's badge uses (`clientTokPerSec`), kept equal on
+# purpose so the two surfaces cannot disagree about one request.
+DECODE_MIN_TOKENS = 2
+DECODE_MIN_WINDOW_MS = 250
 
 
 @dataclass(slots=True)
@@ -105,6 +112,9 @@ class AttemptRow:
     usage_known: bool = False
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    # Time to this attempt's first streamed event — TTFT, gateway-side.
+    # None for non-streamed attempts, which have no first token to time.
+    first_ms: int | None = None
 
 
 @dataclass(slots=True)
@@ -184,7 +194,8 @@ CREATE TABLE IF NOT EXISTS attempt (
     retry_disposition TEXT,
     usage_known INTEGER NOT NULL DEFAULT 0,
     prompt_tokens INTEGER,
-    completion_tokens INTEGER
+    completion_tokens INTEGER,
+    first_ms   INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS attempt_request ON attempt (request_id);
@@ -313,7 +324,7 @@ class MetricsStore:
         conn.commit()
 
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        if row is not None and int(row[0]) in (2, 3):
+        if row is not None and int(row[0]) in (2, 3, 4):
             columns = {r[1] for r in conn.execute("PRAGMA table_info(request)")}
             for column in ("client_key_id", "client_key_name"):
                 if column not in columns:
@@ -325,6 +336,10 @@ class MetricsStore:
                     "usage_known": "INTEGER NOT NULL DEFAULT 0",
                     "prompt_tokens": "INTEGER",
                     "completion_tokens": "INTEGER",
+                    # v5: TTFT. Additive, so every older version migrates
+                    # in place — the existence check makes this idempotent
+                    # whatever version the file starts at.
+                    "first_ms": "INTEGER",
                 },
             }.items():
                 existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -501,8 +516,8 @@ class MetricsStore:
                 conn.executemany(
                     "INSERT INTO attempt (request_id, seq, driver, runtime, node, backend,"
                     " elapsed_ms, served, error, backend_ms, retry_disposition, usage_known,"
-                    " prompt_tokens, completion_tokens)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " prompt_tokens, completion_tokens, first_ms)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         (
                             request_id,
@@ -519,6 +534,7 @@ class MetricsStore:
                             int(a.usage_known),
                             a.prompt_tokens,
                             a.completion_tokens,
+                            a.first_ms,
                         )
                         for seq, a in enumerate(row.tries)
                     ],
@@ -645,6 +661,7 @@ class MetricsStore:
         model: str | None = None,
         driver: str | None = None,
         bucket: str = "none",
+        group_by: str = "backend",
     ) -> list[dict[str, Any]]:
         """Aggregate raw rows over a window, grouped as the contract says.
 
@@ -653,6 +670,13 @@ class MetricsStore:
         expressed once than as window functions, and the row counts here
         are small: a window is bounded by retention, and retention is
         bounded by a config key with a documented size.
+
+        `group_by` collapses the dimension tuple — `model` drops the
+        backend dimensions, `total` drops the model too — and it is a
+        server-side parameter rather than client-side math because
+        percentiles do not recombine: the install-wide p90 is not
+        computable from per-backend p90s, so the coarse grain must be
+        computed here, over the raw rows.
         """
         where = ["r.started_at >= ?", "r.started_at < ?"]
         params: list[Any] = [_iso(since), _iso(until)]
@@ -671,7 +695,8 @@ class MetricsStore:
             SELECT r.started_at, r.requested_model, r.outcome, r.attempts, r.tier,
                    r.total_ms, r.waited_ms, r.swapped_in, r.completion_tokens,
                    served.driver, served.runtime, served.node, served.backend,
-                   served.elapsed_ms, r.routing_ms, served.backend_ms
+                   served.elapsed_ms, r.routing_ms, served.backend_ms,
+                   served.first_ms, served.served
             FROM request r
             -- The attempt a request is ATTRIBUTED to: the one that served
             -- it, or, when none did, the last one tried.
@@ -717,18 +742,30 @@ class MetricsStore:
             s_elapsed,
             routing_ms,
             s_backend_ms,
+            s_first_ms,
+            s_served,
         ) in rows:
             bucket_start = started_at[:13] + ":00:00Z" if bucket == "hour" else None
-            key = (bucket_start, requested_model, s_driver, s_runtime, s_node, s_backend)
+            key: tuple[Any, ...]
+            if group_by == "total":
+                key = (bucket_start,)
+            elif group_by == "model":
+                key = (bucket_start, requested_model)
+            else:
+                key = (bucket_start, requested_model, s_driver, s_runtime, s_node, s_backend)
             g = groups.get(key)
             if g is None:
                 g = groups[key] = {
                     "bucketStart": bucket_start,
-                    "model": requested_model,
-                    "driver": s_driver,
-                    "runtime": s_runtime,
-                    "node": s_node,
-                    "backend": s_backend,
+                    # A collapsed grain omits the dimensions it collapsed
+                    # rather than carrying whichever value arrived first —
+                    # a `total` group naming one model would be a lie told
+                    # by iteration order.
+                    "model": requested_model if group_by != "total" else None,
+                    "driver": s_driver if group_by == "backend" else None,
+                    "runtime": s_runtime if group_by == "backend" else None,
+                    "node": s_node if group_by == "backend" else None,
+                    "backend": s_backend if group_by == "backend" else None,
                     "requests": 0,
                     "errors": 0,
                     "cascaded": 0,
@@ -736,6 +773,8 @@ class MetricsStore:
                     "_latency": [],
                     "_waited": [],
                     "_tps": [],
+                    "_ttft": [],
+                    "_decode": [],
                     "_routing": [],
                     "_overhead": [],
                     "tierCounts": {},
@@ -757,6 +796,20 @@ class MetricsStore:
             # exists to prevent.
             if completion_tokens and s_elapsed and s_elapsed > 0:
                 g["_tps"].append(completion_tokens * 1000.0 / s_elapsed)
+            # TTFT and decode rate, from attempts that SERVED only. The
+            # attributed attempt for a failed request is the last one
+            # tried, and a stream that died mid-answer has a first_ms
+            # too — mixing its timing into a group's TTFT would report
+            # the failure's latency as the backend's speed.
+            if s_served and s_first_ms is not None:
+                g["_ttft"].append(int(s_first_ms))
+                window = int(s_elapsed or 0) - int(s_first_ms)
+                if (
+                    completion_tokens
+                    and completion_tokens >= DECODE_MIN_TOKENS
+                    and window >= DECODE_MIN_WINDOW_MS
+                ):
+                    g["_decode"].append(completion_tokens * 1000.0 / window)
             if routing_ms is not None:
                 g["_routing"].append(int(routing_ms))
             # The control plane's own cost. Clamped at zero because the
@@ -772,6 +825,8 @@ class MetricsStore:
             latency = sorted(g.pop("_latency"))
             waited = sorted(g.pop("_waited"))
             tps = sorted(g.pop("_tps"))
+            ttft = sorted(g.pop("_ttft"))
+            decode = sorted(g.pop("_decode"))
             routing = sorted(g.pop("_routing"))
             overhead = sorted(g.pop("_overhead"))
             g["routingMs"] = _spread(routing)
@@ -803,6 +858,29 @@ class MetricsStore:
                     "samples": len(tps),
                 }
                 if tps
+                else None
+            )
+            # Null, not zeroed, for the same reason as tokensPerSecond:
+            # a group of non-streamed requests has no first token to
+            # time, and "unmeasured" must stay distinguishable from
+            # "instant".
+            g["ttftMs"] = (
+                {
+                    "p50": _percentile(ttft, 0.50),
+                    "p90": _percentile(ttft, 0.90),
+                    "p99": _percentile(ttft, 0.99),
+                    "max": ttft[-1],
+                }
+                if ttft
+                else None
+            )
+            g["decodeTokensPerSecond"] = (
+                {
+                    "p50": round(_pct_float(decode, 0.50), 2),
+                    "p90": round(_pct_float(decode, 0.90), 2),
+                    "samples": len(decode),
+                }
+                if decode
                 else None
             )
             out.append(g)
@@ -913,11 +991,12 @@ class MetricsStore:
                 usage_known,
                 prompt_tokens,
                 completion_tokens,
+                first_ms,
             ) in conn.execute(
                 f"""
                 SELECT request_id, driver, runtime, node, backend, elapsed_ms, served,
                        error, backend_ms, retry_disposition, usage_known,
-                       prompt_tokens, completion_tokens
+                       prompt_tokens, completion_tokens, first_ms
                 FROM attempt WHERE request_id IN ({placeholders}) ORDER BY request_id, seq
                 """,
                 ids,
@@ -936,6 +1015,7 @@ class MetricsStore:
                         "usageKnown": bool(usage_known),
                         "promptTokens": prompt_tokens,
                         "completionTokens": completion_tokens,
+                        "firstMs": first_ms,
                     }
                 )
 
