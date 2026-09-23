@@ -787,6 +787,17 @@ def translate_request(raw: Mapping[str, Any]) -> ChatCompletionRequest:
     )
 
 
+def translate_count_request(raw: Mapping[str, Any]) -> ChatCompletionRequest:
+    """A `count_tokens` body, translated exactly as a message is.
+
+    It has no `max_tokens` -- Anthropic's count endpoint takes none and
+    Claude Code sends none (captured) -- so one is supplied, and the shared
+    translation, every refusal in it included, applies unchanged. Nothing
+    is generated, so the number is never used for anything.
+    """
+    return translate_request({"max_tokens": 1, **raw})
+
+
 # --------------------------------------------------------------------------- #
 # Response translation
 # --------------------------------------------------------------------------- #

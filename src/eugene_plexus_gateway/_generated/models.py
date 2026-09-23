@@ -1365,6 +1365,14 @@ class RoutingBackendView(BaseModel):
     )
 
 
+class AnthropicTokenCount(BaseModel):
+    input_tokens: int = Field(
+        ...,
+        description="The prompt's size as the serving backend's own template and\ntokenizer count it -- what a generation of the same request\nwould report as its input.\n",
+        ge=0,
+    )
+
+
 class Role3(StrEnum):
     user = 'user'
     assistant = 'assistant'
@@ -2597,6 +2605,26 @@ class AnthropicMessagesRequest(BaseModel):
         None,
         description='Prompt-cache hints, read and dropped wherever they appear —\non system blocks, on the last user content block, and on\n`tool_result` blocks. A local engine owns its own KV cache\nand there is nothing here to honour.\n',
     )
+
+
+class AnthropicCountTokensRequest(BaseModel):
+    """
+    Request body for `POST /v1/messages/count_tokens`: a Messages
+    request without `max_tokens` (Claude Code sends `model`,
+    `messages` and, per category, `system` or `tools`). Translated
+    exactly as `POST /v1/messages` translates it, with the same
+    refusals enforced against the raw body.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    model: str
+    messages: list[AnthropicInputMessage]
+    system: str | list[AnthropicSystemBlock] | None = None
+    tools: list[AnthropicToolDefinition] | None = None
+    tool_choice: AnthropicToolChoice | None = None
 
 
 class Message(BaseModel):

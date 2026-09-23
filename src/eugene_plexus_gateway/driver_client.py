@@ -37,11 +37,16 @@ from ._generated.driver_models import (
     GenerateResponse,
     Problem,
     RetryDisposition,
+    TokenCount,
 )
 from ._http import internal_client
 from .circuit import Circuit
 
 log = logging.getLogger(__name__)
+
+# A count is two small calls to the backend beside its slots, never a
+# prefill, so it does not get a generation's minutes.
+_COUNT_TIMEOUT_SECONDS = 30.0
 
 
 class DriverError(Exception):
@@ -182,6 +187,7 @@ class DriverClient(Protocol):
     async def embed(self, request: EmbedRequest) -> EmbedResponse: ...
 
     async def decide(self, request: DecisionRequest) -> DecisionResponse: ...
+    async def count_tokens(self, request: GenerateRequest) -> int: ...
     def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]: ...
     async def aclose(self) -> None: ...
 
@@ -348,6 +354,25 @@ class HttpDriverClient:
             )
         try:
             return DecisionResponse.model_validate(response.json())
+        except ValueError as exc:
+            raise self._invalid_reply() from exc
+
+    async def count_tokens(self, request: GenerateRequest) -> int:
+        """The driver's `/v1/generate/count`: the backend's own tokenizer, no generation."""
+        payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
+        response = await self._client.post(
+            "/v1/generate/count", json=payload, timeout=_COUNT_TIMEOUT_SECONDS
+        )
+        if response.status_code >= 400:
+            raise DriverError(
+                driver_name=self.name,
+                driver_url=self.base_url,
+                status_code=response.status_code,
+                problem=_problem_from_response(response),
+                raw_body=response.text,
+            )
+        try:
+            return TokenCount.model_validate(response.json()).promptTokens
         except ValueError as exc:
             raise self._invalid_reply() from exc
 
@@ -1025,6 +1050,40 @@ class TieredClient:
             type(exc).__name__,
             next_action,
         )
+
+    async def count_tokens(self, request: GenerateRequest) -> int:
+        """Counted by a backend of the tier that would serve, or not at all.
+
+        **Never past the first tier that holds anything**, and that is the
+        rule rather than a shortcut: a later tier is another model, whose
+        tokenizer answers a different question -- a count of the fallback's
+        prompt presented as the primary's. The embeddings door's
+        no-cross-model rule, applied to counts.
+
+        Within that tier each replica is asked in the balancer's order
+        until one counts. That replays nothing: a count generates nothing,
+        so asking the next replica is not the uncertain-work replay the
+        generate cascade refuses. A 400 is the request's fault and would
+        be the same on every replica, so it is raised at once.
+        """
+        tier = next((t for t in self._tiers if t), [])
+        last: Exception | None = None
+        for candidate in tier:
+            try:
+                count = await candidate.count_tokens(request)
+            except DriverError as exc:
+                if exc.status_code == 400:
+                    raise
+                last = exc
+                continue
+            except httpx.HTTPError as exc:
+                last = exc
+                continue
+            self.served_by, self.served_by_node = candidate.name, candidate.node
+            return count
+        if last is None:  # pragma: no cover - pick() never builds an empty slot
+            raise ValueError(f"driver slot {self.name!r} has no backend to count with")
+        raise last
 
     async def aclose(self) -> None:
         for candidate in self.candidates:

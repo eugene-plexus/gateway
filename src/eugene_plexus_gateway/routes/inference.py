@@ -1013,6 +1013,101 @@ async def create_anthropic_message(request: Request) -> Any:
         )
 
 
+def _cannot_count(model: str, reason: str) -> JSONResponse:
+    """A count this door will not give, as the 400 Claude Code falls back on.
+
+    **A 400 and never a 5xx, measured**: `/context` tries a 4xx count
+    once and then counts by sending the request itself, and retries a
+    5xx first -- so every "cannot count", a backend that is down
+    included, is the status that costs the client one attempt.
+    """
+    return anthropic.error_response(
+        400,
+        f"Cannot count tokens for {model!r} without generating: {reason}. Nothing was "
+        "sent to the model; a client can count by sending the request instead.",
+    )
+
+
+@router.post("/v1/messages/count_tokens")
+async def count_anthropic_message_tokens(request: Request) -> Any:
+    """Anthropic's `count_tokens`, answered by the backend that would serve.
+
+    Claude Code's `/context` sends 13-14 of these, and against a 404 it
+    counts by generating -- a real one-token request per category, each
+    a full prefill (measured). So the body is translated as a message
+    is, and a **ready** backend of the tier that would serve counts it
+    with its own template and tokenizer; nothing is generated, nothing
+    is woken, nothing is recorded.
+
+    **A key check, not an admission.** Fourteen counts at once would
+    take fourteen of a key's concurrent reservations and fourteen of its
+    requests a minute, for a command that runs no inference; the key is
+    still verified and its model scope and `localOnly` still apply.
+    """
+    try:
+        await anthropic.authorize(request)
+    except anthropic.Refusal as refusal:
+        return refusal.response()
+    try:
+        raw = await request.json()
+    except Exception:
+        return anthropic.error_response(400, "The request body is not valid JSON.")
+    if not isinstance(raw, dict):
+        return anthropic.error_response(400, "The request body must be a JSON object.")
+    try:
+        body = anthropic.translate_count_request(raw)
+    except anthropic.Refusal as refusal:
+        return refusal.response()
+
+    await admission.authorize(request, None)
+    table = _routing(request)
+    if table is None:
+        return _cannot_count(body.model, "the gateway is starting or in safe mode")
+    store = _store(request)
+    generate = _to_generate_request(body, store)
+    resolution = await admission.permitted(table.resolve(body.model), requirements=generate)
+    if not resolution.has_backends():
+        return _no_such_model(body.model, table).as_anthropic()
+    surfaces = resolution.surfaces()
+    if surfaces and "chat" not in surfaces:
+        return _wrong_surface(
+            body.model, surfaces, wanted="chat", instead="/v1/embeddings"
+        ).as_anthropic()
+    if body.tools and not _any_backend_carries_tools(resolution):
+        return _tools_unsupported(body.model).as_anthropic()
+    if has_images(body.messages):
+        return _cannot_count(
+            body.model,
+            "an image's token cost is decided by the projector when it encodes the picture",
+        )
+
+    client = table.pick(resolution)
+    if client is None and await table.refresh_if_stale():
+        resolution = await admission.permitted(table.resolve(body.model), requirements=generate)
+        client = table.pick(resolution)
+    if client is None:
+        # Deliberately no wake. A caller who wants a sleeping model loaded
+        # to count with can send the request itself -- which is exactly
+        # the fallback Claude Code takes on this 400, knowingly.
+        return _cannot_count(body.model, "nothing that serves it is running")
+
+    generate.localOnly = admission.local_only()
+    try:
+        counted = await serve_while_connected(
+            request, client.count_tokens(generate), what="a token count"
+        )
+    except ClientGone as e:
+        return _serve_failure(e, body, store).as_anthropic()
+    except DriverError as e:
+        detail = (e.problem.detail if e.problem is not None else None) or str(e)
+        if e.status_code == 400:
+            return anthropic.error_response(400, f"The backend rejected this request: {detail}")
+        return _cannot_count(body.model, detail)
+    except httpx.HTTPError as e:
+        return _cannot_count(body.model, f"its backend could not be reached ({type(e).__name__})")
+    return JSONResponse(content={"input_tokens": counted})
+
+
 # --------------------------------------------------------------------------- #
 # /v1/embeddings
 # --------------------------------------------------------------------------- #

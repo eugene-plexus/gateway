@@ -857,6 +857,17 @@ class DirectoryEntryKind(StrEnum):
     file = 'file'
 
 
+class TokenCount(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    promptTokens: int = Field(
+        ...,
+        description="Tokens the backend's own template and tokenizer produce for\nthis request's prompt -- what `usage.promptTokens` on a\ngeneration of the same request would report.\n",
+        ge=0,
+    )
+
+
 class FinishReason(StrEnum):
     """
     **`content_filter` is separate from `error` since

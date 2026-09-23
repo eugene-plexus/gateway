@@ -23,6 +23,7 @@ from eugene_plexus_gateway._generated.driver_models import (
     FinishReason,
     GenerateRequest,
     GenerateResponse,
+    Problem,
     ToolCall,
     Usage,
 )
@@ -30,7 +31,7 @@ from eugene_plexus_gateway._generated.driver_models import (
     Kind as DecisionKindEnum,
 )
 from eugene_plexus_gateway.app import create_app
-from eugene_plexus_gateway.driver_client import StreamEvent
+from eugene_plexus_gateway.driver_client import DriverError, StreamEvent
 from eugene_plexus_gateway.routing import (
     RoutingTable,
     _Backend,
@@ -138,6 +139,10 @@ class FakeDriverClient:
         self.embed_error: Exception | None = None
         """If set, `embed()` raises this instead of returning."""
         self.embed_calls = 0
+        self.prompt_tokens: int | None = None
+        """What `count_tokens` answers; None answers the driver's 501."""
+        self.count_calls: list[GenerateRequest] = []
+        self.count_error: Exception | None = None
         self.generate_hook: Callable[[], Awaitable[Any]] | None = None
         self.embed_hook: Callable[[], Awaitable[Any]] | None = None
         """Awaited before the canned answer. The disconnect tests hand
@@ -202,6 +207,33 @@ class FakeDriverClient:
             usage=self.usage,
             latencyMs=1,
         )
+
+    async def count_tokens(self, request: GenerateRequest) -> int:
+        """The driver's `/v1/generate/count`: `prompt_tokens`, or its 501.
+
+        None -- the default -- is what every backend but llama.cpp answers,
+        so a fake nobody configured cannot count, exactly as a real
+        vLLM or Ollama cannot. The 501's words are the real driver's.
+        """
+        self.count_calls.append(request)
+        if self.count_error is not None:
+            raise self.count_error
+        if self.prompt_tokens is None:
+            raise DriverError(
+                driver_name=self.name,
+                driver_url=self.base_url,
+                status_code=501,
+                problem=Problem(
+                    type="https://github.com/eugene-plexus/inference-driver#token-count-unsupported",
+                    title="This backend cannot count this prompt without generating",
+                    status=501,
+                    detail="Cannot count exactly: this backend has no /apply-template (HTTP "
+                    "404); only llama.cpp's llama-server can count a chat prompt without "
+                    "generating. Nothing was sent to the model.",
+                ),
+                raw_body="",
+            )
+        return self.prompt_tokens
 
     async def embed(self, request: Any) -> Any:
         """Vectors, or the scripted failure. Values derive from the

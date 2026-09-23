@@ -269,6 +269,9 @@ CLIENT_ADMISSION_PATHS = frozenset(
         "/v1/models",
         "/v1/chat/completions",
         "/v1/messages",
+        # A count verifies the key and applies its scope, and is a check
+        # rather than an admission -- see the route.
+        "/v1/messages/count_tokens",
         "/v1/embeddings",
         "/v1/systemone",
     }
@@ -317,7 +320,7 @@ class ClientAdmissionMiddleware:
             await send(message)
 
         async def refuse(exc: AdmissionFailure) -> None:
-            anthropic = scope["path"] == "/v1/messages"
+            anthropic = scope["path"] in ("/v1/messages", "/v1/messages/count_tokens")
             status = 403 if anthropic and exc.status == 401 else exc.status
             kind = (
                 "authentication_error"
