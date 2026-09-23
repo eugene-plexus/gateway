@@ -82,6 +82,34 @@ class FakeDriverClient:
         self.tool_calls: list[ToolCall] | None = None
         """When set, `generate`/`stream` answer with these instead of
         text -- the tool-call-only turn, whose `content` is None."""
+        self.reasoning: str | None = None
+        """When set, both paths report this as the model's reasoning:
+        `generate` on the response, `stream` as two reasoning events
+        ahead of the text -- two, so a translator that only handles the
+        first fragment of a block is caught."""
+        self.stream_error_after_reasoning = False
+        """Raise once the reasoning is out and before any text: the
+        commit-point case for a model that thinks first."""
+        self.stop_sequence: str | None = None
+        """`stopSequence` on both paths' result, for a backend (vLLM)
+        that names the stop string it matched."""
+        self.supported_settings: list[str] = [
+            "maxTokens",
+            "temperature",
+            "topP",
+            "seed",
+            "stop",
+            "tools",
+            "toolChoice",
+            "responseFormat",
+            "topK",
+            "minP",
+            "frequencyPenalty",
+            "presencePenalty",
+            "parallelToolCalls",
+        ]
+        """What `describe()` advertises as `supportedSettings`. A knob so
+        a test can hand the gateway a backend that cannot carry one."""
         self.finish_reason: FinishReason = FinishReason.stop
         """The terminal reason both paths report. A knob because
         `content_filter` has to be observable on BOTH -- a filtered
@@ -119,16 +147,7 @@ class FakeDriverClient:
     def describe(self) -> DriverInfo:
         """The same answer `info()` gives, without needing a loop."""
         capabilities = Capabilities(
-            supportedSettings=[
-                "maxTokens",
-                "temperature",
-                "topP",
-                "seed",
-                "stop",
-                "tools",
-                "toolChoice",
-                "responseFormat",
-            ],
+            supportedSettings=list(self.supported_settings),
             maxContextTokens=self.max_context_tokens,
             toolCalling=self.supports_tools,
             embeddings=self.supports_embeddings or None,
@@ -175,7 +194,9 @@ class FakeDriverClient:
         text = self.responses.pop(0) if self.responses else f"<{self.name} default response>"
         return GenerateResponse(
             content=text,
+            reasoning=self.reasoning,
             finishReason=self.finish_reason,
+            stopSequence=self.stop_sequence,
             backend=self.backend,
             modelId=self.model_id,
             usage=self.usage,
@@ -307,6 +328,12 @@ class FakeDriverClient:
             )
             return
         text = self.responses.pop(0) if self.responses else f"<{self.name} default response>"
+        if self.reasoning:
+            half = len(self.reasoning) // 2
+            yield StreamEvent(reasoning=self.reasoning[:half])
+            yield StreamEvent(reasoning=self.reasoning[half:])
+            if self.stream_error_after_reasoning:
+                raise self.stream_error
         pieces = [w + " " for w in text.split(" ")]
         if pieces:
             pieces[-1] = pieces[-1].rstrip()
@@ -318,6 +345,8 @@ class FakeDriverClient:
             done=True,
             result=GenerateResponse(
                 content=text,
+                reasoning=self.reasoning,
+                stopSequence=self.stop_sequence,
                 finishReason=self.finish_reason,
                 backend=self.backend,
                 modelId=self.model_id,

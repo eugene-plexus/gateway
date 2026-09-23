@@ -135,9 +135,12 @@ def test_conflicting_limits(client: TestClient, fake_driver: FakeDriverClient) -
     "extra,param",
     [
         ({"reasoning_effort": "high"}, "reasoning_effort"),
-        ({"frequency_penalty": 1}, "frequency_penalty"),
+        # `frequency_penalty` and `parallel_tool_calls` stood here until
+        # 2026-09-23, when the driver's request grew fields to carry them;
+        # these two are still consequential and still have nowhere to go.
+        ({"top_logprobs": 2}, "top_logprobs"),
         ({"logit_bias": {"1": -100}}, "logit_bias"),
-        ({"parallel_tool_calls": False}, "parallel_tool_calls"),
+        ({"modalities": ["text", "audio"]}, "modalities"),
         ({"n": 2}, "n"),
         ({"logprobs": True}, "logprobs"),
         ({"store": True}, "store"),
@@ -261,7 +264,10 @@ def test_anthropic_compatibility_hints_are_disclosed(client: TestClient, stream:
         json=body(
             max_tokens=25,
             stream=stream,
-            thinking={"type": "adaptive"},
+            # A budget is still not enforced, so `thinking` is still named.
+            # `{"type": "adaptive"}` alone no longer is: since 2026-09-23 it
+            # decides whether reasoning comes back, and that is honoured.
+            thinking={"type": "enabled", "budget_tokens": 1024},
             context_management={"edits": []},
             system=[{"type": "text", "text": "SECRET", "cache_control": {"type": "ephemeral"}}],
         ),
@@ -274,7 +280,10 @@ def test_anthropic_compatibility_hints_are_disclosed(client: TestClient, stream:
 
 
 @pytest.mark.parametrize(
-    "extra", [{"top_k": 5}, {"unknown_setting": "SECRET"}, {"max_tokens": True}]
+    # `top_k` stood first here until 2026-09-23; it is carried now, and
+    # test_reasoning_and_local_samplers.py asserts that it arrives.
+    "extra",
+    [{"service_tier": "auto"}, {"unknown_setting": "SECRET"}, {"max_tokens": True}],
 )
 def test_anthropic_unsupported_settings_are_explicit(
     client: TestClient, extra: dict[str, Any]

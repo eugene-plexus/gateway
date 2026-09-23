@@ -944,6 +944,16 @@ class Usage(BaseModel):
     promptTokens: int | None = Field(None, ge=0)
     completionTokens: int | None = Field(None, ge=0)
     totalTokens: int | None = Field(None, ge=0)
+    cachedPromptTokens: int | None = Field(
+        None,
+        description='How many of `promptTokens` the backend served from its\nprompt cache rather than computing. Reported by llama.cpp\nand vLLM as `usage.prompt_tokens_details.cached_tokens`;\nabsent when the backend says nothing, never guessed.\n',
+        ge=0,
+    )
+    reasoningTokens: int | None = Field(
+        None,
+        description='How many of `completionTokens` were reasoning. vLLM reports\nit (`completion_tokens_details.reasoning_tokens`) when its\nreasoning parser is on; llama.cpp b10948 does not, and a\ncount this driver made up from characters would be a\ntokenizer it does not have. Absent means unknown, not zero.\n',
+        ge=0,
+    )
 
 
 class EmbedRequest(BaseModel):
@@ -1329,12 +1339,21 @@ class DirectoryEntry(BaseModel):
 
 class StreamToken(BaseModel):
     """
-    One `event: token` payload. Exactly one of `text` or `toolCalls`
-    is set.
+    One `event: token` payload. Exactly one of `text`, `reasoning`
+    or `toolCalls` is set.
+
+    A reasoning frame is output like any other: it is the first
+    thing a reasoning model produces, so it is also the commit point
+    one layer up -- once a caller has been shown the model thinking,
+    a failure cannot cascade onto another model's answer.
 
     """
 
     text: str | None = Field(None, description="A fragment of the assistant's text.")
+    reasoning: str | None = Field(
+        None,
+        description="A fragment of the model's reasoning, from a backend that\nstreams it separately (`delta.reasoning_content` on\nllama.cpp, `delta.reasoning` on vLLM). Never sent when this\ndriver's `thinkingMode` is `off`.\n",
+    )
     toolCalls: list[ToolCallDelta] | None = Field(
         None,
         description='Fragments of one or more tool calls, accumulated by `index`.\n',
@@ -1438,6 +1457,14 @@ class GenerateResponse(BaseModel):
         None,
         description='The generated assistant text. **Nullable since tool calling\nlanded:** a turn that only calls a tool produces no text,\nand an empty string would be a lie about what the model\nsaid. Was required; a response with `toolCalls` and no\n`content` is the common agent-loop case.\n',
     )
+    reasoning: str | None = Field(
+        None,
+        description="The model's reasoning for this turn, when the backend\nreports it separately from `content` -- `reasoning_content`\nfrom llama.cpp, `reasoning` from vLLM. Absent when there was\nnone, when the backend puts reasoning inline in `content`\n(then `thinkingMode` and the thinking filter govern it), and\nalways when this driver's `thinkingMode` is `off`.\n\n**Added 2026-09-23, and before it every token of it was\ndiscarded.** Measured against llama.cpp b10948 launched with\nthe agent's own argv: a reasoning model's thinking arrives\nin `reasoning_content` by default, this driver read only\n`content`, and a Qwen3 that spent its whole `max_tokens`\nbudget thinking came back as an **empty answer with\n`finishReason: length`** and nothing to say why. A stop\nsequence can match inside the reasoning too, which produced\nthe same empty `stop`.\n",
+    )
+    stopSequence: str | None = Field(
+        None,
+        description="Which of the request's `stop` strings ended the answer, when\nthe backend says. vLLM does (`stop_reason` on the choice);\n**llama.cpp b10948 does not** -- measured, its choice carries\n`finish_reason`, `index` and `message` and nothing else -- so\nfor most local installs this stays null and `finishReason`\nstays `stop`. Set together with `finishReason: stop_sequence`.\n",
+    )
     toolCalls: list[ToolCall] | None = Field(
         None,
         description='Tools the model chose to call. Present when `finishReason`\nis `tool_calls`.\n',
@@ -1479,6 +1506,10 @@ class Message(BaseModel):
         None,
         description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
     )
+    reasoning: str | None = Field(
+        None,
+        description="On an **assistant** message: the reasoning the model produced\nfor that turn, as the backend reported it separately from\n`content` (`reasoning_content` on llama.cpp, `reasoning` on\nvLLM). Handed back so the next turn of a tool loop reaches\nthe model with its own earlier thinking.\n\n**Load-bearing rather than decorative, and measured:**\nllama.cpp b10948 renders a history turn's reasoning into the\nprompt for templates that preserve it (Qwen3, gpt-oss) --\nthe same tool-loop request was 172 prompt tokens without it\nand 184 with a twelve-token canary. Dropped here, a model\nresuming a tool loop has forgotten why it called the tool.\n\nAbsent on every other role, and an adapter whose backend\nhas no such channel (the agentic CLIs, a hosted OpenAI\nendpoint) omits it upstream rather than inventing one.\n",
+    )
     timestamp: AwareDatetime | None = Field(
         None, description='When the message was produced. Server-assigned if omitted.'
     )
@@ -1491,7 +1522,7 @@ class GenerateRequest(BaseModel):
     )
     callerSettings: list[str] | None = Field(
         None,
-        description="A2 provenance: names of settings explicitly requested by the caller,\nusing this request's field names (maxTokens, temperature, topP, seed,\nstop, tools, toolChoice, responseFormat). The gateway preserves this\nlist on each fallback attempt. An adapter must refuse a known unsupported\nexplicit setting with 400, rather than silently dropping it. Settings\nsupplied only by profiles/defaults retain the adapter's default behavior.\nThis field is internal and is not forwarded to upstream providers.\n",
+        description="A2 provenance: names of settings explicitly requested by the caller,\nusing this request's field names (maxTokens, temperature, topP, seed,\nstop, tools, toolChoice, responseFormat, topK, minP, frequencyPenalty,\npresencePenalty, parallelToolCalls). The gateway preserves this\nlist on each fallback attempt. An adapter must refuse a known unsupported\nexplicit setting with 400, rather than silently dropping it. Settings\nsupplied only by profiles/defaults retain the adapter's default behavior.\nThis field is internal and is not forwarded to upstream providers.\n",
     )
     messages: list[Message] = Field(
         ...,
@@ -1519,6 +1550,33 @@ class GenerateRequest(BaseModel):
         description='Deterministic-sampling seed. Owned by the caller, carried to\nbackends that implement it, dropped with a logged warning by\nadapters whose backends do not.\n\n**Added 2026-09-19 for the same reason as `topP`**, and it\nis the more load-bearing of the two: a caller asking for a\nseed is asking for a reproducible answer, and silently\ndropping it returns a different answer each time while the\ncontract says otherwise. Nothing in a response says whether\nthe seed arrived, so the failure is invisible to the caller\nby construction.\n',
     )
     stop: list[str] | None = Field(None, description='Optional stop sequences.')
+    topK: int | None = Field(
+        None,
+        description="Sample from only the K most likely tokens; 0 disables the cut.\nNot an OpenAI parameter -- llama.cpp and vLLM both take it as\n`top_k`, and Anthropic's Messages API has it natively. Caller-\nowned like every sampler here: carried when the caller set it,\nnever substituted by a driver.\n\n**Added 2026-09-23.** Until then both front doors refused it\nwith a 400 because this request had nowhere to put it, which\nmade it the last sampling parameter with that gap after\n`topP` and `seed` closed theirs on 2026-09-19.\n\nAn adapter whose backend is known to reject it (a hosted\nOpenAI endpoint, the agentic CLIs) refuses it when explicit,\nand omits it from `capabilities.supportedSettings` so the\ngateway routes around that backend instead.\n",
+        ge=0,
+    )
+    minP: float | None = Field(
+        None,
+        description='Discard tokens less likely than this fraction of the most\nlikely one. A llama.cpp and vLLM extension (`min_p`), carried\nand refused exactly as `topK` is.\n',
+        ge=0.0,
+        le=1.0,
+    )
+    frequencyPenalty: float | None = Field(
+        None,
+        description="OpenAI's `frequency_penalty`: penalise a token by how often\nit has already appeared. Carried to every backend that takes\nit; refused when explicit by the agentic CLIs and, by the\nsame rule that omits `temperature`, by models whose sampler\nis fixed.\n",
+        ge=-2.0,
+        le=2.0,
+    )
+    presencePenalty: float | None = Field(
+        None,
+        description="OpenAI's `presence_penalty`: penalise a token for having\nappeared at all. Carried and refused exactly as\n`frequencyPenalty` is.\n",
+        ge=-2.0,
+        le=2.0,
+    )
+    parallelToolCalls: bool | None = Field(
+        None,
+        description="Whether the model may request several tools in one turn.\nOpenAI's `parallel_tool_calls`, which llama.cpp also reads.\n**The default differs by backend**: llama.cpp assumes false\nwhen it is absent and OpenAI assumes true, so an absent\nfield is left absent rather than filled in -- choosing for\nthe caller would change what some backend already does.\n",
+    )
     requestId: UUID | None = Field(
         None,
         description='Caller-supplied id for log correlation. Echoed in the response.',

@@ -20,6 +20,7 @@ actually prevent.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 import pytest
@@ -160,7 +161,9 @@ async def test_a_client_that_stays_gets_its_answer(app: FastAPI) -> None:
     request = _request(app, gone)
     result = await asyncio.wait_for(create_chat_completion(request), timeout=5)
 
-    assert result.choices[0].message.content == "the answer"
+    # A serialised body since 2026-09-23, so that fields which say nothing
+    # (a non-reasoning model's `reasoning_content`) are absent, not null.
+    assert json.loads(bytes(result.body))["choices"][0]["message"]["content"] == "the answer"
 
 
 def test_the_watcher_does_not_hang_a_plain_request(client) -> None:  # type: ignore[no-untyped-def]

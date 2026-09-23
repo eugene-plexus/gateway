@@ -951,7 +951,18 @@ class ToolChoice(StrEnum):
 
 
 class Role1(StrEnum):
+    """
+    `developer` is OpenAI's newer name for the instruction role,
+    sent by current SDKs and frameworks when they target a
+    reasoning model. It reaches the backend as `system`, in
+    place -- local chat templates know only `system`, and the
+    two mean the same thing to a model that is not OpenAI's.
+    Refused with a 400 until 2026-09-23.
+
+    """
+
     system = 'system'
+    developer = 'developer'
     user = 'user'
     assistant = 'assistant'
     tool = 'tool'
@@ -1082,6 +1093,29 @@ class ResponseJsonSchema(BaseModel):
     strict: bool | None = None
 
 
+class PromptTokensDetails(BaseModel):
+    """
+    Present only when the backend reported it. `cached_tokens`
+    is the part of `prompt_tokens` served from the backend's
+    prompt cache -- llama.cpp and vLLM both report it.
+
+    """
+
+    cached_tokens: int | None = Field(None, ge=0)
+
+
+class CompletionTokensDetails(BaseModel):
+    """
+    Present only when the backend reported it.
+    `reasoning_tokens` is the part of `completion_tokens` spent
+    reasoning; vLLM reports it with its reasoning parser on,
+    llama.cpp does not, and it is never estimated here.
+
+    """
+
+    reasoning_tokens: int | None = Field(None, ge=0)
+
+
 class CompletionUsage(BaseModel):
     """
     Token accounting in OpenAI's field names. Fields may be absent
@@ -1098,6 +1132,14 @@ class CompletionUsage(BaseModel):
     prompt_tokens: int | None = Field(None, ge=0)
     completion_tokens: int | None = Field(None, ge=0)
     total_tokens: int | None = Field(None, ge=0)
+    prompt_tokens_details: PromptTokensDetails | None = Field(
+        None,
+        description="Present only when the backend reported it. `cached_tokens`\nis the part of `prompt_tokens` served from the backend's\nprompt cache -- llama.cpp and vLLM both report it.\n",
+    )
+    completion_tokens_details: CompletionTokensDetails | None = Field(
+        None,
+        description='Present only when the backend reported it.\n`reasoning_tokens` is the part of `completion_tokens` spent\nreasoning; vLLM reports it with its reasoning parser on,\nllama.cpp does not, and it is never estimated here.\n',
+    )
 
 
 class CompletionRoutingInfo(BaseModel):
@@ -1337,8 +1379,12 @@ class AnthropicContentBlock(BaseModel):
     we do not own.
 
     The variants this gateway carries: `text` (`text`), `tool_use`
-    (`id`, `name`, `input`), and `tool_result` (`tool_use_id`,
-    `content`, `is_error`).
+    (`id`, `name`, `input`), `tool_result` (`tool_use_id`,
+    `content`, `is_error`), and `thinking` (`thinking`,
+    `signature`) -- returned ahead of the answer when the request
+    enabled thinking, and read back on an assistant turn as that
+    turn's reasoning. `redacted_thinking` is accepted on the way in
+    and dropped.
 
     The variants it refuses with a 400: `image` and `document`. They
     are refused rather than dropped because a model that never
@@ -1372,6 +1418,14 @@ class AnthropicContentBlock(BaseModel):
     is_error: bool | None = Field(
         None,
         description="On `tool_result`: the tool failed. Carried into the `tool`\nmessage's text rather than dropped, because a harness that\ncannot see its own tool failed will call it again.\n",
+    )
+    thinking: str | None = Field(
+        None,
+        description="On `thinking`: the model's reasoning, as the backend reported it.",
+    )
+    signature: str | None = Field(
+        None,
+        description='On `thinking`: opaque to the client, as Anthropic\'s is. From\nthis gateway it is empty when the text is shown, and\n`eugene-plexus-reasoning-v1:<base64 of the reasoning>` when\nthe request asked for `display: "omitted"` -- so a client\nthat echoes the block back unchanged, as Anthropic tells it\nto, returns the reasoning for the next turn. Not Anthropic\'s\nsignature and not verifiable by Anthropic; a signature\nwithout that prefix is ignored on the way in.\n',
     )
     cache_control: dict[str, Any] | None = None
 
@@ -1438,6 +1492,10 @@ class AnthropicToolChoice(BaseModel):
     )
     type: Type2
     name: str | None = Field(None, description='With `type: tool`: which one.')
+    disable_parallel_tool_use: bool | None = Field(
+        None,
+        description="Carried as the backend's `parallel_tool_calls` with the\nopposite sense: true asks for at most one tool call per\nturn. **Silently dropped until 2026-09-23**, which broke the\nrule that a setting changing the answer is refused or\nhonoured, never discarded.\n",
+    )
 
 
 class Type3(StrEnum):
@@ -1477,9 +1535,16 @@ class StopReason(Enum):
 class AnthropicUsage(BaseModel):
     """
     Token counts, renamed from the backend's OpenAI-shaped `usage`.
-    Cache fields are reported as zero rather than omitted: a client
-    that reads them should see an honest nothing rather than an
-    absence it has to guess about.
+
+    **Anthropic's `input_tokens` excludes cached input and ours
+    follows it**: when the backend reports how much of the prompt
+    came from its cache (llama.cpp and vLLM both do), that part is
+    `cache_read_input_tokens` and `input_tokens` is the rest, so the
+    three fields sum to the prompt the way a client that computes
+    context usage expects. Reported as zero when the backend says
+    nothing -- an honest nothing rather than an absence to guess
+    about. `cache_creation_input_tokens` is always zero: a local
+    engine's cache is not something a request pays to write.
 
     """
 
@@ -1536,7 +1601,7 @@ class AnthropicStreamEvent(BaseModel):
     content_block: AnthropicContentBlock | None = None
     delta: dict[str, Any] | None = Field(
         None,
-        description='`{"type": "text_delta", "text": …}` for prose,\n`{"type": "input_json_delta", "partial_json": …}` for a tool\ncall\'s arguments, and on `message_delta` the `stop_reason`.\n',
+        description='`{"type": "text_delta", "text": …}` for prose,\n`{"type": "thinking_delta", "thinking": …}` for reasoning\n(none under `display: "omitted"`), a closing\n`{"type": "signature_delta", "signature": …}` on an omitted\nthinking block,\n`{"type": "input_json_delta", "partial_json": …}` for a tool\ncall\'s arguments, and on `message_delta` the `stop_reason`\nand `stop_sequence`.\n',
     )
     usage: AnthropicUsage | None = None
     error: dict[str, Any] | None = None
@@ -2093,6 +2158,10 @@ class Delta(BaseModel):
 
     role: Role2 | None = None
     content: str | None = None
+    reasoning_content: str | None = Field(
+        None,
+        description="A fragment of the model's reasoning, forwarded as the\nbackend produces it and before any `content`. Accumulate\nit the way `content` is accumulated. Its first frame is\nthe stream's commit point like any other output: once a\ncaller has seen the model thinking, a failure truncates\nrather than cascading onto another model.\n",
+    )
     tool_calls: list[ToolCallDelta] | None = Field(
         None,
         description='Tool-call fragments. Each carries an `index` and the\ncaller accumulates by it: `id` and `function.name`\narrive once, `function.arguments` arrives as a string\nsplit across any number of frames. A single frame is\n**not** parseable JSON and was never meant to be.\n',
@@ -2226,13 +2295,16 @@ class AnthropicMessageResponse(BaseModel):
     )
     content: list[AnthropicContentBlock] = Field(
         ...,
-        description='`text` blocks and `tool_use` blocks, in the order the\nbackend produced them.\n',
+        description='A `thinking` block first when the request enabled thinking\nand the backend reported reasoning, then `text` and\n`tool_use` blocks in the order the backend produced them.\n',
     )
     stop_reason: StopReason | None = Field(
         None,
         description="Mapped from the backend's finish reason: `stop` becomes\n`end_turn`, `length` becomes `max_tokens`, `tool_calls`\nbecomes `tool_use`, and **since 2026-09-19 a backend's\n`content_filter` becomes `refusal`** — Anthropic's own name\nfor a classifier stopping the answer, so a client switching\non this field gets a value from the vocabulary it already\nparses rather than one we invented. Not verified against a\nlive Anthropic SDK; the OpenAI door's `content_filter` was.\n\nA backend error still reports `end_turn`, because there is\nno Anthropic stop reason for *the backend broke* and the\ntruncation is reported where it can be acted on — the log\nline and the metrics row.\n",
     )
-    stop_sequence: str | None = None
+    stop_sequence: str | None = Field(
+        None,
+        description='Which `stop_sequences` entry ended the answer, with\n`stop_reason: stop_sequence`, when the backend says so. vLLM\ndoes; **llama.cpp does not** -- it reports a matched stop\nstring and a natural end identically -- so behind llama.cpp\nthis stays null and `stop_reason` reads `end_turn`.\n',
+    )
     usage: AnthropicUsage | None = None
 
 
@@ -2383,10 +2455,17 @@ class ChatCompletionMessage(BaseModel):
 
     """
 
-    role: Role1
+    role: Role1 = Field(
+        ...,
+        description="`developer` is OpenAI's newer name for the instruction role,\nsent by current SDKs and frameworks when they target a\nreasoning model. It reaches the backend as `system`, in\nplace -- local chat templates know only `system`, and the\ntwo mean the same thing to a model that is not OpenAI's.\nRefused with a 400 until 2026-09-23.\n",
+    )
     content: str | MessageContent1 | None = Field(
         None,
         description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
+    )
+    reasoning_content: str | None = Field(
+        None,
+        description="**On a response:** the model's reasoning for this turn, when\nthe backend reported it separately from `content`. The name\nis DeepSeek's and llama.cpp's, and the one OpenAI-compatible\nclients already parse (vLLM's `reasoning` is normalised to\nit). Absent when there was none or when the serving driver's\n`thinkingMode` is `off`.\n\n**On a request:** accepted on an `assistant` message and\nhanded back to the backend, so a tool loop resumes with the\nmodel's own earlier thinking -- a client that appends the\nresponse message verbatim sends it back, and llama.cpp\nrenders it into the prompt for templates that keep it.\n\nAdded 2026-09-23. Before it every token of a reasoning\nmodel's thinking was discarded one hop down, so a model that\nspent its whole budget thinking answered with an empty\n`content` and `finish_reason: length`, with nothing to say\nwhy.\n",
     )
     name: str | None = Field(None, description='Optional participant name, per OpenAI.')
     tool_calls: list[ToolCall] | None = Field(
@@ -2438,10 +2517,11 @@ class AnthropicMessagesRequest(BaseModel):
     """
     Request body for `POST /v1/messages`, in Anthropic's shape.
 
-    Measured Claude Code hints (`thinking`, `cache_control`,
-    `context_management`) are accepted with a response header naming ignored
-    settings. Metadata is discarded. Unknown top-level settings and top_k
-    are explicitly rejected. This is a text/tool translation, not full parity.
+    Measured Claude Code hints (`cache_control`, `context_management`)
+    are accepted with a response header naming ignored settings;
+    `thinking` chooses whether reasoning is returned. Metadata is
+    discarded. Unknown top-level settings are explicitly rejected.
+    This is a text/tool translation, not full parity.
 
     Consequently **this schema does not decide what is refused**.
     The refusals — image and document blocks, server-side tools,
@@ -2484,7 +2564,7 @@ class AnthropicMessagesRequest(BaseModel):
     top_p: float | None = Field(None, ge=0.0, le=1.0)
     top_k: int | None = Field(
         None,
-        description='Unsupported. A non-null value returns 400 naming top_k. Before A2\nthis was silently discarded despite controlling generation.\n',
+        description='Carried to the backend since 2026-09-23. Before A2 it was\nsilently discarded despite controlling generation; from A2\nuntil 2026-09-23 it was refused with a 400, because the\ninternal request had nowhere to put it. Backends known to\nreject it are routed around.\n',
         ge=0,
     )
     stop_sequences: list[str] | None = Field(
@@ -2502,7 +2582,11 @@ class AnthropicMessagesRequest(BaseModel):
     )
     thinking: dict[str, Any] | None = Field(
         None,
-        description='**Read and dropped, never refused**, and the distinction was\nmeasured. Present on every Claude Code request, in three\nshapes: `{"budget_tokens": N, "type": "enabled"}` for a\nknown Claude id, `{"type": "adaptive"}` for an arbitrary\nlocal id, and **`null` when the caller set\n`MAX_THINKING_TOKENS=0`** — so even `"thinking" in body` is\ntrue for the one configuration asking for no thinking at\nall.\n\nThis is a compatibility concession, not enforcement of the caller\'s\nreasoning budget. Non-null values are disclosed on the ignored-settings\nresponse header. The operator\'s profile governs local thinking behavior.\n',
+        description='**Read and dropped, never refused**, and the distinction was\nmeasured. Present on every Claude Code request, in three\nshapes: `{"budget_tokens": N, "type": "enabled"}` for a\nknown Claude id, `{"type": "adaptive"}` for an arbitrary\nlocal id, and **`null` when the caller set\n`MAX_THINKING_TOKENS=0`** — so even `"thinking" in body` is\ntrue for the one configuration asking for no thinking at\nall.\n\n**What it does decide, since 2026-09-23: whether the\nresponse carries `thinking` blocks, and whether their text\nis shown.** Non-null and not `{"type": "disabled"}` returns\nthe model\'s reasoning, when the backend reported any, as a\n`thinking` block ahead of the answer -- with the text, or\nwith the text empty and the reasoning carried in `signature`\nwhen `display` is `"omitted"`. Absent, null or disabled\nreturns none, which is Anthropic\'s own behaviour and keeps\n`content[0].text` pointing at the answer for every client\nthat never asked.\n\nWhat it does not decide: a `budget_tokens` is not enforced,\nand `disabled` hides the blocks without stopping the model\nthinking. Either is named on the ignored-settings response\nheader. The operator\'s `thinkingMode` governs what a local\nmodel actually does.\n',
+    )
+    output_config: dict[str, Any] | None = Field(
+        None,
+        description='**Accepted for `effort` only, and not enforced.** Claude Code\nsends `{"effort": "high"}` on every request -- measured\n2026-09-23 (2.1.207 with agent-sdk 0.3.280, beta header\n`effort-2025-11-24`), absent from the 2026-09-19 capture --\nand the unknown-field refusal A2 added turned that into a\n400 on the first request of every session: **Claude Code\ncould not use this door at all** until this field was named.\nHow hard a local model thinks is the operator\'s\n`thinkingMode`, exactly as for `thinking.budget_tokens`, so a\nnon-null value is named on the ignored-settings header.\n\nAny other key -- structured output\'s `format` above all --\nis refused with a 400 naming it: it changes what the answer\nis, and this door does not implement it.\n',
     )
     cache_control: dict[str, Any] | None = Field(
         None,
@@ -2530,6 +2614,10 @@ class Message(BaseModel):
     toolCallId: str | None = Field(
         None,
         description='On a **tool** message: which call this is the result of.\n`content` is the result, serialized by the caller.\n',
+    )
+    reasoning: str | None = Field(
+        None,
+        description="On an **assistant** message: the reasoning the model produced\nfor that turn, as the backend reported it separately from\n`content` (`reasoning_content` on llama.cpp, `reasoning` on\nvLLM). Handed back so the next turn of a tool loop reaches\nthe model with its own earlier thinking.\n\n**Load-bearing rather than decorative, and measured:**\nllama.cpp b10948 renders a history turn's reasoning into the\nprompt for templates that preserve it (Qwen3, gpt-oss) --\nthe same tool-loop request was 172 prompt tokens without it\nand 184 with a twelve-token canary. Dropped here, a model\nresuming a tool loop has forgotten why it called the tool.\n\nAbsent on every other role, and an adapter whose backend\nhas no such channel (the agentic CLIs, a hosted OpenAI\nendpoint) omits it upstream rather than inventing one.\n",
     )
     timestamp: AwareDatetime | None = Field(
         None, description='When the message was produced. Server-assigned if omitted.'
@@ -2578,6 +2666,29 @@ class ChatCompletionRequest(BaseModel):
         None,
         description='Passed through to backends that support deterministic\nsampling; dropped with a warning where they do not.\n\n**True since 2026-09-19 and unfulfillable before it** —\nthere was no `seed` on `GenerateRequest`, so the value was\ndropped by every backend and the warning this sentence\npromises was logged by none of them. A caller asking for a\nseed is asking for a reproducible answer and was getting a\ndifferent one each time, with nothing in the response to\nsay so.\n',
     )
+    frequency_penalty: float | None = Field(
+        None,
+        description="Carried to the backend. Refused with 400 by backends that\ncannot honour it (the agentic CLIs; OpenAI models with a\nfixed sampler), which are skipped when choosing a backend\nrather than tried and failed.\n\n**Refused with a 400 at this door until 2026-09-23**, like\nthe four fields below it, although llama.cpp and vLLM both\ntake all of them: the internal request had nowhere to carry\nthem, and a refusal was the honest answer to that. Clients\nthat send them by default -- SillyTavern, Open WebUI's\nadvanced parameters -- could not use this door at all.\n",
+        ge=-2.0,
+        le=2.0,
+    )
+    presence_penalty: float | None = Field(
+        None,
+        description='Carried and refused exactly as `frequency_penalty` is.',
+        ge=-2.0,
+        le=2.0,
+    )
+    top_k: int | None = Field(
+        None,
+        description="**Not an OpenAI parameter.** A local-engine extension that\nllama.cpp and vLLM both read; 0 disables the cut. Refused\nby backends known to reject it -- OpenAI's own endpoint and\nthe agentic CLIs -- and those are routed around.\n",
+        ge=0,
+    )
+    min_p: float | None = Field(
+        None,
+        description="**Not an OpenAI parameter.** llama.cpp's and vLLM's `min_p`,\ncarried and refused exactly as `top_k` is.\n",
+        ge=0.0,
+        le=1.0,
+    )
     stream: bool | None = Field(
         False,
         description='When true the response is an SSE stream of\n`ChatCompletionChunk` objects terminated by `data: [DONE]`.\n',
@@ -2616,6 +2727,10 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: ToolChoice | NamedToolChoice | None = Field(
         None,
         description='How the model should use `tools`. `auto` is the default when\ntools are present, `none` forbids calling one, `required`\nforces at least one call, and an object names a specific\nfunction. Passed through; the gateway does not enforce it.\n',
+    )
+    parallel_tool_calls: bool | None = Field(
+        None,
+        description='Whether the model may request several tools in one turn.\nCarried when set and left absent when not, because the\nbackends disagree about the default -- llama.cpp assumes\nfalse, OpenAI true -- and filling one in would change what\none of them already does.\n',
     )
     response_format: ResponseFormat | None = None
 

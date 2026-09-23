@@ -65,6 +65,7 @@ from .._generated.models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     CompletionRoutingInfo,
+    CompletionTokensDetails,
     CompletionUsage,
     Delta,
     EmbeddingData,
@@ -76,6 +77,7 @@ from .._generated.models import (
     ModelList,
     Object,
     Object1,
+    PromptTokensDetails,
     ResponseFormat,
     Role1,
     Role2,
@@ -753,7 +755,7 @@ async def create_chat_completion(request: Request) -> Any:
             usage=response.usage,
             backend_ms=response.latencyMs,
         )
-        return result
+        return JSONResponse(content=_completion_body(result))
 
 
 # --------------------------------------------------------------------------- #
@@ -810,6 +812,7 @@ async def _stream_anthropic(
     prepared: _Serving,
     *,
     model: str,
+    display: str | None = None,
 ) -> AsyncIterator[str]:
     """The driver's stream as Anthropic's typed events.
 
@@ -821,7 +824,7 @@ async def _stream_anthropic(
     point, the same `_record` -- and they share it by construction
     because both are handed the same `_Serving`.
     """
-    translator = anthropic.StreamTranslator(model)
+    translator = anthropic.StreamTranslator(model, display=display)
     with collect_attempts() as tries:
         response: GenerateResponse | None = None
         try:
@@ -842,6 +845,14 @@ async def _stream_anthropic(
                     yield translator.start()
                 if event.tool_calls:
                     for chunk in translator.tool_fragments(event.tool_calls):
+                        yield chunk
+                    continue
+                if event.reasoning:
+                    # A `thinking` block when the request enabled one, and
+                    # nothing otherwise -- but `message_start` above has
+                    # gone out either way, because reasoning is output and
+                    # the cascade is committed from its first fragment.
+                    for chunk in translator.thinking(event.reasoning):
                         yield chunk
                     continue
                 if event.text:
@@ -890,7 +901,9 @@ async def _stream_anthropic(
             truncated, body, response.usage, getattr(prepared.client, "served_by", None)
         )
         for chunk in translator.finish(
-            reason=anthropic.stop_reason(response.finishReason), usage=response.usage
+            reason=anthropic.stop_reason(response.finishReason),
+            usage=response.usage,
+            stop_sequence=response.stopSequence,
         ):
             yield chunk
 
@@ -941,7 +954,9 @@ async def create_anthropic_message(request: Request) -> Any:
         # The generator runs AFTER this function returns, so the
         # attempt-collection scope has to live inside it.
         return StreamingResponse(
-            _stream_anthropic(body, prepared, model=body.model),
+            _stream_anthropic(
+                body, prepared, model=body.model, display=anthropic.thinking_display(raw)
+            ),
             media_type="text/event-stream",
             headers=anthropic.compatibility_headers(raw),
         )
@@ -977,6 +992,9 @@ async def create_anthropic_message(request: Request) -> Any:
                 tool_calls=response.toolCalls,
                 finish=response.finishReason,
                 usage=response.usage,
+                reasoning=response.reasoning,
+                display=anthropic.thinking_display(raw),
+                stop_sequence=response.stopSequence,
             ),
             headers={
                 **anthropic.compatibility_headers(raw),
@@ -1309,6 +1327,11 @@ def _to_generate_request(
                 ("tools", "tools"),
                 ("tool_choice", "toolChoice"),
                 ("response_format", "responseFormat"),
+                ("top_k", "topK"),
+                ("min_p", "minP"),
+                ("frequency_penalty", "frequencyPenalty"),
+                ("presence_penalty", "presencePenalty"),
+                ("parallel_tool_calls", "parallelToolCalls"),
             )
             if getattr(body, source) is not None
         ]
@@ -1334,6 +1357,17 @@ def _to_generate_request(
         tools=_to_driver_tools(body.tools),
         toolChoice=_to_driver_tool_choice(body.tool_choice),
         responseFormat=_to_driver_response_format(body.response_format),
+        # **Carried since 2026-09-23**, refused with a 400 before because
+        # the driver's request had nowhere to put them. Caller-only, like
+        # the seed: no profile or install default is invented for any of
+        # them, so an absent field stays absent -- and `parallel_tool_calls`
+        # most of all, since llama.cpp and OpenAI disagree about its
+        # default and filling one in would change what one of them does.
+        topK=body.top_k,
+        minP=body.min_p,
+        frequencyPenalty=body.frequency_penalty,
+        presencePenalty=body.presence_penalty,
+        parallelToolCalls=body.parallel_tool_calls,
     )
 
 
@@ -1344,15 +1378,73 @@ def _to_driver_message(message: ChatCompletionMessage) -> Message:
     shared schema declines to be a third definition of OpenAI's object
     -- so the calls go across as plain dicts and the driver re-shapes
     them for its backend.
+
+    `developer` is OpenAI's newer name for the instruction role and
+    becomes `system` here, in place: local chat templates know only
+    `system`, and to a model that is not OpenAI's the two mean the same
+    thing. An assistant turn's `reasoning_content` goes across as its
+    `reasoning`, so the backend can render it back into the prompt.
     """
+    role = "system" if message.role.value == "developer" else message.role.value
     return Message(
-        role=Role(message.role.value),
+        role=Role(role),
         content=message.model_dump(mode="json", exclude_none=True).get("content"),
         toolCalls=[c.model_dump(mode="json", exclude_none=True) for c in message.tool_calls]
         if message.tool_calls
         else None,
         toolCallId=message.tool_call_id,
+        # Only ever set on an assistant turn: the OpenAI door refuses it
+        # anywhere else and the Anthropic door reads it only from one.
+        reasoning=message.reasoning_content,
     )
+
+
+def _openai_usage(usage: Any) -> CompletionUsage | None:
+    """The driver's usage in OpenAI's names, both paths.
+
+    The two detail objects appear only when the backend reported them --
+    llama.cpp and vLLM report cached prompt tokens, vLLM reasoning
+    tokens -- and are never estimated: a zero would claim the backend
+    counted and found none.
+    """
+    if usage is None:
+        return None
+    cached = getattr(usage, "cachedPromptTokens", None)
+    reasoning = getattr(usage, "reasoningTokens", None)
+    return CompletionUsage(
+        prompt_tokens=usage.promptTokens,
+        completion_tokens=usage.completionTokens,
+        total_tokens=usage.totalTokens,
+        prompt_tokens_details=PromptTokensDetails(cached_tokens=cached)
+        if cached is not None
+        else None,
+        completion_tokens_details=CompletionTokensDetails(reasoning_tokens=reasoning)
+        if reasoning is not None
+        else None,
+    )
+
+
+def _completion_body(result: ChatCompletionResponse) -> dict[str, Any]:
+    """The batch response as JSON, with fields that say nothing left out.
+
+    FastAPI serialises a returned model with every `None` as `null`, and
+    this response relies on that elsewhere -- `x_eugene_plexus` promises
+    null rather than absent for its unset fields. Three new fields must
+    not inherit it: `reasoning_content` on a model that did not reason,
+    and the two usage details a backend did not report. A reply from a
+    non-reasoning model is byte-for-byte what it was before they existed.
+    """
+    payload = result.model_dump(mode="json", by_alias=True)
+    for choice in payload.get("choices") or []:
+        message = choice.get("message") or {}
+        if message.get("reasoning_content") is None:
+            message.pop("reasoning_content", None)
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        for key in ("prompt_tokens_details", "completion_tokens_details"):
+            if usage.get(key) is None:
+                usage.pop(key, None)
+    return payload
 
 
 def _to_driver_tools(tools: list[Tool] | None) -> list[DriverTool] | None:
@@ -1617,13 +1709,7 @@ def _to_chat_completion(
     waited_ms: int = 0,
     swapped_in: bool = False,
 ) -> ChatCompletionResponse:
-    usage = None
-    if response.usage is not None:
-        usage = CompletionUsage(
-            prompt_tokens=response.usage.promptTokens,
-            completion_tokens=response.usage.completionTokens,
-            total_tokens=response.usage.totalTokens,
-        )
+    usage = _openai_usage(response.usage)
     truncated = _prompt_truncated(body, response.usage)
     _warn_if_truncated(truncated, body, response.usage, getattr(client, "served_by", None))
     return ChatCompletionResponse(
@@ -1639,6 +1725,12 @@ def _to_chat_completion(
                 message=ChatCompletionMessage(
                     role=Role1.assistant,
                     content=response.content,
+                    # The model's thinking, when its backend reported it
+                    # apart from the answer. Discarded one hop down until
+                    # 2026-09-23, so a model that thought until
+                    # `max_tokens` answered with an empty `content` and
+                    # nothing to say why.
+                    reasoning_content=response.reasoning,
                     tool_calls=_to_openai_tool_calls(response.toolCalls),
                 ),
                 finish_reason=_finish_reason(response),
@@ -1767,6 +1859,18 @@ async def _stream_completion(
                         )
                     )
                     continue
+                if event.reasoning:
+                    # Its own delta field, ahead of the answer, under the
+                    # name OpenAI-compatible clients already accumulate.
+                    # Past the commit point like any other output.
+                    yield frame(
+                        envelope(
+                            delta=Delta(reasoning_content=event.reasoning),
+                            finish=None,
+                            model=body.model,
+                        )
+                    )
+                    continue
                 yield frame(
                     envelope(delta=Delta(content=event.text), finish=None, model=body.model)
                 )
@@ -1836,13 +1940,7 @@ async def _stream_completion(
                 envelope(delta=Delta(role=Role2.assistant), finish=None, model=served_model)
             )
 
-        usage = None
-        if response.usage is not None:
-            usage = CompletionUsage(
-                prompt_tokens=response.usage.promptTokens,
-                completion_tokens=response.usage.completionTokens,
-                total_tokens=response.usage.totalTokens,
-            )
+        usage = _openai_usage(response.usage)
         _record(
             rec,
             body,

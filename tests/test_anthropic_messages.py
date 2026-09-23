@@ -66,6 +66,11 @@ def body(**overrides: Any) -> dict[str, Any]:
         "stream": False,
         "thinking": {"type": "adaptive", "display": "omitted"},
         "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+        # On every request since agent-sdk 0.3.280 (captured 2026-09-23).
+        # Absent from this fixture until then, which is exactly how A2's
+        # unknown-field refusal came to 400 every real Claude Code request
+        # while every test here stayed green.
+        "output_config": {"effort": "high"},
         "metadata": {"user_id": '{"device_id":"abc","account_uuid":"","session_id":"def"}'},
         "system": [
             {

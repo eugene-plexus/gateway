@@ -97,6 +97,14 @@ def parse_request(raw: Any) -> ChatCompletionRequest:
             raise Refusal("response_format.json_schema", "is required for json_schema output")
         if fmt.type.value != "json_schema" and fmt.json_schema is not None:
             raise Refusal("response_format.json_schema", "requires type json_schema")
+    # Only a model's own turn has reasoning to hand back. Anywhere else it
+    # has nowhere to go, and dropping text that changes the prompt is the
+    # silent discard A2 exists to refuse.
+    for index, message in enumerate(parsed.messages):
+        if message.reasoning_content is not None and message.role.value != "assistant":
+            raise Refusal(
+                f"messages[{index}].reasoning_content", "is accepted only on assistant messages"
+            )
     try:
         validate_messages(parsed.messages)
     except ImageRefusal as exc:

@@ -20,6 +20,8 @@ tests while refusing the one client it exists for.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
 import time
@@ -261,17 +263,96 @@ _REFUSED_BLOCK_TYPES = {"image", "document"}
 # A blanket unknown-field refusal passes every refusal test and then
 # fails on the first real request, which is the trap this whole door was
 # scoped around.
-_DROPPED_TOP_LEVEL = ("thinking", "cache_control", "metadata", "context_management")
+_DROPPED_TOP_LEVEL = (
+    "thinking",
+    "cache_control",
+    "metadata",
+    "context_management",
+    # On every Claude Code request since agent-sdk 0.3.280 (captured
+    # 2026-09-23) as `{"effort": "high"}`. Refused as an unknown field until
+    # then, which failed the first request of every session.
+    "output_config",
+)
+
+# The only `output_config` key this door accepts. Anything else --
+# structured output's `format` above all -- changes what the answer is.
+_ACCEPTED_OUTPUT_CONFIG = frozenset({"effort"})
 
 # Fields whose presence means the caller wants something this control
-# plane cannot do at all, as opposed to something it can ignore.
-_REFUSED_TOP_LEVEL = ("mcp_servers", "top_k")
+# plane cannot do at all, as opposed to something it can ignore. `top_k`
+# left this list on 2026-09-23: the driver's request carries it now.
+_REFUSED_TOP_LEVEL = ("mcp_servers",)
+
+# The opaque signature an omitted thinking block carries. Anthropic's own
+# signature exists so the server keeps continuity when a client echoes a
+# block back without its text; ours does the same job, readably, and says
+# whose it is so nobody mistakes it for Anthropic's.
+_SIGNATURE_PREFIX = "eugene-plexus-reasoning-v1:"
+
+
+def thinking_display(raw: Mapping[str, Any]) -> str | None:
+    """How this request asked to see the model's reasoning, if at all.
+
+    None -- no `thinking` blocks: the request sent no `thinking`, sent
+    null, or sent `{"type": "disabled"}`. Anthropic's own rule, and the
+    one that keeps `content[0].text` pointing at the answer for the
+    commonest line of SDK code there is.
+
+    `"omitted"` -- blocks with the text empty and the reasoning in the
+    signature. **Claude Code asks for this on every request** (measured,
+    2.1.207), which is Anthropic's `display: "omitted"`.
+
+    `"text"` -- blocks with the reasoning in them, for `"summarized"` or
+    no `display`: ours is the whole reasoning, with nothing to condense
+    it and nothing to hide.
+    """
+    thinking = raw.get("thinking")
+    if not isinstance(thinking, Mapping) or thinking.get("type") == "disabled":
+        return None
+    return "omitted" if thinking.get("display") == "omitted" else "text"
+
+
+def encode_signature(reasoning: str) -> str:
+    return _SIGNATURE_PREFIX + base64.b64encode(reasoning.encode("utf-8")).decode("ascii")
+
+
+def decode_signature(signature: Any) -> str | None:
+    """The reasoning an omitted block carried, or None for anyone else's.
+
+    A signature without our prefix is Anthropic's, or garbage, and is
+    ignored rather than guessed at; so is one whose body will not decode.
+    """
+    if not isinstance(signature, str) or not signature.startswith(_SIGNATURE_PREFIX):
+        return None
+    try:
+        text = base64.b64decode(signature[len(_SIGNATURE_PREFIX) :], validate=True).decode()
+    except (binascii.Error, UnicodeDecodeError):
+        return None
+    return text or None
+
+
+def thinking_block(reasoning: str, display: str) -> dict[str, Any]:
+    if display == "omitted":
+        return {"type": "thinking", "thinking": "", "signature": encode_signature(reasoning)}
+    return {"type": "thinking", "thinking": reasoning, "signature": ""}
 
 
 def compatibility_headers(raw: Mapping[str, Any]) -> dict[str, str]:
-    ignored = [
-        name for name in _DROPPED_TOP_LEVEL if name != "metadata" and raw.get(name) is not None
-    ]
+    def not_honoured(name: str) -> bool:
+        value = raw.get(name)
+        if name == "metadata" or value is None:
+            return False
+        if name != "thinking":
+            return True
+        # `thinking` decides whether reasoning is returned and whether its
+        # text is shown, and both are honoured. What is not: a token budget,
+        # and `disabled` as an instruction to the model -- the model thinks
+        # regardless, and only the operator's `thinkingMode` changes that.
+        return not isinstance(value, Mapping) or (
+            value.get("budget_tokens") is not None or value.get("type") == "disabled"
+        )
+
+    ignored = [name for name in _DROPPED_TOP_LEVEL if not_honoured(name)]
 
     # Cache hints also arrive on system, tool and message blocks. Do not walk
     # tool JSON Schemas or user metadata looking for coincidental property names.
@@ -404,6 +485,20 @@ def _tool_choice(choice: Any) -> Any:
     )
 
 
+def _parallel_tool_calls(choice: Any) -> bool | None:
+    """`disable_parallel_tool_use` as the backend's `parallel_tool_calls`.
+
+    Opposite sense, and only when the caller said something: absent
+    stays absent, because llama.cpp and OpenAI disagree about the default
+    and filling one in would change what one of them does. **Silently
+    dropped until 2026-09-23** -- accepted by the loose model, read by
+    nothing -- which is the one outcome a setting that changes the
+    answer must never have.
+    """
+    disable = getattr(choice, "disable_parallel_tool_use", None) if choice is not None else None
+    return None if disable is None else not disable
+
+
 def _tools(definitions: Any) -> list[Tool] | None:
     """Anthropic tool definitions in OpenAI's function shape.
 
@@ -457,6 +552,16 @@ def translate_request(raw: Mapping[str, Any]) -> ChatCompletionRequest:
     except ValidationError as e:
         raise _validation_refusal(e) from e
 
+    output_config = raw.get("output_config")
+    if isinstance(output_config, Mapping):
+        for key in output_config:
+            if key not in _ACCEPTED_OUTPUT_CONFIG:
+                raise Refusal(
+                    f"output_config.{chat_contract._field_name(str(key))}: unsupported "
+                    "setting. Only `effort` is accepted here (and not enforced: the "
+                    "model's settings profile governs how it thinks)."
+                )
+
     for name in _REFUSED_TOP_LEVEL:
         if raw.get(name) is not None:
             raise Refusal(
@@ -484,6 +589,7 @@ def translate_request(raw: Mapping[str, Any]) -> ChatCompletionRequest:
         _refuse_unsupported_blocks(blocks, where=f"{turn.role.value} message")
 
         text_parts: list[str] = []
+        reasoning_parts: list[str] = []
         calls: list[ToolCall] = []
         results: list[ChatCompletionMessage] = []
 
@@ -492,6 +598,18 @@ def translate_request(raw: Mapping[str, Any]) -> ChatCompletionRequest:
             if kind == "text":
                 if _field(block, "text"):
                     text_parts.append(str(_field(block, "text")))
+            elif kind == "thinking" and turn.role.value == "assistant":
+                # A thinking block we returned, handed back as Anthropic
+                # tells clients to: its text when it was shown, else the
+                # reasoning our signature carried. Either way it becomes
+                # this turn's reasoning, which llama.cpp renders back into
+                # the prompt for templates that keep it -- so a tool loop
+                # resumes with the model's own thinking. Anyone else's
+                # signature is ignored. `redacted_thinking` falls through
+                # to the drop below: nothing in it is readable here.
+                thought = _field(block, "thinking") or decode_signature(_field(block, "signature"))
+                if thought:
+                    reasoning_parts.append(str(thought))
             elif kind == "tool_use":
                 # The inbound half. Without it a tool loop cannot
                 # continue past its first turn, because the assistant
@@ -527,12 +645,13 @@ def translate_request(raw: Mapping[str, Any]) -> ChatCompletionRequest:
         # an OpenAI backend expects every `tool` message to follow the
         # assistant message that asked for it with nothing between.
         messages.extend(results)
-        if text_parts or calls:
+        if text_parts or calls or reasoning_parts:
             messages.append(
                 ChatCompletionMessage(
                     role=Role1(turn.role.value),
                     content="\n\n".join(text_parts) if text_parts else None,
                     tool_calls=calls or None,
+                    reasoning_content="\n\n".join(reasoning_parts) if reasoning_parts else None,
                 )
             )
 
@@ -549,10 +668,14 @@ def translate_request(raw: Mapping[str, Any]) -> ChatCompletionRequest:
         # caller asked for.
         temperature=body.temperature,
         top_p=body.top_p,
+        # Refused with a 400 from A2 until 2026-09-23: the driver's request
+        # had nowhere to put it. Both local engines read it.
+        top_k=body.top_k,
         stop=Stop(body.stop_sequences) if body.stop_sequences else None,
         stream=bool(body.stream),
         tools=_tools(body.tools),
         tool_choice=_tool_choice(body.tool_choice),
+        parallel_tool_calls=_parallel_tool_calls(body.tool_choice),
     )
 
 
@@ -590,23 +713,42 @@ def stop_reason(finish: Any) -> str:
 
 
 def usage_block(usage: Any) -> dict[str, int]:
-    """Token counts, renamed.
+    """Token counts, renamed -- and split the way Anthropic splits them.
 
-    Cache counts are reported as an honest zero rather than omitted: a
-    client that reads them should see nothing rather than an absence it
-    has to guess about.
+    **Anthropic's `input_tokens` excludes cached input**: a client that
+    computes context usage adds `input_tokens`, `cache_read_input_tokens`
+    and `cache_creation_input_tokens`. So when the backend reports how
+    much of the prompt came from its cache (llama.cpp and vLLM do), that
+    part moves to `cache_read_input_tokens` and the three still sum to the
+    prompt. Reporting the cached count on top of an unreduced
+    `input_tokens` would double it in every such client.
+
+    Cache counts are an honest zero when the backend said nothing, and
+    creation is always zero: a local engine's cache is not something a
+    request pays to write.
     """
+    prompt = getattr(usage, "promptTokens", 0) or 0
+    cached = getattr(usage, "cachedPromptTokens", None) or 0
+    cached = min(cached, prompt)
     return {
-        "input_tokens": getattr(usage, "promptTokens", 0) or 0,
+        "input_tokens": prompt - cached,
         "output_tokens": getattr(usage, "completionTokens", 0) or 0,
         "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 0,
+        "cache_read_input_tokens": cached,
     }
 
 
-def content_blocks(content: str | None, tool_calls: Any) -> list[dict[str, Any]]:
-    """Text and tool calls as Anthropic content blocks, text first."""
+def content_blocks(
+    content: str | None,
+    tool_calls: Any,
+    *,
+    reasoning: str | None = None,
+    display: str | None = None,
+) -> list[dict[str, Any]]:
+    """A thinking block when asked for, then text and tool calls, text first."""
     blocks: list[dict[str, Any]] = []
+    if reasoning and display is not None:
+        blocks.append(thinking_block(reasoning, display))
     if content:
         blocks.append({"type": "text", "text": content})
     for call in tool_calls or []:
@@ -627,16 +769,26 @@ def content_blocks(content: str | None, tool_calls: Any) -> list[dict[str, Any]]
 
 
 def message_response(
-    *, model: str, content: str | None, tool_calls: Any, finish: Any, usage: Any
+    *,
+    model: str,
+    content: str | None,
+    tool_calls: Any,
+    finish: Any,
+    usage: Any,
+    reasoning: str | None = None,
+    display: str | None = None,
+    stop_sequence: str | None = None,
 ) -> dict[str, Any]:
     return {
         "id": f"msg_{uuid.uuid4().hex}",
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": content_blocks(content, tool_calls),
+        "content": content_blocks(content, tool_calls, reasoning=reasoning, display=display),
         "stop_reason": stop_reason(finish),
-        "stop_sequence": None,
+        # Named when the backend named it (vLLM does, llama.cpp does not)
+        # and only beside the stop reason that says a sequence matched.
+        "stop_sequence": stop_sequence if stop_reason(finish) == "stop_sequence" else None,
         "usage": usage_block(usage),
     }
 
@@ -687,13 +839,21 @@ class StreamTranslator:
     that produced nothing.
     """
 
-    def __init__(self, model: str) -> None:
+    def __init__(self, model: str, *, display: str | None = None) -> None:
         self.model = model
         self.started = False
         self._next_index = 0
         self._text_index: int | None = None
         self._tool_index: dict[int, int] = {}
         self._message_id = f"msg_{uuid.uuid4().hex}"
+        #: How the request asked to see reasoning -- see `thinking_display`.
+        #: None hides it: its events still start the message (they are
+        #: output, and past the commit point) but open no block.
+        self._display = display
+        self._thinking_index: int | None = None
+        #: Under `"omitted"` the text is not streamed; it is held here and
+        #: sent as the block's closing `signature_delta`.
+        self._withheld: list[str] = []
 
     def start(self, model: str | None = None) -> str:
         """`message_start`, emitted on the FIRST DRIVER EVENT.
@@ -734,8 +894,78 @@ class StreamTranslator:
         self._text_index = None
         return out
 
-    def text(self, chunk: str) -> list[str]:
+    def thinking(self, chunk: str) -> list[str]:
+        """Reasoning as a `thinking` block, or as nothing when not asked for.
+
+        Opens its block ahead of the answer and is closed before the next
+        kind of block starts -- Anthropic allows one open block at a time.
+        Under `"omitted"` no `thinking_delta` is sent at all; the text is
+        withheld and travels in the closing `signature_delta`, which is
+        what Anthropic's own omitted stream looks like.
+        """
+        if self._display is None:
+            return []
         out: list[str] = []
+        if self._thinking_index is None:
+            out.extend(self._close_text())
+            out.extend(self._close_tool_except(None))
+            self._thinking_index = self._next_index
+            self._next_index += 1
+            out.append(
+                frame(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": self._thinking_index,
+                        "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+                    },
+                )
+            )
+        if self._display == "omitted":
+            self._withheld.append(chunk)
+            return out
+        out.append(
+            frame(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": self._thinking_index,
+                    "delta": {"type": "thinking_delta", "thinking": chunk},
+                },
+            )
+        )
+        return out
+
+    def _close_thinking(self) -> list[str]:
+        if self._thinking_index is None:
+            return []
+        out: list[str] = []
+        if self._display == "omitted" and self._withheld:
+            out.append(
+                frame(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": self._thinking_index,
+                        "delta": {
+                            "type": "signature_delta",
+                            "signature": encode_signature("".join(self._withheld)),
+                        },
+                    },
+                )
+            )
+        out.append(
+            frame(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": self._thinking_index},
+            )
+        )
+        self._thinking_index = None
+        self._withheld = []
+        return out
+
+    def text(self, chunk: str) -> list[str]:
+        out: list[str] = self._close_thinking()
         if self._text_index is None:
             self._text_index = self._next_index
             self._next_index += 1
@@ -776,8 +1006,9 @@ class StreamTranslator:
                 call_index = position
             if call_index not in self._tool_index:
                 # A new call. Close whatever is open first: Anthropic
-                # allows one open block at a time, and a text block left
-                # open is a stream a strict client rejects.
+                # allows one open block at a time, and a text or thinking
+                # block left open is a stream a strict client rejects.
+                out.extend(self._close_thinking())
                 out.extend(self._close_text())
                 out.extend(self._close_tool_except(call_index))
                 index = self._next_index
@@ -818,7 +1049,7 @@ class StreamTranslator:
                 )
         return out
 
-    def _close_tool_except(self, keep: int) -> list[str]:
+    def _close_tool_except(self, keep: int | None) -> list[str]:
         out: list[str] = []
         for call_index, index in list(self._tool_index.items()):
             if call_index == keep:
@@ -829,17 +1060,23 @@ class StreamTranslator:
 
     def close_blocks(self) -> list[str]:
         """Every block that opened also closes, in the order it opened."""
-        out = self._close_text()
+        out = self._close_thinking()
+        out.extend(self._close_text())
         for _, index in sorted(self._tool_index.items(), key=lambda kv: kv[1]):
             out.append(frame("content_block_stop", {"type": "content_block_stop", "index": index}))
         self._tool_index.clear()
         return out
 
-    def finish(self, *, reason: str, usage: Any = None) -> list[str]:
+    def finish(
+        self, *, reason: str, usage: Any = None, stop_sequence: str | None = None
+    ) -> list[str]:
         out = self.close_blocks()
         delta: dict[str, Any] = {
             "type": "message_delta",
-            "delta": {"stop_reason": reason, "stop_sequence": None},
+            "delta": {
+                "stop_reason": reason,
+                "stop_sequence": stop_sequence if reason == "stop_sequence" else None,
+            },
         }
         if usage is not None:
             delta["usage"] = usage_block(usage)
