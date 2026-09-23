@@ -99,7 +99,7 @@ def codex_request(**overrides: Any) -> dict[str, Any]:
         "store": False,
         "stream": True,
         "include": [],
-        "prompt_cache_key": "01a0cf68-2278-74d0-8dc5-5aefa90662ca",
+        "prompt_cache_key": "00000000-0000-0000-0000-000000000001",
         "client_metadata": {"x-codex-installation-id": "a40c9e44"},
     }
     request.update(overrides)
