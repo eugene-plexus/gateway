@@ -1378,7 +1378,8 @@ class AnthropicContentBlock(BaseModel):
     union that rejects the next block type Anthropic adds, on a wire
     we do not own.
 
-    The variants this gateway carries: `text` (`text`), `tool_use`
+    The variants this gateway carries: `text` (`text`), `image`
+    (`source`, base64 only -- see the endpoint), `tool_use`
     (`id`, `name`, `input`), `tool_result` (`tool_use_id`,
     `content`, `is_error`), and `thinking` (`thinking`,
     `signature`) -- returned ahead of the answer when the request
@@ -1386,11 +1387,11 @@ class AnthropicContentBlock(BaseModel):
     turn's reasoning. `redacted_thinking` is accepted on the way in
     and dropped.
 
-    The variants it refuses with a 400: `image` and `document`. They
-    are refused rather than dropped because a model that never
-    received the image is not answering the question that was
-    asked, and a silently text-only answer to *"what is in this
-    screenshot"* is worse than a refusal that names the reason.
+    The variant it refuses with a 400: `document`. Refused rather
+    than dropped because a model that never received the document
+    is not answering the question that was asked. `image` was
+    refused on the same reasoning until 2026-09-23, when it began
+    to be carried to backends that confirm image input.
 
     """
 
@@ -1413,7 +1414,7 @@ class AnthropicContentBlock(BaseModel):
     )
     content: str | list[AnthropicContentBlock] | None = Field(
         None,
-        description='On `tool_result`: the result, as a string or as a list of\nblocks. Claude Code sends a plain string; a list containing\nan image block is refused like any other image.\n',
+        description='On `tool_result`: the result, as a string or as a list of\nblocks. Claude Code sends a plain string for text, and for\nits `Read` of an image a list holding one `image` block and\nno text -- whose picture is carried on the next user message,\nsince a `tool` message carries text only.\n',
     )
     is_error: bool | None = Field(
         None,
@@ -1426,6 +1427,10 @@ class AnthropicContentBlock(BaseModel):
     signature: str | None = Field(
         None,
         description='On `thinking`: opaque to the client, as Anthropic\'s is. From\nthis gateway it is empty when the text is shown, and\n`eugene-plexus-reasoning-v1:<base64 of the reasoning>` when\nthe request asked for `display: "omitted"` -- so a client\nthat echoes the block back unchanged, as Anthropic tells it\nto, returns the reasoning for the next turn. Not Anthropic\'s\nsignature and not verifiable by Anthropic; a signature\nwithout that prefix is ignored on the way in.\n',
+    )
+    source: dict[str, Any] | None = Field(
+        None,
+        description='On `image`: `{"type": "base64", "media_type": "image/png",\n"data": "<base64>"}`. `media_type` is `image/png`,\n`image/jpeg`, `image/gif` or `image/webp`; the last two are\nre-encoded to PNG. A `url` or `file` source is refused.\n',
     )
     cache_control: dict[str, Any] | None = None
 
@@ -2521,10 +2526,10 @@ class AnthropicMessagesRequest(BaseModel):
     are accepted with a response header naming ignored settings;
     `thinking` chooses whether reasoning is returned. Metadata is
     discarded. Unknown top-level settings are explicitly rejected.
-    This is a text/tool translation, not full parity.
+    This is a text, image and tool translation, not full parity.
 
     Consequently **this schema does not decide what is refused**.
-    The refusals — image and document blocks, server-side tools,
+    The refusals — document blocks, server-side tools,
     `mcp_servers`, more than four `stop_sequences` — are enforced
     against the raw request body by the implementation, with a 400
     naming the field, because a model that ignores extra keys cannot

@@ -33,16 +33,19 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from . import chat_contract, security
+from . import chat_contract, images, security
 from ._generated.models import (
     AnthropicMessagesRequest,
     ChatCompletionMessage,
     ChatCompletionRequest,
     Function,
     FunctionDefinition,
+    ImageContentPart,
+    ImageUrl,
     NamedToolChoice,
     Role1,
     Stop,
+    TextContentPart,
     Tool,
     ToolCall,
     ToolChoice,
@@ -252,10 +255,11 @@ async def authorize(request: Request) -> None:
 
 # Block types this gateway will not carry. Refused rather than dropped,
 # because each changes what the answer would be: a model that never
-# received the image is not answering the question that was asked, and a
-# confident text-only reply to "what is in this screenshot" is worse
-# than a refusal naming the reason.
-_REFUSED_BLOCK_TYPES = {"image", "document"}
+# received the document is not answering the question that was asked.
+# `image` left this set on 2026-09-23 -- it is carried now, on the path
+# the OpenAI door's images already take, and a backend that cannot see
+# it is never asked (see `_image_part`).
+_REFUSED_BLOCK_TYPES = {"document"}
 
 # Fields that arrive on every real request and have no equivalent here.
 # Accepted for the measured Claude Code client; A2 reports ignored controls
@@ -408,7 +412,7 @@ def _field(block: Any, name: str) -> Any:
 
 
 def _refuse_unsupported_blocks(blocks: Iterable[Any], *, where: str) -> None:
-    """Refuse an image or document anywhere it can appear.
+    """Refuse a document anywhere it can appear.
 
     **Including inside a `tool_result`**, which is the case a check that
     only walked top-level blocks would pass its own test on and then
@@ -463,6 +467,74 @@ def _tool_result_text(block: Any) -> str:
     if _field(block, "is_error"):
         return f"[tool error] {text}" if text else "[tool error]"
     return text
+
+
+def _image_part(block: Any, where: str, budget: images.ImageBudget) -> ImageContentPart:
+    """An Anthropic `image` block as the part the OpenAI door already carries.
+
+    From there it is the shared path's: the same limits, the same
+    PNG/JPEG check, and routing only to a backend that confirms image
+    input, so a model that cannot see it is refused rather than asked.
+    Named in the caller's own coordinates (`messages.2.content.0...`),
+    because that is the list the caller can find the picture in.
+    """
+    field = f"{where}.source"
+    source = _field(block, "source")
+    if not isinstance(source, Mapping) or source.get("type") != "base64":
+        # A URL is never fetched, as on the OpenAI door: the gateway
+        # dialling an address a caller names is the request forgery R2.4
+        # closed for node addresses. A Files API id names a store that
+        # exists only at Anthropic.
+        raise Refusal(
+            f"{field}: send the image inline as base64. URLs are not fetched and "
+            "file references cannot be resolved here."
+        )
+    try:
+        url = images.data_url_from_base64(source.get("media_type"), source.get("data"), field)
+        budget.admit(url, field)
+    except images.ImageRefusal as e:
+        raise Refusal(str(e)) from None
+    return ImageContentPart(type="image_url", image_url=ImageUrl(url=url))
+
+
+def _tool_result_images(
+    block: Any, where: str, budget: images.ImageBudget
+) -> list[ImageContentPart]:
+    """The pictures a tool returned -- Claude Code's `Read` of an image.
+
+    Captured 2026-09-23: that `tool_result` holds a lone `image` block and
+    no text. An OpenAI `tool` message carries text only and image parts
+    ride on user messages, so they cannot stay where they arrived.
+    """
+    content = _field(block, "content")
+    if not isinstance(content, list):
+        return []
+    return [
+        _image_part(inner, f"{where}.content.{i}", budget)
+        for i, inner in enumerate(content)
+        if _field(inner, "type") == "image"
+    ]
+
+
+def _joined(parts: list[TextContentPart | ImageContentPart]) -> Any:
+    """A turn's content: a string as ever, or ordered parts when it holds a picture.
+
+    Adjacent text blocks join with a blank line either way, which is how
+    this door has always joined them, so a turn's words read the same to
+    the model whether or not an image sits beside them.
+    """
+    merged: list[TextContentPart | ImageContentPart] = []
+    for part in parts:
+        previous = merged[-1] if merged else None
+        if isinstance(part, TextContentPart) and isinstance(previous, TextContentPart):
+            merged[-1] = TextContentPart(type="text", text=f"{previous.text}\n\n{part.text}")
+        else:
+            merged.append(part)
+    if not merged:
+        return None
+    if len(merged) == 1 and isinstance(merged[0], TextContentPart):
+        return merged[0].text
+    return merged
 
 
 def _tool_choice(choice: Any) -> Any:
@@ -584,20 +656,33 @@ def translate_request(raw: Mapping[str, Any]) -> ChatCompletionRequest:
     if system:
         messages.append(ChatCompletionMessage(role=Role1.system, content=system))
 
-    for turn in body.messages:
+    budget = images.ImageBudget()
+    for turn_index, turn in enumerate(body.messages):
         blocks = _blocks(turn.content)
         _refuse_unsupported_blocks(blocks, where=f"{turn.role.value} message")
+        role = turn.role.value
 
-        text_parts: list[str] = []
+        parts: list[TextContentPart | ImageContentPart] = []
+        # Pictures a tool returned, carried on this turn's user message
+        # ahead of the person's own words: they answer the call above.
+        hoisted: list[TextContentPart | ImageContentPart] = []
         reasoning_parts: list[str] = []
         calls: list[ToolCall] = []
         results: list[ChatCompletionMessage] = []
 
-        for block in blocks:
+        for block_index, block in enumerate(blocks):
+            where = f"messages.{turn_index}.content.{block_index}"
             kind = _field(block, "type")
             if kind == "text":
                 if _field(block, "text"):
-                    text_parts.append(str(_field(block, "text")))
+                    parts.append(TextContentPart(type="text", text=str(_field(block, "text"))))
+            elif kind == "image":
+                if role != "user":
+                    raise Refusal(
+                        f"{where}: images are accepted on user turns and inside tool "
+                        f"results, not on a {role} turn."
+                    )
+                parts.append(_image_part(block, where, budget))
             elif kind == "thinking" and turn.role.value == "assistant":
                 # A thinking block we returned, handed back as Anthropic
                 # tells clients to: its text when it was shown, else the
@@ -633,23 +718,46 @@ def translate_request(raw: Mapping[str, Any]) -> ChatCompletionRequest:
                 # this wrong turns the tool's output into the human
                 # speaking, which is exactly the defect step 6 found on
                 # the other protocol.
-                results.append(
-                    ChatCompletionMessage(
-                        role=Role1.tool,
-                        content=_tool_result_text(block),
-                        tool_call_id=str(_field(block, "tool_use_id") or ""),
+                call_id = str(_field(block, "tool_use_id") or "")
+                text = _tool_result_text(block)
+                pictures = _tool_result_images(block, where, budget)
+                if pictures and role != "user":
+                    raise Refusal(f"{where}: a tool result belongs on a user turn.")
+                if pictures:
+                    # The tool message still answers its call and says where
+                    # the picture went: a model reading an empty result and
+                    # then an unexplained image cannot tell which call made it.
+                    many = len(pictures) > 1
+                    note = (
+                        f"[The tool returned {len(pictures)} images; they are attached to "
+                        "the next user message.]"
+                        if many
+                        else "[The tool returned an image; it is attached to the next user "
+                        "message.]"
                     )
+                    text = f"{text}\n{note}" if text else note
+                    label = "The images" if many else "The image"
+                    hoisted.append(
+                        TextContentPart(
+                            type="text", text=f"{label} returned by tool call {call_id}:"
+                        )
+                    )
+                    hoisted.extend(pictures)
+                results.append(
+                    ChatCompletionMessage(role=Role1.tool, content=text, tool_call_id=call_id)
                 )
 
         # Results first: they answer the assistant turn above them, and
         # an OpenAI backend expects every `tool` message to follow the
-        # assistant message that asked for it with nothing between.
+        # assistant message that asked for it with nothing between. A
+        # tool's pictures then follow them at once, on the user message.
         messages.extend(results)
-        if text_parts or calls or reasoning_parts:
+        content = _joined(hoisted + parts)
+        if content is not None or calls or reasoning_parts:
             messages.append(
                 ChatCompletionMessage(
-                    role=Role1(turn.role.value),
-                    content="\n\n".join(text_parts) if text_parts else None,
+                    role=Role1(role),
+                    content=content,
                     tool_calls=calls or None,
                     reasoning_content="\n\n".join(reasoning_parts) if reasoning_parts else None,
                 )

@@ -235,9 +235,13 @@ def test_metadata_and_context_management_are_dropped(settings: Settings) -> None
 # --------------------------------------------------------------------------- #
 
 
-def test_an_image_block_is_refused_naming_the_field(settings: Settings) -> None:
-    """Refused rather than dropped: a model that never received the
-    image is not answering the question that was asked."""
+def test_an_image_that_will_not_decode_is_refused_naming_the_field(settings: Settings) -> None:
+    """Amended 2026-09-23. This asserted that EVERY image block was
+    refused; images are carried now (`test_anthropic_images.py`), and
+    the payload here, four characters of a PNG header, is refused for
+    being no picture at all -- which the old assertion, `"image" in
+    message`, would have accepted as the same thing. It names the block
+    now, in the caller's coordinates, so the two cannot be confused."""
     fake = FakeDriverClient(name="d1", model_id=MODEL)
     request = body(
         messages=[
@@ -259,7 +263,8 @@ def test_an_image_block_is_refused_naming_the_field(settings: Settings) -> None:
     payload = r.json()
     assert payload["type"] == "error"
     assert payload["error"]["type"] == "invalid_request_error"
-    assert "image" in payload["error"]["message"]
+    assert "messages.0.content.1.source" in payload["error"]["message"]
+    assert "invalid" in payload["error"]["message"]
     assert not fake.calls, "a refused request must not reach a backend"
 
 
@@ -279,9 +284,11 @@ def test_a_document_block_is_refused(settings: Settings) -> None:
     assert "document" in r.json()["error"]["message"]
 
 
-def test_an_image_inside_a_tool_result_is_refused_too(settings: Settings) -> None:
-    """The nested case. A refusal that only looked at top-level blocks
-    would pass its own test and then serve a screenshot-blind answer."""
+def test_an_image_inside_a_tool_result_is_checked_too(settings: Settings) -> None:
+    """The nested case, amended 2026-09-23 like the one above: a check
+    that only looked at top-level blocks would pass its own test and then
+    carry a picture it never validated. This one has no `media_type` and
+    is refused for that, at its nested coordinate."""
     fake = FakeDriverClient(name="d1", model_id=MODEL, supports_tools=True)
     request = body(
         messages=[
@@ -307,7 +314,9 @@ def test_an_image_inside_a_tool_result_is_refused_too(settings: Settings) -> Non
     with _client(_app_with(settings, fake)) as client:
         r = client.post("/v1/messages", json=request)
     assert r.status_code == 400
-    assert "image" in r.json()["error"]["message"]
+    assert "messages.2.content.0.content.0.source" in r.json()["error"]["message"]
+    assert "media_type" in r.json()["error"]["message"]
+    assert not fake.calls
 
 
 def test_a_server_side_tool_is_refused(settings: Settings) -> None:

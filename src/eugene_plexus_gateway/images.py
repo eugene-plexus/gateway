@@ -40,9 +40,30 @@ def has_images(messages: Any) -> bool:
     )
 
 
+class ImageBudget:
+    """One request's image count and decoded total, whichever door it came in by.
+
+    The Anthropic door names a picture in its caller's own coordinates and
+    the OpenAI door in its, so the limits live here and the field name is
+    the caller's to supply.
+    """
+
+    def __init__(self) -> None:
+        self.count = 0
+        self.total = 0
+
+    def admit(self, url: str, field: str) -> None:
+        self.count += 1
+        if self.count > MAX_IMAGES:
+            raise ImageRefusal(field, "at most four images are allowed per request")
+        self.total += _validate_image(url, field)
+        if self.total > MAX_TOTAL_BYTES:
+            raise ImageRefusal(field, "images exceed the 10 MiB decoded request limit")
+
+
 def validate_messages(messages: Any) -> None:
     """Validate typed messages, then flatten only arrays consisting entirely of text."""
-    count = total = 0
+    budget = ImageBudget()
     for index, message in enumerate(messages or []):
         content = content_wire(message.content)
         if not isinstance(content, list):
@@ -55,14 +76,58 @@ def validate_messages(messages: Any) -> None:
             if getattr(message.role, "value", message.role) != "user":
                 raise ImageRefusal(field, "images are supported only on user messages")
             contains_image = True
-            count += 1
-            if count > MAX_IMAGES:
-                raise ImageRefusal(field, "at most four images are allowed per request")
-            total += _validate_image(part["image_url"]["url"], field)
-            if total > MAX_TOTAL_BYTES:
-                raise ImageRefusal(field, "images exceed the 10 MiB decoded request limit")
+            budget.admit(part["image_url"]["url"], field)
         if not contains_image:
             message.content = "".join(part["text"] for part in content)
+
+
+# Anthropic accepts four image types. Local engines, and this gateway's own
+# contract, take two; the other two are re-encoded rather than refused,
+# because Claude Code sends a small `.webp` or `.gif` exactly as it found it
+# (captured 2026-09-23) and a refusal would fail its `Read` of either.
+# PNG is lossless, so the model sees the same pixels the caller sent.
+_REENCODED = {"image/gif": "GIF", "image/webp": "WEBP"}
+
+
+def data_url_from_base64(media_type: Any, data: Any, field: str) -> str:
+    """An Anthropic base64 image source as the data URL the shared path carries."""
+    if not isinstance(media_type, str) or not isinstance(data, str) or not data:
+        raise ImageRefusal(field, "an image source needs base64 `data` and a `media_type`")
+    if media_type in ("image/png", "image/jpeg"):
+        return f"data:{media_type};base64,{data}"
+    fmt = _REENCODED.get(media_type)
+    if fmt is None:
+        raise ImageRefusal(field, "use a PNG, JPEG, GIF or WebP image")
+    if len(data) > 4 * ((MAX_IMAGE_BYTES + 2) // 3):
+        raise ImageRefusal(field, "image exceeds the 5 MiB decoded limit")
+    try:
+        raw = base64.b64decode(data, validate=True)
+    except (ValueError, binascii.Error):
+        raise ImageRefusal(field, "image has invalid base64") from None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(raw), formats=[fmt]) as picture:
+                width, height = picture.size
+                if max(width, height) > MAX_DIMENSION or width * height > MAX_PIXELS:
+                    raise ImageRefusal(
+                        field, "image exceeds 8192 pixels per side or 16 million pixels"
+                    )
+                if getattr(picture, "is_animated", False):
+                    raise ImageRefusal(field, "animated images are not supported")
+                out = io.BytesIO()
+                picture.save(out, format="PNG")
+    except ImageRefusal:
+        raise
+    except (
+        OSError,
+        ValueError,
+        SyntaxError,
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+    ):
+        raise ImageRefusal(field, "image is invalid or does not match its GIF/WebP type") from None
+    return "data:image/png;base64," + base64.b64encode(out.getvalue()).decode()
 
 
 def _validate_image(url: str, field: str) -> int:
