@@ -10,7 +10,13 @@ from typing import Any
 
 from PIL import Image
 
-MAX_IMAGES = 4
+#: The default for the gateway's `maxImagesPerRequest`. It was a fixed four
+#: until 2026-09-23, when it was measured to refuse a Claude Code session on
+#: every turn after its fifth screenshot: a client resends its history, so the
+#: count is the whole conversation's.
+DEFAULT_MAX_IMAGES = 12
+#: The most the setting accepts, and the inference-driver's own ceiling.
+MAX_IMAGES_CEILING = 64
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_TOTAL_BYTES = 10 * 1024 * 1024
 MAX_PIXELS = 16_000_000
@@ -48,22 +54,36 @@ class ImageBudget:
     the caller's to supply.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, max_images: int = DEFAULT_MAX_IMAGES) -> None:
         self.count = 0
         self.total = 0
+        self.max_images = max_images
 
     def admit(self, url: str, field: str) -> None:
         self.count += 1
-        if self.count > MAX_IMAGES:
-            raise ImageRefusal(field, "at most four images are allowed per request")
+        if self.count > self.max_images:
+            raise ImageRefusal(
+                field,
+                f"at most {self.max_images} images are allowed per request, counted across "
+                "the whole conversation (the gateway's maxImagesPerRequest)",
+            )
         self.total += _validate_image(url, field)
         if self.total > MAX_TOTAL_BYTES:
             raise ImageRefusal(field, "images exceed the 10 MiB decoded request limit")
 
 
-def validate_messages(messages: Any) -> None:
+def max_images(store: Any) -> int:
+    """The operator's limit, or the default when the store says nothing usable."""
+    try:
+        value = int(store.get("maxImagesPerRequest")) if store is not None else DEFAULT_MAX_IMAGES
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_IMAGES
+    return min(max(value, 1), MAX_IMAGES_CEILING)
+
+
+def validate_messages(messages: Any, max_images: int = DEFAULT_MAX_IMAGES) -> None:
     """Validate typed messages, then flatten only arrays consisting entirely of text."""
-    budget = ImageBudget()
+    budget = ImageBudget(max_images)
     for index, message in enumerate(messages or []):
         content = content_wire(message.content)
         if not isinstance(content, list):

@@ -77,7 +77,7 @@ ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 # on every request, so a browser client of that door is a shape its
 # authors expect.
 FRONT_DOOR_PATHS: frozenset[str] = frozenset(
-    {"/v1/models", "/v1/chat/completions", "/v1/embeddings", "/v1/messages"}
+    {"/v1/models", "/v1/chat/completions", "/v1/embeddings", "/v1/messages", "/v1/responses"}
 )
 
 # What the three paths accept between them. A preflight for PATCH on

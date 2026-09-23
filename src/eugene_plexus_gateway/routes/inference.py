@@ -38,7 +38,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
-from .. import admission, anthropic, chat_contract, decisions
+from .. import admission, anthropic, chat_contract, decisions, responses
 from .._generated.driver_models import (
     DecisionQuestion as DriverDecisionQuestion,
 )
@@ -93,7 +93,7 @@ from ..config import ConfigStore
 from ..dependencies import require_authorized
 from ..disconnect import ClientGone, serve_while_connected
 from ..driver_client import DriverClient, DriverError, TieredClient
-from ..images import has_images
+from ..images import has_images, max_images
 from ..lifecycle import LifecycleManager, WakeResult
 from ..metrics import AttemptRow, CandidateRow, MetricsStore, RequestRow
 from ..routing import Resolution, RoutingTable, collect_attempts
@@ -282,6 +282,20 @@ class _Failure:
     def as_openai(self) -> JSONResponse:
         response = _error(
             code=self.code, message=self.message, error_type=self.error_type, param=self.param
+        )
+        if self.retry_after:
+            response.headers["Retry-After"] = self.retry_after
+        return response
+
+    def as_responses(self) -> JSONResponse:
+        # A 404 becomes a 400 on this door too, on its own measurement:
+        # Codex retries a 404 five times before it shows the message.
+        response = responses.error_response(
+            responses.status_for(self.code),
+            self.message,
+            error_type=self.error_type,
+            param=self.param,
+            code=responses.error_code(self.code, self.message, self.error_type),
         )
         if self.retry_after:
             response.headers["Retry-After"] = self.retry_after
@@ -496,7 +510,12 @@ class _Serving:
 
 
 async def _prepare(
-    request: Request, body: ChatCompletionRequest, *, surface: str, instead: str
+    request: Request,
+    body: ChatCompletionRequest,
+    *,
+    surface: str,
+    instead: str,
+    install_max_tokens: bool = True,
 ) -> _Serving | _Failure:
     """Resolve, refuse, refresh, wake, and start the clock.
 
@@ -515,7 +534,7 @@ async def _prepare(
     arrived = time.perf_counter()
     refreshed = False
 
-    constraints = _to_generate_request(body, _store(request))
+    constraints = _to_generate_request(body, _store(request), install_max_tokens=install_max_tokens)
     table = _routing(request)
     if table is None:
         return _Failure(
@@ -593,7 +612,7 @@ async def _prepare(
     store = _store(request)
     if isinstance(client, TieredClient):
         client.authorize_attempt = admission.before_attempt
-    generate = _to_generate_request(body, store)
+    generate = _to_generate_request(body, store, install_max_tokens=install_max_tokens)
     generate.localOnly = admission.local_only()
     profiles = getattr(request.app.state, "profile_defaults", None)
     if profiles is not None and isinstance(client, TieredClient):
@@ -616,7 +635,9 @@ async def _prepare(
             ):
                 return original
             defaults = await profiles.get(paths.get((candidate.node, candidate.name)))
-            prepared = _to_generate_request(body, store, defaults)
+            prepared = _to_generate_request(
+                body, store, defaults, install_max_tokens=install_max_tokens
+            )
             prepared.localOnly = original.localOnly
             prepared.requestId = original.requestId
             return prepared
@@ -664,7 +685,9 @@ async def create_chat_completion(request: Request) -> Any:
             param="body",
         )
     try:
-        body = await run_in_threadpool(chat_contract.parse_request, raw)
+        body = await run_in_threadpool(
+            lambda: chat_contract.parse_request(raw, max_images=max_images(_store(request)))
+        )
     except chat_contract.Refusal as exc:
         return _error(
             code=400, message=exc.message, error_type="invalid_request_error", param=exc.field
@@ -942,7 +965,7 @@ async def create_anthropic_message(request: Request) -> Any:
         return anthropic.error_response(400, "The request body must be a JSON object.")
 
     try:
-        body = anthropic.translate_request(raw)
+        body = anthropic.translate_request(raw, max_images=max_images(_store(request)))
     except anthropic.Refusal as refusal:
         return refusal.response()
 
@@ -1055,7 +1078,7 @@ async def count_anthropic_message_tokens(request: Request) -> Any:
     if not isinstance(raw, dict):
         return anthropic.error_response(400, "The request body must be a JSON object.")
     try:
-        body = anthropic.translate_count_request(raw)
+        body = anthropic.translate_count_request(raw, max_images=max_images(_store(request)))
     except anthropic.Refusal as refusal:
         return refusal.response()
 
@@ -1106,6 +1129,221 @@ async def count_anthropic_message_tokens(request: Request) -> Any:
     except httpx.HTTPError as e:
         return _cannot_count(body.model, f"its backend could not be reached ({type(e).__name__})")
     return JSONResponse(content={"input_tokens": counted})
+
+
+# --------------------------------------------------------------------------- #
+# /v1/responses -- OpenAI's Responses door, for Codex CLI
+# --------------------------------------------------------------------------- #
+
+
+async def _stream_responses(
+    body: ChatCompletionRequest,
+    prepared: _Serving,
+    translated: responses.Translated,
+    response_id: str,
+    store: ConfigStore | None,
+) -> AsyncIterator[str]:
+    """The driver's stream as the Responses event stream.
+
+    A sibling of `_stream_anthropic`, sharing the same `client.stream`, the
+    same commit point and the same `_record`, with one difference that was
+    measured into it: **the stream opens before the first token**, and says
+    `response.in_progress` every ten seconds until output arrives. Codex
+    drops a stream that is silent for five minutes -- before its first
+    event too -- and starts the whole request again, which on a slow
+    prefill is a loop that never finishes (record §5).
+    """
+    translator = responses.StreamTranslator(
+        response_id,
+        body.model,
+        echo=translated.echo,
+        include_reasoning=translated.include_reasoning,
+    )
+    for chunk in translator.start():
+        yield chunk
+    with collect_attempts() as tries:
+        response: GenerateResponse | None = None
+        try:
+            async for event in responses.with_keepalive(
+                prepared.client.stream(prepared.generate), responses.KEEPALIVE_SECONDS
+            ):
+                if event is None:
+                    yield translator.keepalive()
+                    continue
+                if event.done:
+                    # Captured, NOT broken out of -- see `_stream_completion`.
+                    response = event.result
+                    continue
+                if event.tool_calls:
+                    for chunk in translator.tool_fragments(event.tool_calls):
+                        yield chunk
+                    continue
+                if event.reasoning:
+                    for chunk in translator.reasoning(event.reasoning):
+                        yield chunk
+                    continue
+                if event.text:
+                    for chunk in translator.text(event.text):
+                        yield chunk
+        except (DriverError, httpx.HTTPError) as e:
+            log.warning("responses stream for %r failed: %s", body.model, e)
+            _record(prepared.rec, body, tries)
+            failure = _serve_failure(e, body, store)
+            for chunk in translator.failed(
+                failure.message,
+                code=responses.stream_error_code(failure.code, failure.message, failure.error_type),
+            ):
+                yield chunk
+            return
+
+        if response is None:
+            # A truncation, not a completion. `server_error`, which Codex
+            # retries: the backend broke, and another attempt may be served
+            # by another backend.
+            log.warning("driver stream for %r ended without a done event", body.model)
+            _record(prepared.rec, body, tries)
+            for chunk in translator.failed(
+                "The backend stopped before it finished. What arrived above is partial.",
+                code="server_error",
+            ):
+                yield chunk
+            return
+
+        served_model = response.modelId or body.model
+        _record(
+            prepared.rec,
+            body,
+            tries,
+            served_model=served_model,
+            tier=getattr(prepared.client, "tier", 1),
+            usage=response.usage,
+            backend_ms=response.latencyMs,
+        )
+        truncated = _prompt_truncated(body, response.usage)
+        _warn_if_truncated(
+            truncated, body, response.usage, getattr(prepared.client, "served_by", None)
+        )
+        for chunk in translator.finish(
+            model=served_model, finish=response.finishReason, usage=response.usage
+        ):
+            yield chunk
+
+
+@router.post("/v1/responses")
+async def create_response(request: Request) -> Any:
+    """OpenAI's Responses API, translated onto the shared path.
+
+    **Auth and the body are handled here rather than declared**, for the
+    reasons `/v1/messages` gives: the shared dependency's refusal is a
+    `problem+json` inside FastAPI's `detail`, and a declared body's
+    validation failure is FastAPI's 422 -- neither is the envelope an
+    OpenAI client reads its message from.
+    """
+    try:
+        await responses.authorize(request)
+    except responses.Refusal as refusal:
+        return refusal.response()
+    try:
+        raw = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        return responses.error_response(400, "body: must be valid JSON.", param="body")
+    if not isinstance(raw, dict):
+        return responses.error_response(400, "body: must be a JSON object.", param="body")
+
+    store = _store(request)
+    try:
+        translated = await run_in_threadpool(
+            lambda: responses.translate_request(raw, max_images=max_images(store))
+        )
+    except responses.Refusal as refusal:
+        return refusal.response()
+    body = translated.request
+
+    prepared = await _prepare(
+        request, body, surface="chat", instead="/v1/embeddings", install_max_tokens=False
+    )
+    if isinstance(prepared, _Failure):
+        return prepared.as_responses()
+    response_id = responses.new_id(admission.request_id())
+
+    if body.stream:
+        return StreamingResponse(
+            _stream_responses(body, prepared, translated, response_id, store),
+            media_type="text/event-stream",
+            headers=translated.headers(),
+        )
+
+    created_at = int(time.time())
+    with collect_attempts() as tries:
+        try:
+            response = await serve_while_connected(
+                request, prepared.client.generate(prepared.generate), what="a response"
+            )
+        except (ClientGone, DriverError, httpx.HTTPError) as e:
+            _record(prepared.rec, body, tries)
+            return _serve_failure(e, body, store).as_responses()
+
+        served_model = response.modelId or body.model
+        truncated = _prompt_truncated(body, response.usage)
+        _warn_if_truncated(
+            truncated, body, response.usage, getattr(prepared.client, "served_by", None)
+        )
+        _record(
+            prepared.rec,
+            body,
+            tries,
+            served_model=served_model,
+            tier=getattr(prepared.client, "tier", 1),
+            usage=response.usage,
+            backend_ms=response.latencyMs,
+        )
+        status, details = responses.status_of(response.finishReason)
+        return JSONResponse(
+            content=responses.response_object(
+                response_id=response_id,
+                created_at=created_at,
+                model=served_model,
+                status=status,
+                output=responses.output_items(
+                    content=response.content,
+                    tool_calls=response.toolCalls,
+                    reasoning=response.reasoning,
+                    include_reasoning=translated.include_reasoning,
+                    status=status,
+                ),
+                echo=translated.echo,
+                usage=response.usage,
+                incomplete_details=details,
+            ),
+            headers={
+                **translated.headers(),
+                **anthropic.envelope_headers(
+                    _routing_info(
+                        prepared.client,
+                        prepared.table,
+                        body.model,
+                        prepared.started,
+                        waited_ms=prepared.waited_ms,
+                        swapped_in=prepared.swapped_in,
+                        prompt_truncated=truncated,
+                    )
+                ),
+            },
+        )
+
+
+@router.api_route("/v1/responses/{rest:path}", methods=["GET", "POST", "DELETE"])
+async def no_stored_responses(rest: str) -> Any:
+    """A stored response, asked for by id. There are none, and the caller is
+    told why in OpenAI's envelope rather than getting a framework's bare
+    404."""
+    return responses.error_response(
+        404,
+        "This gateway keeps no response store: every response is returned once and "
+        "forgotten. Send the whole conversation in `input` with `store: false`.",
+        param="response_id",
+        code="response_not_found",
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1391,7 +1629,11 @@ async def create_decision(request: Request, body: SystemOneRequest) -> Any:
 
 
 def _to_generate_request(
-    body: ChatCompletionRequest, store: ConfigStore | None, defaults: dict[str, Any] | None = None
+    body: ChatCompletionRequest,
+    store: ConfigStore | None,
+    defaults: dict[str, Any] | None = None,
+    *,
+    install_max_tokens: bool = True,
 ) -> GenerateRequest:
     """OpenAI request -> the driver's uniform surface.
 
@@ -1400,12 +1642,19 @@ def _to_generate_request(
     value reaches a backend, the gateway put it there. When the caller
     omits one, use the selected model's default profile, then the install
     default. Profile lookup is per actual candidate, including fallbacks.
+
+    `install_max_tokens=False` skips the install default for the output
+    cap only, and only `/v1/responses` passes it: that protocol reads an
+    absent `max_output_tokens` as no cap, and Codex regenerates an answer
+    that ends `incomplete` five times before failing (measured). The
+    profile's cap still applies; without one the driver sends none and the
+    answer is bounded by the context window and the request deadline.
     """
     defaults = defaults or {}
     max_tokens = body.max_tokens if body.max_tokens is not None else defaults.get("maxTokens")
     temperature = body.temperature if body.temperature is not None else defaults.get("temperature")
     if store is not None:
-        if max_tokens is None:
+        if max_tokens is None and install_max_tokens:
             max_tokens = store.get("defaultMaxTokens")
         if temperature is None:
             temperature = store.get("defaultTemperature")

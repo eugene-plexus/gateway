@@ -1650,7 +1650,153 @@ class AnthropicErrorResponse(BaseModel):
     error: Error
 
 
+class ToolChoice1(StrEnum):
+    """
+    `auto`, `none`, `required`, or `{"type": "function", "name": …}`.
+    Forcing any other tool type is refused.
+
+    """
+
+    auto = 'auto'
+    none = 'none'
+    required = 'required'
+
+
+class Truncation(Enum):
+    auto = 'auto'
+    disabled = 'disabled'
+    NoneType_None = None
+
+
+class ResponsesInputItem(BaseModel):
+    """
+    One conversation item. **Modelled loosely on purpose**, as
+    `AnthropicContentBlock` is: the variants differ by `type`, and a
+    strict union would reject the next item type on a wire we do not
+    own.
+
+    Carried: `message` (`role` user, assistant, system or developer;
+    `content` a string or parts; `type` may be omitted), `function_call`
+    (`call_id`, `name`, `arguments` as a JSON string),
+    `function_call_output` (`call_id`, `output` as a string or a list
+    of `input_text` / `input_image` parts), and `reasoning`
+    (`content` of `reasoning_text` parts, `encrypted_content`).
+    Codex drops `id` and `status` when it sends items back
+    (measured), so neither is required. Refused: `item_reference` and
+    any other type.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    type: str | None = None
+    role: str | None = None
+    content: Any | None = Field(None, description='A string, or a list of parts.')
+    call_id: str | None = None
+    name: str | None = None
+    arguments: str | None = None
+    output: Any | None = Field(
+        None, description='A string, or a list of `input_text` / `input_image` parts.'
+    )
+    summary: list[dict[str, Any]] | None = None
+    encrypted_content: str | None = None
+
+
+class ResponsesTool(BaseModel):
+    """
+    A `function` tool (`name`, `description`, `parameters`, `strict`)
+    maps onto an OpenAI chat function. `web_search` is accepted and
+    removed (see the endpoint); any other `type` is refused.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    type: str
+    name: str | None = None
+    description: str | None = None
+    parameters: dict[str, Any] | None = None
+    strict: bool | None = None
+
+
+class Object2(StrEnum):
+    response = 'response'
+
+
+class Status1(StrEnum):
+    """
+    `incomplete` when the answer was cut at the output cap
+    (`incomplete_details.reason: max_output_tokens`) or by a
+    content filter (`content_filter`).
+
+    """
+
+    completed = 'completed'
+    incomplete = 'incomplete'
+    failed = 'failed'
+    in_progress = 'in_progress'
+
+
 class Type6(StrEnum):
+    reasoning = 'reasoning'
+    message = 'message'
+    function_call = 'function_call'
+
+
+class ResponsesOutputItem(BaseModel):
+    """
+    `{"type": "reasoning", "id", "summary": [], "content":
+    [{"type": "reasoning_text", "text"}], "encrypted_content"?}`,
+    `{"type": "message", "id", "role": "assistant", "status",
+    "content": [{"type": "output_text", "text", "annotations": []}]}`,
+    or `{"type": "function_call", "id", "status", "call_id", "name",
+    "arguments"}`.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    type: Type6
+    id: str | None = None
+
+
+class ResponsesUsage(BaseModel):
+    """
+    Token counts in OpenAI's names. **Unlike Anthropic's,
+    `input_tokens` includes cached input**; `input_tokens_details` and
+    `output_tokens_details` appear only when the backend reported them.
+
+    """
+
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    input_tokens_details: dict[str, Any] | None = None
+    output_tokens_details: dict[str, Any] | None = None
+
+
+class Type7(StrEnum):
+    response_created = 'response.created'
+    response_in_progress = 'response.in_progress'
+    response_output_item_added = 'response.output_item.added'
+    response_output_item_done = 'response.output_item.done'
+    response_content_part_added = 'response.content_part.added'
+    response_content_part_done = 'response.content_part.done'
+    response_output_text_delta = 'response.output_text.delta'
+    response_output_text_done = 'response.output_text.done'
+    response_reasoning_text_delta = 'response.reasoning_text.delta'
+    response_reasoning_text_done = 'response.reasoning_text.done'
+    response_function_call_arguments_delta = 'response.function_call_arguments.delta'
+    response_function_call_arguments_done = 'response.function_call_arguments.done'
+    response_completed = 'response.completed'
+    response_incomplete = 'response.incomplete'
+    response_failed = 'response.failed'
+
+
+class Type8(StrEnum):
     noul = 'noul'
     choice = 'choice'
     score = 'score'
@@ -1667,7 +1813,7 @@ class SystemOneQuestion(BaseModel):
 
     """
 
-    type: Type6
+    type: Type8
     instructions: str | dict[str, Any] | list[Any]
     criteria: Any | None = Field(
         None, description='Shape depends on `type`; see above.'
@@ -1685,7 +1831,7 @@ class SystemOneAnswer(BaseModel):
 
     """
 
-    type: Type6
+    type: Type8
     noul: float | None = Field(None, ge=0.0, le=1.0)
     choice: str | None = None
     score: float | None = None
@@ -1730,9 +1876,9 @@ class Error1(BaseModel):
 
 class OpenAIErrorResponse(BaseModel):
     """
-    Error envelope for the two OpenAI-compatible operations. The
-    rest of the gateway returns RFC 7807 `problem+json`; these two
-    cannot, because OpenAI SDKs parse this shape to build their
+    Error envelope for the OpenAI-compatible operations, `/v1/responses`
+    included. The rest of the gateway returns RFC 7807 `problem+json`;
+    these cannot, because OpenAI SDKs parse this shape to build their
     exceptions and would report a problem+json body as an unhelpful
     generic failure. One surface, one foreign convention, honoured
     exactly.
@@ -2321,6 +2467,133 @@ class AnthropicMessageResponse(BaseModel):
     usage: AnthropicUsage | None = None
 
 
+class ResponsesRequest(BaseModel):
+    """
+    Request body for `POST /v1/responses`, in OpenAI's shape. Like
+    `AnthropicMessagesRequest`, **this schema is what the gateway
+    reads, not what it refuses**: the refusals are enforced against
+    the raw body by the implementation, with a 400 naming the field,
+    and the endpoint description lists them. A top-level field not
+    named here is refused.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    model: str = Field(
+        ...,
+        description="A model id from `GET /v1/models`, resolved against this install's slots.",
+    )
+    input: str | list[ResponsesInputItem] = Field(
+        ...,
+        description='A string (one user message), or the conversation as a list of\nitems. Codex resends the whole conversation on every turn.\n',
+    )
+    instructions: str | None = Field(None, description='The leading system message.')
+    tools: list[ResponsesTool] | None = None
+    tool_choice: ToolChoice1 | dict[str, Any] | None = Field(
+        None,
+        description='`auto`, `none`, `required`, or `{"type": "function", "name": …}`.\nForcing any other tool type is refused.\n',
+    )
+    parallel_tool_calls: bool | None = None
+    stream: bool | None = Field(None, description='Codex sets this on every request.')
+    temperature: float | None = Field(None, ge=0.0, le=2.0)
+    top_p: float | None = Field(None, ge=0.0, le=1.0)
+    max_output_tokens: int | None = Field(
+        None,
+        description='Absent means no cap here -- see "No cap from the install\ndefault" on the endpoint. The model\'s settings profile still\napplies.\n',
+        ge=1,
+    )
+    text: dict[str, Any] | None = Field(
+        None,
+        description="`format` (`text`, `json_object`, or `json_schema` with `name`,\n`schema`, `strict`, `description`) is carried as the backend's\nresponse format. `verbosity` is accepted and not honoured.\n",
+    )
+    reasoning: dict[str, Any] | None = Field(
+        None,
+        description='`effort` and `summary` are accepted and not honoured, and are\nnamed on the ignored-settings header when set. Codex sends\nnull for a model id it does not know.\n',
+    )
+    include: list[str] | None = Field(
+        None,
+        description='`reasoning.encrypted_content` is honoured. The server-side tool\nincludes are accepted (nothing here produces those items).\n`message.output_text.logprobs` is refused.\n',
+    )
+    store: bool | None = Field(
+        None,
+        description='Nothing is ever stored; `true` is named on the ignored-settings header.',
+    )
+    previous_response_id: str | None = Field(
+        None, description='Refused when set. This gateway keeps no response store.'
+    )
+    truncation: Truncation | None = None
+    metadata: dict[str, Any] | None = None
+    client_metadata: dict[str, Any] | None = Field(
+        None, description='Sent by Codex (`x-codex-installation-id`). Discarded.'
+    )
+    prompt_cache_key: str | None = Field(
+        None,
+        description='Sent by Codex (the session id). A local engine keeps its own cache.',
+    )
+    user: str | None = None
+    safety_identifier: str | None = None
+    service_tier: str | None = None
+    max_tool_calls: int | None = None
+    top_logprobs: int | None = None
+    background: bool | None = None
+    stream_options: dict[str, Any] | None = None
+    prompt_cache_retention: str | None = None
+    conversation: Any | None = Field(
+        None, description='Refused when set. Conversations are stored objects.'
+    )
+    prompt: Any | None = Field(
+        None,
+        description='Refused when set. A stored prompt template exists only at OpenAI.',
+    )
+
+
+class ResponsesResponse(BaseModel):
+    """
+    A response object. `output` holds a `reasoning` item first when
+    the model reasoned, then a `message` with one `output_text` part,
+    then one `function_call` item per tool call. The request's settings
+    are echoed as OpenAI echoes them; `store` is always false.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    id: str
+    object: Object2
+    created_at: int
+    status: Status1 = Field(
+        ...,
+        description='`incomplete` when the answer was cut at the output cap\n(`incomplete_details.reason: max_output_tokens`) or by a\ncontent filter (`content_filter`).\n',
+    )
+    incomplete_details: dict[str, Any] | None = None
+    error: dict[str, Any] | None = None
+    model: str = Field(
+        ...,
+        description='The model that answered, which after a cascade may not be the one asked for.',
+    )
+    output: list[ResponsesOutputItem]
+    usage: ResponsesUsage | None = None
+
+
+class ResponsesStreamEvent(BaseModel):
+    """
+    One frame of the Responses event stream. The SSE `event:` name
+    and `data.type` always agree, and every frame has a
+    `sequence_number`.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    type: Type7
+    sequence_number: int
+    response: ResponsesResponse | None = None
+
+
 class SystemOneRequest(BaseModel):
     """
     The pinned TypeSafe System One request, verbatim — see
@@ -2411,7 +2684,7 @@ class DriversInfo(BaseModel):
 class MessageContent1(RootModel[list[TextContentPart | ImageContentPart]]):
     root: list[TextContentPart | ImageContentPart] = Field(
         ...,
-        description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
+        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n",
         min_length=1,
     )
 
@@ -2474,7 +2747,7 @@ class ChatCompletionMessage(BaseModel):
     )
     content: str | MessageContent1 | None = Field(
         None,
-        description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
+        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n",
     )
     reasoning_content: str | None = Field(
         None,
@@ -2638,7 +2911,7 @@ class Message(BaseModel):
     role: Role
     content: str | MessageContent1 | None = Field(
         None,
-        description='Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: four per request, 5 MiB decoded each,\n10 MiB decoded total, 16 million pixels each, maximum dimension 8192.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n',
+        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n",
     )
     toolCalls: list[dict[str, Any]] | None = Field(
         None,

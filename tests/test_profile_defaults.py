@@ -327,3 +327,28 @@ async def test_profile_wait_reserves_runtime_and_cancellation_releases_it(stream
     if iterator:
         await iterator.aclose()
     await table.aclose()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("profile_cap", [True, False])
+def test_the_responses_door_caps_by_profile_and_never_by_install_default(
+    app: FastAPI, library: Library, stream: bool, profile_cap: bool
+) -> None:
+    """Codex sends no `max_output_tokens` and regenerates an `incomplete`
+    answer five times (measured), so the install's `defaultMaxTokens` is not
+    applied on `/v1/responses` -- but the model's own profile still is. An
+    operator who wants a cap there sets it on the model."""
+    if not profile_cap:
+        del library.values["/models/a.gguf"]["maxTokens"]
+    driver = FakeDriverClient(
+        name="driver", base_url="http://driver.invalid", model_id="alias", runtime="run"
+    )
+    profiles = setup_routes(app, library, driver)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/responses", json={"model": "alias", "input": "hello", "stream": stream}
+        )
+        assert response.status_code == 200, response.text
+        assert driver.calls[-1].maxTokens == (91 if profile_cap else None)
+        assert driver.calls[-1].temperature == 0
+        client.portal.call(profiles.aclose)

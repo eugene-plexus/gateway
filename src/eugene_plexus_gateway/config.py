@@ -83,7 +83,10 @@ FIELDS: list[ConfigField] = [
             "Cap on a single response when neither the request nor the model's "
             "default Library profile specifies one (roughly 0.75 words per token; 2048 is 1,500 "
             "words). Raise it for long-form work; keep it low for "
-            "snappier chat."
+            "snappier chat. Not applied to /v1/responses (Codex CLI): that "
+            "protocol reads a missing cap as no cap, and Codex regenerates an "
+            "answer cut short five times before failing. Set Max tokens on a "
+            "model's profile to cap it there."
         ),
         category="generation",
         valueType=ConfigValueType.integer,
@@ -178,6 +181,23 @@ FIELDS: list[ConfigField] = [
         default=32,
         minimum=1,
         maximum=256,
+    ),
+    ConfigField(
+        key="maxImagesPerRequest",
+        label="Images per request",
+        description=(
+            "Most images one request may carry, counted across the whole "
+            "conversation, because a chat client resends its history and the "
+            "model sees every picture in it each time. A request over the "
+            "limit is refused with a message naming this setting, before "
+            "anything is sent to a model. Each image is still limited to "
+            "5 MiB and the request to 10 MiB of images in total. At most 64."
+        ),
+        category="routing",
+        valueType=ConfigValueType.integer,
+        default=12,
+        minimum=1,
+        maximum=64,
     ),
     ConfigField(
         key="modelSlots",

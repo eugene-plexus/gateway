@@ -235,7 +235,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # belongs here.
     app.add_middleware(
         InferenceBodyLimit,
-        paths={"/v1/chat/completions", "/v1/messages", "/v1/embeddings", "/v1/systemone"},
+        paths={
+            "/v1/chat/completions",
+            "/v1/messages",
+            "/v1/embeddings",
+            "/v1/systemone",
+            "/v1/responses",
+        },
         driver=False,
     )
     return app

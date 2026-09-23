@@ -274,6 +274,8 @@ CLIENT_ADMISSION_PATHS = frozenset(
         "/v1/messages/count_tokens",
         "/v1/embeddings",
         "/v1/systemone",
+        # Slice 4, 2026-09-23: Codex CLI's only door.
+        "/v1/responses",
     }
 )
 
@@ -345,8 +347,20 @@ class ClientAdmissionMiddleware:
                     headers={"Retry-After": exc.retry} if exc.retry else None,
                 )(scope, incoming, outgoing)
             elif not response_complete:
-                prefix = "event: error\n" if anthropic else ""
-                frame = prefix + "data: " + json.dumps(error) + "\n\n"
+                if scope["path"] == "/v1/responses":
+                    # `response.failed`, never a bare `error` event: Codex
+                    # reports the latter without our message, and the code
+                    # decides whether Codex tries again (record §4).
+                    from . import responses
+
+                    frame = responses.failed_frame(
+                        responses.new_id(uuid.UUID(context.id)),
+                        exc.message,
+                        code=responses.middleware_code(exc.status),
+                    )
+                else:
+                    prefix = "event: error\n" if anthropic else ""
+                    frame = prefix + "data: " + json.dumps(error) + "\n\n"
                 await outgoing(
                     {"type": "http.response.body", "body": frame.encode(), "more_body": False}
                 )

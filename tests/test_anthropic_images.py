@@ -346,14 +346,34 @@ def test_a_picture_that_is_not_what_it_claims_is_refused(settings: Settings) -> 
     assert "invalid" in message
 
 
+def test_five_screenshots_are_no_longer_refused(settings: Settings) -> None:
+    """The reproduction. At a fixed four, a session that had read five
+    screenshots was refused on every turn after the fifth."""
+    request = claude_code_read(
+        [image_block(), image_block(), image_block()],
+        own=[image_block(), image_block()],
+    )
+    driver = VisionDriver(name="vision", model_id=MODEL, supports_tools=True)
+    driver.responses = ["ok"]
+    with serve(settings, driver) as client:
+        r = client.post("/v1/messages", json=request)
+    assert r.status_code == 200, r.text
+
+
 def test_the_per_request_image_limit_counts_both_places(settings: Settings) -> None:
     request = claude_code_read(
         [image_block(), image_block(), image_block()],
         own=[image_block(), image_block()],
     )
-    message = refused(settings, request)
-    assert "four images" in message
+    driver = VisionDriver(name="vision", model_id=MODEL, supports_tools=True)
+    with serve(settings, driver) as client:
+        client.patch("/v1/config", json={"maxImagesPerRequest": 4})
+        r = client.post("/v1/messages", json=request)
+    assert r.status_code == 400
+    message = r.json()["error"]["message"]
+    assert "at most 4 images" in message and "maxImagesPerRequest" in message
     assert "messages.2.content.2" in message
+    assert not driver.calls
 
 
 def test_an_image_on_an_assistant_turn_is_refused(settings: Settings) -> None:

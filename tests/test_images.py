@@ -107,7 +107,7 @@ def test_invalid_image_is_not_fetched_or_echoed(client, fake_driver, url):
 
 def test_limits_mime_and_role():
     for body in [
-        request(count=5),
+        request(count=images.DEFAULT_MAX_IMAGES + 1),
         request(role="assistant"),
         request(picture(size=(8193, 1))),
         request(picture().replace("image/png", "image/jpeg")),
@@ -115,6 +115,54 @@ def test_limits_mime_and_role():
         with pytest.raises(Refusal):
             parse_request(body)
     parse_request(request(picture("JPEG")))
+
+
+def test_five_images_pass_where_four_was_the_limit():
+    """The reproduction. Fixed at four until 2026-09-23, which refused a
+    Claude Code session on every turn after its fifth screenshot."""
+    assert parse_request(request(count=5)).messages[0].content
+
+
+def test_the_default_limit_is_twelve_and_the_refusal_names_the_setting():
+    parse_request(request(count=12))
+    with pytest.raises(Refusal, match=r"at most 12 images.*maxImagesPerRequest"):
+        parse_request(request(count=13))
+
+
+def test_the_limit_is_the_operators_setting(tmp_path):
+    """Read from the live config on every request, as the door sees it."""
+    from eugene_plexus_gateway.settings import Settings
+
+    app = create_app(
+        settings=Settings(
+            config_file=tmp_path / "config.yaml", metrics_file=tmp_path / "metrics.sqlite3"
+        )
+    )
+    driver = VisionDriver(name="vision", model_id="fixture")
+    driver.responses = ["ok"]
+    app.state.routing = make_routing_table(driver)
+    with TestClient(app) as client:
+        assert client.patch("/v1/config", json={"maxImagesPerRequest": 2}).json()["applied"]
+        refused = client.post("/v1/chat/completions", json=request(count=3))
+        served = client.post("/v1/chat/completions", json=request(count=2))
+    assert refused.status_code == 400
+    assert "at most 2 images" in refused.json()["error"]["message"]
+    assert served.status_code == 200, served.text
+    assert len(driver.calls) == 1
+
+
+def test_the_setting_is_clamped_to_the_drivers_ceiling():
+    class Store:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self, key):
+            return self.value
+
+    assert images.max_images(Store(1000)) == images.MAX_IMAGES_CEILING
+    assert images.max_images(Store(0)) == 1
+    assert images.max_images(Store(None)) == images.DEFAULT_MAX_IMAGES
+    assert images.max_images(None) == images.DEFAULT_MAX_IMAGES
 
 
 def test_aggregate_and_decoded_size_limits(monkeypatch):

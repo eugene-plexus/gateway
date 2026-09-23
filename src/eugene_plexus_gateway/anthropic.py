@@ -604,7 +604,9 @@ def _tools(definitions: Any) -> list[Tool] | None:
     return out
 
 
-def translate_request(raw: Mapping[str, Any]) -> ChatCompletionRequest:
+def translate_request(
+    raw: Mapping[str, Any], *, max_images: int = images.DEFAULT_MAX_IMAGES
+) -> ChatCompletionRequest:
     """An Anthropic body as the request the shared path already serves.
 
     Measured Claude Code hints remain accepted, with response warnings. Unknown
@@ -656,7 +658,7 @@ def translate_request(raw: Mapping[str, Any]) -> ChatCompletionRequest:
     if system:
         messages.append(ChatCompletionMessage(role=Role1.system, content=system))
 
-    budget = images.ImageBudget()
+    budget = images.ImageBudget(max_images)
     for turn_index, turn in enumerate(body.messages):
         blocks = _blocks(turn.content)
         _refuse_unsupported_blocks(blocks, where=f"{turn.role.value} message")
@@ -787,7 +789,9 @@ def translate_request(raw: Mapping[str, Any]) -> ChatCompletionRequest:
     )
 
 
-def translate_count_request(raw: Mapping[str, Any]) -> ChatCompletionRequest:
+def translate_count_request(
+    raw: Mapping[str, Any], *, max_images: int = images.DEFAULT_MAX_IMAGES
+) -> ChatCompletionRequest:
     """A `count_tokens` body, translated exactly as a message is.
 
     It has no `max_tokens` -- Anthropic's count endpoint takes none and
@@ -795,7 +799,7 @@ def translate_count_request(raw: Mapping[str, Any]) -> ChatCompletionRequest:
     translation, every refusal in it included, applies unchanged. Nothing
     is generated, so the number is never used for anything.
     """
-    return translate_request({"max_tokens": 1, **raw})
+    return translate_request({"max_tokens": 1, **raw}, max_images=max_images)
 
 
 # --------------------------------------------------------------------------- #

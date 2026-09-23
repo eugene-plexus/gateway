@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import BaseModel, RootModel, ValidationError
 
 from ._generated.models import ChatCompletionRequest
-from .images import ImageRefusal, validate_messages
+from .images import DEFAULT_MAX_IMAGES, ImageRefusal, validate_messages
 
 
 class Refusal(Exception):
@@ -40,7 +40,7 @@ def _check_objects(raw: Any, parsed: Any, path: str = "") -> None:
             _check_objects(value, item, f"{path}[{index}]")
 
 
-def parse_request(raw: Any) -> ChatCompletionRequest:
+def parse_request(raw: Any, *, max_images: int = DEFAULT_MAX_IMAGES) -> ChatCompletionRequest:
     if not isinstance(raw, dict):
         raise Refusal("body", "must be a JSON object")
     body = dict(raw)
@@ -106,7 +106,7 @@ def parse_request(raw: Any) -> ChatCompletionRequest:
                 f"messages[{index}].reasoning_content", "is accepted only on assistant messages"
             )
     try:
-        validate_messages(parsed.messages)
+        validate_messages(parsed.messages, max_images)
     except ImageRefusal as exc:
         raise Refusal(exc.field, exc.reason) from None
     return parsed
