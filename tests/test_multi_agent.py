@@ -78,6 +78,9 @@ class TwoAgents:
         # `baseUrl`, or a driver older than M4 -- so the table has to
         # fall back to the alias, per node.
         self.drop_runtime_from_info = False
+        # When true, agent A's own `/v1/node` answers 503 -- a blip in
+        # the read that tells the gateway which node it runs on.
+        self.own_node_fails = False
         # **The names are IDENTICAL on both nodes, and that is the
         # reproduction** (R1.6, review §6.1 #8). This fixture used to say
         # `qwen-a` / `qwen-b`, which no install produces: the UI names a
@@ -170,6 +173,8 @@ class TwoAgents:
         if host in ("agent-a", "agent-b") and port == 8079:
             node = "node-a" if host == "agent-a" else "node-b"
             if path == "/v1/node":
+                if host == "agent-a" and self.own_node_fails:
+                    return httpx.Response(503, json={"detail": "restarting"})
                 enrolled = host == "agent-a" and self.enrolled_to is not None
                 return httpx.Response(
                     200,
@@ -345,6 +350,73 @@ async def test_without_an_advertise_url_the_remote_companion_is_unreachable(
     # A control root IS configured here, so both nodes are named; only
     # node A's driver is reachable.
     assert _nodes_for(table) == ["node-a"]
+    await table.aclose()
+
+
+def _containerise(fake: TwoAgents) -> None:
+    """Node A as the control-plane container really reports itself.
+
+    Enrolled, like every control host since M9, and advertising the NAS
+    address -- so its companion driver's `advertiseUrl` is the NAS
+    address with the driver's own port, **a port the container never
+    published**. From inside the container that reaches the NAS, not
+    the driver: a connection error here, as it would be there.
+    """
+    fake.enrolled_to = CONTROL
+    fake.components["agent-a"][0]["advertiseUrl"] = "http://nas:8090"
+
+
+@pytest.mark.parametrize("configured", [True, False], ids=["controlUrl-set", "derived"])
+async def test_a_driver_on_this_gateways_own_node_is_dialled_on_loopback(
+    two: TwoAgents, configured: bool
+) -> None:
+    """**The container finding (2026-09-23).** A model launched on the
+    control-plane container's own GPU gets a companion driver in the
+    same container, advertised at `nas:<driver port>`. The gateway beside
+    it dialled that, reached nothing, and the model was unroutable while
+    everything reported healthy. On its own node the gateway dials the
+    address the agent binds and probes, which this host reaches by
+    construction.
+
+    Both ways the control root is found, because the node name has to
+    be learned either way -- an operator-set `controlUrl` skipped the one
+    read that carried it."""
+    _containerise(two)
+    table = RoutingTable(
+        agent_url=AGENT_A, control_url=CONTROL if configured else None, refresh_seconds=3600
+    )
+    await table.refresh()
+    assert "127.0.0.1:8090" in two.probed
+    assert "nas:8090" not in two.probed
+    assert _nodes_for(table) == ["node-a", "node-b"], "both replicas routable"
+    # And another node's driver is still dialled where peers reach it.
+    assert "agent-b:8091" in two.probed
+    assert "127.0.0.1:8091" not in two.probed
+    await table.aclose()
+
+
+async def test_the_config_test_button_dials_the_same_addresses(two: TwoAgents) -> None:
+    """`POST /v1/config/test` reads the topology fresh through
+    `fetch_driver_entries`; a Test button that dialled the unpublished
+    port would report a working driver as broken."""
+    _containerise(two)
+    table = await _table()
+    entries = sorted(await table.fetch_driver_entries())
+    assert entries == [(DRIVER, "http://127.0.0.1:8090"), (DRIVER, "http://agent-b:8091")]
+    await table.aclose()
+
+
+async def test_a_blip_in_the_own_node_read_keeps_the_local_addresses(two: TwoAgents) -> None:
+    """One failed `/v1/node` must not turn this node's drivers remote
+    for a refresh -- which in a container is every local model going
+    unroutable for fifteen seconds."""
+    _containerise(two)
+    table = await _table()
+    two.own_node_fails = True
+    two.probed.clear()
+    await table.refresh()
+    assert "127.0.0.1:8090" in two.probed
+    assert "nas:8090" not in two.probed
     await table.aclose()
 
 

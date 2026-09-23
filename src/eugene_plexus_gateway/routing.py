@@ -534,6 +534,14 @@ class RoutingTable:
         # so a root that is sealed for an hour costs one line, not one
         # every refresh -- and its recovery costs one more.
         self._announced_unreachable: str | None = None
+        # The name this gateway's OWN node goes by in the control root's
+        # node list, from its own agent's `GET /v1/node` -- so a driver on
+        # this node is dialled where this host reaches it (`url`, the
+        # loopback address its agent binds and probes) rather than where
+        # other hosts do (`advertiseUrl`). See `_fetch_driver_entries`. A
+        # failed read keeps the last answer: one blip must not make every
+        # local driver look remote.
+        self._self_node: str | None = None
 
     @property
     def _control_url(self) -> str | None:
@@ -654,7 +662,22 @@ class RoutingTable:
         except ValueError as e:
             return None, f"not JSON: {e}"
 
-    async def _derive_control_url(self) -> tuple[str | None, str | None]:
+    async def _read_own_node(self) -> dict[str, Any] | None:
+        """This gateway's own agent's `GET /v1/node`, learning its node name.
+
+        An answer that says *not enrolled* clears the name -- a node can
+        un-enroll -- and no answer keeps it.
+        """
+        node = await self._get_json(f"{self._agent_url}/v1/node")
+        if not isinstance(node, dict):
+            return None
+        name = node.get("name")
+        self._self_node = name if node.get("enrolled") and isinstance(name, str) and name else None
+        return node
+
+    async def _derive_control_url(
+        self, node: dict[str, Any] | None
+    ) -> tuple[str | None, str | None]:
         """Ask this gateway's own agent where the install's control root is.
 
         Two places a host already knows it: `GET /v1/node` names the root
@@ -668,8 +691,10 @@ class RoutingTable:
         Returns `(url, "node" | "components")`, or `(None, None)`. Read
         on every refresh, like `controlUrl` itself, so an enrollment or a
         promotion reaches the next refresh with no restart.
+
+        `node` is this agent's `GET /v1/node`, already read by
+        `_discover` to learn this gateway's own node name.
         """
-        node = await self._get_json(f"{self._agent_url}/v1/node")
         if isinstance(node, dict) and node.get("enrolled"):
             url = node.get("controlUrl")
             if isinstance(url, str) and url.strip():
@@ -731,13 +756,16 @@ class RoutingTable:
         down must not empty the routing table -- and the facts say it
         did not answer, so the admin view and the no-models 404 can.
         """
+        # Read whether or not the root is configured: the node name it
+        # yields decides how this node's own drivers are dialled.
+        own_node = await self._read_own_node()
         configured = self._control_url
         via: str | None = None
         if configured is not None:
             control_url: str | None = configured
             source = "config"
         else:
-            control_url, via = await self._derive_control_url()
+            control_url, via = await self._derive_control_url(own_node)
             source = "agent" if control_url is not None else "none"
         self._announce_control_root(control_url, source, via)
         if control_url is None:
@@ -944,7 +972,7 @@ class RoutingTable:
         is exactly what a missed read should not be allowed to erase.
         """
         (entries, entries_ok), (runtimes, runtimes_ok) = await asyncio.gather(
-            self._fetch_driver_entries(url),
+            self._fetch_driver_entries(url, local=self._is_own_node(node)),
             self._fetch_runtime_facts(url, node),
         )
         if entries_ok:
@@ -968,16 +996,36 @@ class RoutingTable:
         """
         agents = await self.discover_agents()
         out: list[tuple[str, str]] = []
-        for url in agents.values():
-            entries, _ = await self._fetch_driver_entries(url)
+        for node, url in agents.items():
+            entries, _ = await self._fetch_driver_entries(url, local=self._is_own_node(node))
             out.extend(entries)
         return out
 
-    async def _fetch_driver_entries(self, agent_url: str) -> tuple[list[tuple[str, str]], bool]:
+    def _is_own_node(self, node: str | None) -> bool:
+        """Is `node` the one this gateway runs on? `None` is the
+        single-host map, whose only agent is this gateway's own."""
+        return node is None or (self._self_node is not None and node == self._self_node)
+
+    async def _fetch_driver_entries(
+        self, agent_url: str, *, local: bool = False
+    ) -> tuple[list[tuple[str, str]], bool]:
         """`(entries, answered)`. Entries are `(name, url)` for each
         inference-driver one agent declares, at the address a peer
         reaches it — `Component.advertiseUrl` when the agent stamps one,
         else `url`.
+
+        **Except on this gateway's own node (`local`), where it is always
+        `url`** (2026-09-23). `advertiseUrl` is the node's advertise host
+        with the driver's own port, and that derivation is wrong wherever
+        the host's ports are remapped -- a container, where the node
+        advertises the NAS address and a published agent port, and the
+        companion driver's port was never published at all. Dialling it
+        from inside the container reaches the NAS, not the driver, so a
+        model launched on the container's own GPU was unroutable from the
+        gateway beside it. `url` is the loopback address the agent binds
+        the driver on and probes it at, so it is reachable from this host
+        by construction -- on bare metal too, where it also saves the
+        trip out through the LAN address and back.
 
         **The flag is the point.** An empty list used to mean both "this
         agent supervises no drivers" and "this agent did not answer", and
@@ -1004,12 +1052,15 @@ class RoutingTable:
             # `advertiseUrl` is where a peer on another host reaches the
             # component — the agent's advertise host with that component's
             # port — and `url` is what the agent binds and probes, which is
-            # loopback for everything an agent spawns. Prefer the first; a
-            # single-host agent sends no advertiseUrl and the two would say
-            # the same thing. This one line is what makes a companion
-            # driver on another node routable from here (M7).
+            # loopback for everything an agent spawns. Prefer the first for
+            # another node -- that is what makes a companion driver there
+            # routable from here (M7) -- and the second for this one.
             name = entry.get("name")
-            url = entry.get("advertiseUrl") or entry.get("url")
+            url = (
+                entry.get("url") or entry.get("advertiseUrl")
+                if local
+                else entry.get("advertiseUrl") or entry.get("url")
+            )
             if isinstance(name, str) and name and isinstance(url, str) and url:
                 out.append((name, url.rstrip("/")))
         return out, True
