@@ -40,6 +40,7 @@ class Recorded(TwoAgents):
         self.seen: list[tuple[str, str, str | None]] = []
         self.minted: list[str] = []
         self.refuse_minting = False
+        self.control_requires_token = False
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         auth = request.headers.get("authorization")
@@ -48,7 +49,16 @@ class Recorded(TwoAgents):
             assert request.url.host == "agent-a", "only this node's own agent mints"
             assert auth == f"Bearer {LOCAL}"
             if self.refuse_minting:
-                return httpx.Response(403, json={"detail": "not granted"})
+                return httpx.Response(
+                    403,
+                    json={
+                        "detail": {
+                            "title": "Not granted",
+                            "detail": "this node may not send a 'gateway' token to control: "
+                            "it holds no gateway grant",
+                        }
+                    },
+                )
             audience = json.loads(request.content)["audience"]
             self.minted.append(audience)
             return httpx.Response(
@@ -58,6 +68,8 @@ class Recorded(TwoAgents):
                     "expiresAt": datetime.fromtimestamp(4102444800, UTC).isoformat(),
                 },
             )
+        if request.url.host == "control" and self.control_requires_token and not auth:
+            return httpx.Response(401, json={"detail": {"title": "Missing token"}})
         return super().handler(request)
 
     def tokens_sent_to(self, host: str) -> set[str | None]:
@@ -119,6 +131,24 @@ async def test_the_spawn_time_token_never_leaves_this_machine(recorded: Recorded
         finally:
             await table.aclose()
             await outbound.aclose()
+
+
+async def test_a_refused_mint_is_named_where_the_operator_looks(recorded: Recorded) -> None:
+    """The far side sees no token and says only "Missing token"; the
+    reason -- this node has no gateway grant -- is on this machine, so the
+    routing view says so rather than sending someone to check the root."""
+    recorded.refuse_minting = True
+    recorded.control_requires_token = True
+    outbound = _outbound()
+    table = await _table(outbound)
+    try:
+        error = table.control_root().error or ""
+        assert "401 Missing token" in error
+        assert "would not give the gateway a token" in error
+        assert "holds no gateway grant" in error
+    finally:
+        await table.aclose()
+        await outbound.aclose()
 
 
 async def test_a_token_is_minted_once_per_machine_not_per_request(recorded: Recorded) -> None:
@@ -232,6 +262,33 @@ async def test_an_agent_that_does_not_answer_keeps_an_unexpired_token_and_is_not
     # Past expiry, still failing: nothing, and never the local token.
     clock.now += 1000
     assert await outbound.token("node:b") is None
+    await outbound.aclose()
+
+
+async def test_a_refusal_is_forgotten_once_the_agent_agrees() -> None:
+    """A stale "no gateway grant" beside a working token would send an
+    operator to fix something already fixed."""
+    clock, answers = Clock(), [403, 200]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = answers.pop(0)
+        if status == 403:
+            return httpx.Response(403, json={"detail": {"title": "Not granted"}})
+        expires = datetime.fromtimestamp(clock.now + 900, UTC).isoformat()
+        return httpx.Response(200, json={"token": "t", "expiresAt": expires})
+
+    outbound = Outbound(
+        recipient="node:a",
+        local_token=LOCAL,
+        agent_url="http://agent",
+        transport=httpx.MockTransport(handler),
+        clock=clock,
+    )
+    assert await outbound.token("control") is None
+    assert outbound.refusal("control") == "403: Not granted"
+    clock.now += 10
+    assert await outbound.token("control") == "t"
+    assert outbound.refusal("control") is None
     await outbound.aclose()
 
 

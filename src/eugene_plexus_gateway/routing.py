@@ -674,7 +674,12 @@ class RoutingTable:
             except ValueError:
                 title = None
             code = str(response.status_code)
-            return None, f"{code} {title}" if isinstance(title, str) and title else f"HTTP {code}"
+            said = f"{code} {title}" if isinstance(title, str) and title else f"HTTP {code}"
+            refused = self._outbound.refusal(recipient) if self._outbound is not None else None
+            if response.status_code == 401 and refused:
+                # The far side saw no token; the reason is on this machine.
+                said += f" (this node's agent would not give the gateway a token for it: {refused})"
+            return None, said
         try:
             return response.json(), None
         except ValueError as e:

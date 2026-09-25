@@ -64,6 +64,9 @@ class Outbound:
         self._cache: dict[str, tuple[str, float, float]] = {}
         self._retry_at: dict[str, float] = {}
         self._warned_at: dict[str, float] = {}
+        # Why the agent last refused a recipient, until it next agrees:
+        # a far side's bare 401 says nothing about a grant it never saw.
+        self._refused: dict[str, str] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._client: httpx.AsyncClient | None = None
 
@@ -110,6 +113,10 @@ class Outbound:
         token = await self.token(recipient)
         return {"Authorization": f"Bearer {token}"} if token else {}
 
+    def refusal(self, recipient: str | None) -> str | None:
+        """Why this node's agent last refused a token for `recipient`, if it did."""
+        return self._refused.get(recipient) if recipient is not None else None
+
     def auth(self, recipient: str | None) -> httpx.Auth:
         """An `httpx.Auth` presenting this recipient's token on every request."""
         return _OutboundAuth(self, recipient)
@@ -129,6 +136,7 @@ class Outbound:
         except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
             now = self._clock()
             self._retry_at[recipient] = now + _RETRY_AFTER_SECONDS
+            self._refused[recipient] = _describe(exc)
             if now - self._warned_at.get(recipient, float("-inf")) >= _WARN_INTERVAL_SECONDS:
                 self._warned_at[recipient] = now
                 log.warning(
@@ -143,6 +151,7 @@ class Outbound:
         # long before the token it carries lapses.
         self._cache[recipient] = (token, issued + max(0.0, expires - issued) / 2, expires)
         self._retry_at.pop(recipient, None)
+        self._refused.pop(recipient, None)
         return token
 
     def _ensure_client(self) -> httpx.AsyncClient:
@@ -181,5 +190,14 @@ def _unix(value: Any) -> float:
 
 def _describe(exc: BaseException) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
-        return f"HTTP {exc.response.status_code}: {exc.response.text[:200]}"
+        response = exc.response
+        try:
+            body = response.json()
+            problem = body.get("detail", body) if isinstance(body, dict) else {}
+            said = (
+                problem.get("detail") or problem.get("title") if isinstance(problem, dict) else None
+            )
+        except ValueError:
+            said = None
+        return f"{response.status_code}: {said}" if said else f"HTTP {response.status_code}"
     return str(exc) or type(exc).__name__
