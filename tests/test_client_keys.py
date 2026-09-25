@@ -428,13 +428,58 @@ async def test_a_key_minted_after_the_last_refresh_is_accepted_at_once(agent: Fa
     await guard.aclose()
 
 
-async def test_unknown_keys_cannot_turn_into_a_stream_of_reads(agent: FakeAgent) -> None:
+async def test_unknown_keys_cannot_turn_into_a_stream_of_reads(
+    agent: FakeAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Twenty unlisted keys at once share reads, and a flood of them one
+    after another costs a read a window, however many arrive."""
+    import asyncio
+
+    from eugene_plexus_gateway import client_keys
+
+    monkeypatch.setattr(client_keys, "MISS_REFRESH_SECONDS", 0.2)
     guard = agent.as_guard(ttl_seconds=3600)
     assert await guard.decision("key-1") == "allowed"
     reads = agent.reads
-    for _ in range(20):
-        assert await guard.decision("never-made") == "unregistered"
-    assert agent.reads == reads + 1, "one re-read per second, however many unknown keys arrive"
+    answers = await asyncio.gather(*(guard.decision(f"never-{n}") for n in range(20)))
+    assert set(answers) == {"unregistered"}
+    # The first request's read, and one after the window for the rest,
+    # which all arrived after that read began.
+    assert agent.reads <= reads + 2
+
+    import time as clock
+
+    reads = agent.reads
+    started, lookups = clock.perf_counter(), 0
+    while clock.perf_counter() - started < 0.6:
+        assert await guard.decision(f"flood-{lookups}") == "unregistered"
+        lookups += 1
+    assert lookups >= 2
+    assert agent.reads - reads <= 0.6 / 0.2 + 2, (lookups, agent.reads - reads)
+    await guard.aclose()
+
+
+async def test_a_second_key_made_inside_the_window_is_accepted_too(
+    agent: FakeAgent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The browser case: make a key and check it (one re-read), make
+    another half a second later and use it. The second waits out the
+    window and is read for, rather than refused."""
+    import time as clock
+
+    from eugene_plexus_gateway import client_keys
+
+    monkeypatch.setattr(client_keys, "MISS_REFRESH_SECONDS", 0.3)
+    guard = agent.as_guard(ttl_seconds=3600)
+    assert await guard.decision("key-1") == "allowed"
+    agent.registered.append("first")
+    assert await guard.decision("first") == "allowed"
+    reads = agent.reads
+    agent.registered.append("second")
+    started = clock.perf_counter()
+    assert await guard.decision("second") == "allowed"
+    assert agent.reads == reads + 1
+    assert clock.perf_counter() - started < 1.0
     await guard.aclose()
 
 

@@ -67,6 +67,9 @@ class ClientKeyGuard:
         self._client: httpx.AsyncClient | None = None
         self._last_warning = -math.inf
         self._last_miss_refresh = -math.inf
+        # When the most recent policy read began: a request is answered by
+        # a read that began after it arrived, never by an older one.
+        self._last_fetch_started = -math.inf
         self._load()
 
     @property
@@ -90,6 +93,7 @@ class ClientKeyGuard:
         return max(wall_age, self._initial_age + elapsed)
 
     async def decision(self, key_id: str | None) -> Decision:
+        arrived = time.perf_counter()
         if not key_id:
             return "unregistered"
         if key_id in self._revoked:
@@ -104,7 +108,7 @@ class ClientKeyGuard:
         # Not listed: most likely made a moment ago, after the policy this
         # gateway holds. Ask once before refusing; the 401 says "make a new
         # one", which would only be refused the same way.
-        if not await self._refresh_for_miss():
+        if not await self._refresh_for_miss(arrived):
             return "unregistered"
         if key_id in self._revoked:
             return "revoked"
@@ -118,20 +122,36 @@ class ClientKeyGuard:
             k.id == key_id and k.expiresAt.timestamp() > time.time() for k in self._policy.keys
         )
 
-    async def _refresh_for_miss(self) -> bool:
-        """Re-read the policy for a key it does not list, at most once a second."""
-        if self._task is not None and not self._task.done():
-            await asyncio.shield(self._task)
-            return True
-        now = time.perf_counter()
-        if self._failures and now < self._next_attempt:
-            return False
-        if now - self._last_miss_refresh < MISS_REFRESH_SECONDS:
-            return False
-        self._last_miss_refresh = now
+    async def _refresh_for_miss(self, arrived: float) -> bool:
+        """Re-read the policy for a key it does not list; at most one miss read a second.
+
+        The answer must come from a read that began after this request
+        arrived -- a key made a moment ago is exactly what an older read
+        cannot know. A request inside the window waits out the rest of it
+        rather than being refused: a person who makes two keys in a row and
+        uses both at once is the common case, and the first key's re-read
+        must not cost the second one a 401. Concurrent misses share a read,
+        so the bound holds, and an unknown key costs a second at most.
+        """
+        while True:
+            if self._task is not None and not self._task.done():
+                await asyncio.shield(self._task)
+                continue
+            if self._last_fetch_started >= arrived:
+                return True
+            now = time.perf_counter()
+            if self._failures and now < self._next_attempt:
+                return False
+            remaining = MISS_REFRESH_SECONDS - (now - self._last_miss_refresh)
+            if remaining > 0:
+                await asyncio.sleep(remaining)
+                continue
+            self._last_miss_refresh = now
+            self._start_fetch()
+
+    def _start_fetch(self) -> None:
+        self._last_fetch_started = time.perf_counter()
         self._task = asyncio.create_task(self._fetch())
-        await asyncio.shield(self._task)
-        return True
 
     async def is_revoked(self, key_id: str | None) -> bool:
         """Legacy query helper; authorization uses the four-way decision."""
@@ -144,7 +164,8 @@ class ClientKeyGuard:
             return
         if now < self._next_attempt:
             return
-        self._task = asyncio.create_task(self._fetch())
+        self._start_fetch()
+        assert self._task is not None
         await asyncio.shield(self._task)
 
     @staticmethod
