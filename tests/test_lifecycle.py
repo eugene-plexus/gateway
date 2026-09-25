@@ -191,7 +191,7 @@ def table(
 
 @pytest.fixture
 def manager(agent: FakeAgent, table: RoutingTable) -> LifecycleManager:
-    client = AgentLifecycleClient(service_token="t")
+    client = AgentLifecycleClient(None)
     client._client = httpx.AsyncClient(transport=httpx.MockTransport(agent.handler))
     return LifecycleManager(
         table,

@@ -56,7 +56,7 @@ async def test_a_routing_refresh_builds_no_clients_for_its_reads(
     seven clients — ~0.7 s of synchronous CPU on the loop serving every
     stream. The table owns one, built in `__init__`.
     """
-    table = RoutingTable(agent_url="http://127.0.0.1:8079", service_token=None)
+    table = RoutingTable(agent_url="http://127.0.0.1:8079")
     built = _count_constructions(monkeypatch)
     for i in range(7):
         await table._get_json(f"http://127.0.0.1:8079/v1/does-not-exist-{i}")
@@ -67,7 +67,7 @@ async def test_a_routing_refresh_builds_no_clients_for_its_reads(
 async def test_the_topology_client_is_closed_with_the_table() -> None:
     """A client that outlives its table is a leaked pool; `aclose()`
     already closed the per-driver clients and not this one."""
-    table = RoutingTable(agent_url="http://127.0.0.1:8079", service_token=None)
+    table = RoutingTable(agent_url="http://127.0.0.1:8079")
     client = table._json_client
     await table.aclose()
     assert client.is_closed
@@ -77,7 +77,7 @@ async def test_a_failed_read_does_not_poison_the_shared_client() -> None:
     """Every topology read is a connection refusal on this box. The
     client has to stay usable, or one unreachable node would take the
     whole refresh down with it for the life of the process."""
-    table = RoutingTable(agent_url="http://127.0.0.1:8079", service_token=None)
+    table = RoutingTable(agent_url="http://127.0.0.1:8079")
     body, error = await table._get_json_or_error("http://127.0.0.1:9/v1/nodes")
     assert body is None and error
     body2, error2 = await table._get_json_or_error("http://127.0.0.1:9/v1/components")
@@ -99,19 +99,19 @@ def test_the_topology_client_declines_an_ambient_proxy(monkeypatch: pytest.Monke
     """
     monkeypatch.setenv("HTTP_PROXY", "http://corp.proxy:3128")
     monkeypatch.setenv("HTTPS_PROXY", "http://corp.proxy:3128")
-    table = RoutingTable(agent_url="http://127.0.0.1:8079", service_token=None)
+    table = RoutingTable(agent_url="http://127.0.0.1:8079")
     assert table._json_client._mounts == {}
 
 
 def test_the_driver_client_declines_an_ambient_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HTTP_PROXY", "http://corp.proxy:3128")
-    client = HttpDriverClient(name="d", base_url="http://127.0.0.1:8081", service_token=None)
+    client = HttpDriverClient(name="d", base_url="http://127.0.0.1:8081")
     assert client._client._mounts == {}
 
 
 def test_the_lifecycle_client_declines_an_ambient_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HTTP_PROXY", "http://corp.proxy:3128")
-    assert AgentLifecycleClient(service_token=None)._client._mounts == {}
+    assert AgentLifecycleClient(None)._client._mounts == {}
 
 
 def test_the_client_key_guard_declines_an_ambient_proxy(monkeypatch: pytest.MonkeyPatch) -> None:

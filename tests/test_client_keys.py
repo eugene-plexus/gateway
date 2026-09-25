@@ -17,49 +17,26 @@ install's harnesses down -- is tested by making the agent actually fail.
 from __future__ import annotations
 
 import json
-import secrets
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
-import jwt
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from eugene_plexus_gateway import tokens
 from eugene_plexus_gateway.app import create_app
-from eugene_plexus_gateway.auth_state import AuthState
 from eugene_plexus_gateway.client_keys import ClientKeyGuard
 from eugene_plexus_gateway.settings import Settings
-from tests.conftest import FakeDriverClient, make_routing_table
-
-_JWT_ALG = "HS256"
+from tests.conftest import FakeDriverClient, FakeInstall, make_routing_table
 
 # The model `make_routing_table`'s fake driver serves. Named rather than
 # typed inline: a chat test that 404s on a wrong model name is a test
 # that passed its auth check and asserted nothing about it.
 FAKE_MODEL = "Qwen3-30B-A3B-Q4_K_M"
-
-
-def _issue(
-    *,
-    signing_key: bytes,
-    sub: str,
-    aud: str,
-    ttl_seconds: int = 3600,
-    jti: str | None = None,
-) -> str:
-    claims: dict[str, Any] = {
-        "sub": sub,
-        "aud": aud,
-        "iat": int(time.time()),
-        "exp": int(time.time()) + ttl_seconds,
-    }
-    if jti is not None:
-        claims["jti"] = jti
-    return jwt.encode(claims, signing_key, algorithm=_JWT_ALG)
 
 
 class FakeAgent:
@@ -124,11 +101,6 @@ class FakeAgent:
 
 
 @pytest.fixture
-def signing_key() -> bytes:
-    return secrets.token_bytes(32)
-
-
-@pytest.fixture
 def agent() -> FakeAgent:
     return FakeAgent()
 
@@ -136,19 +108,13 @@ def agent() -> FakeAgent:
 @pytest.fixture
 def authed_app(
     settings: Settings,
-    signing_key: bytes,
+    install: FakeInstall,
     fake_driver: FakeDriverClient,
     agent: FakeAgent,
 ) -> FastAPI:
     app = create_app(settings=settings)
     app.state.routing = make_routing_table(fake_driver)
-    app.state.auth_state = AuthState(
-        signing_key=signing_key,
-        service_token=_issue(
-            signing_key=signing_key, sub="gateway", aud="service:gateway", ttl_seconds=86400
-        ),
-        master_key=None,
-    )
+    app.state.auth_state = install.auth_state()
     # A short TTL so "the gateway notices a revocation" is a test rather
     # than a fifteen-second wait.
     app.state.client_key_guard = agent.as_guard(ttl_seconds=0.0)
@@ -162,8 +128,8 @@ def authed_client(authed_app: FastAPI) -> Iterator[TestClient]:
 
 
 @pytest.fixture
-def client_key(signing_key: bytes) -> str:
-    return _issue(signing_key=signing_key, sub="Continue", aud="client", jti="key-1")
+def client_key(install: FakeInstall) -> str:
+    return install.client_key(name="Continue", jti="key-1")
 
 
 # --------------------------------------------------------------------- #
@@ -229,9 +195,9 @@ def test_a_client_key_opens_no_operator_path(
 
 
 def test_an_operator_token_still_works_everywhere(
-    authed_client: TestClient, signing_key: bytes
+    authed_client: TestClient, install: FakeInstall
 ) -> None:
-    token = _issue(signing_key=signing_key, sub="operator", aud="operator")
+    token = install.session(sub="operator")
     assert (
         authed_client.get("/v1/config", headers={"Authorization": f"Bearer {token}"}).status_code
         == 200
@@ -266,15 +232,15 @@ def test_a_revoked_key_stops_working_and_says_why(
 
 
 def test_revoking_one_key_leaves_the_others(
-    authed_client: TestClient, signing_key: bytes, agent: FakeAgent
+    authed_client: TestClient, install: FakeInstall, agent: FakeAgent
 ) -> None:
     """The whole reason for a key per app.
 
     If revoking took every key down it would be the signing-key rotation
     with extra steps, and there would be no point minting more than one.
     """
-    laptop = _issue(signing_key=signing_key, sub="laptop", aud="client", jti="key-1")
-    phone = _issue(signing_key=signing_key, sub="phone", aud="client", jti="key-2")
+    laptop = install.client_key(name="laptop", jti="key-1")
+    phone = install.client_key(name="phone", jti="key-2")
     agent.revoke("key-1")
 
     assert (
@@ -288,7 +254,7 @@ def test_revoking_one_key_leaves_the_others(
 
 
 def test_a_client_token_with_no_jti_is_refused(
-    authed_client: TestClient, signing_key: bytes
+    authed_client: TestClient, install: FakeInstall
 ) -> None:
     """A credential that can never be revoked is not one to accept.
 
@@ -296,7 +262,7 @@ def test_a_client_token_with_no_jti_is_refused(
     without one did not come from this install's mint, and there would
     be no way to turn it off.
     """
-    token = _issue(signing_key=signing_key, sub="mystery", aud="client")
+    token = install.raw(install.root, tokens.TYP_CLIENT, sub="mystery", aud=["gateway"])
     resp = authed_client.get("/v1/models", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 401
 
@@ -336,11 +302,11 @@ def test_a_revocation_survives_the_agent_going_down_afterwards(
 
 
 def test_only_a_client_key_consults_the_agent(
-    authed_client: TestClient, signing_key: bytes, agent: FakeAgent
+    authed_client: TestClient, install: FakeInstall, agent: FakeAgent
 ) -> None:
     """An install where nobody minted a client key never makes the call."""
-    operator = _issue(signing_key=signing_key, sub="operator", aud="operator")
-    service = _issue(signing_key=signing_key, sub="library", aud="service:library")
+    operator = install.session(sub="operator")
+    service = install.service("library")
     authed_client.get("/v1/models", headers={"Authorization": f"Bearer {operator}"})
     authed_client.get("/v1/models", headers={"Authorization": f"Bearer {service}"})
     assert agent.reads == 0
@@ -405,7 +371,7 @@ async def test_a_failed_read_does_not_make_the_copy_look_fresh() -> None:
 
 
 def test_no_policy_is_503_for_both_protocols_but_operator_can_repair(
-    authed_client, client_key, agent, signing_key
+    authed_client, client_key, agent, install
 ):
     agent.fail = True
     assert (
@@ -421,14 +387,14 @@ def test_no_policy_is_503_for_both_protocols_but_operator_can_repair(
     }
     response = authed_client.post("/v1/messages", json=body, headers={"x-api-key": client_key})
     assert response.status_code == 503 and response.json()["error"]["type"] == "api_error"
-    operator = _issue(signing_key=signing_key, sub="operator", aud="operator")
+    operator = install.session(sub="operator")
     assert (
         authed_client.get("/v1/config", headers={"Authorization": f"Bearer {operator}"}).status_code
         == 200
     )
 
 
-def test_revoked_and_unknown_anthropic_keys_are_403(authed_client, client_key, agent, signing_key):
+def test_revoked_and_unknown_anthropic_keys_are_403(authed_client, client_key, agent, install):
     agent.revoke("key-1")
     body = {
         "model": FAKE_MODEL,
@@ -437,6 +403,6 @@ def test_revoked_and_unknown_anthropic_keys_are_403(authed_client, client_key, a
     }
     response = authed_client.post("/v1/messages", json=body, headers={"x-api-key": client_key})
     assert response.status_code == 403 and "turned off" in response.text.lower()
-    unknown = _issue(signing_key=signing_key, sub="app", aud="client", jti="not-in-registry")
+    unknown = install.client_key(name="app", jti="not-in-registry")
     response = authed_client.post("/v1/messages", json=body, headers={"x-api-key": unknown})
     assert response.status_code == 403 and "not registered" in response.text.lower()

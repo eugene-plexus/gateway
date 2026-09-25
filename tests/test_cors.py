@@ -14,16 +14,16 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import Iterator
+from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
 from eugene_plexus_gateway.app import create_app
-from eugene_plexus_gateway.auth_state import AuthState
 from eugene_plexus_gateway.cors import FrontDoorCors
 from eugene_plexus_gateway.settings import Settings
-from tests.conftest import FakeDriverClient, make_routing_table
+from tests.conftest import FakeDriverClient, FakeInstall, make_routing_table
 
 ORIGIN = "http://192.168.16.75:8079"
 OTHER = "http://evil.example"
@@ -36,7 +36,9 @@ PREFLIGHT = {
 
 
 @pytest.fixture
-def cors_client(settings: Settings, fake_driver: FakeDriverClient) -> Iterator[TestClient]:
+def cors_client(
+    settings: Settings, fake_driver: FakeDriverClient, tmp_path: Path
+) -> Iterator[TestClient]:
     """Auth ON, so a preflight that reached a route would 401.
 
     The default `client` fixture runs with auth disabled, which would let
@@ -46,7 +48,7 @@ def cors_client(settings: Settings, fake_driver: FakeDriverClient) -> Iterator[T
     """
     app = create_app(settings=settings)
     app.state.routing = make_routing_table(fake_driver)
-    app.state.auth_state = AuthState(signing_key=b"k" * 32, service_token="unused", master_key=None)
+    app.state.auth_state = FakeInstall(tmp_path / "node").auth_state()
     with TestClient(app) as c:
         yield c
 

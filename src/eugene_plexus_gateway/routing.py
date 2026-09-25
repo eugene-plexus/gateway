@@ -79,6 +79,7 @@ from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from .driver_client import DriverClient, HttpDriverClient, TieredClient
 from .driver_client import Key as DriverKey
 from .metrics import AttemptRow, CandidateRow
+from .outbound import RECIPIENT_CONTROL, Outbound
 
 # Deadline for one topology read (an agent's `/v1/components`, a control
 # root's `/v1/nodes`). Short because a refresh can run inside a request
@@ -446,7 +447,7 @@ class RoutingTable:
         self,
         *,
         agent_url: str,
-        service_token: str | None = None,
+        outbound: Outbound | None = None,
         request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
         refresh_seconds: float = 15.0,
         slots: Callable[[], Any] | None = None,
@@ -466,7 +467,9 @@ class RoutingTable:
         self._control_url_source: Callable[[], Any] = (
             control_url if callable(control_url) else (lambda: control_url)
         )
-        self._service_token = service_token
+        # Which token each read and each driver call carries (D8); None
+        # runs unauthenticated, as a test table and a dev install do.
+        self._outbound = outbound
         self._request_timeout = request_timeout_seconds
         self._refresh_seconds = refresh_seconds
         # Read live on every resolve, so a PATCH to `modelSlots` or
@@ -625,16 +628,31 @@ class RoutingTable:
             return False
         return True
 
-    def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._service_token}"} if self._service_token else {}
+    def recipient_for(self, node: str | None) -> str | None:
+        """The audience a token for `node`'s machine names; `None` is this one."""
+        if self._outbound is None:
+            return None
+        return self._outbound.for_node(None if self._is_own_node(node) else node)
 
-    async def _get_json(self, url: str) -> Any | None:
-        body, error = await self._get_json_or_error(url)
+    async def _headers(self, recipient: str | None) -> dict[str, str]:
+        if self._outbound is None:
+            return {}
+        return await self._outbound.headers(recipient)
+
+    def _driver_auth(self, node: str | None) -> httpx.Auth | None:
+        if self._outbound is None or not self._outbound.enabled:
+            return None
+        return self._outbound.auth(self.recipient_for(node))
+
+    async def _get_json(self, url: str, recipient: str | None = None) -> Any | None:
+        body, error = await self._get_json_or_error(url, recipient)
         if error is not None:
             log.debug("could not read %s: %s", url, error)
         return body
 
-    async def _get_json_or_error(self, url: str) -> tuple[Any | None, str | None]:
+    async def _get_json_or_error(
+        self, url: str, recipient: str | None = None
+    ) -> tuple[Any | None, str | None]:
         """The body, or why there is none.
 
         The reason is the HTTP status plus the problem's title when the
@@ -643,7 +661,7 @@ class RoutingTable:
         in a 404 an operator reads.
         """
         try:
-            response = await self._json_client.get(url, headers=self._headers())
+            response = await self._json_client.get(url, headers=await self._headers(recipient))
         except httpx.HTTPError as e:
             return None, str(e) or type(e).__name__
         if response.status_code >= 400:
@@ -668,7 +686,7 @@ class RoutingTable:
         An answer that says *not enrolled* clears the name -- a node can
         un-enroll -- and no answer keeps it.
         """
-        node = await self._get_json(f"{self._agent_url}/v1/node")
+        node = await self._get_json(f"{self._agent_url}/v1/node", self.recipient_for(None))
         if not isinstance(node, dict):
             return None
         name = node.get("name")
@@ -699,7 +717,7 @@ class RoutingTable:
             url = node.get("controlUrl")
             if isinstance(url, str) and url.strip():
                 return url.strip().rstrip("/"), "node"
-        body = await self._get_json(f"{self._agent_url}/v1/components")
+        body = await self._get_json(f"{self._agent_url}/v1/components", self.recipient_for(None))
         components = body.get("components") if isinstance(body, dict) else None
         for entry in components if isinstance(components, list) else []:
             if isinstance(entry, dict) and entry.get("kind") == "control":
@@ -771,7 +789,9 @@ class RoutingTable:
         if control_url is None:
             return {None: self._agent_url}, ControlRootFacts()
 
-        body, error = await self._get_json_or_error(f"{control_url}/v1/nodes")
+        body, error = await self._get_json_or_error(
+            f"{control_url}/v1/nodes", RECIPIENT_CONTROL if self._outbound else None
+        )
         nodes = body.get("nodes") if isinstance(body, dict) else None
         if not isinstance(nodes, list):
             reason = error or "the response carried no node list"
@@ -972,7 +992,7 @@ class RoutingTable:
         is exactly what a missed read should not be allowed to erase.
         """
         (entries, entries_ok), (runtimes, runtimes_ok) = await asyncio.gather(
-            self._fetch_driver_entries(url, local=self._is_own_node(node)),
+            self._fetch_driver_entries(url, local=self._is_own_node(node), node=node),
             self._fetch_runtime_facts(url, node),
         )
         if entries_ok:
@@ -985,8 +1005,8 @@ class RoutingTable:
             runtimes = dict(self._last_facts.get(node, {}))
         return entries, runtimes
 
-    async def fetch_driver_entries(self) -> list[tuple[str, str]]:
-        """`(name, url)` for every inference-driver across every agent.
+    async def fetch_driver_entries(self) -> list[tuple[str | None, str, str]]:
+        """`(node, name, url)` for every inference-driver across every agent.
 
         Public because `POST /v1/config/test` reads the topology fresh
         rather than off the last refresh — the point of a Test button is
@@ -995,10 +1015,12 @@ class RoutingTable:
         answers from a cache is answering the wrong question.
         """
         agents = await self.discover_agents()
-        out: list[tuple[str, str]] = []
+        out: list[tuple[str | None, str, str]] = []
         for node, url in agents.items():
-            entries, _ = await self._fetch_driver_entries(url, local=self._is_own_node(node))
-            out.extend(entries)
+            entries, _ = await self._fetch_driver_entries(
+                url, local=self._is_own_node(node), node=node
+            )
+            out.extend((node, name, entry_url) for name, entry_url in entries)
         return out
 
     def _is_own_node(self, node: str | None) -> bool:
@@ -1007,7 +1029,7 @@ class RoutingTable:
         return node is None or (self._self_node is not None and node == self._self_node)
 
     async def _fetch_driver_entries(
-        self, agent_url: str, *, local: bool = False
+        self, agent_url: str, *, local: bool = False, node: str | None = None
     ) -> tuple[list[tuple[str, str]], bool]:
         """`(entries, answered)`. Entries are `(name, url)` for each
         inference-driver one agent declares, at the address a peer
@@ -1038,7 +1060,7 @@ class RoutingTable:
         per-driver `/v1/info` probe below is the real liveness check and
         still runs.
         """
-        body = await self._get_json(f"{agent_url}/v1/components")
+        body = await self._get_json(f"{agent_url}/v1/components", self.recipient_for(node))
         if body is None:
             log.warning("could not read %s/v1/components; keeping what it last declared", agent_url)
             return [], False
@@ -1083,7 +1105,7 @@ class RoutingTable:
         Reach switch performs on purpose. A failed read means **keep the
         previous facts**, not keep the faith.
         """
-        body = await self._get_json(f"{agent_url}/v1/runtimes")
+        body = await self._get_json(f"{agent_url}/v1/runtimes", self.recipient_for(node))
         if body is None:
             log.warning(
                 "could not read %s/v1/runtimes; keeping the facts from its last answer", agent_url
@@ -1130,7 +1152,7 @@ class RoutingTable:
                 name=name,
                 base_url=url,
                 timeout_seconds=self._request_timeout,
-                service_token=self._service_token,
+                auth=self._driver_auth(node),
                 node=node,
             )
             self._clients[(node, name, url)] = client

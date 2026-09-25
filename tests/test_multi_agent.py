@@ -402,7 +402,10 @@ async def test_the_config_test_button_dials_the_same_addresses(two: TwoAgents) -
     _containerise(two)
     table = await _table()
     entries = sorted(await table.fetch_driver_entries())
-    assert entries == [(DRIVER, "http://127.0.0.1:8090"), (DRIVER, "http://agent-b:8091")]
+    assert entries == [
+        ("node-a", DRIVER, "http://127.0.0.1:8090"),
+        ("node-b", DRIVER, "http://agent-b:8091"),
+    ]
     await table.aclose()
 
 
@@ -640,9 +643,11 @@ async def test_the_idle_pass_reserves_the_replica_it_is_stopping(
     seen: list[dict[str | None, bool]] = []
     real_stop = manager._client.stop
 
-    async def watching_stop(agent_url: str, name: str, *, reason: str) -> bool:
+    async def watching_stop(
+        agent_url: str, name: str, *, reason: str, node: str | None = None
+    ) -> bool:
         seen.append({b.node: b.eligible for b in table.backends_for(MODEL)})
-        return await real_stop(agent_url, name, reason=reason)
+        return await real_stop(agent_url, name, reason=reason, node=node)
 
     monkeypatch.setattr(manager._client, "stop", watching_stop)
 

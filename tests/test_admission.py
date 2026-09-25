@@ -14,10 +14,9 @@ from fastapi.testclient import TestClient
 
 from eugene_plexus_gateway._generated.driver_models import Usage
 from eugene_plexus_gateway.app import create_app
-from eugene_plexus_gateway.auth_state import AuthState
 from tests.conftest import FakeDriverClient, install_snapshot, make_routing_table
 from tests.test_client_disconnect import _SCOPE, _Hang
-from tests.test_client_keys import FakeAgent, _issue
+from tests.test_client_keys import FakeAgent
 
 
 class Authority(FakeAgent):
@@ -62,12 +61,11 @@ class Authority(FakeAgent):
 
 
 @pytest.fixture
-def setup(settings):
+def setup(settings, install):
     authority = Authority()
-    signing = b"a" * 32
-    token = _issue(signing_key=signing, sub="Original name", aud="client", jti="key-1")
+    token = install.client_key(name="Original name", jti="key-1")
     app = create_app(settings=settings)
-    app.state.auth_state = AuthState(signing_key=signing, service_token="service", master_key=None)
+    app.state.auth_state = install.auth_state()
     app.state.client_key_guard = authority.as_guard(ttl_seconds=0)
     allowed = FakeDriverClient(name="allowed-driver", model_id="allowed")
     excluded = FakeDriverClient(name="excluded-driver", model_id="excluded")
@@ -75,9 +73,7 @@ def setup(settings):
         allowed, excluded, slots=[{"model": "alias", "targets": ["allowed", "excluded"]}]
     )
     headers = {"Authorization": "Bearer " + token}
-    operator = {
-        "Authorization": "Bearer " + _issue(signing_key=signing, sub="operator", aud="operator")
-    }
+    operator = {"Authorization": "Bearer " + install.session(sub="operator")}
     return app, authority, allowed, excluded, headers, operator
 
 

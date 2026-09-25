@@ -33,7 +33,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from . import chat_contract, images, security
+from . import chat_contract, images, tokens
 from ._generated.models import (
     AnthropicMessagesRequest,
     ChatCompletionMessage,
@@ -200,23 +200,18 @@ async def authorize(request: Request) -> None:
             kind="authentication_error",
         )
 
-    assert auth.signing_key is not None  # narrowed by auth_disabled
+    from .dependencies import front_door_claims
+
     try:
-        payload = security.decode_token(
-            token=token,
-            signing_key=auth.signing_key,
-            accept_operator=True,
-            accept_any_service=True,
-            accept_client=True,
-        )
-    except Exception as e:
+        payload = front_door_claims(auth, token)
+    except tokens.TokenError as e:
         raise Refusal(
             f"That key was rejected: {e}. Make a new one under Home -> Use it from your apps.",
             status=403,
             kind="authentication_error",
         ) from e
 
-    if payload.aud != security.AUDIENCE_CLIENT:
+    if not payload.is_client:
         return
     from .admission import current
 
@@ -235,8 +230,8 @@ async def authorize(request: Request) -> None:
         )
     if decision == "unregistered":
         raise Refusal(
-            "This key is not registered. Check migration on the node that made it "
-            "under Use it from your apps, or replace it.",
+            "This key is not registered with the current authority. Make a new one under "
+            "Home -> Use it from your apps.",
             status=403,
             kind="permission_error",
         )

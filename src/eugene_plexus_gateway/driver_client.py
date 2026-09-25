@@ -259,7 +259,7 @@ class HttpDriverClient:
         name: str,
         base_url: str,
         timeout_seconds: float = 180.0,
-        service_token: str | None = None,
+        auth: httpx.Auth | None = None,
         node: str | None = None,
     ) -> None:
         self.name = name
@@ -276,11 +276,11 @@ class HttpDriverClient:
         self.served_by: str | None = name
         self.served_by_node: str | None = node
         self.tier = 1
-        # When the agent threaded a service token in, attach it to
-        # every outbound call. The driver validates against the shared
-        # HMAC signing key. Headers stay unset when running unauthenticated
-        # (dev / standalone) so the existing test path still works.
-        headers = {"Authorization": f"Bearer {service_token}"} if service_token else None
+        # `auth` presents the token for this driver's machine on every
+        # call: the gateway's own token when the driver is beside it, a
+        # fifteen-minute one for another machine (`outbound.py`). None
+        # when running unauthenticated (dev / standalone), and on the
+        # admin probe, which dials whatever URL an operator typed.
         # `internal_client`: one SSL context for the process instead of a
         # fresh certifi parse per client (~104 ms of synchronous CPU on
         # the event loop), and no proxy, because a driver is this machine
@@ -289,7 +289,7 @@ class HttpDriverClient:
         self._client = internal_client(
             base_url=self.base_url,
             timeout=httpx.Timeout(timeout_seconds, connect=10.0),
-            headers=headers,
+            auth=auth,
         )
 
     async def info(self) -> DriverInfo:

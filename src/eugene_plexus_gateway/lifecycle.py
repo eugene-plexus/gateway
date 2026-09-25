@@ -45,6 +45,7 @@ from urllib.parse import quote
 import httpx
 
 from ._http import internal_client
+from .outbound import Outbound
 from .routing import READY, Key, Resolution, RoutingTable, _RuntimeFacts
 
 log = logging.getLogger(__name__)
@@ -55,25 +56,34 @@ _AGENT_TIMEOUT_SECONDS = 10.0
 
 
 class AgentLifecycleClient:
-    """The four calls this module makes on an agent, with the gateway's
-    own service token — `service:gateway` is the one non-operator
-    audience the agent's stop and start accept."""
+    """The four calls this module makes on an agent, each with a token
+    addressed to that agent's machine -- `sub: gateway` is the one
+    service token the agent's stop and start accept."""
 
-    def __init__(self, service_token: str | None) -> None:
-        self._headers = {"Authorization": f"Bearer {service_token}"} if service_token else {}
+    def __init__(self, outbound: Outbound | None) -> None:
+        self._outbound = outbound
         # One client, shared SSL context, no proxy: every URL this class
         # dials is an agent of this install. See `_http`.
         self._client = internal_client(timeout=_AGENT_TIMEOUT_SECONDS)
 
+    async def _headers(self, node: str | None) -> dict[str, str]:
+        """The token for `node`'s agent: this gateway's own when it is
+        this machine, a short one from this node's agent when it is not."""
+        if self._outbound is None:
+            return {}
+        return await self._outbound.headers(self._outbound.for_node(node))
+
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def stop(self, agent_url: str, name: str, *, reason: str) -> bool:
+    async def stop(
+        self, agent_url: str, name: str, *, reason: str, node: str | None = None
+    ) -> bool:
         try:
             response = await self._client.post(
                 f"{agent_url.rstrip('/')}/v1/runtimes/{quote(name, safe='')}/stop",
                 json={"reason": reason},
-                headers=self._headers,
+                headers=await self._headers(node),
             )
         except httpx.HTTPError as e:
             log.warning("could not ask %s to stop runtime %r: %s", agent_url, name, e)
@@ -89,24 +99,26 @@ class AgentLifecycleClient:
             return False
         return True
 
-    async def start(self, agent_url: str, name: str) -> tuple[int, str]:
+    async def start(self, agent_url: str, name: str, *, node: str | None = None) -> tuple[int, str]:
         """`(status, detail)`. 202 means started or already running; 422
         means admission refused, with the arithmetic in `detail`."""
         try:
             response = await self._client.post(
                 f"{agent_url.rstrip('/')}/v1/runtimes/{quote(name, safe='')}/start",
-                headers=self._headers,
+                headers=await self._headers(node),
             )
         except httpx.HTTPError as e:
             return 0, f"the agent at {agent_url} did not answer: {e}"
         return response.status_code, _detail(response)
 
-    async def admission(self, agent_url: str, spec: dict[str, Any]) -> dict[str, Any] | None:
+    async def admission(
+        self, agent_url: str, spec: dict[str, Any], *, node: str | None = None
+    ) -> dict[str, Any] | None:
         try:
             response = await self._client.post(
                 f"{agent_url.rstrip('/')}/v1/runtimes/admission",
                 json=spec,
-                headers=self._headers,
+                headers=await self._headers(node),
             )
             if response.status_code >= 400:
                 return None
@@ -116,11 +128,13 @@ class AgentLifecycleClient:
             log.info("admission dry run at %s failed: %s", agent_url, e)
             return None
 
-    async def runtime(self, agent_url: str, name: str) -> dict[str, Any] | None:
+    async def runtime(
+        self, agent_url: str, name: str, *, node: str | None = None
+    ) -> dict[str, Any] | None:
         try:
             response = await self._client.get(
                 f"{agent_url.rstrip('/')}/v1/runtimes/{quote(name, safe='')}",
-                headers=self._headers,
+                headers=await self._headers(node),
             )
             if response.status_code >= 400:
                 return None
@@ -239,7 +253,9 @@ class LifecycleManager:
             # out of routing for exactly that span; afterwards the
             # runtime's own status carries it.
             with self._table.stopping(facts.key):
-                unloaded = await self._client.stop(agent_url, facts.name, reason="idle")
+                unloaded = await self._client.stop(
+                    agent_url, facts.name, reason="idle", node=facts.node
+                )
             if unloaded:
                 stopped.append(facts.name)
                 self.stopped_idle.append(facts.name)
@@ -295,13 +311,13 @@ class LifecycleManager:
         agent_url = self._table.agent_url_for(facts)
         evicted: list[str] = []
 
-        status, detail = await self._client.start(agent_url, facts.name)
+        status, detail = await self._client.start(agent_url, facts.name, node=facts.node)
         if status == 422:
             # Admission refused. Make room, bounded by opt-in, then once
             # more. The agent's dry run names what holds the device.
             evicted = await self._evict_for(facts, agent_url)
             if evicted:
-                status, detail = await self._client.start(agent_url, facts.name)
+                status, detail = await self._client.start(agent_url, facts.name, node=facts.node)
         if status != 202:
             return WakeResult(
                 ok=False,
@@ -317,7 +333,7 @@ class LifecycleManager:
         deadline = started + max(1.0, float(self._swap_wait()))
         last_status: str | None = None
         while time.perf_counter() < deadline:
-            body = await self._client.runtime(agent_url, facts.name)
+            body = await self._client.runtime(agent_url, facts.name, node=facts.node)
             last_status = str(body.get("status")) if body and body.get("status") else last_status
             if last_status == READY:
                 await self._table.refresh()
@@ -359,7 +375,7 @@ class LifecycleManager:
         declared `idleUnloadSeconds` and have nothing in flight here."""
         evicted: list[str] = []
         for _ in range(8):
-            admission = await self._client.admission(agent_url, facts.spec)
+            admission = await self._client.admission(agent_url, facts.spec, node=facts.node)
             if admission is None or admission.get("decision") != "refuse":
                 break
             blockers = [
@@ -393,7 +409,9 @@ class LifecycleManager:
             # the loop above — and on a path a user is actively waiting
             # on, so the request that lands in it is likelier.
             with self._table.stopping((facts.node, victim)):
-                evicted_ok = await self._client.stop(agent_url, victim, reason="idle")
+                evicted_ok = await self._client.stop(
+                    agent_url, victim, reason="idle", node=facts.node
+                )
             if not evicted_ok:
                 break
             evicted.append(victim)

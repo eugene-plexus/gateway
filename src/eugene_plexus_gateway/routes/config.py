@@ -66,19 +66,20 @@ async def test_config(
 
     timeout = float(get("requestTimeoutSeconds") or 30)
     settings = request.app.state.settings
-    service_token = request.app.state.auth_state.service_token
-    headers = {"Authorization": f"Bearer {service_token}"} if service_token else None
+    outbound = getattr(request.app.state, "outbound", None)
 
     # Read the topology fresh rather than off the routing table: the
     # point of a Test button is to check the world as it is now, which
     # may differ from the last refresh.
     probe_table = RoutingTable(
         agent_url=settings.agent_url,
-        service_token=service_token,
+        outbound=outbound,
         request_timeout_seconds=timeout,
     )
     try:
         entries = await probe_table.fetch_driver_entries()
+        # Each probe carries the token for its own driver's machine.
+        recipients = {node: probe_table.recipient_for(node) for node, _, _ in entries}
     finally:
         await probe_table.aclose()
 
@@ -98,11 +99,12 @@ async def test_config(
         )
 
     async def probe(
-        client: httpx.AsyncClient, name: str, base_url: str
+        client: httpx.AsyncClient, node: str | None, name: str, base_url: str
     ) -> tuple[str, str | None, str | None]:
         """Returns (name, error-or-None, modelId-or-None)."""
+        headers = await outbound.headers(recipients[node]) if outbound is not None else {}
         try:
-            response = await client.get(base_url.rstrip("/") + "/v1/info")
+            response = await client.get(base_url.rstrip("/") + "/v1/info", headers=headers)
             response.raise_for_status()
             info = response.json()
         except Exception as e:
@@ -114,8 +116,10 @@ async def test_config(
     # under `gather`, so a per-probe client made an N-driver install pay
     # N certifi parses (~104 ms of synchronous CPU apiece) back to back
     # on the event loop -- inside an operator-facing request.
-    async with internal_client(timeout=timeout, headers=headers) as client:
-        results = await asyncio.gather(*(probe(client, name, url) for name, url in entries))
+    async with internal_client(timeout=timeout) as client:
+        results = await asyncio.gather(
+            *(probe(client, node, name, url) for node, name, url in entries)
+        )
 
     failures = [err for _, err, _ in results if err]
     if failures:

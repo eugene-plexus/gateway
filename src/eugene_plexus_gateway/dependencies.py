@@ -1,22 +1,27 @@
-"""FastAPI dependencies for v0.2 bearer auth.
+"""FastAPI dependencies for bearer auth, against this machine's trust bundle.
 
 Two dependencies, both pass-through when `AuthState.auth_disabled` is
 true (the dev/standalone path):
 
-  * `require_authorized` — accepts an operator-audience OR any
-    `service:*`-audience token OR a **client key** (`aud: client`).
-    Used for routes reachable from both the UI and peer components (the
-    OpenAI-compatible front door), and since S4 the only place in the
-    install that accepts a client key at all. A revoked client key is
-    refused here, from the list `ClientKeyGuard` keeps.
+  * `require_authorized` -- the front door. An operator session
+    addressed to this machine, a service token this machine's own agent
+    minted for itself or one of its children, or a **client key**
+    (`ep-client+jwt`, addressed to `gateway`, signed by the install's
+    authority). The only place in the install that accepts a client key
+    at all; a turned-off one is refused here, from the policy
+    `ClientKeyGuard` keeps.
 
-  * `require_operator` — accepts operator-audience only. Used for
-    operator-only routes (config edits, admin/restart, drivers
-    list/probe).
+  * `require_operator` -- an operator session only. Config edits,
+    admin/restart, drivers list/probe, metrics.
 
-Both raise 401 with a Problem JSON body on missing / malformed /
-expired / wrong-audience tokens, mirroring the agent's shape so the
-UI can render one error path across components.
+**No `service:*` wildcard, and no service token from another machine**
+(per-node token keys, 2026-09-25). Until then any component's token
+from any machine opened the front door, because a service token named a
+kind and every machine shared one key.
+
+Both raise 401 with a Problem JSON body on a missing, malformed,
+expired or misaddressed token, mirroring the agent's shape so the UI can
+render one error path across components.
 """
 
 from __future__ import annotations
@@ -24,13 +29,15 @@ from __future__ import annotations
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from . import security
+from . import tokens
 from ._generated.models import Problem
 from .admission import current
 from .auth_state import AuthState
 from .client_keys import ClientKeyGuard
 
 _bearer_scheme = HTTPBearer(auto_error=False)
+
+FRONT_DOOR = (tokens.TYP_SESSION, tokens.TYP_SERVICE, tokens.TYP_CLIENT)
 
 
 def _problem(status_code: int, title: str, detail: str) -> HTTPException:
@@ -46,14 +53,27 @@ def _problem(status_code: int, title: str, detail: str) -> HTTPException:
     )
 
 
+def front_door_claims(auth: AuthState, token: str) -> tokens.Claims:
+    """A front-door credential's claims, or `TokenError` saying why not.
+
+    Shared with the Anthropic and Responses doors, which read their
+    credential from a different header and answer in their own shape.
+    """
+    claims = auth.verify(token, classes=FRONT_DOOR)
+    if claims.is_service and not claims.is_local_service(str(auth.recipient)):
+        raise tokens.TokenError(
+            f"a service token from {claims.iss!r} is not accepted at this front door; "
+            "only this machine's own components and the operator may use it"
+        )
+    return claims
+
+
 def _validate(
     request: Request,
     creds: HTTPAuthorizationCredentials | None,
     *,
-    accept_operator: bool,
-    accept_any_service: bool,
-    accept_client: bool = False,
-) -> security.TokenPayload | None:
+    front_door: bool,
+) -> tokens.Claims | None:
     auth: AuthState = request.app.state.auth_state
     if auth.auth_disabled:
         return None
@@ -63,16 +83,11 @@ def _validate(
             "Missing token",
             "Provide a bearer token via the Authorization: Bearer header.",
         )
-    assert auth.signing_key is not None  # narrowed by auth_disabled
     try:
-        return security.decode_token(
-            token=creds.credentials,
-            signing_key=auth.signing_key,
-            accept_operator=accept_operator,
-            accept_any_service=accept_any_service,
-            accept_client=accept_client,
-        )
-    except Exception as e:
+        if front_door:
+            return front_door_claims(auth, creds.credentials)
+        return auth.verify(creds.credentials, classes=(tokens.TYP_SESSION,))
+    except tokens.TokenError as e:
         raise _problem(
             status.HTTP_401_UNAUTHORIZED,
             "Invalid token",
@@ -83,25 +98,23 @@ def _validate(
 async def require_authorized(
     request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
-) -> security.TokenPayload | None:
-    """Operator, any service token, or a client key — the front door.
+) -> tokens.Claims | None:
+    """A session, this machine's services, or a client key -- the front door.
 
     Async since S4, because a client key has one more question to
     answer: has the operator turned it off? Nothing about the other two
-    audiences awaits anything, and an install where nobody has minted a
+    classes awaits anything, and an install where nobody has minted a
     client key never touches the guard.
     """
-    payload = _validate(
-        request, creds, accept_operator=True, accept_any_service=True, accept_client=True
-    )
-    if payload is None or payload.aud != security.AUDIENCE_CLIENT:
-        return payload
+    claims = _validate(request, creds, front_door=True)
+    if claims is None or not claims.is_client:
+        return claims
     context = current.get()
     if context is not None:
-        context.key_id = payload.jti
-        context.key_name = payload.sub
+        context.key_id = claims.jti
+        context.key_name = claims.sub
     guard: ClientKeyGuard | None = getattr(request.app.state, "client_key_guard", None)
-    decision = await guard.decision(payload.jti) if guard is not None else "unavailable"
+    decision = await guard.decision(claims.jti) if guard is not None else "unavailable"
     if decision == "unavailable":
         raise _problem(
             503,
@@ -113,8 +126,8 @@ async def require_authorized(
         raise _problem(
             401,
             "Key not registered",
-            "This key is not registered with the current authority. Open Use it from "
-            "your apps on the node that originally made it to check migration, or replace it.",
+            "This key is not registered with the current authority. Make a new one under "
+            "Home -> Use it from your apps.",
         )
     if decision == "revoked":
         raise _problem(
@@ -123,16 +136,16 @@ async def require_authorized(
             "This client key was turned off. Make a new one under "
             "Home -> Use it from your apps, and paste it into the app that is failing.",
         )
-    return payload
+    return claims
 
 
 def require_operator(
     request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
-) -> security.TokenPayload | None:
-    """Operator-audience tokens only — for config / admin endpoints.
+) -> tokens.Claims | None:
+    """An operator session only -- for config / admin endpoints.
 
-    `accept_client` is left at its default `False`: a key handed to
-    Open WebUI must not be able to edit this gateway's config or read
-    what every other caller asked it."""
-    return _validate(request, creds, accept_operator=True, accept_any_service=False)
+    A key handed to Open WebUI must not be able to edit this gateway's
+    config or read what every other caller asked it, and neither may
+    any component's token."""
+    return _validate(request, creds, front_door=False)

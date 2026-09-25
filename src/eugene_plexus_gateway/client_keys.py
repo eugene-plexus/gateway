@@ -37,7 +37,7 @@ class ClientKeyGuard:
         max_age_seconds: float = DEFAULT_MAX_AGE_SECONDS,
         retry_seconds: float = 1.0,
         cache_file: Path | None = None,
-        verification_key: bytes | None = None,
+        authority: str | None = None,
     ) -> None:
         self._agent_url = agent_url.rstrip("/")
         self._service_token = service_token
@@ -46,8 +46,11 @@ class ClientKeyGuard:
         self._max_age = max_age_seconds
         self._retry = retry_seconds
         self._cache_file = cache_file
+        # A cached policy is only ever read back by the same authority
+        # through the same agent: a re-enrolled node must not trust the
+        # last install's list of who was turned off.
         self._scope = hashlib.sha256(
-            (verification_key or b"") + b"\0" + self._agent_url.encode()
+            (authority or "").encode() + b"\0" + self._agent_url.encode()
         ).hexdigest()
         self._policy: ClientKeyPolicy | None = None
         self._observed_revoked: set[str] = set()

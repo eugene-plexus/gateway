@@ -28,6 +28,7 @@ from .cors import FrontDoorCors
 from .dependencies import require_operator
 from .lifecycle import AgentLifecycleClient, LifecycleManager
 from .metrics import MetricsStore
+from .outbound import Outbound
 from .profiles import ProfileDefaults
 from .routes import admin as admin_routes
 from .routes import config as config_routes
@@ -59,16 +60,28 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Tests can pre-populate `app.state.auth_state` to exercise authed
     # paths; the default build reads env vars via Settings and produces
-    # an auth-disabled state when the agent didn't supply a signing
-    # key (dev / standalone).
+    # an auth-disabled state when the agent supplied no trust bundle
+    # (dev / standalone).
     if not hasattr(app.state, "auth_state"):
         app.state.auth_state = load_auth_state(
-            signing_key_b64=settings.auth_signing_key,
-            verify_key_b64=settings.auth_verify_key,
+            trust_bundle_file=settings.trust_bundle_file,
+            trust_authority=settings.trust_authority,
+            auth_recipient=settings.auth_recipient,
             service_token=settings.service_token,
             master_key_b64=settings.master_key,
         )
     auth_state: AuthState = app.state.auth_state
+
+    # Every outbound call's credential: this machine's own token here,
+    # a fifteen-minute one from this node's agent anywhere else (D8).
+    owns_outbound = not hasattr(app.state, "outbound")
+    if owns_outbound:
+        app.state.outbound = Outbound(
+            recipient=auth_state.recipient,
+            local_token=auth_state.service_token,
+            agent_url=settings.agent_url,
+        )
+    outbound: Outbound = app.state.outbound
 
     # Retained request metrics (M8). Built before the routing table, so
     # the very first completion is recorded — the gateway is routable the
@@ -114,12 +127,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             guard = ClientKeyGuard(
                 agent_url=settings.agent_url,
                 service_token=auth_state.service_token,
+                authority=auth_state.authority,
                 ttl_seconds=settings.client_key_refresh_seconds,
                 max_age_seconds=settings.client_key_max_age_seconds,
                 timeout_seconds=settings.client_key_timeout_seconds,
                 retry_seconds=settings.client_key_retry_seconds,
                 cache_file=settings.config_file.with_suffix(".client-keys.json"),
-                verification_key=auth_state.signing_key,
             )
             app.state.client_key_guard = guard
 
@@ -137,7 +150,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         else:
             table = RoutingTable(
                 agent_url=settings.agent_url,
-                service_token=auth_state.service_token,
+                outbound=outbound,
                 request_timeout_seconds=float(
                     store.get("requestTimeoutSeconds") or DEFAULT_REQUEST_TIMEOUT_SECONDS
                 ),
@@ -159,7 +172,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             # start on demand, with the gateway's own service token.
             lifecycle = LifecycleManager(
                 table,
-                client=AgentLifecycleClient(auth_state.service_token),
+                client=AgentLifecycleClient(outbound),
                 swap_wait_seconds=lambda: float(store.get("swapWaitSeconds") or 120),
                 idle_check_seconds=lambda: float(store.get("idleCheckSeconds") or 15),
             )
@@ -177,6 +190,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await app.state.routing.aclose()
         if guard is not None:
             await guard.aclose()
+        if owns_outbound:
+            await outbound.aclose()
         # Last, so rows queued by requests still in flight during
         # shutdown are flushed rather than dropped.
         if metrics is not None:

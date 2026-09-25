@@ -9,12 +9,10 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from eugene_plexus_gateway.app import create_app
-from eugene_plexus_gateway.auth_state import AuthState
 from eugene_plexus_gateway.config import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from eugene_plexus_gateway.settings import Settings
 
-from .conftest import FakeDriverClient, make_routing_table
-from .test_auth import _issue
+from .conftest import FakeDriverClient, FakeInstall, make_routing_table
 
 
 def _app_with(settings: Settings, table: object) -> FastAPI:
@@ -253,7 +251,9 @@ def test_healthz_is_ok_and_unauthenticated(client: TestClient) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_the_probe_does_not_hand_a_service_token_to_a_typed_url(app: FastAPI) -> None:
+def test_the_probe_does_not_hand_a_service_token_to_a_typed_url(
+    app: FastAPI, install: FakeInstall
+) -> None:
     """The Test button dials whatever the operator typed.
 
     That is the feature and it stays -- an operator checking a backend
@@ -279,18 +279,11 @@ def test_the_probe_does_not_hand_a_service_token_to_a_typed_url(app: FastAPI) ->
         def log_message(self, *args: object) -> None:
             return
 
-    signing_key = b"k" * 32
-    # A real install's posture: a real signing key and a real
-    # `service:gateway` token, set before the lifespan so it is left
-    # alone -- the question is what the probe does with it.
-    app.state.auth_state = AuthState(
-        signing_key=signing_key,
-        service_token=_issue(
-            signing_key=signing_key, sub="gateway", aud="service:gateway", ttl_seconds=3600
-        ),
-        master_key=None,
-    )
-    operator = _issue(signing_key=signing_key, sub="operator", aud="operator")
+    # A real install's posture: a real bundle and this gateway's own
+    # token, set before the lifespan so it is left alone -- the question
+    # is what the probe does with it.
+    app.state.auth_state = install.auth_state()
+    operator = install.session(sub="operator")
 
     server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

@@ -30,9 +30,8 @@ from eugene_plexus_gateway.app import create_app
 from eugene_plexus_gateway.driver_client import DriverError
 from eugene_plexus_gateway.settings import Settings
 from tests.test_admission import Authority
-from tests.test_client_keys import _issue
 
-from .conftest import FakeDriverClient, make_routing_table, runtime_facts
+from .conftest import FakeDriverClient, FakeInstall, make_routing_table, runtime_facts
 
 MODEL = "qwen3-0.6b"
 PATH = "/v1/messages/count_tokens?beta=true"
@@ -236,14 +235,12 @@ def test_the_messages_doors_refusals_apply(
 
 
 @pytest.fixture
-def keyed(settings: Settings):
+def keyed(settings: Settings, install: FakeInstall):
     authority = Authority()
-    signing = b"a" * 32
-    token = _issue(signing_key=signing, sub="app", aud="client", jti="key-1")
-    from eugene_plexus_gateway.auth_state import AuthState
+    token = install.client_key(name="app", jti="key-1")
 
     app = create_app(settings=settings)
-    app.state.auth_state = AuthState(signing_key=signing, service_token="service", master_key=None)
+    app.state.auth_state = install.auth_state()
     app.state.client_key_guard = authority.as_guard(ttl_seconds=0)
     allowed = counting("allowed-driver", model_id="allowed", count=11)
     excluded = counting("excluded-driver", model_id="excluded", count=22)

@@ -196,7 +196,7 @@ async def probe_driver(request: Request, body: DriverProbeRequest) -> DriverHeal
         # this is not an open relay -- but an operator typing a URL is
         # not an operator deciding to hand out a credential, and those
         # are different acts.
-        service_token=None,
+        auth=None,
     )
     try:
         return await _driver_health(client)

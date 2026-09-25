@@ -170,7 +170,7 @@ async def _table() -> RoutingTable:
 def _manager(table: RoutingTable) -> LifecycleManager:
     return LifecycleManager(
         table,
-        client=AgentLifecycleClient(service_token=None),
+        client=AgentLifecycleClient(None),
         swap_wait_seconds=lambda: 5.0,
         idle_check_seconds=lambda: 3600.0,
         poll_seconds=0.01,

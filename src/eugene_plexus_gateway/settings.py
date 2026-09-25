@@ -46,16 +46,21 @@ class Settings(BaseSettings):
     the operator's repair survives the next non-safe-mode boot. Per the
     safe-mode contract in specs/openapi/gateway.yaml."""
 
-    auth_verify_key: str | None = None
-    """Base64 public Ed25519 PEM from the agent. Exclusive with auth_signing_key."""
+    trust_bundle_file: str | None = None
+    """The trust bundle the agent keeps beside `node.yaml`
+    (EUGENE_PLEXUS_GATEWAY_TRUST_BUNDLE_FILE), reloaded when it changes."""
 
-    auth_signing_key: str | None = None
-    """Legacy base64 32-byte HS256 key; used only until install rotation."""
+    trust_authority: str | None = None
+    """The public key that bundle must be signed by (base64url Ed25519)."""
+
+    auth_recipient: str | None = None
+    """This machine as a token's audience names it: `node:<name>`."""
 
     service_token: str | None = None
-    """Long-lived service JWT for outbound calls to peer components
-    (EUGENE_PLEXUS_GATEWAY_SERVICE_TOKEN). Required when `auth_signing_key`
-    is set; the gateway presents this on every outbound httpx call."""
+    """This gateway's own token, addressed to this machine alone
+    (EUGENE_PLEXUS_GATEWAY_SERVICE_TOKEN). It reaches this machine's agent,
+    drivers and library; for any other machine the gateway asks its agent
+    for a fifteen-minute token addressed there (`outbound.py`)."""
 
     master_key: str | None = None
     """Base64-encoded 32-byte secretbox key for at-rest decryption

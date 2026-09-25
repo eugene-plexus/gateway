@@ -1,88 +1,45 @@
-"""Tests for v0.2 bearer auth on the gateway.
+"""Bearer auth on the gateway, against this machine's trust bundle.
 
-The gateway is verify-only — the agent issues the signing key
-and tokens. These tests stand in for the agent by constructing
-JWTs directly via PyJWT against a known key, then asserting the
-gateway's dependencies accept / reject the right shapes.
+The gateway is verify-only: it holds no key (per-node token keys,
+2026-09-25). These tests stand in for the agent and the control root with
+`FakeInstall` -- a real bundle on disk, signed by a real authority key,
+listing the root's token key, this machine's (`node:gw`) and another
+machine's (`node:far`) -- and assert the dependencies accept and refuse
+the right shapes.
 
 Auth posture is selected by whether `app.state.auth_state` is
 pre-populated before the lifespan runs:
 
-  * default fixtures (`client`) leave it unset → lifespan reads env
-    vars (empty in tests) → `auth_disabled=True`. Verifies the
-    backward-compat / dev path.
-  * `authed_app` injects a real `AuthState` with a known signing key,
-    exercising the production path.
+  * default fixtures (`client`) leave it unset -> lifespan reads env
+    vars (empty in tests) -> `auth_disabled=True`, the dev path.
+  * `authed_app` injects the fake install's `AuthState`.
 """
 
 from __future__ import annotations
 
-import secrets
 import time
 from collections.abc import Iterator
+from pathlib import Path
 
-import jwt
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from eugene_plexus_gateway import tokens
 from eugene_plexus_gateway.app import create_app
-from eugene_plexus_gateway.auth_state import AuthState
+from eugene_plexus_gateway.auth_state import load_auth_state
 from eugene_plexus_gateway.settings import Settings
-from tests.conftest import FakeDriverClient, make_routing_table
+from tests.conftest import FakeDriverClient, FakeInstall, make_routing_table
 
-_JWT_ALG = "HS256"
-
-
-def _issue(
-    *,
-    signing_key: bytes,
-    sub: str,
-    aud: str,
-    ttl_seconds: int = 60,
-    iat: int | None = None,
-) -> str:
-    """Mint a JWT exactly the way the agent would."""
-    issued_at = iat if iat is not None else int(time.time())
-    claims = {
-        "sub": sub,
-        "aud": aud,
-        "iat": issued_at,
-        "exp": issued_at + ttl_seconds,
-    }
-    return jwt.encode(claims, signing_key, algorithm=_JWT_ALG)
-
-
-# --------------------------------------------------------------------------- #
-# Auth-enabled fixtures
-# --------------------------------------------------------------------------- #
+CHAT = {"messages": [{"role": "user", "content": "hi"}]}
 
 
 @pytest.fixture
-def signing_key() -> bytes:
-    return secrets.token_bytes(32)
-
-
-@pytest.fixture
-def authed_app(
-    settings: Settings,
-    signing_key: bytes,
-    fake_driver: FakeDriverClient,
-) -> FastAPI:
+def authed_app(settings: Settings, install: FakeInstall, fake_driver: FakeDriverClient) -> FastAPI:
     app = create_app(settings=settings)
     app.state.routing = make_routing_table(fake_driver)
-    # Pre-populate auth_state with a real signing key; the lifespan
-    # leaves it alone because hasattr is True.
-    app.state.auth_state = AuthState(
-        signing_key=signing_key,
-        service_token=_issue(
-            signing_key=signing_key,
-            sub="gateway",
-            aud="service:gateway",
-            ttl_seconds=365 * 24 * 3600,
-        ),
-        master_key=None,
-    )
+    # The lifespan leaves a pre-populated auth_state alone.
+    app.state.auth_state = install.auth_state()
     return app
 
 
@@ -93,13 +50,19 @@ def authed_client(authed_app: FastAPI) -> Iterator[TestClient]:
 
 
 @pytest.fixture
-def operator_token(signing_key: bytes) -> str:
-    return _issue(signing_key=signing_key, sub="operator", aud="operator")
+def operator_token(install: FakeInstall) -> str:
+    return install.session()
 
 
-@pytest.fixture
-def service_token(signing_key: bytes) -> str:
-    return _issue(signing_key=signing_key, sub="connector", aud="service:connector")
+def _bearer(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _chat(client: TestClient, driver: FakeDriverClient, token: str) -> int:
+    driver.responses = ["hello"]
+    return client.post(
+        "/v1/chat/completions", json={"model": driver.model_id, **CHAT}, headers=_bearer(token)
+    ).status_code
 
 
 # --------------------------------------------------------------------------- #
@@ -108,183 +71,212 @@ def service_token(signing_key: bytes) -> str:
 
 
 def test_auth_disabled_lets_everything_through(client: TestClient) -> None:
-    """When no signing key is wired in, every route should answer
-    normally without a bearer header. That's the dev / standalone
-    posture — production via the agent supplies the env vars."""
+    """With no trust bundle wired in, every route answers without a
+    bearer. The dev / standalone posture; the agent always supplies one."""
     assert client.get("/healthz").status_code == 200
     assert client.get("/v1/admin/drivers").status_code == 200
     assert client.get("/v1/config").status_code == 200
 
 
-# --------------------------------------------------------------------------- #
-# Health stays unauthenticated even when auth is on
-# --------------------------------------------------------------------------- #
-
-
 def test_healthz_is_always_open(authed_client: TestClient) -> None:
-    """Supervisors and load balancers must be able to probe /healthz
-    without holding credentials. Auth-on must NOT change that."""
-    response = authed_client.get("/healthz")
-    assert response.status_code == 200
+    assert authed_client.get("/healthz").status_code == 200
 
 
 # --------------------------------------------------------------------------- #
-# Missing / malformed / wrong-key tokens
+# Missing / malformed / foreign tokens
 # --------------------------------------------------------------------------- #
 
 
 def test_missing_bearer_rejects_with_401(authed_client: TestClient) -> None:
     response = authed_client.get("/v1/config")
     assert response.status_code == 401
-    body = response.json()
-    assert "detail" in body
-    assert body["detail"]["component"] == "gateway"
+    assert response.json()["detail"]["component"] == "gateway"
 
 
-def test_wrong_signing_key_rejects(authed_client: TestClient) -> None:
-    other_key = secrets.token_bytes(32)
-    token = _issue(signing_key=other_key, sub="operator", aud="operator")
-    response = authed_client.get("/v1/config", headers={"Authorization": f"Bearer {token}"})
-    assert response.status_code == 401
+def test_a_session_signed_by_a_key_the_bundle_does_not_list_is_refused(
+    authed_client: TestClient, install: FakeInstall
+) -> None:
+    stranger = tokens.Signer(key=tokens.generate_private_key(), issuer="control")
+    token, _ = stranger.mint(
+        typ=tokens.TYP_SESSION, sub="operator", aud=[install.recipient], ttl_seconds=60
+    )
+    assert authed_client.get("/v1/config", headers=_bearer(token)).status_code == 401
 
 
 def test_garbage_bearer_rejects(authed_client: TestClient) -> None:
-    response = authed_client.get("/v1/config", headers={"Authorization": "Bearer not.a.real.jwt"})
+    response = authed_client.get("/v1/config", headers=_bearer("not.a.real.jwt"))
     assert response.status_code == 401
 
 
-def test_expired_token_rejects(authed_client: TestClient, signing_key: bytes) -> None:
-    expired = _issue(
-        signing_key=signing_key,
-        sub="operator",
-        aud="operator",
-        ttl_seconds=-600,  # past the 300 s clock-skew leeway, not merely past exp
-        iat=int(time.time()) - 120,
-    )
-    response = authed_client.get("/v1/config", headers={"Authorization": f"Bearer {expired}"})
-    assert response.status_code == 401
+def test_expired_token_rejects(authed_client: TestClient, install: FakeInstall) -> None:
+    # Past the 300 s clock-skew leeway, not merely past exp.
+    expired = install.session(ttl=60, now=int(time.time()) - 1000)
+    assert authed_client.get("/v1/config", headers=_bearer(expired)).status_code == 401
+
+
+def test_a_session_for_another_machine_is_refused(
+    authed_client: TestClient, install: FakeInstall, fake_driver: FakeDriverClient
+) -> None:
+    """A session is addressed to the machines it may be used on. One the
+    operator holds for `far` opens nothing here."""
+    elsewhere = install.session(aud=["node:far"])
+    assert authed_client.get("/v1/config", headers=_bearer(elsewhere)).status_code == 401
+    assert _chat(authed_client, fake_driver, elsewhere) == 401
 
 
 # --------------------------------------------------------------------------- #
-# Operator audience — accepted on operator routes AND mixed routes
+# The operator's session -- operator routes and the front door
 # --------------------------------------------------------------------------- #
 
 
 def test_operator_token_accepted_on_config(authed_client: TestClient, operator_token: str) -> None:
-    response = authed_client.get(
-        "/v1/config", headers={"Authorization": f"Bearer {operator_token}"}
-    )
-    assert response.status_code == 200
+    assert authed_client.get("/v1/config", headers=_bearer(operator_token)).status_code == 200
 
 
 def test_operator_token_accepted_on_admin(authed_client: TestClient, operator_token: str) -> None:
-    response = authed_client.get(
-        "/v1/admin/drivers",
-        headers={"Authorization": f"Bearer {operator_token}"},
-    )
+    response = authed_client.get("/v1/admin/drivers", headers=_bearer(operator_token))
     assert response.status_code == 200
 
 
 def test_operator_token_accepted_on_chat(
     authed_client: TestClient, operator_token: str, fake_driver: FakeDriverClient
 ) -> None:
-    fake_driver.responses = ["hello from the model"]
-    response = authed_client.post(
-        "/v1/chat/completions",
-        json={
-            "model": fake_driver.model_id,
-            "messages": [{"role": "user", "content": "hi"}],
-        },
-        headers={"Authorization": f"Bearer {operator_token}"},
-    )
-    assert response.status_code == 200, response.text
+    assert _chat(authed_client, fake_driver, operator_token) == 200
 
 
-def test_service_token_rejected_on_config(authed_client: TestClient, service_token: str) -> None:
-    """Config is operator-only: a peer component has no business editing it."""
-    response = authed_client.get("/v1/config", headers={"Authorization": f"Bearer {service_token}"})
-    assert response.status_code == 401
+def test_a_session_exchanged_for_this_machine_is_accepted(
+    authed_client: TestClient, install: FakeInstall
+) -> None:
+    """What another console's agent presents after exchanging its
+    operator's session at the root: five minutes, this machine alone."""
+    exchanged = install.root.mint(
+        typ=tokens.TYP_SESSION,
+        sub="operator",
+        aud=[install.recipient],
+        ttl_seconds=300,
+        extra={"act": {"sub": "node:far"}, "sid": "s-1"},
+    )[0]
+    assert authed_client.get("/v1/config", headers=_bearer(exchanged)).status_code == 200
+
+
+def test_a_signed_out_session_is_refused(
+    authed_client: TestClient, install: FakeInstall, operator_token: str
+) -> None:
+    """A sign-out anywhere reaches this gateway through the bundle."""
+    assert authed_client.get("/v1/config", headers=_bearer(operator_token)).status_code == 200
+    claims = install.auth_state().verify(operator_token, classes=(tokens.TYP_SESSION,))
+    install.publish(revoked=((claims.jti, claims.exp),))
+    # The bundle file is re-read at most once a second.
+    time.sleep(1.1)
+    assert authed_client.get("/v1/config", headers=_bearer(operator_token)).status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# Service tokens -- the front door takes this machine's own, and only those
+# --------------------------------------------------------------------------- #
+
+
+def test_service_token_rejected_on_config(authed_client: TestClient, install: FakeInstall) -> None:
+    """Config is operator-only: a component has no business editing it."""
+    token = install.service("library")
+    assert authed_client.get("/v1/config", headers=_bearer(token)).status_code == 401
 
 
 def test_service_token_rejected_on_admin_restart(
-    authed_client: TestClient, service_token: str
+    authed_client: TestClient, install: FakeInstall
 ) -> None:
-    """And it certainly has no business restarting the gateway."""
-    response = authed_client.post(
-        "/v1/admin/restart", headers={"Authorization": f"Bearer {service_token}"}
-    )
-    assert response.status_code == 401
+    token = install.service("library")
+    assert authed_client.post("/v1/admin/restart", headers=_bearer(token)).status_code == 401
 
 
-def test_service_token_accepted_on_chat(
-    authed_client: TestClient, service_token: str, fake_driver: FakeDriverClient
+def test_this_machines_service_token_is_accepted_on_chat(
+    authed_client: TestClient, install: FakeInstall, fake_driver: FakeDriverClient
 ) -> None:
-    """The front door accepts service tokens: another component calling
-    in (a Discord connector, say) is a legitimate caller of the one
-    OpenAI-compatible endpoint."""
-    fake_driver.responses = ["hello"]
-    response = authed_client.post(
-        "/v1/chat/completions",
-        json={
-            "model": fake_driver.model_id,
-            "messages": [{"role": "user", "content": "hi"}],
-        },
-        headers={"Authorization": f"Bearer {service_token}"},
-    )
-    assert response.status_code == 200, response.text
+    """A component beside this gateway calling the one OpenAI-compatible
+    endpoint is a legitimate caller."""
+    assert _chat(authed_client, fake_driver, install.service("library")) == 200
 
 
-def test_service_token_accepted_on_models(authed_client: TestClient, service_token: str) -> None:
-    response = authed_client.get("/v1/models", headers={"Authorization": f"Bearer {service_token}"})
+def test_this_machines_service_token_is_accepted_on_models(
+    authed_client: TestClient, install: FakeInstall
+) -> None:
+    response = authed_client.get("/v1/models", headers=_bearer(install.service("library")))
     assert response.status_code == 200
 
 
-def test_load_auth_state_disabled_when_no_signing_key() -> None:
-    from eugene_plexus_gateway.auth_state import load_auth_state
+def test_another_machines_service_token_is_refused_at_the_front_door(
+    authed_client: TestClient, install: FakeInstall, fake_driver: FakeDriverClient
+) -> None:
+    """The case per-node keys exist for: a token another machine signed,
+    correctly, and addressed here. A leaked worker key must not buy
+    inference on every machine in the install."""
+    assert _chat(authed_client, fake_driver, install.foreign_service("agent")) == 401
+    response = authed_client.get("/v1/models", headers=_bearer(install.foreign_service()))
+    assert response.status_code == 401
 
-    state = load_auth_state(signing_key_b64=None, service_token=None, master_key_b64=None)
+
+def test_a_node_key_cannot_mint_a_session_or_a_client_key(
+    authed_client: TestClient, install: FakeInstall, fake_driver: FakeDriverClient
+) -> None:
+    assert install.node is not None
+    for typ, aud in ((tokens.TYP_SESSION, [install.recipient]), (tokens.TYP_CLIENT, ["gateway"])):
+        forged, _ = install.node.mint(typ=typ, sub="operator", aud=aud, ttl_seconds=60)
+        assert _chat(authed_client, fake_driver, forged) == 401
+        assert authed_client.get("/v1/config", headers=_bearer(forged)).status_code == 401
+
+
+# --------------------------------------------------------------------------- #
+# Loading the environment the agent supplies
+# --------------------------------------------------------------------------- #
+
+
+def _env(install: FakeInstall) -> dict[str, str | None]:
+    return {
+        "trust_bundle_file": str(install.bundle_path),
+        "trust_authority": install.authority,
+        "auth_recipient": install.recipient,
+        "service_token": install.service(),
+        "master_key_b64": None,
+    }
+
+
+def test_load_auth_state_disabled_when_nothing_is_supplied() -> None:
+    state = load_auth_state(
+        trust_bundle_file=None,
+        trust_authority=None,
+        auth_recipient=None,
+        service_token=None,
+        master_key_b64=None,
+    )
     assert state.auth_disabled is True
 
 
-def test_load_auth_state_rejects_partial_auth() -> None:
-    """SERVICE_TOKEN without AUTH_SIGNING_KEY is a configuration bug —
-    fail loudly rather than silently disabling auth."""
-    from eugene_plexus_gateway.auth_state import load_auth_state
-
-    with pytest.raises(ValueError, match="inconsistent"):
-        load_auth_state(
-            signing_key_b64=None,
-            service_token="dummy",
-            master_key_b64=None,
-        )
+@pytest.mark.parametrize(
+    "missing", ["trust_bundle_file", "trust_authority", "auth_recipient", "service_token"]
+)
+def test_load_auth_state_refuses_a_partial_environment(install: FakeInstall, missing: str) -> None:
+    """Some but not all is a wiring bug: fail loudly rather than run half-authenticated."""
+    env = _env(install)
+    env[missing] = None
+    with pytest.raises(ValueError, match="missing"):
+        load_auth_state(**env)  # type: ignore[arg-type]
 
 
-def test_load_auth_state_requires_service_token_when_enabled(signing_key: bytes) -> None:
-    """AUTH_SIGNING_KEY without SERVICE_TOKEN means the gateway
-    has nothing to present on outbound calls — refuse."""
-    import base64
-
-    from eugene_plexus_gateway.auth_state import load_auth_state
-
-    with pytest.raises(ValueError, match="SERVICE_TOKEN is missing"):
-        load_auth_state(
-            signing_key_b64=base64.b64encode(signing_key).decode("ascii"),
-            service_token=None,
-            master_key_b64=None,
-        )
+def test_load_auth_state_refuses_an_authority_that_is_not_a_key(install: FakeInstall) -> None:
+    env = _env(install)
+    env["trust_authority"] = "not-a-key"
+    with pytest.raises(ValueError, match="TRUST_AUTHORITY"):
+        load_auth_state(**env)  # type: ignore[arg-type]
 
 
-def test_load_auth_state_rejects_wrong_length_signing_key() -> None:
-    """Bad config should produce a clear error, not a runtime jwt
-    failure half a second after a request lands."""
-    import base64
-
-    from eugene_plexus_gateway.auth_state import load_auth_state
-
-    short = base64.b64encode(b"\x00" * 16).decode("ascii")
-    with pytest.raises(ValueError, match="32 bytes"):
-        load_auth_state(
-            signing_key_b64=short,
-            service_token="dummy",
-            master_key_b64=None,
-        )
+def test_a_bundle_signed_by_another_authority_verifies_nothing(
+    tmp_path: Path, install: FakeInstall
+) -> None:
+    """The file is the agent's, but the authority is pinned: a bundle
+    anyone else wrote there is refused and nothing is trusted from it."""
+    impostor = FakeInstall(tmp_path / "impostor")
+    env = _env(install)
+    env["trust_bundle_file"] = str(impostor.bundle_path)
+    state = load_auth_state(**env)  # type: ignore[arg-type]
+    with pytest.raises(tokens.TokenError):
+        state.verify(impostor.session(aud=[install.recipient]), classes=(tokens.TYP_SESSION,))

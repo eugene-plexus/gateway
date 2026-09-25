@@ -17,13 +17,11 @@ import asyncio
 import base64
 import io
 import json
-import secrets
 import time
 from collections.abc import AsyncGenerator
 from typing import Any
 
 import httpx
-import jwt
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -38,11 +36,10 @@ from eugene_plexus_gateway._generated.driver_models import (
     Usage,
 )
 from eugene_plexus_gateway.app import create_app
-from eugene_plexus_gateway.auth_state import AuthState
 from eugene_plexus_gateway.driver_client import DriverError
 from eugene_plexus_gateway.settings import Settings
 
-from .conftest import FakeDriverClient, make_routing_table
+from .conftest import FakeDriverClient, FakeInstall, make_routing_table
 
 MODEL = "qwen3-0.6b"
 
@@ -654,15 +651,13 @@ def test_a_model_nothing_serves_is_400_here_and_404_on_the_chat_door(settings: S
     assert chat.status_code == 404
 
 
-def test_a_rejected_key_is_401_in_openais_envelope(settings: Settings) -> None:
-    signing_key = secrets.token_bytes(32)
+def test_a_rejected_key_is_401_in_openais_envelope(
+    settings: Settings, install: FakeInstall
+) -> None:
     app = create_app(settings=settings)
     app.state.routing = make_routing_table(driver())
-    app.state.auth_state = AuthState(signing_key=signing_key, service_token=None, master_key=None)
-    now = int(time.time())
-    good = jwt.encode(
-        {"sub": "troy", "aud": "operator", "iat": now, "exp": now + 60}, signing_key, "HS256"
-    )
+    app.state.auth_state = install.auth_state()
+    good = install.session(sub="troy")
     with TestClient(app) as client:
         missing = client.post("/v1/responses", json=codex_request(stream=False))
         wrong = client.post(

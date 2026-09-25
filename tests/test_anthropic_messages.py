@@ -19,26 +19,23 @@ event stream, because an unmodified SDK is the audience.
 from __future__ import annotations
 
 import json
-import secrets
 import time
 from collections.abc import Iterator
 from typing import Any
 
 import httpx
-import jwt
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from eugene_plexus_gateway import tokens
 from eugene_plexus_gateway._generated.driver_models import FunctionCall, ToolCall
 from eugene_plexus_gateway.app import create_app
-from eugene_plexus_gateway.auth_state import AuthState
 from eugene_plexus_gateway.settings import Settings
 
-from .conftest import FakeDriverClient, make_routing_table
+from .conftest import FakeDriverClient, FakeInstall, make_routing_table
 
 MODEL = "Qwen3-30B-A3B-Q4_K_M"
-_JWT_ALG = "HS256"
 
 
 def _app_with(settings: Settings, *fakes: FakeDriverClient) -> FastAPI:
@@ -775,42 +772,13 @@ def test_a_backend_that_dies_mid_stream_reports_an_error_event(settings: Setting
 # --------------------------------------------------------------------------- #
 
 
-def _issue(
-    *,
-    signing_key: bytes,
-    sub: str,
-    aud: str,
-    ttl_seconds: int = 60,
-    jti: str | None = "key-1",
-) -> str:
-    """Mint a JWT exactly the way the agent would.
-
-    `jti` is not decoration. S4's rule is that a client-audience token
-    **without** one is refused, because it could never be matched
-    against the revocation list and a credential that cannot be turned
-    off is not one to accept on a signature alone. The first draft of
-    these tests omitted it and read the resulting 403 as a bug in the
-    new door; it was the old rule, working.
-    """
-    now = int(time.time())
-    claims: dict[str, Any] = {"sub": sub, "aud": aud, "iat": now, "exp": now + ttl_seconds}
-    if jti is not None:
-        claims["jti"] = jti
-    return jwt.encode(claims, signing_key, algorithm=_JWT_ALG)
-
-
 @pytest.fixture
-def signing_key() -> bytes:
-    return secrets.token_bytes(32)
-
-
-@pytest.fixture
-def authed_client(settings: Settings, signing_key: bytes) -> Iterator[TestClient]:
+def authed_client(settings: Settings, install: FakeInstall) -> Iterator[TestClient]:
     fake = FakeDriverClient(name="d1", model_id=MODEL)
     fake.responses = ["ok"]
     app = create_app(settings=settings)
     app.state.routing = make_routing_table(fake)
-    app.state.auth_state = AuthState(signing_key=signing_key, service_token=None, master_key=None)
+    app.state.auth_state = install.auth_state()
     from tests.test_client_keys import FakeAgent
 
     app.state.client_key_guard = FakeAgent().as_guard()
@@ -819,27 +787,27 @@ def authed_client(settings: Settings, signing_key: bytes) -> Iterator[TestClient
         yield client
 
 
-def test_x_api_key_is_a_credential_here(authed_client: TestClient, signing_key: bytes) -> None:
+def test_x_api_key_is_a_credential_here(authed_client: TestClient, install: FakeInstall) -> None:
     """The reproduction of the auth half. Measured: `ANTHROPIC_API_KEY`
     sends this header and **no `Authorization` header at all**, so a
     door on the existing bearer scheme sees no credential rather than
     the wrong one."""
-    token = _issue(signing_key=signing_key, sub="app", aud="client")
+    token = install.client_key(name="app")
     r = authed_client.post("/v1/messages", json=body(), headers={"x-api-key": token})
     assert r.status_code == 200, r.text
 
 
-def test_authorization_bearer_still_works(authed_client: TestClient, signing_key: bytes) -> None:
+def test_authorization_bearer_still_works(authed_client: TestClient, install: FakeInstall) -> None:
     """`ANTHROPIC_AUTH_TOKEN` sends this one, and no `x-api-key`."""
-    token = _issue(signing_key=signing_key, sub="app", aud="client")
+    token = install.client_key(name="app")
     r = authed_client.post(
         "/v1/messages", json=body(), headers={"Authorization": f"Bearer {token}"}
     )
     assert r.status_code == 200, r.text
 
 
-def test_an_operator_token_works_too(authed_client: TestClient, signing_key: bytes) -> None:
-    token = _issue(signing_key=signing_key, sub="troy", aud="operator")
+def test_an_operator_token_works_too(authed_client: TestClient, install: FakeInstall) -> None:
+    token = install.session(sub="troy")
     r = authed_client.post("/v1/messages", json=body(), headers={"x-api-key": token})
     assert r.status_code == 200, r.text
 
@@ -863,8 +831,8 @@ def test_a_bad_token_is_403(authed_client: TestClient) -> None:
     assert r.json()["type"] == "error"
 
 
-def test_an_expired_token_is_403(authed_client: TestClient, signing_key: bytes) -> None:
-    token = _issue(signing_key=signing_key, sub="app", aud="client", ttl_seconds=-3600)
+def test_an_expired_token_is_403(authed_client: TestClient, install: FakeInstall) -> None:
+    token = install.client_key(name="app", ttl=60, now=int(time.time()) - 7200)
     r = authed_client.post("/v1/messages", json=body(), headers={"x-api-key": token})
     assert r.status_code == 403
 
@@ -881,21 +849,24 @@ def test_the_openai_door_still_answers_401(authed_client: TestClient) -> None:
     assert r.status_code == 401
 
 
-def test_a_wrong_audience_is_refused(authed_client: TestClient, signing_key: bytes) -> None:
-    """`aud: client` is accepted on the front door; an audience that is
-    neither operator, service nor client is not a credential here."""
-    token = _issue(signing_key=signing_key, sub="x", aud="nonsense")
+def test_a_wrong_audience_is_refused(authed_client: TestClient, install: FakeInstall) -> None:
+    """A session for another machine, or a component's token from
+    another machine, is not a credential at this door."""
+    token = install.session(sub="x", aud=["node:elsewhere"])
+    r = authed_client.post("/v1/messages", json=body(), headers={"x-api-key": token})
+    assert r.status_code == 403
+    token = install.foreign_service("agent")
     r = authed_client.post("/v1/messages", json=body(), headers={"x-api-key": token})
     assert r.status_code == 403
 
 
 def test_a_client_key_with_no_jti_is_refused_here_too(
-    authed_client: TestClient, signing_key: bytes
+    authed_client: TestClient, install: FakeInstall
 ) -> None:
     """S4's rule, asserted on the new door rather than assumed to carry
     over: a client token that cannot be matched against the revocation
     list is a credential that can never be turned off."""
-    token = _issue(signing_key=signing_key, sub="app", aud="client", jti=None)
+    token = install.raw(install.root, tokens.TYP_CLIENT, sub="app", aud=["gateway"])
     r = authed_client.post("/v1/messages", json=body(), headers={"x-api-key": token})
     assert r.status_code == 403
 
