@@ -437,7 +437,8 @@ def write_bundle_file(path: str | os.PathLike[str], bundle: TrustBundle) -> None
 class Signer:
     """A private token key and the issuer name its tokens carry."""
 
-    key: Ed25519PrivateKey
+    # A type annotation, not a secret; the scanner's generic rule reads it as one.
+    key: Ed25519PrivateKey  # gitleaks:allow
     issuer: str
 
     @property
