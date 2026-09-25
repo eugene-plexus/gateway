@@ -23,6 +23,11 @@ DEFAULT_TTL_SECONDS = 15.0
 DEFAULT_TIMEOUT_SECONDS = 4.0
 DEFAULT_MAX_AGE_SECONDS = 60.0
 CLOCK_TOLERANCE_SECONDS = 5.0
+# How often a key the policy does not list may make the guard ask again.
+# A key the root minted a moment ago is signed by the root and missing
+# from a policy up to a refresh old; one re-read settles it. Bounded, so a
+# stream of unknown keys cannot turn into a stream of reads.
+MISS_REFRESH_SECONDS = 1.0
 type Decision = Literal["allowed", "revoked", "unregistered", "unavailable"]
 
 
@@ -61,6 +66,7 @@ class ClientKeyGuard:
         self._task: asyncio.Task[None] | None = None
         self._client: httpx.AsyncClient | None = None
         self._last_warning = -math.inf
+        self._last_miss_refresh = -math.inf
         self._load()
 
     @property
@@ -93,13 +99,39 @@ class ClientKeyGuard:
             return "revoked"
         if self._policy is None or self._age() >= self._max_age:
             return "unavailable"
-        return (
-            "allowed"
-            if any(
-                k.id == key_id and k.expiresAt.timestamp() > time.time() for k in self._policy.keys
-            )
-            else "unregistered"
+        if self._registered(key_id):
+            return "allowed"
+        # Not listed: most likely made a moment ago, after the policy this
+        # gateway holds. Ask once before refusing; the 401 says "make a new
+        # one", which would only be refused the same way.
+        if not await self._refresh_for_miss():
+            return "unregistered"
+        if key_id in self._revoked:
+            return "revoked"
+        if self._policy is None or self._age() >= self._max_age:
+            return "unavailable"
+        return "allowed" if self._registered(key_id) else "unregistered"
+
+    def _registered(self, key_id: str) -> bool:
+        assert self._policy is not None
+        return any(
+            k.id == key_id and k.expiresAt.timestamp() > time.time() for k in self._policy.keys
         )
+
+    async def _refresh_for_miss(self) -> bool:
+        """Re-read the policy for a key it does not list, at most once a second."""
+        if self._task is not None and not self._task.done():
+            await asyncio.shield(self._task)
+            return True
+        now = time.perf_counter()
+        if self._failures and now < self._next_attempt:
+            return False
+        if now - self._last_miss_refresh < MISS_REFRESH_SECONDS:
+            return False
+        self._last_miss_refresh = now
+        self._task = asyncio.create_task(self._fetch())
+        await asyncio.shield(self._task)
+        return True
 
     async def is_revoked(self, key_id: str | None) -> bool:
         """Legacy query helper; authorization uses the four-way decision."""

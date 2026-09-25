@@ -54,6 +54,7 @@ class FakeAgent:
 
     def __init__(self) -> None:
         self.revoked: list[str] = []
+        self.registered: list[str] = []
         self.revision = 0
         self.fail = False
         self.reads = 0
@@ -78,7 +79,7 @@ class FakeAgent:
                 "expiresAt": datetime.fromtimestamp(time.time() + 3600, UTC).isoformat(),
                 **({"revokedAt": datetime.now(UTC).isoformat()} if key in self.revoked else {}),
             }
-            for key in set(["a", "key-1", "key-2", *self.revoked])
+            for key in set(["a", "key-1", "key-2", *self.revoked, *self.registered])
         ]
         return httpx.Response(
             200,
@@ -406,3 +407,41 @@ def test_revoked_and_unknown_anthropic_keys_are_403(authed_client, client_key, a
     unknown = install.client_key(name="app", jti="not-in-registry")
     response = authed_client.post("/v1/messages", json=body, headers={"x-api-key": unknown})
     assert response.status_code == 403 and "not registered" in response.text.lower()
+
+
+# --------------------------------------------------------------------- #
+# A key made a moment ago
+# --------------------------------------------------------------------- #
+
+
+async def test_a_key_minted_after_the_last_refresh_is_accepted_at_once(agent: FakeAgent) -> None:
+    """The root signs a new key and the gateway's policy is up to a refresh
+    old. Refusing it until then answered "make a new one" -- which would
+    be refused the same way. One re-read settles it."""
+    guard = agent.as_guard(ttl_seconds=3600)
+    assert await guard.decision("key-1") == "allowed"
+    reads = agent.reads
+    agent.registered.append("fresh")
+    agent.revision += 1
+    assert await guard.decision("fresh") == "allowed"
+    assert agent.reads == reads + 1
+    await guard.aclose()
+
+
+async def test_unknown_keys_cannot_turn_into_a_stream_of_reads(agent: FakeAgent) -> None:
+    guard = agent.as_guard(ttl_seconds=3600)
+    assert await guard.decision("key-1") == "allowed"
+    reads = agent.reads
+    for _ in range(20):
+        assert await guard.decision("never-made") == "unregistered"
+    assert agent.reads == reads + 1, "one re-read per second, however many unknown keys arrive"
+    await guard.aclose()
+
+
+async def test_a_revocation_seen_on_the_re_read_is_honoured(agent: FakeAgent) -> None:
+    guard = agent.as_guard(ttl_seconds=3600)
+    assert await guard.decision("key-1") == "allowed"
+    agent.registered.append("brief")
+    agent.revoke("brief")
+    assert await guard.decision("brief") == "revoked"
+    await guard.aclose()
