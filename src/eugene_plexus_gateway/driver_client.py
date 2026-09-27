@@ -113,6 +113,12 @@ class StreamEvent:
     delta, and validating a *fragment* against the whole-call shape
     would reject the normal case -- `id` and `name` arrive once, and
     `arguments` arrives split at arbitrary points."""
+    progress: dict[str, Any] | None = None
+    """What the backend is doing while it produces no output, as the
+    driver's `StreamProgress` (camelCase, parsed JSON). **Not output**:
+    `TieredClient.stream` neither commits on it nor times a first token by
+    it, so a backend that fails after reporting progress still fails over.
+    Only a request with `reportProgress` gets any."""
     done: bool = False
     result: GenerateResponse | None = None
 
@@ -463,6 +469,9 @@ class HttpDriverClient:
                         raise self._invalid_reply() from exc
                     yield StreamEvent(done=True, result=result)
                     return
+                if event_name == "progress":
+                    yield StreamEvent(progress=parsed)
+                    continue
                 if not isinstance(parsed, dict):
                     continue
                 # A token frame carries text, reasoning or tool-call
@@ -878,6 +887,13 @@ class TieredClient:
                     )
                     stream = candidate.stream(prepared)
                     async for event in stream:
+                        if event.progress is not None:
+                            # Not output. The caller has been told what
+                            # the backend is doing, not given any of its
+                            # answer, so this attempt can still fail over
+                            # -- and the first token is still to come.
+                            yield event
+                            continue
                         if first_ms is None:
                             first_ms = int((time.perf_counter() - started) * 1000)
                         committed = True

@@ -1708,7 +1708,11 @@ class MemoryBudget(BaseModel):
     )
     ramAvailableBytes: int | None = Field(None, ge=0)
     ramTotalBytes: int | None = Field(None, ge=0)
-    gpuCount: int | None = Field(None, ge=0)
+    gpuCount: int | None = Field(
+        None,
+        description='How many cards the budget spans. More than one means the\nmodel is spread across them, and the overhead allowance is\ncounted once per card.\n',
+        ge=0,
+    )
     unifiedMemory: bool | None = Field(
         None,
         description='One pool shared with host memory: Apple silicon, where the\nreal ceiling is the wired limit rather than a separate pool,\nand since 2026-09-27 an integrated GPU (an Intel Arc or Iris,\nan AMD Radeon 780M or Strix Halo) or NVIDIA\'s GB10. Reported\nbecause the naive reading of "VRAM" on a 96 GB Mac is zero,\nwhich would tell one of the better local-inference boxes on\nthe market that it has no GPU. Either detected or passed as\nthe `unifiedMemory` query parameter.\n',

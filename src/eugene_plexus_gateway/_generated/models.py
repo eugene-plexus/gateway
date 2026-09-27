@@ -1073,6 +1073,10 @@ class StreamOptions(BaseModel):
         extra='forbid',
     )
     include_usage: bool | None = None
+    include_progress: bool | None = Field(
+        None,
+        description="**An Eugene Plexus extension, not OpenAI's.** With streaming,\ntrue adds progress chunks saying what the backend is doing\nwhile it is not producing output: `choices: []` and an\n`x_eugene_plexus` carrying only `progress`. Local and cloud\nbackends alike report what they can observe -- llama.cpp how\nfar it has read the prompt, any HTTP backend that the service\nhas the request, Claude Code and Codex the tools they run.\nSee `StreamProgress`. A client that sets it must tolerate a\nchunk with no choices, as it already must for\n`include_usage`.\n\nA progress chunk is not output: failover to another backend\nis still possible after one, and a second backend's progress\nstarts again from its own beginning.\n",
+    )
 
 
 class ToolChoice(StrEnum):
@@ -1281,58 +1285,64 @@ class CompletionUsage(BaseModel):
     )
 
 
-class CompletionRoutingInfo(BaseModel):
+class Stage(StrEnum):
     """
-    Namespaced extension recording how this particular request was
-    served. Not part of OpenAI's schema, and ignored by clients that
-    do not know it.
-
-    It exists because the failure mode of a routing layer is being
-    opaque: when one of several backends is slow or a cascade fired,
-    an operator needs to see which one answered without going to the
-    logs. `attempts` above 1 is the visible evidence that failover
-    did its job.
+    `prompt`: reading the prompt, with the token counts below.
+    `working`: the backend says it is working and not how far.
+    `tool`: an agent backend is running one of its own tools,
+    named in `tool`.
 
     """
 
-    driver: str | None = Field(
-        None, description='Name of the inference-driver that served this request.'
+    prompt = 'prompt'
+    working = 'working'
+    tool = 'tool'
+
+
+class StreamProgress(BaseModel):
+    """
+    What the backend is doing while it is not producing output, on a
+    progress chunk (`stream_options.include_progress`). The only
+    thing such a chunk carries: its `x_eugene_plexus` has this and
+    nothing else, and its `choices` is empty. It can arrive at any
+    point before the final chunk -- an agent backend runs a tool
+    between two bursts of thinking.
+
+    What each backend can report is in `inference-driver.yaml`'s
+    `StreamProgress`: llama.cpp's prompt reading, a hosted API
+    accepting the request and its keepalives, Claude Code's and
+    Codex's own tools. Nothing is estimated here.
+
+    **Why it exists (2026-09-27).** Until the first token a stream
+    said nothing. On the processor a long prompt takes minutes to
+    read -- measured, 35 s for 7,795 tokens with a 0.6B -- and a
+    tester who saw nothing for that long concluded the request had
+    failed. A cloud agent is the same shape from the other end.
+
+    """
+
+    stage: Stage = Field(
+        ...,
+        description='`prompt`: reading the prompt, with the token counts below.\n`working`: the backend says it is working and not how far.\n`tool`: an agent backend is running one of its own tools,\nnamed in `tool`.\n',
     )
-    runtime: str | None = Field(
+    tool: str | None = Field(
+        None, description="On `tool`, the tool's name as the backend gives it."
+    )
+    prompt_tokens: int | None = Field(
+        None, description='On `prompt`, tokens in the whole prompt.', ge=0
+    )
+    cached_tokens: int | None = Field(
         None,
-        description='Name of the engine runtime behind that driver, when it is a\nlocal engine. Absent for hosted and CLI backends, which have\nno runtime of ours.\n',
-    )
-    backend: BackendKind | None = None
-    latency_ms: int | None = Field(
-        None, description='Gateway-side wall-clock time, including any failed attempts.'
-    )
-    attempts: int | None = Field(
-        None,
-        description='How many backends were tried. Greater than 1 means the\npriority-list cascade fired and an earlier backend failed.\n',
-        ge=1,
-    )
-    tier: int | None = Field(
-        None,
-        description="Which tier of the slot answered, 1-based. Greater than 1\nmeans every backend in an earlier tier was ineligible or\nfailed — a cloud target answering for a local model, say.\n\n**Positional, counted over the slot's tiers rather than over\nthe ones that had anything in them**, which is the only\nreading that answers the question this field exists for:\n*did the primary serve this?* A primary whose companion\ndriver is down is a tier with no backends, and it still\noccupies its number. See `ModelRoutingInfo.tiers` for which\ntier can be absent and why.\n",
-        ge=1,
-    )
-    swapped_in: bool | None = Field(
-        None,
-        description='True when the gateway had to start a `startOnDemand`\nruntime to serve this request. The visible cost of idle\nunload, next to the request that paid it.\n',
-    )
-    waited_ms: int | None = Field(
-        None,
-        description='How long the request waited for a runtime to reach `ready`\nbefore being sent. Zero when nothing had to be woken.\n',
+        description="Of those, reused from the backend's cache and not read again.\nThe fraction still to read is\n`(prompt_tokens - processed_tokens) / (prompt_tokens - cached_tokens)`.\n",
         ge=0,
     )
-    context_length: int | None = Field(
-        None,
-        description='The context window of the backend that actually answered, as\nthat backend resolved it. **Null** when it does not expose\none — a hosted provider, a CLI subscription, or a local\nengine that was not reachable to ask. Null and not absent:\nthis envelope serializes its unset fields, as `runtime` has\nsince M0.\n\nPer-request, and therefore not the same number as\n`x_eugene_plexus.context_length` on `GET /v1/models`: that\none is the smallest across every backend serving the name,\nbecause a request may land on any of them. This one is the\nwindow that applied to *this* request, which is what makes a\ntruncated answer explicable after the fact.\n',
-        ge=1,
+    processed_tokens: int | None = Field(
+        None, description='Read so far, the cached ones included.', ge=0
     )
-    prompt_truncated: bool | None = Field(
+    elapsed_ms: int | None = Field(
         None,
-        description="**The backend silently dropped input.** True when the prompt\nwe sent was far larger than the token count the backend\nreported consuming — the signature of a server that fits an\nover-long prompt into the window by discarding the middle of\nthe conversation and answering anyway, with a 200 and no\nflag of its own.\n\nThis is the failure that makes a coding harness loop: it\nsends file contents, the model never receives them, and the\nconfident answer that comes back is about code nobody read.\nMeasured on this project's own hardware: 66,389 characters\nacross six messages came back as `prompt_tokens: 86`, HTTP\n200, nothing anywhere saying so.\n\nDetected, not predicted. It is computed from\n`usage.prompt_tokens` **after** the answer, by a ratio\nchosen to be far below any real tokenizer's — so it cannot\nfire on a merely token-dense prompt, and it needs no\ntokenizer of ours.\n\n**Three states, and the difference matters.** `null` means\nnot evaluated — the backend reported no usage, or the prompt\nwas too small for the test to mean anything — and must not\nbe read as reassurance. `false` means it was checked and the\ninput arrived. `true` means it did not. Null and not absent:\nthis envelope serializes its unset fields, as `runtime` has\nsince M0.\n\n**Why a flag and not an error.** The answer has already been\ngenerated, and on a streamed request it has already been\ndelivered — M10's rule is that a stream cannot be unsent.\nFailing one path and flagging the other would make the same\ncondition report two different ways, so both flag. A backend\nthat refuses instead of truncating needs none of this: its\nrefusal is exact and is passed straight through as a 400.\n",
+        description="The backend's time on this prompt so far, from which a client\ncan estimate what is left.\n",
+        ge=0,
     )
 
 
@@ -1990,16 +2000,6 @@ class SystemOneUsage(BaseModel):
     output_tokens: int | None = Field(None, ge=0)
 
 
-class SystemOneResponse(BaseModel):
-    model: str = Field(
-        ...,
-        description="The public alias that served the request — after a cascade\nit names what answered, exactly as the chat doors do. The\nbackend's own model revision is preserved on the driver's\n`reportedModel` for provenance and surfaced in\n`x_eugene_plexus`.\n",
-    )
-    answers: dict[str, SystemOneAnswer]
-    usage: SystemOneUsage | None = None
-    x_eugene_plexus: CompletionRoutingInfo | None = None
-
-
 class Error1(BaseModel):
     message: str = Field(
         ...,
@@ -2519,6 +2519,62 @@ class ResponseFormat(BaseModel):
     )
 
 
+class CompletionRoutingInfo(BaseModel):
+    """
+    Namespaced extension recording how this particular request was
+    served. Not part of OpenAI's schema, and ignored by clients that
+    do not know it.
+
+    It exists because the failure mode of a routing layer is being
+    opaque: when one of several backends is slow or a cascade fired,
+    an operator needs to see which one answered without going to the
+    logs. `attempts` above 1 is the visible evidence that failover
+    did its job.
+
+    """
+
+    driver: str | None = Field(
+        None, description='Name of the inference-driver that served this request.'
+    )
+    runtime: str | None = Field(
+        None,
+        description='Name of the engine runtime behind that driver, when it is a\nlocal engine. Absent for hosted and CLI backends, which have\nno runtime of ours.\n',
+    )
+    backend: BackendKind | None = None
+    latency_ms: int | None = Field(
+        None, description='Gateway-side wall-clock time, including any failed attempts.'
+    )
+    attempts: int | None = Field(
+        None,
+        description='How many backends were tried. Greater than 1 means the\npriority-list cascade fired and an earlier backend failed.\n',
+        ge=1,
+    )
+    tier: int | None = Field(
+        None,
+        description="Which tier of the slot answered, 1-based. Greater than 1\nmeans every backend in an earlier tier was ineligible or\nfailed — a cloud target answering for a local model, say.\n\n**Positional, counted over the slot's tiers rather than over\nthe ones that had anything in them**, which is the only\nreading that answers the question this field exists for:\n*did the primary serve this?* A primary whose companion\ndriver is down is a tier with no backends, and it still\noccupies its number. See `ModelRoutingInfo.tiers` for which\ntier can be absent and why.\n",
+        ge=1,
+    )
+    swapped_in: bool | None = Field(
+        None,
+        description='True when the gateway had to start a `startOnDemand`\nruntime to serve this request. The visible cost of idle\nunload, next to the request that paid it.\n',
+    )
+    waited_ms: int | None = Field(
+        None,
+        description='How long the request waited for a runtime to reach `ready`\nbefore being sent. Zero when nothing had to be woken.\n',
+        ge=0,
+    )
+    context_length: int | None = Field(
+        None,
+        description='The context window of the backend that actually answered, as\nthat backend resolved it. **Null** when it does not expose\none — a hosted provider, a CLI subscription, or a local\nengine that was not reachable to ask. Null and not absent:\nthis envelope serializes its unset fields, as `runtime` has\nsince M0.\n\nPer-request, and therefore not the same number as\n`x_eugene_plexus.context_length` on `GET /v1/models`: that\none is the smallest across every backend serving the name,\nbecause a request may land on any of them. This one is the\nwindow that applied to *this* request, which is what makes a\ntruncated answer explicable after the fact.\n',
+        ge=1,
+    )
+    prompt_truncated: bool | None = Field(
+        None,
+        description="**The backend silently dropped input.** True when the prompt\nwe sent was far larger than the token count the backend\nreported consuming — the signature of a server that fits an\nover-long prompt into the window by discarding the middle of\nthe conversation and answering anyway, with a 200 and no\nflag of its own.\n\nThis is the failure that makes a coding harness loop: it\nsends file contents, the model never receives them, and the\nconfident answer that comes back is about code nobody read.\nMeasured on this project's own hardware: 66,389 characters\nacross six messages came back as `prompt_tokens: 86`, HTTP\n200, nothing anywhere saying so.\n\nDetected, not predicted. It is computed from\n`usage.prompt_tokens` **after** the answer, by a ratio\nchosen to be far below any real tokenizer's — so it cannot\nfire on a merely token-dense prompt, and it needs no\ntokenizer of ours.\n\n**Three states, and the difference matters.** `null` means\nnot evaluated — the backend reported no usage, or the prompt\nwas too small for the test to mean anything — and must not\nbe read as reassurance. `false` means it was checked and the\ninput arrived. `true` means it did not. Null and not absent:\nthis envelope serializes its unset fields, as `runtime` has\nsince M0.\n\n**Why a flag and not an error.** The answer has already been\ngenerated, and on a streamed request it has already been\ndelivered — M10's rule is that a stream cannot be unsent.\nFailing one path and flagging the other would make the same\ncondition report two different ways, so both flag. A backend\nthat refuses instead of truncating needs none of this: its\nrefusal is exact and is passed straight through as a 400.\n",
+    )
+    progress: StreamProgress | None = None
+
+
 class EmbeddingResponse(BaseModel):
     object: Object
     data: list[EmbeddingData]
@@ -2753,6 +2809,16 @@ class SystemOneRequest(BaseModel):
     questions: dict[str, SystemOneQuestion]
 
 
+class SystemOneResponse(BaseModel):
+    model: str = Field(
+        ...,
+        description="The public alias that served the request — after a cascade\nit names what answered, exactly as the chat doors do. The\nbackend's own model revision is preserved on the driver's\n`reportedModel` for provenance and surfaced in\n`x_eugene_plexus`.\n",
+    )
+    answers: dict[str, SystemOneAnswer]
+    usage: SystemOneUsage | None = None
+    x_eugene_plexus: CompletionRoutingInfo | None = None
+
+
 class MetricRequest(BaseModel):
     requestId: str | None = Field(
         None,
@@ -2929,7 +2995,7 @@ class ChatCompletionChunk(BaseModel):
     usage: CompletionUsage | None = None
     x_eugene_plexus: CompletionRoutingInfo | None = Field(
         None,
-        description='Set on the **final frame only**, alongside `usage` — the\nsame place OpenAI puts its own end-of-stream extras.\nAbsent on every earlier frame, because the values are not\nknown until the completion is done.\n\nAdded at M8. Until then a streaming client could see no\nrouting information at all: the non-streaming response\ncarried this and the stream did not, so exactly the clients\nthat stream — the UI playground among them — were the ones\nthat could not tell which backend answered. Retained\nmetrics do not depend on this (they are recorded at the\nrouting hooks, which fire on both paths); this closes the\nmatching gap in what a caller can see.\n',
+        description='Set on the **final frame only**, alongside `usage` — the\nsame place OpenAI puts its own end-of-stream extras.\nAbsent on every earlier frame, because the values are not\nknown until the completion is done. **One exception, asked\nfor:** with `stream_options.include_progress`, a progress\nchunk before the first token carries an `x_eugene_plexus`\nholding only `progress`, with `choices: []`.\n\nAdded at M8. Until then a streaming client could see no\nrouting information at all: the non-streaming response\ncarried this and the stream did not, so exactly the clients\nthat stream — the UI playground among them — were the ones\nthat could not tell which backend answered. Retained\nmetrics do not depend on this (they are recorded at the\nrouting hooks, which fire on both paths); this closes the\nmatching gap in what a caller can see.\n',
     )
 
 

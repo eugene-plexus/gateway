@@ -79,8 +79,9 @@ def parse_request(raw: Any, *, max_images: int = DEFAULT_MAX_IMAGES) -> ChatComp
         body["stop"] = [body["stop"]]
     options = body.get("stream_options")
     if isinstance(options, dict):
-        if "include_usage" in options and type(options["include_usage"]) is not bool:
-            raise Refusal("stream_options.include_usage", "must be a boolean")
+        for flag in ("include_usage", "include_progress"):
+            if flag in options and type(options[flag]) is not bool:
+                raise Refusal(f"stream_options.{flag}", "must be a boolean")
         if body.get("stream") is not True:
             raise Refusal("stream_options", "requires stream true")
     try:

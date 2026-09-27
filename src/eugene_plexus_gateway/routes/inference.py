@@ -81,6 +81,7 @@ from .._generated.models import (
     ResponseFormat,
     Role1,
     Role2,
+    StreamProgress,
     SystemOneAnswer,
     SystemOneRequest,
     SystemOneResponse,
@@ -1712,6 +1713,12 @@ def _to_generate_request(
         frequencyPenalty=body.frequency_penalty,
         presencePenalty=body.presence_penalty,
         parallelToolCalls=body.parallel_tool_calls,
+        # Asked for by the caller and only then: a progress chunk has no
+        # choices, and an OpenAI client that was not expecting one should
+        # never see it. `stream_options` without `stream: true` is refused
+        # by the chat contract before this, so it cannot ask on a batch
+        # request.
+        reportProgress=bool(body.stream_options and body.stream_options.include_progress) or None,
     )
 
 
@@ -2162,6 +2169,24 @@ async def _stream_completion(
         response: GenerateResponse | None = None
         try:
             async for event in client.stream(generate):
+                if event.progress is not None:
+                    # What the backend is doing, before or between its
+                    # output. No role chunk first: it is not the answer
+                    # starting, and the model that answers can still
+                    # change if this backend fails.
+                    progress = _progress_of(event.progress)
+                    if progress is not None and generate.reportProgress:
+                        yield frame(
+                            ChatCompletionChunk(
+                                id=completion_id,
+                                object="chat.completion.chunk",
+                                created=created,
+                                model=body.model,
+                                choices=[],
+                                x_eugene_plexus=CompletionRoutingInfo(progress=progress),
+                            )
+                        )
+                    continue
                 if event.done:
                     # Captured, NOT broken out of. Breaking here abandons
                     # the generator while it is suspended at its yield, so
@@ -2338,6 +2363,30 @@ async def _stream_completion(
                 )
             )
         yield "data: [DONE]\n\n"
+
+
+def _progress_of(raw: dict[str, Any]) -> StreamProgress | None:
+    """The driver's `StreamProgress` in the caller's words, or None.
+
+    camelCase to snake_case, one field at a time, because the two
+    documents name the same thing in their own conventions. A frame the
+    driver sent that does not parse is dropped rather than failing an
+    answer that has not even started.
+    """
+    try:
+        return StreamProgress.model_validate(
+            {
+                "stage": raw.get("stage"),
+                "tool": raw.get("tool"),
+                "prompt_tokens": raw.get("promptTokens"),
+                "cached_tokens": raw.get("cachedTokens"),
+                "processed_tokens": raw.get("processedTokens"),
+                "elapsed_ms": raw.get("elapsedMs"),
+            }
+        )
+    except ValueError:
+        log.debug("unreadable progress frame from a driver: %r", raw)
+        return None
 
 
 def _driver_failure(e: DriverError) -> _Failure:

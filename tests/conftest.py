@@ -94,6 +94,10 @@ class FakeDriverClient:
         `generate` on the response, `stream` as two reasoning events
         ahead of the text -- two, so a translator that only handles the
         first fragment of a block is caught."""
+        self.progress: list[dict[str, Any]] = []
+        """`event: progress` payloads (the driver's camelCase shape),
+        streamed first -- and only to a request with `reportProgress`,
+        as a real driver sends them."""
         self.stream_error_after_reasoning = False
         """Raise once the reasoning is out and before any text: the
         commit-point case for a model that thinks first."""
@@ -330,6 +334,9 @@ class FakeDriverClient:
         self.calls.append(request)
         if self.generate_error is not None:
             raise self.generate_error
+        if request.reportProgress:
+            for payload in self.progress:
+                yield StreamEvent(progress=payload)
         if self.tool_calls is not None:
             # Split `arguments` in half so the test double reproduces
             # the property that actually breaks readers: no single
