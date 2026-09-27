@@ -1,0 +1,3 @@
+# GitHub source archives -- what every install is built from -- stamp the
+# commit into this file. See the file for why.
+src/eugene_plexus_gateway/_build.py export-subst
