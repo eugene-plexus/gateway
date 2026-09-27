@@ -110,8 +110,14 @@ def test_preparation_and_wake_spend_the_same_deadline(setup, phase):
         else:
             app.state.lifecycle = Slow()
         original = app.state.config_store.get
+        # **0.5 s, not 0.08** (2026-09-27): a CI runner took longer than
+        # 80 ms to start the slow call at all, the deadline cancelled a
+        # task that never began, its `finally` never ran, and `cancelled`
+        # was empty on a correct gateway. The question is whether the
+        # call is cancelled once it is under way, which needs it to get
+        # under way.
         app.state.config_store.get = lambda key: (
-            0.08 if key == "requestTimeoutSeconds" else original(key)
+            0.5 if key == "requestTimeoutSeconds" else original(key)
         )
         response = client.post("/v1/chat/completions", json=body(), headers=headers)
         assert response.status_code == 504, response.text
