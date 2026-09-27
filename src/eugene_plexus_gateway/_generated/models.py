@@ -155,6 +155,15 @@ class ComputeDeviceKind(StrEnum):
     """
     What kind of device this is.
 
+    `vulkan` is a GPU served by llama.cpp's Vulkan build, which needs
+    nothing but the graphics driver: an Intel Arc, an AMD Radeon or
+    any other vendor's card on a machine without that vendor's
+    compute SDK. Added 2026-09-27. Before it, such a card was
+    invisible to this list even when the Vulkan build was the one
+    installed to serve it, so every fit on that machine was scored
+    against host memory. `rocm` and `xpu` are for a card whose SDK
+    is present.
+
     A named schema rather than an inline enum because an inline one
     generated a bare `Kind` class, which is too generic to sit in a
     module every component imports.
@@ -172,6 +181,7 @@ class ComputeDeviceKind(StrEnum):
     rocm = 'rocm'
     xpu = 'xpu'
     metal = 'metal'
+    vulkan = 'vulkan'
     cpu = 'cpu'
 
 
@@ -2306,13 +2316,17 @@ class ComputeDevice(BaseModel):
     )
     index: int | None = Field(
         None,
-        description="Device ordinal on its own host — what `CUDA_VISIBLE_DEVICES`\nor `HIP_VISIBLE_DEVICES` in a runtime's `env` selects to pin\nthat runtime to one card.\n",
+        description="Device ordinal on its own host — what `CUDA_VISIBLE_DEVICES`\nor `HIP_VISIBLE_DEVICES` in a runtime's `env` selects to pin\nthat runtime to one card. For a `vulkan` device it is the\norder the operating system lists its adapters in, which is\nnot promised to be the order `GGML_VK_VISIBLE_DEVICES`\ncounts in.\n",
         ge=0,
     )
     memoryTotalBytes: int | None = None
     memoryFreeBytes: int | None = Field(
         None,
         description='Free decides whether a model fits, not total — M3 measured\n2.9 GiB of a 32 GiB card already held on an idle desktop.\nBoth are reported so the difference is visible rather than\nsurprising.\n',
+    )
+    sharedMemory: bool | None = Field(
+        None,
+        description='True when this device has no memory of its own and computes\nout of the host\'s RAM: an integrated GPU (an Intel Arc or\nIris in a laptop or mini PC, an AMD Radeon 780M or Strix\nHalo), Apple silicon, NVIDIA\'s GB10. Then `memoryTotalBytes`\nis how much RAM the operating system lets the GPU address,\nplus any carve-out reserved for it at boot, and\n`memoryFreeBytes` is what is left of that. There is no second\npool for a partial offload to spill into, so a fit that also\ncounted host RAM would count the same memory twice.\n\nAbsent or false for a card with memory of its own. Added\n2026-09-27, when an Intel Arc mini PC read "no GPU" and the\nonly unified-memory case the install knew was a Mac.\n',
     )
 
 

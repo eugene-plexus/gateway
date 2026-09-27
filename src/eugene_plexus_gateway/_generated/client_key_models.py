@@ -13,13 +13,6 @@ class Scope(StrEnum):
     standalone = 'standalone'
 
 
-class Migration(StrEnum):
-    complete = 'complete'
-    pending = 'pending'
-    error = 'error'
-    standalone = 'standalone'
-
-
 class AllowedModel(RootModel[str]):
     root: str = Field(..., max_length=256, min_length=1)
 
@@ -115,14 +108,9 @@ class ClientKey(BaseModel):
     lastUsedAt: AwareDatetime | None = Field(
         None, description='Reserved; not currently measured.'
     )
-    originNode: str | None = None
     limits: ClientKeyLimits | None = Field(
         None,
         description='Absent on legacy keys (all models, no per-key limits); new keys receive bounded defaults.',
-    )
-    migrated: bool | None = Field(
-        None,
-        description='True for a record imported from a pre-A3 node-local registry.',
     )
 
 
@@ -131,7 +119,6 @@ class ClientKeyList(BaseModel):
     authority: str | None = None
     revision: int | None = Field(None, ge=0)
     scope: Scope | None = None
-    migration: Migration | None = None
     detail: str | None = None
 
 
@@ -149,15 +136,4 @@ class ClientKeyCreated(BaseModel):
     token: str = Field(
         ...,
         description='Returned once; never persisted in the registry or gateway cache.',
-    )
-
-
-class ClientKeyImport(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    keys: list[ClientKey] = Field(..., max_length=10000)
-    signature: str = Field(
-        ...,
-        description='Base64 Ed25519 signature by the enrolled node over UTF-8\n\'eugene-plexus/client-keys/import/v1\\n\' followed by canonical JSON\n{"node":name,"keys":keys}, sorted keys, compact separators, ensure_ascii=false.\nIdempotent; imported revocations cannot be cleared by replay.\n',
     )
