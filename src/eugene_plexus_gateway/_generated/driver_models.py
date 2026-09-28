@@ -137,6 +137,26 @@ class AudioOutputFormat(StrEnum):
     pcm16 = 'pcm16'
 
 
+class SpeechFormat(StrEnum):
+    """
+    OpenAI's speech formats (P3a). `pcm` is 16-bit little-endian mono at
+    24 kHz with no header, and `wav` is that with one. **Each backend
+    makes only some** (measured 2026-09-28): OpenRouter `mp3` and `pcm`,
+    ElevenLabs mp3, pcm and opus on its lower plans, OpenAI's API all
+    six. `wav` is served wherever `pcm` is, by adding the header. A
+    format a model cannot make is refused naming the ones it can,
+    never transcoded.
+
+    """
+
+    mp3 = 'mp3'
+    opus = 'opus'
+    aac = 'aac'
+    flac = 'flac'
+    wav = 'wav'
+    pcm = 'pcm'
+
+
 class ReasoningEffort(StrEnum):
     """
     How much a reasoning model thinks before it answers: OpenAI's
@@ -264,6 +284,10 @@ class BackendKind(StrEnum):
     driver on this protocol serves decisions and not chat; see
     `Capabilities.chatCapable`.
 
+    `elevenlabs_http` is ElevenLabs' own API (P3a, 2026-09-28): speech
+    only, keyed by `xi-api-key`, nothing OpenAI-shaped about it. The
+    driver translates `POST /v1/speak` to its text-to-speech route.
+
     """
 
     anthropic_api = 'anthropic_api'
@@ -272,6 +296,7 @@ class BackendKind(StrEnum):
     codex_cli = 'codex_cli'
     openai_compat_http = 'openai_compat_http'
     systemone_http = 'systemone_http'
+    elevenlabs_http = 'elevenlabs_http'
 
 
 class ComponentKind(StrEnum):
@@ -1638,6 +1663,10 @@ class Capabilities(BaseModel):
         None,
         description="Whether the model is confirmed to read a `file` part (PDF).\nThe same rule as `audioInput`. From `file` in the account's\n`input_modalities`; no local engine reads one today, so a\nsingle-model driver reports false.\n",
     )
+    speechFormats: list[SpeechFormat] | None = Field(
+        None,
+        description='For a `speech` model: the formats this driver can give it in,\n`wav` included where it is made from `pcm` (P3a).\n',
+    )
     audioOutput: bool | None = Field(
         None,
         description="Whether the model is confirmed to answer with audio\n(`GenerateRequest.audioOutput`). From `audio` in the\naccount's `output_modalities`; no local engine or CLI speaks,\nso they report false. Unknown is false, as for the inputs.\n\n**Not from `supported_parameters`** (A2's setting list): no\naudio-output model on OpenRouter lists `modalities` or\n`audio` there (measured 2026-09-28), so routing by it would\nroute nothing. Added 2026-09-28 (P2b).\n",
@@ -1871,6 +1900,46 @@ class DirectoryEntry(BaseModel):
         False,
         description='A dot-prefixed name, or the hidden attribute on Windows.\nOnly present in a listing that asked for `showHidden`.\n',
     )
+
+
+class SpeakRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    model: str | None = Field(
+        None,
+        description="Which of this driver's models the request is for: an `id` from\n`DriverInfo.models`, **unprefixed** — the gateway strips the\n`<driver name>/` it added. Optional so a caller from before P1\nstill works against a single-model driver, which serves its one\nmodel when this is absent. An account driver refuses a request\nwithout it (400, `#model-required`), and every driver refuses a\nmodel it does not list (404, `#model-not-served`) before calling\nits backend.\n",
+        min_length=1,
+    )
+    localOnly: bool | None = Field(
+        False,
+        description='As `GenerateRequest.localOnly`: refuse before forwarding any text\nunless the active engine is classified local.\n',
+    )
+    input: str = Field(
+        ...,
+        description="The text to speak. OpenAI's limit, 4,096 characters.",
+        max_length=4096,
+        min_length=1,
+    )
+    voice: str = Field(
+        ...,
+        description="The backend's own voice id, passed through (P3-3): `alloy` on\nOpenAI, `af_heart` on Kokoro, `21m00Tcm4TlvDq8ikWAM` on\nElevenLabs. `DriverModel.voices` lists them where the backend\nsays.\n",
+        max_length=128,
+        min_length=1,
+    )
+    format: SpeechFormat | None = None
+    speed: float | None = Field(
+        None,
+        description='1.0 is normal. ElevenLabs takes 0.7 to 1.2 and refuses the rest;\nthe refusal is relayed.\n',
+        ge=0.25,
+        le=4.0,
+    )
+    instructions: str | None = Field(
+        None,
+        description="How to speak, for a backend that takes it (OpenAI's\n`gpt-4o-mini-tts`). Refused with 400 by one that cannot\n(ElevenLabs), never dropped.\n",
+        max_length=4096,
+    )
+    requestId: UUID | None = None
 
 
 class Tool(BaseModel):

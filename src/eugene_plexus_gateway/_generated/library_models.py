@@ -160,6 +160,26 @@ class AudioOutputFormat(StrEnum):
     pcm16 = 'pcm16'
 
 
+class SpeechFormat(StrEnum):
+    """
+    OpenAI's speech formats (P3a). `pcm` is 16-bit little-endian mono at
+    24 kHz with no header, and `wav` is that with one. **Each backend
+    makes only some** (measured 2026-09-28): OpenRouter `mp3` and `pcm`,
+    ElevenLabs mp3, pcm and opus on its lower plans, OpenAI's API all
+    six. `wav` is served wherever `pcm` is, by adding the header. A
+    format a model cannot make is refused naming the ones it can,
+    never transcoded.
+
+    """
+
+    mp3 = 'mp3'
+    opus = 'opus'
+    aac = 'aac'
+    flac = 'flac'
+    wav = 'wav'
+    pcm = 'pcm'
+
+
 class ReasoningEffort(StrEnum):
     """
     How much a reasoning model thinks before it answers: OpenAI's
@@ -287,6 +307,10 @@ class BackendKind(StrEnum):
     driver on this protocol serves decisions and not chat; see
     `Capabilities.chatCapable`.
 
+    `elevenlabs_http` is ElevenLabs' own API (P3a, 2026-09-28): speech
+    only, keyed by `xi-api-key`, nothing OpenAI-shaped about it. The
+    driver translates `POST /v1/speak` to its text-to-speech route.
+
     """
 
     anthropic_api = 'anthropic_api'
@@ -295,6 +319,7 @@ class BackendKind(StrEnum):
     codex_cli = 'codex_cli'
     openai_compat_http = 'openai_compat_http'
     systemone_http = 'systemone_http'
+    elevenlabs_http = 'elevenlabs_http'
 
 
 class ComponentKind(StrEnum):

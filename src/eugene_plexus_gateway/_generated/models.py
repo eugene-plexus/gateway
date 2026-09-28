@@ -50,6 +50,10 @@ class BackendKind(StrEnum):
     driver on this protocol serves decisions and not chat; see
     `Capabilities.chatCapable`.
 
+    `elevenlabs_http` is ElevenLabs' own API (P3a, 2026-09-28): speech
+    only, keyed by `xi-api-key`, nothing OpenAI-shaped about it. The
+    driver translates `POST /v1/speak` to its text-to-speech route.
+
     """
 
     anthropic_api = 'anthropic_api'
@@ -58,6 +62,7 @@ class BackendKind(StrEnum):
     codex_cli = 'codex_cli'
     openai_compat_http = 'openai_compat_http'
     systemone_http = 'systemone_http'
+    elevenlabs_http = 'elevenlabs_http'
 
 
 class Role(StrEnum):
@@ -173,6 +178,26 @@ class AudioOutputFormat(StrEnum):
     opus = 'opus'
     aac = 'aac'
     pcm16 = 'pcm16'
+
+
+class SpeechFormat(StrEnum):
+    """
+    OpenAI's speech formats (P3a). `pcm` is 16-bit little-endian mono at
+    24 kHz with no header, and `wav` is that with one. **Each backend
+    makes only some** (measured 2026-09-28): OpenRouter `mp3` and `pcm`,
+    ElevenLabs mp3, pcm and opus on its lower plans, OpenAI's API all
+    six. `wav` is served wherever `pcm` is, by adding the header. A
+    format a model cannot make is refused naming the ones it can,
+    never transcoded.
+
+    """
+
+    mp3 = 'mp3'
+    opus = 'opus'
+    aac = 'aac'
+    flac = 'flac'
+    wav = 'wav'
+    pcm = 'pcm'
 
 
 class ReasoningEffort(StrEnum):
@@ -1184,6 +1209,7 @@ class Surface(StrEnum):
     chat = 'chat'
     embeddings = 'embeddings'
     decisions = 'decisions'
+    speech = 'speech'
 
 
 class ModelRoutingInfo(BaseModel):
@@ -1207,7 +1233,7 @@ class ModelRoutingInfo(BaseModel):
     )
     surfaces: list[Surface] | None = Field(
         None,
-        description="Which surfaces this model can be sent to. `decisions` means\n`POST /v1/systemone`; a decision-only model lists nothing\nelse, and a chat request naming it is refused with the\ndoor's name.\n\nOpenAI's own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Measured, not assumed, and the two are not always\ndisjoint**: an Ollama runner started for chat refuses to\nembed, `nomic-embed-text` refuses to chat -- but\n`llama-server` given `--embedding` still serves chat\nperfectly well. Hence a list.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n",
+        description="Which surfaces this model can be sent to. `decisions` means\n`POST /v1/systemone`; a decision-only model lists nothing\nelse, and a chat request naming it is refused with the\ndoor's name. `speech` means `POST /v1/audio/speech` (P3a).\n\nOpenAI's own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Measured, not assumed, and the two are not always\ndisjoint**: an Ollama runner started for chat refuses to\nembed, `nomic-embed-text` refuses to chat -- but\n`llama-server` given `--embedding` still serves chat\nperfectly well. Hence a list.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n",
     )
     image_input: bool | None = Field(
         None,
@@ -1220,6 +1246,14 @@ class ModelRoutingInfo(BaseModel):
     file_input: bool | None = Field(
         None,
         description='At least one backend confirms file (PDF) input for this\nmodel, with the same routing rule. Added 2026-09-28 (P2).\n',
+    )
+    voices: list[str] | None = Field(
+        None,
+        description="For a `speech` model: the voices its provider lists, in the\nprovider's own ids (P3a). Absent when the provider does not say,\nwhich is not the same as having none -- any voice is passed\nthrough and an unknown one is the provider's 400 (P3-3).\n",
+    )
+    speech_formats: list[SpeechFormat] | None = Field(
+        None,
+        description='For a `speech` model: the formats every backend serving it can\ngive, `wav` included where it is made from `pcm`.\n',
     )
     audio_output: bool | None = Field(
         None,
@@ -1303,6 +1337,15 @@ class FunctionCallDelta(BaseModel):
 
     name: str | None = None
     arguments: str | None = None
+
+
+class SpeechStreamFormat(StrEnum):
+    """
+    `audio` is the raw bytes, streamed; `sse` is refused.
+    """
+
+    audio = 'audio'
+    sse = 'sse'
 
 
 class ChatModality(StrEnum):
@@ -2869,6 +2912,28 @@ class Model(BaseModel):
         description='OpenAI sends an organisation here. We send the provider —\n`local`, or the cloud provider key for a subscription\nbackend.\n',
     )
     x_eugene_plexus: ModelRoutingInfo | None = None
+
+
+class SpeechRequest(BaseModel):
+    """
+    OpenAI's speech request (P3a). Unknown fields are refused naming them.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    model: str
+    input: str = Field(..., max_length=4096, min_length=1)
+    voice: str = Field(
+        ...,
+        description="The provider's own voice id, passed through (P3-3).",
+        max_length=128,
+        min_length=1,
+    )
+    response_format: SpeechFormat | None = None
+    speed: float | None = Field(None, ge=0.25, le=4.0)
+    instructions: str | None = Field(None, max_length=4096)
+    stream_format: SpeechStreamFormat | None = None
 
 
 class Delta(BaseModel):

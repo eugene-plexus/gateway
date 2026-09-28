@@ -73,6 +73,7 @@ from ._generated.models import (
     RoutingSlotView,
     RoutingTableView,
     RoutingTierView,
+    SpeechFormat,
     Surface,
 )
 from ._http import internal_client
@@ -309,6 +310,17 @@ class _Backend:
         return "embeddings" in self.surfaces
 
     @property
+    def speaks(self) -> bool:
+        """Whether this model serves the speech surface (P3a)."""
+        return "speech" in self.surfaces
+
+    def takes_speech_format(self, fmt: str) -> bool:
+        """Whether this backend can give its model's speech in `fmt`. An
+        unlisted set is left to the driver, which refuses naming its own."""
+        formats = self.caps.speechFormats if self.caps is not None else None
+        return not formats or any(f.value == fmt for f in formats)
+
+    @property
     def chats(self) -> bool:
         """Whether this model serves chat completions.
 
@@ -459,6 +471,7 @@ class Resolution:
             (["chat"] if any(b.chats for b in backends) else [])
             + (["embeddings"] if any(b.embeds for b in backends) else [])
             + (["decisions"] if any(b.decides for b in backends) else [])
+            + (["speech"] if any(b.speaks for b in backends) else [])
         )
 
     def reported_surfaces(self) -> list[str]:
@@ -1672,6 +1685,51 @@ class RoutingTable:
         ordered = [b.client for b in self._order(resolution.model, eligible)]
         return TieredClient(name=resolution.model, tiers=[ordered], hooks=self)
 
+    def pick_speech(self, resolution: Resolution, fmt: str) -> TieredClient | None:
+        """`pick_embedding`'s single-model tier, for speech (P3a).
+
+        Replicas of the requested model that can give it in `fmt`, and
+        nothing else: a slot's other targets are a different voice.
+        """
+        eligible = [
+            b
+            for b in resolution.eligible_backends()
+            if b.speaks and b.public_id == resolution.model and b.takes_speech_format(fmt)
+        ]
+        if not eligible:
+            return None
+        ordered = [b.client for b in self._order(resolution.model, eligible)]
+        return TieredClient(name=resolution.model, tiers=[ordered], hooks=self)
+
+    @staticmethod
+    def speech_formats_for(resolution: Resolution) -> list[SpeechFormat]:
+        """The formats every backend speaking this model can give, in the
+        enum's order; empty when none says."""
+        speakers = [b for b in resolution.backends() if b.speaks]
+        sets = [
+            {f.value for f in b.caps.speechFormats}
+            for b in speakers
+            if b.caps is not None and b.caps.speechFormats
+        ]
+        if not sets:
+            return []
+        common = set.intersection(*sets)
+        return [f for f in SpeechFormat if f.value in common]
+
+    @staticmethod
+    def voices_for(resolution: Resolution) -> list[str] | None:
+        """Every voice a backend speaking this model lists, or None when
+        none lists any -- which is not "no voices" (P3-3)."""
+        seen: dict[str, None] = {}
+        listed = False
+        for backend in resolution.backends():
+            voices = backend.model.voices if backend.speaks and backend.model is not None else None
+            if voices is not None:
+                listed = True
+                for voice in voices:
+                    seen.setdefault(voice, None)
+        return list(seen) if listed else None
+
     def pick_decision(self, resolution: Resolution) -> TieredClient | None:
         """`pick_embedding`'s single-model tier, for typed decisions.
 
@@ -1882,6 +1940,8 @@ class RoutingTable:
                         audio_input=any(takes(b.caps, _AUDIO) for b in backends),
                         file_input=any(takes(b.caps, _FILE) for b in backends),
                         audio_output=any(takes(b.caps, _SPEAKS) for b in backends),
+                        voices=self.voices_for(resolution),
+                        speech_formats=self.speech_formats_for(resolution) or None,
                         tiers=[[b.name for b in t.backends] for t in resolution.tiers],
                         ready_backends=len(eligible),
                         on_demand=not eligible and bool(resolution.startable()),

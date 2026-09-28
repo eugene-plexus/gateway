@@ -37,6 +37,7 @@ from ._generated.driver_models import (
     GenerateResponse,
     Problem,
     RetryDisposition,
+    SpeakRequest,
     TokenCount,
 )
 from ._http import internal_client
@@ -203,6 +204,7 @@ class DriverClient(Protocol):
     async def decide(self, request: DecisionRequest) -> DecisionResponse: ...
     async def count_tokens(self, request: GenerateRequest) -> int: ...
     def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]: ...
+    def speak(self, request: SpeakRequest) -> AsyncGenerator[str | bytes, None]: ...
     async def aclose(self) -> None: ...
 
 
@@ -406,6 +408,30 @@ class HttpDriverClient:
         except ValueError as exc:
             raise self._invalid_reply() from exc
 
+    async def speak(self, request: SpeakRequest) -> AsyncGenerator[str | bytes, None]:
+        """The driver's `/v1/speak` (P3a): the media type first, then the
+        audio, as it arrives. A non-200 raises before anything is yielded."""
+        payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
+        async with self._client.stream(
+            "POST",
+            "/v1/speak",
+            json=payload,
+            headers={"X-Request-ID": str(request.requestId)} if request.requestId else None,
+        ) as response:
+            if response.status_code >= 400:
+                body = await response.aread()
+                raise DriverError(
+                    driver_name=self.name,
+                    driver_url=self.base_url,
+                    status_code=response.status_code,
+                    problem=_problem_from_bytes(body),
+                    raw_body=body.decode("utf-8", "replace"),
+                )
+            yield response.headers.get("content-type", "application/octet-stream")
+            async for chunk in response.aiter_raw():
+                if chunk:
+                    yield chunk
+
     def _invalid_reply(self) -> DriverError:
         return DriverError(
             driver_name=self.name,
@@ -569,7 +595,9 @@ class BoundClient:
         self.served_model: str | None = public_model
         self.tier = 1
 
-    def _bind[R: (GenerateRequest, EmbedRequest, DecisionRequest)](self, request: R) -> R:
+    def _bind[R: (GenerateRequest, EmbedRequest, DecisionRequest, SpeakRequest)](
+        self, request: R
+    ) -> R:
         return request.model_copy(update={"model": self.model})
 
     def _publish(self, reported: str | None) -> str | None:
@@ -611,6 +639,16 @@ class BoundClient:
                 if event.done and event.result is not None:
                     event.result.modelId = self._publish(event.result.modelId)
                 yield event
+        finally:
+            closer = getattr(events, "aclose", None)
+            if closer is not None:
+                await closer()
+
+    async def speak(self, request: SpeakRequest) -> AsyncGenerator[str | bytes, None]:
+        events = self._inner.speak(self._bind(request))
+        try:
+            async for item in events:
+                yield item
         finally:
             closer = getattr(events, "aclose", None)
             if closer is not None:
@@ -950,6 +988,92 @@ class TieredClient:
                     self.served_by_node = node
                     self.tier = tier_index + 1
                     return result
+        assert last_exc is not None
+        raise last_exc
+
+    async def speak(self, request: SpeakRequest) -> AsyncGenerator[str | bytes, None]:
+        """Speech over replicas of ONE model (P3a), with a commit point.
+
+        `RoutingTable.pick_speech` builds a single tier of backends serving
+        the requested model, so a cascade can only reach a replica: a voice
+        that changed between two clips would be embeddings' noise problem
+        in another form (§5, #4). **The first byte is the commit point**, as
+        a first token is for chat: before it, a proven pre-execution
+        failure moves to the next replica; after it, a failure ends the
+        audio. Yields the media type, then the bytes.
+        """
+        last_exc: Exception | None = None
+        total = len(self.candidates)
+        index = 0
+        for tier_index, tier in enumerate(self._tiers):
+            for candidate in tier:
+                if self.authorize_attempt is not None:
+                    await self.authorize_attempt()
+                circuit = getattr(candidate, "circuit", None)
+                if circuit is not None and not circuit.acquire():
+                    if last_exc is None:
+                        last_exc = _cooling_error(circuit.until - time.perf_counter())
+                    continue
+                probe_epoch = circuit.epoch if circuit is not None and circuit.probing else None
+                self.attempts = index + 1
+                driver = getattr(candidate, "name", None)
+                node = getattr(candidate, "node", None)
+                runtime: Key | None = None
+                if self._hooks is not None and driver:
+                    runtime = self._hooks.on_attempt_start(driver, node=node)
+                started = time.perf_counter()
+                events = candidate.speak(request)
+                try:
+                    media = await anext(events)
+                    first: str | bytes = await anext(events, b"")
+                except BaseException as exc:
+                    await events.aclose()
+                    self._finish_circuit(candidate, exc, probe_epoch=probe_epoch)
+                    if self._hooks is not None and driver:
+                        self._hooks.on_attempt_end(
+                            driver,
+                            node=node,
+                            model=getattr(candidate, "public_model", None),
+                            runtime=runtime,
+                            served=False,
+                            elapsed_ms=int((time.perf_counter() - started) * 1000),
+                            error=type(exc).__name__,
+                            retry_disposition=retry_disposition(exc),
+                        )
+                    if not isinstance(exc, Exception) or not _is_cascade_eligible(exc):
+                        raise
+                    last_exc = exc
+                    self._log_cascade("speak", index, candidate, exc, total=total)
+                    index += 1
+                    continue
+                # Committed: the first byte is in hand.
+                self._finish_circuit(candidate, probe_epoch=probe_epoch)
+                self.served_by = driver
+                self.served_model = getattr(candidate, "public_model", None)
+                self.served_by_node = node
+                self.tier = tier_index + 1
+                first_ms = int((time.perf_counter() - started) * 1000)
+                served = False
+                try:
+                    yield media
+                    if first:
+                        yield first
+                    async for chunk in events:
+                        yield chunk
+                    served = True
+                finally:
+                    await events.aclose()
+                    if self._hooks is not None and driver:
+                        self._hooks.on_attempt_end(
+                            driver,
+                            node=node,
+                            model=getattr(candidate, "public_model", None),
+                            runtime=runtime,
+                            served=served,
+                            elapsed_ms=int((time.perf_counter() - started) * 1000),
+                            first_ms=first_ms,
+                        )
+                return
         assert last_exc is not None
         raise last_exc
 

@@ -7,7 +7,7 @@ from typing import Any
 
 from pydantic import BaseModel, RootModel, ValidationError
 
-from ._generated.models import ChatCompletionRequest
+from ._generated.models import ChatCompletionRequest, SpeechRequest
 from .images import DEFAULT_MAX_IMAGES, ImageRefusal, validate_messages
 
 
@@ -142,6 +142,23 @@ def parse_request(raw: Any, *, max_images: int = DEFAULT_MAX_IMAGES) -> ChatComp
     _check_audio_output(parsed)
     if parsed.top_logprobs is not None and parsed.logprobs is not True:
         raise Refusal("top_logprobs", "requires logprobs true")
+    return parsed
+
+
+def parse_speech(raw: Any) -> SpeechRequest:
+    """The speech door's body (P3a), refused naming the field, as chat is."""
+    if not isinstance(raw, dict):
+        raise Refusal("body", "must be a JSON object")
+    try:
+        parsed = SpeechRequest.model_validate(raw)
+    except ValidationError as exc:
+        parts = _most_specific(exc.errors(include_input=False, include_context=False))
+        where = ".".join(_field_name(p) if isinstance(p, str) else str(p) for p in parts)
+        raise Refusal(where or "body", "has an invalid or missing value") from None
+    if parsed.stream_format is not None and parsed.stream_format.value == "sse":
+        raise Refusal(
+            "stream_format", 'only "audio" is served: the audio itself is streamed as raw bytes'
+        )
     return parsed
 
 

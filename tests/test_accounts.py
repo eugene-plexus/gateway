@@ -118,24 +118,29 @@ def test_the_same_account_name_on_two_machines_is_one_account(settings: Any) -> 
 
 
 def test_a_model_with_no_door_yet_is_not_listed(settings: Any) -> None:
-    """P1-4: an account's speech model is on the driver's list and not on
-    `/v1/models` until the speech door exists."""
+    """P1-4: an account's image model is on the driver's list and not on
+    `/v1/models` until the images door exists (P4). This used a speech model
+    until P3a (2026-09-28) gave speech its door."""
     app = create_app(settings=settings)
 
-    class _WithSpeech(FakeDriverClient):
+    class _WithImages(FakeDriverClient):
         def describe(self):  # type: ignore[no-untyped-def]
             info = super().describe()
             assert info.models is not None
-            info.models[1].surfaces = ["speech"]
+            info.models[1].surfaces = ["image"]
             return info
 
-    account = _WithSpeech(
-        name="openrouter", models=["mistralai/mistral-nemo", "hexgrad/kokoro-82m"], account=True
+    account = _WithImages(
+        name="openrouter",
+        models=["mistralai/mistral-nemo", "black-forest-labs/flux.2-klein-4b"],
+        account=True,
     )
     app.state.routing = make_routing_table(account)
     with TestClient(app) as client:
         ids = [m["id"] for m in client.get("/v1/models").json()["data"]]
-        refused = client.post("/v1/chat/completions", json=_chat("openrouter/hexgrad/kokoro-82m"))
+        refused = client.post(
+            "/v1/chat/completions", json=_chat("openrouter/black-forest-labs/flux.2-klein-4b")
+        )
     assert ids == ["openrouter/mistralai/mistral-nemo"]
     assert refused.status_code >= 400
     assert not account.calls
@@ -275,7 +280,8 @@ async def test_a_refresh_prefixes_an_accounts_models(route_http: Any) -> None:  
         "version": "0.2.0",
         "models": [
             {"id": "mistralai/mistral-nemo", "surfaces": ["chat"]},
-            {"id": "hexgrad/kokoro-82m", "surfaces": ["speech"]},
+            # An image model: no door until P4 (a speech model until P3a).
+            {"id": "black-forest-labs/flux.2-klein-4b", "surfaces": ["image"]},
         ],
         "catalogue": {"source": "openrouter", "total": 2, "exposed": 2},
     }
@@ -289,7 +295,7 @@ async def test_a_refresh_prefixes_an_accounts_models(route_http: Any) -> None:  
     table = RoutingTable(agent_url="http://agent")
     await table.refresh()
     assert table.known_models() == [
-        "openrouter/hexgrad/kokoro-82m",
+        "openrouter/black-forest-labs/flux.2-klein-4b",
         "openrouter/mistralai/mistral-nemo",
     ]
     assert [m.id for m in table.as_model_list()] == ["openrouter/mistralai/mistral-nemo"]

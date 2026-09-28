@@ -47,6 +47,7 @@ from .._generated.driver_models import (
     GenerateResponse,
     Message,
     Role,
+    SpeakRequest,
 )
 from .._generated.driver_models import (
     DecisionQuestion as DriverDecisionQuestion,
@@ -60,6 +61,7 @@ from .._generated.driver_models import PromptCacheRetention as DriverPromptCache
 from .._generated.driver_models import ReasoningEffort as DriverReasoningEffort
 from .._generated.driver_models import ResponseFormat as DriverResponseFormat
 from .._generated.driver_models import ServiceTier as DriverServiceTier
+from .._generated.driver_models import SpeechFormat as DriverSpeechFormat
 from .._generated.driver_models import Tool as DriverTool
 from .._generated.driver_models import ToolChoice as DriverToolChoice
 from .._generated.driver_models import Verbosity as DriverVerbosity
@@ -95,6 +97,7 @@ from .._generated.models import (
     ResponseFormat,
     Role1,
     Role2,
+    SpeechFormat,
     StreamProgress,
     SystemOneAnswer,
     SystemOneRequest,
@@ -1585,6 +1588,132 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
         usage=usage,
         x_eugene_plexus=_routing_info(client, table, body.model, started),
     )
+
+
+# --------------------------------------------------------------------------- #
+# /v1/audio/speech
+# --------------------------------------------------------------------------- #
+
+
+@router.post("/v1/audio/speech", dependencies=_auth)
+async def create_speech(request: Request) -> Any:
+    """Text in, audio bytes out, streamed (P3a, 2026-09-28).
+
+    **Same model only**, as embeddings: `pick_speech` hands back replicas of
+    the requested model and nothing else, so a slot's other targets -- a
+    different voice -- are never reached. **The first byte is the commit
+    point**: the response starts only once `TieredClient.speak` has one in
+    hand, so every failure before it is still an OpenAI-shaped error.
+    """
+    try:
+        raw = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        return _error(
+            code=400,
+            message="body: must be valid JSON.",
+            error_type="invalid_request_error",
+            param="body",
+        )
+    try:
+        body = chat_contract.parse_speech(raw)
+    except chat_contract.Refusal as exc:
+        return _error(
+            code=400, message=exc.message, error_type="invalid_request_error", param=exc.field
+        )
+    await admission.authorize(request, body.model)
+    table = _routing(request)
+    if table is None:
+        return _error(
+            code=503,
+            message="The gateway is starting up or in safe mode; no routing table exists yet.",
+            error_type="service_unavailable",
+        )
+    resolution = await admission.permitted(table.resolve(body.model))
+    if not resolution.has_backends():
+        return _no_such_model(body.model, table).as_openai()
+    surfaces = resolution.surfaces()
+    if surfaces and "speech" not in surfaces:
+        return _wrong_surface(
+            body.model, surfaces, wanted="speech", instead="/v1/chat/completions"
+        ).as_openai()
+    if not surfaces and (reported := resolution.reported_surfaces()):
+        return _no_door_yet(body.model, reported, wanted="speech").as_openai()
+
+    # Always sent: OpenRouter's own default is pcm where OpenAI's is mp3.
+    fmt = body.response_format or SpeechFormat.mp3
+    offered = table.speech_formats_for(resolution)
+    if offered and fmt not in offered:
+        return _error(
+            code=400,
+            message=(
+                f"response_format: {body.model!r} cannot be given in {fmt.value}; it can be "
+                f"given in {', '.join(f.value for f in offered)} "
+                "(x_eugene_plexus.speech_formats on GET /v1/models)."
+            ),
+            error_type="invalid_request_error",
+            param="response_format",
+        )
+    client = table.pick_speech(resolution, fmt.value)
+    if client is None and await table.refresh_if_stale():
+        resolution = await admission.permitted(table.resolve(body.model))
+        client = table.pick_speech(resolution, fmt.value)
+    if client is None:
+        # No wake, as for embeddings: start-on-demand is chat-path lifecycle.
+        return _not_ready(resolution, None).as_openai()
+    if isinstance(client, TieredClient):
+        client.authorize_attempt = admission.before_attempt
+
+    events = client.speak(
+        SpeakRequest(
+            input=body.input,
+            voice=body.voice,
+            format=DriverSpeechFormat(fmt.value),
+            speed=body.speed,
+            instructions=body.instructions,
+            localOnly=admission.local_only(),
+            requestId=admission.request_id(),
+        )
+    )
+    try:
+        media = await serve_while_connected(request, anext(events), what="speech")
+    except ClientGone:
+        await events.aclose()
+        return _error(
+            code=499,
+            message="The client disconnected; the backend call was cancelled.",
+            error_type="client_disconnected",
+        )
+    except DriverError as e:
+        return _driver_failure(e).as_openai()
+    except httpx.TimeoutException as e:
+        return _error(
+            code=504,
+            message=(
+                f"No backend serving {body.model!r} began speaking within the gateway's "
+                f"requestTimeoutSeconds ({_timeout_seconds(_store(request)):g}s). "
+                f"({type(e).__name__})"
+            ),
+            error_type="timeout",
+        )
+    except httpx.HTTPError as e:
+        return _error(
+            code=502,
+            message=f"A backend serving {body.model!r} failed ({type(e).__name__}).",
+            error_type="upstream_error",
+        )
+
+    async def audio() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in events:
+                if isinstance(chunk, bytes):
+                    yield chunk
+        except (DriverError, httpx.HTTPError) as e:
+            # The 200 and some audio are out; the stream just ends.
+            log.warning("speech for %r failed mid-stream: %s", body.model, e)
+        finally:
+            await events.aclose()
+
+    return StreamingResponse(audio(), media_type=str(media))
 
 
 # --------------------------------------------------------------------------- #
