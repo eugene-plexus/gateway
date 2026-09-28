@@ -1288,6 +1288,69 @@ class TranscriptionUsage(BaseModel):
     totalTokens: int | None = None
 
 
+class ImageData(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    data: str = Field(
+        ...,
+        description="The image's bytes, base64, no `data:` prefix.",
+        max_length=35000000,
+        min_length=1,
+    )
+    mediaType: str = Field(
+        ...,
+        description="Read from the bytes by the gateway (`image/png`, `image/jpeg`,\n`image/webp`, `image/gif`), never from an upload's part header:\nthe OpenAI SDK labels a `BytesIO` `application/octet-stream`\n(measured).\n",
+        max_length=64,
+    )
+
+
+class GeneratedImage(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    data: str = Field(..., description='Base64, no `data:` prefix.')
+    mediaType: str = Field(
+        ...,
+        description='What the bytes are, read from them (`image/png`, `image/jpeg`,\n`image/webp`, `image/svg+xml`), whatever format was asked for.\n',
+    )
+    revisedPrompt: str | None = Field(
+        None,
+        description='The prompt the backend actually used, where it says (`dall-e-3`).',
+    )
+
+
+class ImagePartial(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    image: GeneratedImage
+    index: int = Field(
+        ..., description="0-based, as OpenAI's `partial_image_index`.", ge=0
+    )
+
+
+class ImageUsage(BaseModel):
+    """
+    What the backend counted. OpenAI counts `input_tokens` and
+    `output_tokens`; OpenRouter counts chat-style `prompt_tokens` and
+    `completion_tokens`, which are the same quantities under their chat
+    names, plus a `cost`.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    inputTokens: int | None = None
+    outputTokens: int | None = None
+    totalTokens: int | None = None
+    cost: float | None = Field(
+        None,
+        description="The provider's charge in US dollars, where it says (OpenRouter).",
+    )
+
+
 class AudioOutputRequest(BaseModel):
     """
     Answer with audio as well as text (P2b, 2026-09-28): the chat
@@ -1683,53 +1746,54 @@ class DriverCatalogue(BaseModel):
     )
 
 
-class Capabilities(BaseModel):
+class ImageCapabilities(BaseModel):
     """
-    What one model can do behind this driver, which the gateway keys
-    off when routing. Was one object for the whole driver until P1;
-    each `DriverModel` carries its own now. For a backend whose
-    listing says nothing per model, each model inherits the answer
-    the driver would give for itself (P1-3).
+    For an `image` model (P4): what its listing says it takes, which the
+    gateway routes on. **Absent or null means the backend checks its own
+    fields**, and its refusal is relayed: an OpenAI account's image
+    models, whose API is the reference and which lists nothing per
+    model. **An empty list means not taken**: OpenRouter ignores an
+    unlisted `quality` or `background` with a 200 (measured), so a model
+    whose listing does not name one is routed around for it.
 
     """
 
-    supportedSettings: list[str] | None = Field(
-        None,
-        description='Explicit callerSettings this active adapter can carry without\ndropping them. This does not promise the provider accepts every\npossible value. Absent means unknown; ineligible for requests\nrequiring explicit settings. The driver still validates before\nexecution, including after a configuration change.\n',
+    model_config = ConfigDict(
+        extra='forbid',
     )
     streaming: bool | None = Field(
-        None, description='Whether `/v1/generate/stream` emits true incremental tokens.'
-    )
-    imageInput: bool | None = Field(
         None,
-        description='Whether the loaded model is confirmed to accept inline PNG/JPEG\nimages. Unknown or unverified backends report false. Rechecked\nbefore image generation; never inferred from the provider name.\n',
+        description="Whether `/v1/image/stream` gives partial renders. From\nOpenRouter's `supports_streaming` (8 of 55, measured); for\nOpenAI's API, its GPT image models and not `dall-e-*`.\n",
     )
-    audioInput: bool | None = Field(
-        None,
-        description='Whether the model is confirmed to hear an `input_audio` part\n(WAV or MP3). The same rule as `imageInput`: unknown reports\nfalse, and the gateway routes a request carrying audio only\nto a model that says true. From the account\'s listing\n(`audio` in OpenRouter\'s `input_modalities`) or, for\n`llama-server`, its `/props` `modalities.audio`.\n\n**Added 2026-09-28 (P2).** Without it a text-only model is\nsent the audio: measured, OpenRouter answers *"No endpoints\nfound that support input audio"*, and a backend that drops\nthe part answers a question the caller did not ask.\n',
+    maxImages: int | None = Field(
+        None, description='The largest `n`. Null when the backend checks it.', ge=1
     )
-    fileInput: bool | None = Field(
-        None,
-        description="Whether the model is confirmed to read a `file` part (PDF).\nThe same rule as `audioInput`. From `file` in the account's\n`input_modalities`; no local engine reads one today, so a\nsingle-model driver reports false.\n",
-    )
-    speechFormats: list[SpeechFormat] | None = Field(
-        None,
-        description='For a `speech` model: the formats this driver can give it in,\n`wav` included where it is made from `pcm` (P3a).\n',
-    )
-    audioOutput: bool | None = Field(
-        None,
-        description="Whether the model is confirmed to answer with audio\n(`GenerateRequest.audioOutput`). From `audio` in the\naccount's `output_modalities`; no local engine or CLI speaks,\nso they report false. Unknown is false, as for the inputs.\n\n**Not from `supported_parameters`** (A2's setting list): no\naudio-output model on OpenRouter lists `modalities` or\n`audio` there (measured 2026-09-28), so routing by it would\nroute nothing. Added 2026-09-28 (P2b).\n",
-    )
-    toolCalling: bool | None = Field(
-        None,
-        description='Whether this driver can carry `tools` to its backend and\nreport `toolCalls` back.\n\nThe gateway reads it to answer a question a harness\ncannot otherwise ask: a plain answer where a tool call\nwas expected looks identical whether the model declined\nor the backend never saw the tools. A driver that says\n`false` here is failed at the front door with a reason\ninstead.\n',
-    )
-    maxContextTokens: int | None = Field(
-        None,
-        description="The context window the backend **resolved**, read back\nfrom the backend itself — not the model's trained\nmaximum, and never an estimate.\n\nNull means unknown, and unknown is a real answer: a\nhosted provider exposes nothing to read, and a CLI\nsubscription has no window of its own to report. The\ngateway's `_smallest_context` folds this together with\nthe window a supervised runtime reports and publishes\nthe smallest as `x_eugene_plexus.context_length` on\n`GET /v1/models`, so a harness can size a prompt\nagainst the number that will actually apply.\n\n**Populated by a probe of the backend, which is why it\nexists at all.** A supervised runtime already tells the\nagent its window; this field is for the backend nobody\nsupervises — an Ollama or an LM Studio the operator\npoints us at — which until now reported no window\nanywhere. Contracted since M0 and populated by nothing\nuntil then, exactly as `streaming` was until M10.\n\n**Advertising, not enforcement.** Nothing here counts a\nprompt: the window is published so a caller can respect\nit, and a caller that does not is refused by the engine\nitself, whose count is exact. A backend that truncates\nsilently instead of refusing is caught after the fact —\nsee `x_eugene_plexus.prompt_truncated` in\n`gateway.yaml`.\n",
+    minReferences: int | None = Field(
+        0,
+        description='At least this many reference images. One on a model that only\nedits (five on OpenRouter, measured), which a generation routes\naround.\n',
         ge=0,
     )
-    decision: DecisionCapability | None = None
+    maxReferences: int | None = Field(
+        None,
+        description='At most this many reference images; 0 cannot edit. Null when\nthe backend checks it.\n',
+        ge=0,
+    )
+    mask: bool | None = Field(
+        None,
+        description="Whether `mask` is honoured. OpenAI's API only (OpenRouter ignores it, measured).",
+    )
+    qualities: list[str] | None = Field(
+        None,
+        description='The `quality` values taken; `[]` none, null the backend checks.',
+    )
+    backgrounds: list[str] | None = Field(
+        None,
+        description='The `background` values taken; `[]` none, null the backend checks.',
+    )
+    outputFormats: list[str] | None = Field(
+        None,
+        description='The `output_format` values taken. Null where the listing does\nnot say: carried, and the answer labelled by its bytes (P2-2).\n',
+    )
 
 
 class Locality(StrEnum):
@@ -2052,6 +2116,86 @@ class TranscribeResponse(BaseModel):
     latencyMs: int | None = None
 
 
+class ImageRequest(BaseModel):
+    """
+    One request for images (P4). Settings are strings here: the gateway
+    has already checked them against OpenAI's values and routed them to
+    a model whose listing takes them (A2); this driver carries them.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    model: str | None = Field(
+        None,
+        description="Which of this driver's models the request is for: an `id` from\n`DriverInfo.models`, **unprefixed** — the gateway strips the\n`<driver name>/` it added. Optional so a caller from before P1\nstill works against a single-model driver, which serves its one\nmodel when this is absent. An account driver refuses a request\nwithout it (400, `#model-required`), and every driver refuses a\nmodel it does not list (404, `#model-not-served`) before calling\nits backend.\n",
+        min_length=1,
+    )
+    localOnly: bool | None = Field(
+        False,
+        description='As `GenerateRequest.localOnly`: refuse before forwarding the\nprompt or any image unless the active engine is classified local.\n',
+    )
+    prompt: str = Field(
+        ...,
+        description="OpenAI's limit for its GPT image models.",
+        max_length=32000,
+        min_length=1,
+    )
+    n: int | None = Field(None, ge=1, le=10)
+    size: str | None = Field(
+        None,
+        description='`WIDTHxHEIGHT` or `auto`, carried as sent. No OpenRouter model\nlists it and OpenRouter translates it (measured).\n',
+        max_length=32,
+    )
+    quality: str | None = Field(None, max_length=16)
+    background: str | None = Field(None, max_length=16)
+    outputFormat: str | None = Field(
+        None,
+        description="Carried where the model's listing does not name it, because\ngpt-image-1-mini honours it unlisted (measured). The answer's\n`mediaType` says what the image is.\n",
+        max_length=8,
+    )
+    outputCompression: int | None = Field(None, ge=0, le=100)
+    moderation: str | None = Field(None, max_length=16)
+    style: str | None = Field(None, max_length=16)
+    user: str | None = Field(None, max_length=256)
+    inputFidelity: str | None = Field(None, max_length=8)
+    references: list[ImageData] | None = Field(
+        None,
+        description='The images to edit. Present makes this an edit; at most 25 MiB\ndecoded across these and `mask`.\n',
+        max_length=16,
+    )
+    mask: ImageData | None = None
+    partialImages: int | None = Field(
+        None,
+        description='For `/v1/image/stream`, how many partial renders to ask for.',
+        ge=0,
+        le=3,
+    )
+    requestId: UUID | None = None
+
+
+class ImageResponse(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    images: list[GeneratedImage]
+    created: int | None = Field(
+        None,
+        description="The backend's own timestamp, when it gave a real one. Absent\nwhere it sent 0 (flux and gemini on OpenRouter, measured).\n",
+    )
+    size: str | None = Field(
+        None, description="The backend's report of the size, when it gave one."
+    )
+    quality: str | None = None
+    background: str | None = None
+    usage: ImageUsage | None = None
+    modelId: str | None = Field(
+        None, description='The model the backend says answered.'
+    )
+    latencyMs: int | None = None
+
+
 class Tool(BaseModel):
     type: Literal['function']
     function: FunctionDefinition
@@ -2125,78 +2269,54 @@ class DecisionRequest(BaseModel):
     requestId: str | None = Field(None, description='Correlation id, echoed back.')
 
 
-class DriverModel(BaseModel):
+class Capabilities(BaseModel):
     """
-    One model a driver serves, with what that model can do.
-    Everything the gateway used to read off the driver as a whole
-    now sits here per model, because an account's six hundred
-    models do not share one answer.
-
-    """
-
-    id: str = Field(
-        ...,
-        description="What a request names in `model`. A single-model driver's is\nthe public id; an account's is the backend's own id, which\nthe gateway prefixes. May contain `/`, `:` and `~`\n(`anthropic/claude-opus-5.5`, `qwen3:8b`,\n`~openai/gpt-sol-latest`).\n",
-        min_length=1,
-    )
-    name: str | None = Field(
-        None, description="The backend's display name for the model, when it gives one."
-    )
-    upstreamId: str | None = Field(
-        None,
-        description="What this driver actually sends to its backend, when that\ndiffers from `id`. Exists because some backends' served name\nis not ours to choose: `mlx_lm.server` answers only to\nupstream's `default_model` sentinel or to the model's\nabsolute path — the first collides across every MLX runtime\nin an install and the second publishes the operator's\ndirectory layout — so the supervised runtime's companion\ndriver advertises the public alias as `id` and translates to\nthe sentinel at the backend boundary, nowhere else.\n\nDiagnostic, never a routing key: the gateway routes and\nauthorizes on `id` alone, and this value must not appear in\nany public model list. Absent means the same as `id`.\nResponses report `id` (`GenerateResponse`, `EmbedResponse`\nand `DecisionResponse` `modelId`), so two runtimes serving\ndifferent models behind one upstream sentinel stay\ndistinguishable everywhere a caller looks — and so does an\naccount's alias, which the backend answers under its\ntarget's id (`~z-ai/glm-flash-latest` answers as\n`z-ai/glm-5.3-flash`, measured 2026-09-27).\n",
-    )
-    surfaces: list[str] = Field(
-        ...,
-        description='Which requests this model answers. The values so far:\n\n* `chat` (`/v1/generate`), `embeddings` (`/v1/embed`),\n  `decisions` (`/v1/decide`), `speech` (`/v1/speak`, P3a) and\n  `transcription` (`/v1/transcribe`, P3b), which have doors;\n* `completion`, `image`, `video`, `moderation` and `rerank`,\n  which name OpenAI\'s and OpenRouter\'s doors Eugene has not\n  built yet.\n\nA single-model `llama-server` whose projector hears\n(`/props` `modalities.audio`) serves `transcription` beside\n`chat`: its `/v1/audio/transcriptions` answers only then\n(measured).\n\nA driver reports those anyway, so a model\'s id does not\nchange on the day its door arrives, and the gateway lists a\nmodel on `GET /v1/models` only once a door serves one of its\nsurfaces (P1-4).\n\n**Strings, not an enum, on purpose.** A newer driver\nreporting a surface an older gateway has never heard of must\nnot fail that gateway\'s validation of the whole `/v1/info`,\nwhich would make every model on the driver unreachable over\none unknown word. A reader ignores a surface it does not\nknow. Empty only for a model whose kind neither the backend\nnor the driver could decide, which serves nothing.\n\n**Replaces `capabilities.embeddings` and\n`capabilities.chatCapable`**, which said the same thing once\nfor the whole driver. Where they came from still holds for a\nsingle-model driver: `embeddings` is **a property of the\nrunning backend, not of the model**, and not readable from\nanything (`llama-server`\'s `/props` carries no pooling\nfield, and an Ollama runner started for chat refuses with\n*"This server does not support embeddings"*), so it is\ndetermined by trying once and cached for the driver\'s\nlifetime. A System One backend serves `decisions` alone. An\naccount takes each model\'s surfaces from its catalogue.\n',
-    )
-    inputModalities: list[str] | None = Field(
-        None,
-        description="What the model takes in, in the spelling of OpenRouter's\n`architecture.input_modalities` (`text`, `image`, `file`,\n`audio`, `video`), when the backend says. Absent means\nunknown. Strings for the reason `surfaces` gives.\n",
-    )
-    outputModalities: list[str] | None = Field(
-        None,
-        description="What the model gives back, in OpenRouter's spelling of\n`output_modalities` (`text`, `image`, `audio`, `video`,\n`speech`, `transcription`, `embeddings`, `rerank`,\n`decisions`), when the backend says. Absent means unknown.\n",
-    )
-    voices: list[str] | None = Field(
-        None,
-        description="The voices a speech model offers, when the backend lists\nthem (OpenRouter's `supported_voices`). For P3's\n`/v1/audio/speech`; reported now so nothing changes shape\nlater.\n",
-    )
-    capabilities: Capabilities | None = None
-
-
-class DriverInfo(BaseModel):
-    """
-    Driver self-description, and the gateway's only source of truth
-    for what this backend serves. A driver does not know its position
-    in any topology: its operator-supplied name lives in the agent
-    topology, not here.
+    What one model can do behind this driver, which the gateway keys
+    off when routing. Was one object for the whole driver until P1;
+    each `DriverModel` carries its own now. For a backend whose
+    listing says nothing per model, each model inherits the answer
+    the driver would give for itself (P1-3).
 
     """
 
-    locality: Locality | None = Field(
-        'unknown',
-        description="Active engine's configured trust classification. Managed local\nruntimes are local; cloud APIs and subscription CLIs are external.\nCustom HTTP endpoints require an explicit operator assertion;\nURLs, hostnames and loopback addresses never prove locality.\nUnknown and absent are ineligible for local-only routing.\n",
-    )
-    localOnlyEnforced: bool | None = Field(
-        False,
-        description='True only when this driver enforces GenerateRequest/EmbedRequest\nlocalOnly against the active engine before invoking it. A local\nclassification alone is insufficient for a protected request.\n',
-    )
-    backend: BackendKind
-    provider: str | None = Field(
+    supportedSettings: list[str] | None = Field(
         None,
-        description='Operator-friendly provider key from the driver\'s\nregistry (e.g. `"openai"`, `"xai"`, `"openrouter"`,\n`"claude_subscription"`). Reflects which subscription /\nservice this driver is wrapping — `backend` reflects the\n*protocol* underneath, which can be shared across many\nproviders (e.g. xAI, OpenRouter, Ollama all report\n`backend: openai_compat_http`). Optional; omitted when\nthe driver is in degraded mode and never finished\nconstructing.\n',
+        description='Explicit callerSettings this active adapter can carry without\ndropping them. This does not promise the provider accepts every\npossible value. Absent means unknown; ineligible for requests\nrequiring explicit settings. The driver still validates before\nexecution, including after a configuration change.\n',
     )
-    models: list[DriverModel] | None = Field(
+    streaming: bool | None = Field(
+        None, description='Whether `/v1/generate/stream` emits true incremental tokens.'
+    )
+    imageInput: bool | None = Field(
         None,
-        description="**Every model this driver serves, and the gateway's routing\nkey.** Replaces the single `modelId` (P1, 2026-09-27, Troy's\ncall #3): one list for one model and for six hundred.\n\n* **A driver with a model configured** reports one entry,\n  whose `id` is that model's public id (a local runtime's\n  alias, `claude-opus-5-5`, …), with no prefix.\n* **An account** (`catalogue` present) reports one entry per\n  model its catalogue and its include/exclude patterns keep.\n  Their `id`s are the backend's own ids, and the gateway\n  publishes each as `<driver name>/<id>`.\n* **Empty** is a real answer: a single-model driver with no\n  model chosen yet, or an account whose first catalogue read\n  failed (`catalogue.error` says why). The gateway routes\n  nothing here.\n* **Absent** — the key missing from the body — means a driver\n  from before this field existed. The gateway names it,\n  with its machine, as one to update, and never sends it a\n  `model`: an older driver ignores unknown fields and would\n  answer with its one model whatever was asked.\n\nOmitted, deliberately, when the caller passed `models=false`.\n",
+        description='Whether the loaded model is confirmed to accept inline PNG/JPEG\nimages. Unknown or unverified backends report false. Rechecked\nbefore image generation; never inferred from the provider name.\n',
     )
-    catalogue: DriverCatalogue | None = None
-    runtime: str | None = Field(
+    audioInput: bool | None = Field(
         None,
-        description="The supervised engine runtime this driver is following, when\nit was configured with `runtimeName` rather than a literal\n`baseUrl`. Absent for a cloud provider, a CLI subscription,\nor any backend that is not a runtime this install\nsupervises.\n\nReported here despite the rule that a driver never says\nwhere it sits, because this is not the driver's own address —\nit is *what it serves*, which is exactly what `/v1/info` is\nfor. It lets the gateway and the UI show which engine\nprocess is behind a driver, so a model that is loaded but\nunroutable is diagnosable from the routing table instead of\nby reading two components' configs side by side.\n",
+        description='Whether the model is confirmed to hear an `input_audio` part\n(WAV or MP3). The same rule as `imageInput`: unknown reports\nfalse, and the gateway routes a request carrying audio only\nto a model that says true. From the account\'s listing\n(`audio` in OpenRouter\'s `input_modalities`) or, for\n`llama-server`, its `/props` `modalities.audio`.\n\n**Added 2026-09-28 (P2).** Without it a text-only model is\nsent the audio: measured, OpenRouter answers *"No endpoints\nfound that support input audio"*, and a backend that drops\nthe part answers a question the caller did not ask.\n',
     )
-    version: str | None = Field(None, description='inference-driver semver.')
+    fileInput: bool | None = Field(
+        None,
+        description="Whether the model is confirmed to read a `file` part (PDF).\nThe same rule as `audioInput`. From `file` in the account's\n`input_modalities`; no local engine reads one today, so a\nsingle-model driver reports false.\n",
+    )
+    speechFormats: list[SpeechFormat] | None = Field(
+        None,
+        description='For a `speech` model: the formats this driver can give it in,\n`wav` included where it is made from `pcm` (P3a).\n',
+    )
+    audioOutput: bool | None = Field(
+        None,
+        description="Whether the model is confirmed to answer with audio\n(`GenerateRequest.audioOutput`). From `audio` in the\naccount's `output_modalities`; no local engine or CLI speaks,\nso they report false. Unknown is false, as for the inputs.\n\n**Not from `supported_parameters`** (A2's setting list): no\naudio-output model on OpenRouter lists `modalities` or\n`audio` there (measured 2026-09-28), so routing by it would\nroute nothing. Added 2026-09-28 (P2b).\n",
+    )
+    toolCalling: bool | None = Field(
+        None,
+        description='Whether this driver can carry `tools` to its backend and\nreport `toolCalls` back.\n\nThe gateway reads it to answer a question a harness\ncannot otherwise ask: a plain answer where a tool call\nwas expected looks identical whether the model declined\nor the backend never saw the tools. A driver that says\n`false` here is failed at the front door with a reason\ninstead.\n',
+    )
+    maxContextTokens: int | None = Field(
+        None,
+        description="The context window the backend **resolved**, read back\nfrom the backend itself — not the model's trained\nmaximum, and never an estimate.\n\nNull means unknown, and unknown is a real answer: a\nhosted provider exposes nothing to read, and a CLI\nsubscription has no window of its own to report. The\ngateway's `_smallest_context` folds this together with\nthe window a supervised runtime reports and publishes\nthe smallest as `x_eugene_plexus.context_length` on\n`GET /v1/models`, so a harness can size a prompt\nagainst the number that will actually apply.\n\n**Populated by a probe of the backend, which is why it\nexists at all.** A supervised runtime already tells the\nagent its window; this field is for the backend nobody\nsupervises — an Ollama or an LM Studio the operator\npoints us at — which until now reported no window\nanywhere. Contracted since M0 and populated by nothing\nuntil then, exactly as `streaming` was until M10.\n\n**Advertising, not enforcement.** Nothing here counts a\nprompt: the window is published so a caller can respect\nit, and a caller that does not is refused by the engine\nitself, whose count is exact. A backend that truncates\nsilently instead of refusing is caught after the fact —\nsee `x_eugene_plexus.prompt_truncated` in\n`gateway.yaml`.\n",
+        ge=0,
+    )
+    decision: DecisionCapability | None = None
+    image: ImageCapabilities | None = None
 
 
 class InputAudioContentPart(BaseModel):
@@ -2328,6 +2448,80 @@ class StreamToken(BaseModel):
     audio: AudioDelta | None = None
     logprobs: ChatLogprobs | None = None
     annotations: list[ChatAnnotation] | None = None
+
+
+class DriverModel(BaseModel):
+    """
+    One model a driver serves, with what that model can do.
+    Everything the gateway used to read off the driver as a whole
+    now sits here per model, because an account's six hundred
+    models do not share one answer.
+
+    """
+
+    id: str = Field(
+        ...,
+        description="What a request names in `model`. A single-model driver's is\nthe public id; an account's is the backend's own id, which\nthe gateway prefixes. May contain `/`, `:` and `~`\n(`anthropic/claude-opus-5.5`, `qwen3:8b`,\n`~openai/gpt-sol-latest`).\n",
+        min_length=1,
+    )
+    name: str | None = Field(
+        None, description="The backend's display name for the model, when it gives one."
+    )
+    upstreamId: str | None = Field(
+        None,
+        description="What this driver actually sends to its backend, when that\ndiffers from `id`. Exists because some backends' served name\nis not ours to choose: `mlx_lm.server` answers only to\nupstream's `default_model` sentinel or to the model's\nabsolute path — the first collides across every MLX runtime\nin an install and the second publishes the operator's\ndirectory layout — so the supervised runtime's companion\ndriver advertises the public alias as `id` and translates to\nthe sentinel at the backend boundary, nowhere else.\n\nDiagnostic, never a routing key: the gateway routes and\nauthorizes on `id` alone, and this value must not appear in\nany public model list. Absent means the same as `id`.\nResponses report `id` (`GenerateResponse`, `EmbedResponse`\nand `DecisionResponse` `modelId`), so two runtimes serving\ndifferent models behind one upstream sentinel stay\ndistinguishable everywhere a caller looks — and so does an\naccount's alias, which the backend answers under its\ntarget's id (`~z-ai/glm-flash-latest` answers as\n`z-ai/glm-5.3-flash`, measured 2026-09-27).\n",
+    )
+    surfaces: list[str] = Field(
+        ...,
+        description='Which requests this model answers. The values so far:\n\n* `chat` (`/v1/generate`), `embeddings` (`/v1/embed`),\n  `decisions` (`/v1/decide`), `speech` (`/v1/speak`, P3a),\n  `transcription` (`/v1/transcribe`, P3b) and `image`\n  (`/v1/image`, P4), which have doors;\n* `completion`, `video`, `moderation` and `rerank`, which name\n  OpenAI\'s and OpenRouter\'s doors Eugene has not built yet.\n\nAn OpenRouter model whose output is image and text (Gemini\'s\nimage models) serves `image` beside `chat`: its images route\nanswers them too (measured).\n\nA single-model `llama-server` whose projector hears\n(`/props` `modalities.audio`) serves `transcription` beside\n`chat`: its `/v1/audio/transcriptions` answers only then\n(measured).\n\nA driver reports those anyway, so a model\'s id does not\nchange on the day its door arrives, and the gateway lists a\nmodel on `GET /v1/models` only once a door serves one of its\nsurfaces (P1-4).\n\n**Strings, not an enum, on purpose.** A newer driver\nreporting a surface an older gateway has never heard of must\nnot fail that gateway\'s validation of the whole `/v1/info`,\nwhich would make every model on the driver unreachable over\none unknown word. A reader ignores a surface it does not\nknow. Empty only for a model whose kind neither the backend\nnor the driver could decide, which serves nothing.\n\n**Replaces `capabilities.embeddings` and\n`capabilities.chatCapable`**, which said the same thing once\nfor the whole driver. Where they came from still holds for a\nsingle-model driver: `embeddings` is **a property of the\nrunning backend, not of the model**, and not readable from\nanything (`llama-server`\'s `/props` carries no pooling\nfield, and an Ollama runner started for chat refuses with\n*"This server does not support embeddings"*), so it is\ndetermined by trying once and cached for the driver\'s\nlifetime. A System One backend serves `decisions` alone. An\naccount takes each model\'s surfaces from its catalogue.\n',
+    )
+    inputModalities: list[str] | None = Field(
+        None,
+        description="What the model takes in, in the spelling of OpenRouter's\n`architecture.input_modalities` (`text`, `image`, `file`,\n`audio`, `video`), when the backend says. Absent means\nunknown. Strings for the reason `surfaces` gives.\n",
+    )
+    outputModalities: list[str] | None = Field(
+        None,
+        description="What the model gives back, in OpenRouter's spelling of\n`output_modalities` (`text`, `image`, `audio`, `video`,\n`speech`, `transcription`, `embeddings`, `rerank`,\n`decisions`), when the backend says. Absent means unknown.\n",
+    )
+    voices: list[str] | None = Field(
+        None,
+        description="The voices a speech model offers, when the backend lists\nthem (OpenRouter's `supported_voices`). For P3's\n`/v1/audio/speech`; reported now so nothing changes shape\nlater.\n",
+    )
+    capabilities: Capabilities | None = None
+
+
+class DriverInfo(BaseModel):
+    """
+    Driver self-description, and the gateway's only source of truth
+    for what this backend serves. A driver does not know its position
+    in any topology: its operator-supplied name lives in the agent
+    topology, not here.
+
+    """
+
+    locality: Locality | None = Field(
+        'unknown',
+        description="Active engine's configured trust classification. Managed local\nruntimes are local; cloud APIs and subscription CLIs are external.\nCustom HTTP endpoints require an explicit operator assertion;\nURLs, hostnames and loopback addresses never prove locality.\nUnknown and absent are ineligible for local-only routing.\n",
+    )
+    localOnlyEnforced: bool | None = Field(
+        False,
+        description='True only when this driver enforces GenerateRequest/EmbedRequest\nlocalOnly against the active engine before invoking it. A local\nclassification alone is insufficient for a protected request.\n',
+    )
+    backend: BackendKind
+    provider: str | None = Field(
+        None,
+        description='Operator-friendly provider key from the driver\'s\nregistry (e.g. `"openai"`, `"xai"`, `"openrouter"`,\n`"claude_subscription"`). Reflects which subscription /\nservice this driver is wrapping — `backend` reflects the\n*protocol* underneath, which can be shared across many\nproviders (e.g. xAI, OpenRouter, Ollama all report\n`backend: openai_compat_http`). Optional; omitted when\nthe driver is in degraded mode and never finished\nconstructing.\n',
+    )
+    models: list[DriverModel] | None = Field(
+        None,
+        description="**Every model this driver serves, and the gateway's routing\nkey.** Replaces the single `modelId` (P1, 2026-09-27, Troy's\ncall #3): one list for one model and for six hundred.\n\n* **A driver with a model configured** reports one entry,\n  whose `id` is that model's public id (a local runtime's\n  alias, `claude-opus-5-5`, …), with no prefix.\n* **An account** (`catalogue` present) reports one entry per\n  model its catalogue and its include/exclude patterns keep.\n  Their `id`s are the backend's own ids, and the gateway\n  publishes each as `<driver name>/<id>`.\n* **Empty** is a real answer: a single-model driver with no\n  model chosen yet, or an account whose first catalogue read\n  failed (`catalogue.error` says why). The gateway routes\n  nothing here.\n* **Absent** — the key missing from the body — means a driver\n  from before this field existed. The gateway names it,\n  with its machine, as one to update, and never sends it a\n  `model`: an older driver ignores unknown fields and would\n  answer with its one model whatever was asked.\n\nOmitted, deliberately, when the caller passed `models=false`.\n",
+    )
+    catalogue: DriverCatalogue | None = None
+    runtime: str | None = Field(
+        None,
+        description="The supervised engine runtime this driver is following, when\nit was configured with `runtimeName` rather than a literal\n`baseUrl`. Absent for a cloud provider, a CLI subscription,\nor any backend that is not a runtime this install\nsupervises.\n\nReported here despite the rule that a driver never says\nwhere it sits, because this is not the driver's own address —\nit is *what it serves*, which is exactly what `/v1/info` is\nfor. It lets the gateway and the UI show which engine\nprocess is behind a driver, so a model that is loaded but\nunroutable is diagnosable from the routing table instead of\nby reading two components' configs side by side.\n",
+    )
+    version: str | None = Field(None, description='inference-driver semver.')
 
 
 class MessageContent1(

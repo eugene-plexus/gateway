@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -306,7 +307,7 @@ def test_a_v6_store_migrates_in_place_gaining_the_door_and_its_units(tmp_path: P
     asyncio.run(build())
 
     conn = sqlite3.connect(path)
-    for column in ("door", "characters", "audio_seconds"):
+    for column in ("door", "characters", "audio_seconds", "images"):
         conn.execute(f"ALTER TABLE request DROP COLUMN {column}")
     conn.execute("UPDATE meta SET value = '6' WHERE key = 'schema_version'")
     conn.commit()
@@ -317,19 +318,56 @@ def test_a_v6_store_migrates_in_place_gaining_the_door_and_its_units(tmp_path: P
         try:
             rows, _ = store.requests()
             assert len(rows) == 1, "migration lost the v6 rows"
-            assert (rows[0]["door"], rows[0]["characters"], rows[0]["audioSeconds"]) == (
-                None,
-                None,
-                None,
-            )
+            assert (
+                rows[0]["door"],
+                rows[0]["characters"],
+                rows[0]["audioSeconds"],
+                rows[0]["images"],
+            ) == (None, None, None, None)
             with store._reader() as conn:
                 assert conn is not None
                 version = conn.execute(
                     "SELECT value FROM meta WHERE key = 'schema_version'"
                 ).fetchone()
-            assert version == (str(SCHEMA_VERSION),) == ("7",)
+            assert version == (str(SCHEMA_VERSION),) == ("8",)
         finally:
             await store.aclose()
 
     asyncio.run(reopen())
     assert not path.with_suffix(".v6.bak").exists(), "an in-place upgrade renamed the file aside"
+
+
+def test_a_v7_store_migrates_in_place_gaining_the_image_count(tmp_path: Path) -> None:
+    """P4's v8: an alpha.4-plus-P3 store keeps its rows and its door, and
+    gains `images`, null on every older row."""
+    path = tmp_path / "m.sqlite3"
+
+    async def build() -> None:
+        store = await _store(path)
+        try:
+            store._insert([replace(_row(), door="speech", characters=12)])
+        finally:
+            await store.aclose()
+
+    asyncio.run(build())
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE request DROP COLUMN images")
+    conn.execute("UPDATE meta SET value = '7' WHERE key = 'schema_version'")
+    conn.commit()
+    conn.close()
+
+    async def reopen() -> None:
+        store = await _store(path)
+        try:
+            rows, _ = store.requests()
+            assert [(r["door"], r["characters"], r["images"]) for r in rows] == [
+                ("speech", 12, None)
+            ]
+            store._insert([replace(_row(), door="images", images=2)])
+            rows, _ = store.requests()
+            assert rows[0]["door"] == "images" and rows[0]["images"] == 2
+        finally:
+            await store.aclose()
+
+    asyncio.run(reopen())
+    assert not path.with_suffix(".v7.bak").exists(), "an in-place upgrade renamed the file aside"

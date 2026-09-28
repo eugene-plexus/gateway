@@ -1211,6 +1211,7 @@ class Surface(StrEnum):
     decisions = 'decisions'
     speech = 'speech'
     transcription = 'transcription'
+    image = 'image'
 
 
 class ModelRoutingInfo(BaseModel):
@@ -1234,7 +1235,7 @@ class ModelRoutingInfo(BaseModel):
     )
     surfaces: list[Surface] | None = Field(
         None,
-        description="Which surfaces this model can be sent to. `decisions` means\n`POST /v1/systemone`; a decision-only model lists nothing\nelse, and a chat request naming it is refused with the\ndoor's name. `speech` means `POST /v1/audio/speech` (P3a),\n`transcription` `POST /v1/audio/transcriptions` (P3b).\n\nOpenAI's own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Measured, not assumed, and the two are not always\ndisjoint**: an Ollama runner started for chat refuses to\nembed, `nomic-embed-text` refuses to chat -- but\n`llama-server` given `--embedding` still serves chat\nperfectly well. Hence a list.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n",
+        description="Which surfaces this model can be sent to. `decisions` means\n`POST /v1/systemone`; a decision-only model lists nothing\nelse, and a chat request naming it is refused with the\ndoor's name. `speech` means `POST /v1/audio/speech` (P3a),\n`transcription` `POST /v1/audio/transcriptions` (P3b), `image`\n`POST /v1/images/generations` and `/edits` (P4).\n\nOpenAI's own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Measured, not assumed, and the two are not always\ndisjoint**: an Ollama runner started for chat refuses to\nembed, `nomic-embed-text` refuses to chat -- but\n`llama-server` given `--embedding` still serves chat\nperfectly well. Hence a list.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n",
     )
     image_input: bool | None = Field(
         None,
@@ -1255,6 +1256,18 @@ class ModelRoutingInfo(BaseModel):
     speech_formats: list[SpeechFormat] | None = Field(
         None,
         description='For a `speech` model: the formats every backend serving it can\ngive, `wav` included where it is made from `pcm`.\n',
+    )
+    image_streaming: bool | None = Field(
+        None,
+        description='For an `image` model: at least one backend streams partial\nimages. A request with `stream: true` routes only to those\n(P4-3).\n',
+    )
+    image_edits: bool | None = Field(
+        None,
+        description='For an `image` model: at least one backend takes reference\nimages, so `/v1/images/edits` can reach it.\n',
+    )
+    image_mask: bool | None = Field(
+        None,
+        description="For an `image` model: at least one backend honours `mask`\n(OpenAI's API only, measured).\n",
     )
     audio_output: bool | None = Field(
         None,
@@ -1396,6 +1409,115 @@ class TranscriptionUsageOut(BaseModel):
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+
+
+class ImageRef(BaseModel):
+    """
+    One input image. Only a `data:` URL is taken; any other URL, and a
+    `file_id`, are refused (A4; no store).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    image_url: str | None = None
+    file_id: str | None = None
+
+
+class ImageQuality(StrEnum):
+    """
+    OpenAI's values; each model's listing says which it takes.
+    """
+
+    standard = 'standard'
+    hd = 'hd'
+    low = 'low'
+    medium = 'medium'
+    high = 'high'
+    xhigh = 'xhigh'
+    max = 'max'
+    auto = 'auto'
+
+
+class ImageBackground(StrEnum):
+    transparent = 'transparent'
+    opaque = 'opaque'
+    auto = 'auto'
+
+
+class ImageOutputFormat(StrEnum):
+    png = 'png'
+    jpeg = 'jpeg'
+    webp = 'webp'
+
+
+class ImageModeration(StrEnum):
+    low = 'low'
+    auto = 'auto'
+
+
+class ImageStyle(StrEnum):
+    """
+    `dall-e-3` only; carried and dropped where not taken.
+    """
+
+    vivid = 'vivid'
+    natural = 'natural'
+
+
+class ImageInputFidelity(StrEnum):
+    high = 'high'
+    low = 'low'
+
+
+class ImageResponseFormat(StrEnum):
+    """
+    `url` is accepted and ignored (P4-1): every answer is `b64_json`.
+    """
+
+    url = 'url'
+    b64_json = 'b64_json'
+
+
+class ImageStreamEventType(StrEnum):
+    image_generation_partial_image = 'image_generation.partial_image'
+    image_generation_completed = 'image_generation.completed'
+    image_edit_partial_image = 'image_edit.partial_image'
+    image_edit_completed = 'image_edit.completed'
+
+
+class ImageObject(BaseModel):
+    b64_json: str
+    revised_prompt: str | None = None
+
+
+class ImagesUsage(BaseModel):
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+    input_tokens_details: dict[str, Any] | None = None
+
+
+class ImageStreamEvent(BaseModel):
+    """
+    One SSE `data:` event, with the fields OpenAI's schema requires
+    filled here where the backend sent none: `size`, `quality` and
+    `background` as asked (`auto` when not), `output_format` from the
+    bytes. A `partial_image` carries `partial_image_index`; a
+    `completed` carries `usage`.
+
+    """
+
+    type: ImageStreamEventType
+    b64_json: str
+    created_at: int
+    size: str
+    quality: str
+    background: str
+    output_format: str
+    partial_image_index: int | None = None
+    usage: ImagesUsage | None = None
 
 
 class ChatModality(StrEnum):
@@ -3021,6 +3143,94 @@ class TranscriptionVerbose(BaseModel):
     usage: TranscriptionUsageOut | None = None
 
 
+class ImageGenerationRequest(BaseModel):
+    """
+    OpenAI's image generation request (P4). Unknown fields are refused naming them.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    model: str
+    prompt: str = Field(..., max_length=32000, min_length=1)
+    n: int | None = Field(None, ge=1, le=10)
+    size: str | None = Field(
+        None, description='`WIDTHxHEIGHT` or `auto`, carried as sent.', max_length=32
+    )
+    quality: ImageQuality | None = None
+    background: ImageBackground | None = None
+    output_format: ImageOutputFormat | None = None
+    output_compression: int | None = Field(None, ge=0, le=100)
+    moderation: ImageModeration | None = None
+    stream: bool | None = Field(
+        None, description='Routes only to a model that streams (P4-3).'
+    )
+    partial_images: int | None = Field(None, ge=0, le=3)
+    user: str | None = Field(None, max_length=256)
+    response_format: ImageResponseFormat | None = None
+    style: ImageStyle | None = None
+
+
+class ImageEditJsonRequest(BaseModel):
+    """
+    OpenAI's JSON edit form (P4). Unknown fields are refused naming them.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    model: str
+    prompt: str = Field(..., max_length=32000, min_length=1)
+    images: list[ImageRef] = Field(..., max_length=16, min_length=1)
+    mask: ImageRef | None = None
+    input_fidelity: ImageInputFidelity | None = None
+    n: int | None = Field(None, ge=1, le=10)
+    size: str | None = Field(
+        None, description='`WIDTHxHEIGHT` or `auto`, carried as sent.', max_length=32
+    )
+    quality: ImageQuality | None = None
+    background: ImageBackground | None = None
+    output_format: ImageOutputFormat | None = None
+    output_compression: int | None = Field(None, ge=0, le=100)
+    moderation: ImageModeration | None = None
+    stream: bool | None = Field(
+        None, description='Routes only to a model that streams (P4-3).'
+    )
+    partial_images: int | None = Field(None, ge=0, le=3)
+    user: str | None = Field(None, max_length=256)
+
+
+class ImageEditForm(BaseModel):
+    """
+    OpenAI's multipart edit form, as its SDK sends it (P4). The images
+    are `image` (one) or `image[]` (several, once each). Fields this door
+    does not carry are refused naming them.
+
+    """
+
+    model: str
+    prompt: str
+    image: bytes | None = None
+    image__: list[bytes] | None = Field(None, alias='image[]')
+    mask: bytes | None = None
+    input_fidelity: ImageInputFidelity | None = None
+    response_format: ImageResponseFormat | None = None
+    n: int | None = Field(None, ge=1, le=10)
+    size: str | None = Field(
+        None, description='`WIDTHxHEIGHT` or `auto`, carried as sent.', max_length=32
+    )
+    quality: ImageQuality | None = None
+    background: ImageBackground | None = None
+    output_format: ImageOutputFormat | None = None
+    output_compression: int | None = Field(None, ge=0, le=100)
+    moderation: ImageModeration | None = None
+    stream: bool | None = Field(
+        None, description='Routes only to a model that streams (P4-3).'
+    )
+    partial_images: int | None = Field(None, ge=0, le=3)
+    user: str | None = Field(None, max_length=256)
+
+
 class Delta(BaseModel):
     """
     Incremental payload. The first chunk carries `role`;
@@ -3443,7 +3653,7 @@ class MetricRequest(BaseModel):
     completionTokens: int | None = None
     door: str | None = Field(
         None,
-        description='Which door the request came in by (P3b): `speech` or\n`transcription`. Null on rows from before schema v7 and on every\nother door, whose rows carry tokens.\n',
+        description='Which door the request came in by (P3b): `speech`,\n`transcription`, or `images` (P4, schema v8). Null on rows from\nbefore schema v7 and on every other door, whose rows carry\ntokens.\n',
     )
     characters: int | None = Field(
         None,
@@ -3452,6 +3662,10 @@ class MetricRequest(BaseModel):
     audioSeconds: float | None = Field(
         None,
         description='For transcription, the seconds of audio heard, where the backend says.',
+    )
+    images: int | None = Field(
+        None,
+        description='For images, how many were returned (P4, schema v8). Tokens ride beside it.',
     )
     outcome: Outcome
     tries: list[MetricAttempt] = Field(..., min_length=0)
@@ -3537,6 +3751,20 @@ class DirectoryListing(BaseModel):
 class ModelList(BaseModel):
     object: Literal['list']
     data: list[Model]
+
+
+class ImagesResponse(BaseModel):
+    created: int
+    data: list[ImageObject]
+    output_format: str | None = Field(
+        None,
+        description="What the first image is, read from its bytes (P2-2): `png`,\n`jpeg`, `webp`, and `svg` from OpenRouter's vector models.\n",
+    )
+    size: str | None = None
+    quality: str | None = None
+    background: str | None = None
+    usage: ImagesUsage | None = None
+    x_eugene_plexus: CompletionRoutingInfo | None = None
 
 
 class ChatCompletionChunkChoice(BaseModel):

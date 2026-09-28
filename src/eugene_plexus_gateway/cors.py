@@ -88,6 +88,10 @@ FRONT_DOOR_PATHS: frozenset[str] = frozenset(
         # P3b, and the one that refuses, so a browser reads why.
         "/v1/audio/transcriptions",
         "/v1/audio/translations",
+        # P4: an image generator in a page is a plain browser client too.
+        "/v1/images/generations",
+        "/v1/images/edits",
+        "/v1/images/variations",
     }
 )
 

@@ -61,7 +61,7 @@ from typing import Any
 
 import httpx
 
-from ._generated.driver_models import Capabilities, DriverInfo, DriverModel
+from ._generated.driver_models import Capabilities, DriverInfo, DriverModel, ImageCapabilities
 from ._generated.models import (
     BackendKind,
     ControlRootView,
@@ -80,6 +80,7 @@ from ._http import internal_client
 from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from .driver_client import BoundClient, DriverClient, HttpDriverClient, TieredClient
 from .driver_client import Key as DriverKey
+from .image_doors import ImageAsk, rules_out
 from .metrics import AttemptRow, CandidateRow
 from .model_patterns import permits
 from .outbound import RECIPIENT_CONTROL, Outbound
@@ -320,6 +321,16 @@ class _Backend:
         return "transcription" in self.surfaces
 
     @property
+    def makes_images(self) -> bool:
+        """Whether this model serves the image surface (P4)."""
+        return "image" in self.surfaces
+
+    @property
+    def image_caps(self) -> ImageCapabilities | None:
+        """What its listing says it takes on the images doors (P4)."""
+        return self.caps.image if self.caps is not None else None
+
+    @property
     def chats(self) -> bool:
         """Whether this model serves chat completions.
 
@@ -472,6 +483,7 @@ class Resolution:
             + (["decisions"] if any(b.decides for b in backends) else [])
             + (["speech"] if any(b.speaks for b in backends) else [])
             + (["transcription"] if any(b.transcribes for b in backends) else [])
+            + (["image"] if any(b.makes_images for b in backends) else [])
         )
 
     def reported_surfaces(self) -> list[str]:
@@ -1736,6 +1748,66 @@ class RoutingTable:
             return None
         return TieredClient(name=resolution.model, tiers=tiers, hooks=self)
 
+    def pick_image(self, resolution: Resolution, ask: ImageAsk) -> TieredClient | None:
+        """`pick`'s tiers, holding only models that make images and whose
+        listing takes this request (P4).
+
+        Tiers, as chat (§5, call #4): a fallback model's image is still an
+        image. Every tier is filtered by `rules_out`, so a fallback cannot be
+        handed a mask it would ignore, a stream it cannot give (P4-3), or a
+        setting its provider would drop with a 200.
+        """
+        tiers: list[list[DriverClient]] = []
+        for tier in resolution.tiers:
+            eligible = [
+                b
+                for b in tier.eligible()
+                if b.makes_images and rules_out(b.image_caps, ask) is None
+            ]
+            tiers.append([b.client for b in self._order(tier.target, eligible)] if eligible else [])
+        if not any(tiers):
+            return None
+        return TieredClient(name=resolution.model, tiers=tiers, hooks=self)
+
+    @staticmethod
+    def image_refusal(resolution: Resolution, ask: ImageAsk) -> tuple[str, str] | None:
+        """`(field, message)` when no model in the slot that makes images
+        takes this request, whatever is ready; None when one does.
+
+        Read over every backend, not the eligible ones: a model asleep that
+        would take the request is a 503 to retry, and a slot where nothing
+        ever could is a 400 naming the setting (A2's rule, in the caller's
+        words).
+        """
+        reasons: dict[str, tuple[str, str]] = {}
+        for backend in resolution.backends():
+            if not backend.makes_images:
+                continue
+            ruled = rules_out(backend.image_caps, ask)
+            if ruled is None:
+                return None
+            reasons.setdefault(backend.public_id, ruled)
+        if not reasons:
+            return None
+        fields = {f for f, _ in reasons.values()}
+        said = "; ".join(f"{model} {why}" for model, (_, why) in sorted(reasons.items()))
+        first = next(iter(reasons.values()))[0]
+        if len(fields) == 1:
+            if first == "stream":
+                return first, (
+                    f"stream: no model serving {resolution.model!r} streams partial images "
+                    f"({said}). Ask without stream, or choose a model with "
+                    "x_eugene_plexus.image_streaming. Nothing was sent."
+                )
+            return first, (
+                f"{first}: no model serving {resolution.model!r} takes this request ({said}). "
+                "Change or remove it, or choose a model whose listing takes it. "
+                "Nothing was sent."
+            )
+        return first, (
+            f"No model serving {resolution.model!r} takes this request ({said}). Nothing was sent."
+        )
+
     @staticmethod
     def speech_formats_for(resolution: Resolution) -> list[SpeechFormat]:
         """The formats every backend speaking this model -- the slot's first,
@@ -1941,6 +2013,7 @@ class RoutingTable:
                 # chat picker.
                 continue
             backends = resolution.backends()
+            makes_images = any(b.makes_images for b in backends)
             providers = {b.info.provider for b in backends if b.info.provider}
             eligible = resolution.eligible_backends()
             out.append(
@@ -1961,6 +2034,27 @@ class RoutingTable:
                         audio_input=any(takes(b.caps, _AUDIO) for b in backends),
                         file_input=any(takes(b.caps, _FILE) for b in backends),
                         audio_output=any(takes(b.caps, _SPEAKS) for b in backends),
+                        # Said for an image model only: `false` on every chat
+                        # model would be noise in every picker.
+                        image_streaming=any(
+                            b.makes_images and b.image_caps is not None and b.image_caps.streaming
+                            for b in backends
+                        )
+                        if makes_images
+                        else None,
+                        image_edits=any(
+                            b.makes_images
+                            and (b.image_caps is None or b.image_caps.maxReferences != 0)
+                            for b in backends
+                        )
+                        if makes_images
+                        else None,
+                        image_mask=any(
+                            b.makes_images and b.image_caps is not None and bool(b.image_caps.mask)
+                            for b in backends
+                        )
+                        if makes_images
+                        else None,
                         voices=self.voices_for(resolution),
                         speech_formats=self.speech_formats_for(resolution) or None,
                         tiers=[[b.name for b in t.backends] for t in resolution.tiers],

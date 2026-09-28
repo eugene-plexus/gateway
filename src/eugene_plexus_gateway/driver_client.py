@@ -35,6 +35,9 @@ from ._generated.driver_models import (
     EmbedResponse,
     GenerateRequest,
     GenerateResponse,
+    ImagePartial,
+    ImageRequest,
+    ImageResponse,
     Problem,
     RetryDisposition,
     SpeakRequest,
@@ -208,6 +211,10 @@ class DriverClient(Protocol):
     async def count_tokens(self, request: GenerateRequest) -> int: ...
     def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]: ...
     def speak(self, request: SpeakRequest) -> AsyncGenerator[str | bytes, None]: ...
+    async def image(self, request: ImageRequest) -> ImageResponse: ...
+    def image_stream(
+        self, request: ImageRequest
+    ) -> AsyncGenerator[ImagePartial | ImageResponse, None]: ...
     async def aclose(self) -> None: ...
 
 
@@ -412,6 +419,83 @@ class HttpDriverClient:
             return TranscribeResponse.model_validate(response.json())
         except ValueError as exc:
             raise self._invalid_reply() from exc
+
+    async def image(self, request: ImageRequest) -> ImageResponse:
+        """The driver's `/v1/image` (P4): reference images as base64 in JSON."""
+        payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
+        response = await self._client.post(
+            "/v1/image",
+            json=payload,
+            headers={"X-Request-ID": str(request.requestId)} if request.requestId else None,
+        )
+        if response.status_code >= 400:
+            raise DriverError(
+                driver_name=self.name,
+                driver_url=self.base_url,
+                status_code=response.status_code,
+                problem=_problem_from_response(response),
+                raw_body=response.text,
+            )
+        try:
+            return ImageResponse.model_validate(response.json())
+        except ValueError as exc:
+            raise self._invalid_reply() from exc
+
+    async def image_stream(
+        self, request: ImageRequest
+    ) -> AsyncGenerator[ImagePartial | ImageResponse, None]:
+        """The driver's `/v1/image/stream` (P4): `partial` events, then
+        `done`. A non-200 and an `error` event are `DriverError`s, so a
+        failure before the first event cascades as a failed POST does."""
+        payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
+        async with self._client.stream(
+            "POST",
+            "/v1/image/stream",
+            json=payload,
+            headers={
+                "Accept": "text/event-stream",
+                **({"X-Request-ID": str(request.requestId)} if request.requestId else {}),
+            },
+        ) as response:
+            if response.status_code >= 400:
+                body = await response.aread()
+                raise DriverError(
+                    driver_name=self.name,
+                    driver_url=self.base_url,
+                    status_code=response.status_code,
+                    problem=_problem_from_bytes(body),
+                    raw_body=body.decode("utf-8", "replace"),
+                )
+            event_name: str | None = None
+            async for line in response.aiter_lines():
+                if not line.strip():
+                    event_name = None
+                    continue
+                if line.startswith("event:"):
+                    event_name = line[6:].strip()
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                try:
+                    parsed = json.loads(data)
+                    if event_name == "error":
+                        problem = Problem.model_validate(parsed)
+                        raise DriverError(
+                            driver_name=self.name,
+                            driver_url=self.base_url,
+                            status_code=problem.status,
+                            problem=problem,
+                            raw_body=data,
+                        )
+                    if event_name == "partial":
+                        yield ImagePartial.model_validate(parsed)
+                    elif event_name == "done":
+                        yield ImageResponse.model_validate(parsed)
+                        return
+                except ValueError as exc:
+                    raise self._invalid_reply() from exc
+            raise self._invalid_reply()
 
     async def count_tokens(self, request: GenerateRequest) -> int:
         """The driver's `/v1/generate/count`: the backend's own tokenizer, no generation."""
@@ -619,9 +703,16 @@ class BoundClient:
         self.served_model: str | None = public_model
         self.tier = 1
 
-    def _bind[R: (GenerateRequest, EmbedRequest, DecisionRequest, SpeakRequest, TranscribeRequest)](
-        self, request: R
-    ) -> R:
+    def _bind[
+        R: (
+            GenerateRequest,
+            EmbedRequest,
+            DecisionRequest,
+            SpeakRequest,
+            TranscribeRequest,
+            ImageRequest,
+        )
+    ](self, request: R) -> R:
         return request.model_copy(update={"model": self.model})
 
     def _publish(self, reported: str | None) -> str | None:
@@ -660,6 +751,25 @@ class BoundClient:
 
     async def count_tokens(self, request: GenerateRequest) -> int:
         return await self._inner.count_tokens(self._bind(request))
+
+    async def image(self, request: ImageRequest) -> ImageResponse:
+        result = await self._inner.image(self._bind(request))
+        result.modelId = self._publish(result.modelId)
+        return result
+
+    async def image_stream(
+        self, request: ImageRequest
+    ) -> AsyncGenerator[ImagePartial | ImageResponse, None]:
+        events = self._inner.image_stream(self._bind(request))
+        try:
+            async for item in events:
+                if isinstance(item, ImageResponse):
+                    item.modelId = self._publish(item.modelId)
+                yield item
+        finally:
+            closer = getattr(events, "aclose", None)
+            if closer is not None:
+                await closer()
 
     async def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]:
         events = self._inner.stream(self._bind(request))
@@ -949,15 +1059,10 @@ class TieredClient:
         assert last_exc is not None
         raise last_exc
 
-    async def transcribe(self, request: TranscribeRequest) -> TranscribeResponse:
-        """Transcription over the slot's tiers, as chat (P3b, call #4).
-
-        A transcript from a fallback model is still a transcript, so unlike
-        speech and embeddings this walks every tier `pick_transcription`
-        built, each holding only backends that transcribe. The failure
-        taxonomy is `generate()`'s: only a proven pre-execution failure
-        moves on.
-        """
+    async def _over_tiers[T](self, label: str, call: Callable[[Any], Awaitable[T]]) -> T:
+        """One request over the slot's tiers, as chat's is, for a door whose
+        answer arrives whole: transcription (P3b) and images (P4). Only a
+        proven pre-execution failure moves on (`generate()`'s taxonomy)."""
         last_exc: Exception | None = None
         total = len(self.candidates)
         index = 0
@@ -979,7 +1084,7 @@ class TieredClient:
                     runtime = self._hooks.on_attempt_start(driver, node=node)
                 started = time.perf_counter()
                 try:
-                    result = await candidate.transcribe(request)
+                    result = await call(candidate)
                 except BaseException as exc:
                     self._finish_circuit(candidate, exc, probe_epoch=probe_epoch)
                     if self._hooks is not None and driver:
@@ -996,7 +1101,7 @@ class TieredClient:
                     if not isinstance(exc, Exception) or not _is_cascade_eligible(exc):
                         raise
                     last_exc = exc
-                    self._log_cascade("transcribe", index, candidate, exc, total=total)
+                    self._log_cascade(label, index, candidate, exc, total=total)
                     index += 1
                 else:
                     self._finish_circuit(candidate, probe_epoch=probe_epoch)
@@ -1014,6 +1119,103 @@ class TieredClient:
                     self.served_by_node = node
                     self.tier = tier_index + 1
                     return result
+        assert last_exc is not None
+        raise last_exc
+
+    async def transcribe(self, request: TranscribeRequest) -> TranscribeResponse:
+        """Transcription over the slot's tiers, as chat (P3b, call #4).
+
+        A transcript from a fallback model is still a transcript, so unlike
+        speech and embeddings this walks every tier `pick_transcription`
+        built, each holding only backends that transcribe.
+        """
+        return await self._over_tiers("transcribe", lambda c: c.transcribe(request))
+
+    async def image(self, request: ImageRequest) -> ImageResponse:
+        """Images over the slot's tiers, as chat (P4, call #4): a fallback
+        model's image is still an image. `pick_image` built every tier from
+        models whose listing takes this request."""
+        return await self._over_tiers("image", lambda c: c.image(request))
+
+    async def image_stream(
+        self, request: ImageRequest
+    ) -> AsyncGenerator[ImagePartial | ImageResponse, None]:
+        """A streamed image over the slot's tiers, with a commit point (P4).
+
+        **The first event is the commit point**, as a first token is for
+        chat: before it a proven pre-execution failure moves on, after it a
+        failure ends the stream. `pick_image` put only models that stream in
+        these tiers (P4-3).
+        """
+        last_exc: Exception | None = None
+        total = len(self.candidates)
+        index = 0
+        for tier_index, tier in enumerate(self._tiers):
+            for candidate in tier:
+                if self.authorize_attempt is not None:
+                    await self.authorize_attempt()
+                circuit = getattr(candidate, "circuit", None)
+                if circuit is not None and not circuit.acquire():
+                    if last_exc is None:
+                        last_exc = _cooling_error(circuit.until - time.perf_counter())
+                    continue
+                probe_epoch = circuit.epoch if circuit is not None and circuit.probing else None
+                self.attempts = index + 1
+                driver = getattr(candidate, "name", None)
+                node = getattr(candidate, "node", None)
+                runtime: Key | None = None
+                if self._hooks is not None and driver:
+                    runtime = self._hooks.on_attempt_start(driver, node=node)
+                started = time.perf_counter()
+                events = candidate.image_stream(request)
+                try:
+                    first = await anext(events)
+                except BaseException as exc:
+                    await events.aclose()
+                    self._finish_circuit(candidate, exc, probe_epoch=probe_epoch)
+                    if self._hooks is not None and driver:
+                        self._hooks.on_attempt_end(
+                            driver,
+                            node=node,
+                            model=getattr(candidate, "public_model", None),
+                            runtime=runtime,
+                            served=False,
+                            elapsed_ms=int((time.perf_counter() - started) * 1000),
+                            error=type(exc).__name__,
+                            retry_disposition=retry_disposition(exc),
+                        )
+                    if not isinstance(exc, Exception) or not _is_cascade_eligible(exc):
+                        raise
+                    last_exc = exc
+                    self._log_cascade("image stream", index, candidate, exc, total=total)
+                    index += 1
+                    continue
+                # Committed: the first event is in hand.
+                self._finish_circuit(candidate, probe_epoch=probe_epoch)
+                self.served_by = driver
+                self.served_model = getattr(candidate, "public_model", None)
+                self.served_by_node = node
+                self.tier = tier_index + 1
+                first_ms = int((time.perf_counter() - started) * 1000)
+                served = False
+                try:
+                    yield first
+                    async for item in events:
+                        yield item
+                    served = True
+                finally:
+                    await events.aclose()
+                    if self._hooks is not None and driver:
+                        self._hooks.on_attempt_end(
+                            driver,
+                            node=node,
+                            model=getattr(candidate, "public_model", None),
+                            runtime=runtime,
+                            served=served,
+                            elapsed_ms=int((time.perf_counter() - started) * 1000),
+                            first_ms=first_ms,
+                        )
+                return
         assert last_exc is not None
         raise last_exc
 

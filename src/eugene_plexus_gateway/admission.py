@@ -324,6 +324,9 @@ CLIENT_ADMISSION_PATHS = frozenset(
         "/v1/audio/speech",
         "/v1/audio/transcriptions",
         "/v1/audio/translations",
+        "/v1/images/generations",
+        "/v1/images/edits",
+        "/v1/images/variations",
     }
 )
 

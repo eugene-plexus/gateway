@@ -38,13 +38,16 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
-from .. import admission, anthropic, chat_contract, decisions, responses
+from .. import admission, anthropic, chat_contract, decisions, image_doors, responses
 from .._generated.driver_models import AudioOutputFormat as DriverAudioOutputFormat
 from .._generated.driver_models import (
     AudioOutputRequest,
     EmbedRequest,
     GenerateRequest,
     GenerateResponse,
+    ImagePartial,
+    ImageRequest,
+    ImageResponse,
     Message,
     Role,
     SpeakRequest,
@@ -180,7 +183,10 @@ class _Recording:
 
 def _record(
     rec: _Recording,
-    body: ChatCompletionRequest | SpeechRequest | chat_contract.TranscriptionAsk,
+    body: ChatCompletionRequest
+    | SpeechRequest
+    | chat_contract.TranscriptionAsk
+    | image_doors.ImageAsk,
     tries: list[AttemptRow],
     *,
     served_model: str | None = None,
@@ -190,6 +196,7 @@ def _record(
     door: str | None = None,
     characters: int | None = None,
     audio_seconds: float | None = None,
+    images: int | None = None,
 ) -> None:
     """Join the per-attempt rows to the facts only this route holds.
 
@@ -235,8 +242,11 @@ def _record(
                 waited_ms=rec.waited_ms,
                 swapped_in=rec.swapped_in,
                 streamed=rec.streamed,
-                prompt_tokens=getattr(usage, "promptTokens", None),
-                completion_tokens=getattr(usage, "completionTokens", None),
+                # The images doors' usage says input/output tokens (P4).
+                prompt_tokens=getattr(usage, "promptTokens", getattr(usage, "inputTokens", None)),
+                completion_tokens=getattr(
+                    usage, "completionTokens", getattr(usage, "outputTokens", None)
+                ),
                 outcome="served" if served is not None else "error",
                 tries=list(tries),
                 routing_ms=rec.routing_ms,
@@ -250,6 +260,7 @@ def _record(
                 door=door,
                 characters=characters,
                 audio_seconds=audio_seconds,
+                images=images,
             )
         )
         if (context := admission.current.get()) is not None:
@@ -454,6 +465,7 @@ _DOORS = {
     "decisions": "/v1/systemone",
     "speech": "/v1/audio/speech",
     "transcription": "/v1/audio/transcriptions",
+    "image": "/v1/images/generations",
 }
 
 
@@ -1958,6 +1970,305 @@ async def create_translation(request: Request) -> Any:
         ),
         error_type="invalid_request_error",
     )
+
+
+# --------------------------------------------------------------------------- #
+# /v1/images/generations, /v1/images/edits, /v1/images/variations
+# --------------------------------------------------------------------------- #
+
+
+def _image_refused(exc: chat_contract.Refusal) -> JSONResponse:
+    return _error(
+        code=413 if isinstance(exc, chat_contract.TooLarge) else 400,
+        message=exc.message,
+        error_type="invalid_request_error",
+        param=exc.field,
+    )
+
+
+@router.post("/v1/images/generations", dependencies=_auth)
+async def create_image(request: Request) -> Any:
+    """Images from a prompt (P4, 2026-09-28), OpenAI's shape."""
+    try:
+        raw = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        return _error(
+            code=400,
+            message="body: must be valid JSON.",
+            error_type="invalid_request_error",
+            param="body",
+        )
+    try:
+        ask = image_doors.parse_generation(raw)
+    except chat_contract.Refusal as exc:
+        return _image_refused(exc)
+    return await _serve_images(request, ask)
+
+
+@router.post("/v1/images/edits", dependencies=_auth)
+async def create_image_edit(request: Request) -> Any:
+    """Images edited (P4): OpenAI's multipart form, which is all its SDK
+    sends, or its JSON form with `data:` URLs."""
+    if request.headers.get("content-type", "").startswith("multipart/form-data"):
+        try:
+            # Cached first, as for transcription: `form()` consumes the stream
+            # and `serve_while_connected`'s watcher reads the body again.
+            await request.body()
+            form = await request.form(max_files=image_doors.MAX_INPUT_IMAGES + 1, max_fields=32)
+        except Exception:
+            return _error(
+                code=400,
+                message="body: must be multipart/form-data with the images as `image` or "
+                "`image[]`, as the OpenAI SDK sends it, or JSON with `images`.",
+                error_type="invalid_request_error",
+                param="body",
+            )
+        try:
+            ask = await image_doors.read_edit_form(form)
+        except chat_contract.Refusal as exc:
+            return _image_refused(exc)
+        finally:
+            await form.close()
+    else:
+        try:
+            raw = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            return _error(
+                code=400,
+                message="body: must be multipart/form-data, as the OpenAI SDK sends an edit, "
+                "or JSON with `images`.",
+                error_type="invalid_request_error",
+                param="body",
+            )
+        try:
+            ask = image_doors.parse_edit_json(raw)
+        except chat_contract.Refusal as exc:
+            return _image_refused(exc)
+    return await _serve_images(request, ask)
+
+
+@router.post("/v1/images/variations", dependencies=_auth)
+async def create_image_variation(request: Request) -> Any:
+    """Refused (P4-2): only OpenAI's `dall-e-2` makes variations, and there
+    is no OpenAI key here to verify it against. A 400 that says so, as the
+    translation door's does."""
+    return _error(
+        code=400,
+        message=(
+            "No backend here makes image variations: only OpenAI's dall-e-2 serves "
+            "/v1/images/variations, and this door is not built (P4-2). Send the image to "
+            "/v1/images/edits with a prompt describing the variation instead."
+        ),
+        error_type="invalid_request_error",
+    )
+
+
+async def _serve_images(request: Request, ask: image_doors.ImageAsk) -> Any:
+    """Route and answer one images request, from either door (P4).
+
+    **Tiers, as chat** (§5, call #4), each holding only models whose listing
+    takes the request (`rules_out`). A slot where no model ever could is a
+    400 naming the setting; one where a model could but none is ready is a
+    503.
+    """
+    await admission.authorize(request, ask.model)
+    table = _routing(request)
+    if table is None:
+        return _error(
+            code=503,
+            message="The gateway is starting up or in safe mode; no routing table exists yet.",
+            error_type="service_unavailable",
+        )
+    resolution = await admission.permitted(table.resolve(ask.model))
+    if not resolution.has_backends():
+        return _no_such_model(ask.model, table).as_openai()
+    surfaces = resolution.surfaces()
+    if surfaces and "image" not in surfaces:
+        return _wrong_surface(
+            ask.model, surfaces, wanted="image", instead="/v1/chat/completions"
+        ).as_openai()
+    if not surfaces and (reported := resolution.reported_surfaces()):
+        return _no_door_yet(ask.model, reported, wanted="image").as_openai()
+    refused = table.image_refusal(resolution, ask)
+    if refused is not None:
+        field, message = refused
+        return _error(code=400, message=message, error_type="invalid_request_error", param=field)
+    client = table.pick_image(resolution, ask)
+    if client is None and await table.refresh_if_stale():
+        resolution = await admission.permitted(table.resolve(ask.model))
+        client = table.pick_image(resolution, ask)
+    if client is None:
+        # No wake, as for embeddings, speech and transcription.
+        return _not_ready(resolution, None).as_openai()
+    if isinstance(client, TieredClient):
+        client.authorize_attempt = admission.before_attempt
+
+    driver_request = image_doors.to_driver(
+        ask, local_only=admission.local_only(), request_id=admission.request_id()
+    )
+    rec = _Recording(metrics=_metrics(request), started=time.perf_counter(), streamed=ask.stream)
+    if ask.stream:
+        return await _stream_images(request, ask, client, table, rec, driver_request)
+
+    with collect_attempts() as tries:
+
+        def record(result: ImageResponse | None = None) -> None:
+            _record(
+                rec,
+                ask,
+                tries,
+                served_model=getattr(client, "served_model", None) if result else None,
+                tier=getattr(client, "tier", 1) if result else None,
+                usage=result.usage if result else None,
+                door="images",
+                images=len(result.images) if result else None,
+            )
+
+        try:
+            result = await serve_while_connected(
+                request, client.image(driver_request), what="an image request"
+            )
+        except ClientGone:
+            record()
+            return _error(
+                code=499,
+                message="The client disconnected; the backend call was cancelled.",
+                error_type="client_disconnected",
+            )
+        except DriverError as e:
+            record()
+            return _driver_failure(e).as_openai()
+        except httpx.TimeoutException as e:
+            record()
+            return _error(
+                code=504,
+                message=(
+                    f"No backend serving {ask.model!r} made the image within the gateway's "
+                    f"requestTimeoutSeconds ({_timeout_seconds(_store(request)):g}s). It was not "
+                    f"retried on another backend, because that one would take as long. "
+                    f"({type(e).__name__})"
+                ),
+                error_type="timeout",
+            )
+        except httpx.HTTPError as e:
+            record()
+            return _error(
+                code=502,
+                message=f"A backend serving {ask.model!r} failed ({type(e).__name__}).",
+                error_type="upstream_error",
+            )
+        record(result)
+    routing = _routing_info(client, table, ask.model, rec.started)
+    return JSONResponse(
+        image_doors.images_body(result, routing=routing.model_dump(mode="json", exclude_none=True))
+    )
+
+
+async def _stream_images(
+    request: Request,
+    ask: image_doors.ImageAsk,
+    client: DriverClient,
+    table: RoutingTable,
+    rec: _Recording,
+    driver_request: ImageRequest,
+) -> Any:
+    """The streamed answer (P4-3): partial renders, then one `completed` per
+    image. **The first event is the commit point**: every failure before it
+    is still an OpenAI-shaped error with a status code."""
+    with collect_attempts() as tries:
+
+        def record(result: ImageResponse | None = None) -> None:
+            _record(
+                rec,
+                ask,
+                tries,
+                served_model=getattr(client, "served_model", None) if result else None,
+                tier=getattr(client, "tier", 1) if result else None,
+                usage=result.usage if result else None,
+                door="images",
+                images=len(result.images) if result else None,
+            )
+
+        events = client.image_stream(driver_request)
+        try:
+            first = await serve_while_connected(request, anext(events), what="an image stream")
+        except (ClientGone, StopAsyncIteration) as e:
+            await events.aclose()
+            record()
+            if isinstance(e, StopAsyncIteration):
+                return _error(
+                    code=502,
+                    message=f"A backend serving {ask.model!r} ended the stream with no image.",
+                    error_type="upstream_error",
+                )
+            return _error(
+                code=499,
+                message="The client disconnected; the backend call was cancelled.",
+                error_type="client_disconnected",
+            )
+        except DriverError as e:
+            record()
+            return _driver_failure(e).as_openai()
+        except httpx.TimeoutException as e:
+            record()
+            return _error(
+                code=504,
+                message=(
+                    f"No backend serving {ask.model!r} sent a first image within the gateway's "
+                    f"requestTimeoutSeconds ({_timeout_seconds(_store(request)):g}s). "
+                    f"({type(e).__name__})"
+                ),
+                error_type="timeout",
+            )
+        except httpx.HTTPError as e:
+            record()
+            return _error(
+                code=502,
+                message=f"A backend serving {ask.model!r} failed ({type(e).__name__}).",
+                error_type="upstream_error",
+            )
+
+        async def sse() -> AsyncIterator[str]:
+            result: ImageResponse | None = None
+            item: ImagePartial | ImageResponse | None = first
+            try:
+                while item is not None:
+                    if isinstance(item, ImagePartial):
+                        yield image_doors.stream_event(
+                            ask, "partial_image", item.image, index=item.index
+                        )
+                    else:
+                        result = item
+                        routing = _routing_info(client, table, ask.model, rec.started)
+                        last = len(item.images) - 1
+                        for i, image in enumerate(item.images):
+                            yield image_doors.stream_event(
+                                ask,
+                                "completed",
+                                image,
+                                usage=item.usage if i == last else None,
+                                routing=routing.model_dump(mode="json", exclude_none=True)
+                                if i == last
+                                else None,
+                            )
+                    # Read on past the final answer rather than stopping at it:
+                    # the tiered client marks its attempt served only when its
+                    # stream ends, and a stream abandoned here is recorded as
+                    # an error (found by the metrics test).
+                    item = await anext(events, None)
+            except (DriverError, httpx.HTTPError) as e:
+                # The 200 and a partial image are out; say why it stopped.
+                log.warning("image stream for %r failed mid-stream: %s", ask.model, e)
+                failure = {
+                    "type": "error",
+                    "error": {"message": str(e), "type": "upstream_error", "code": None},
+                }
+                yield f"event: error\ndata: {json.dumps(failure)}\n\n"
+            finally:
+                await events.aclose()
+                record(result)
+
+        return StreamingResponse(sse(), media_type="text/event-stream")
 
 
 # --------------------------------------------------------------------------- #

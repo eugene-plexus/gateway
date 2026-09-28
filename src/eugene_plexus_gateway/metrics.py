@@ -50,7 +50,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Bounded because the alternative to dropping rows is stalling
 # completions, and that trade is never worth making. Sized so a burst
@@ -155,6 +155,8 @@ class RequestRow:
     door: str | None = None
     characters: int | None = None
     audio_seconds: float | None = None
+    # v8 (P4): how many images were returned; tokens ride beside it.
+    images: int | None = None
 
 
 _DDL = """
@@ -186,7 +188,8 @@ CREATE TABLE IF NOT EXISTS request (
     elapsed_ms        INTEGER,
     door              TEXT,
     characters        INTEGER,
-    audio_seconds     REAL
+    audio_seconds     REAL,
+    images            INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS request_started_at ON request (started_at);
@@ -337,7 +340,7 @@ class MetricsStore:
         conn.commit()
 
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        if row is not None and int(row[0]) in (2, 3, 4, 5, 6):
+        if row is not None and int(row[0]) in (2, 3, 4, 5, 6, 7):
             columns = {r[1] for r in conn.execute("PRAGMA table_info(request)")}
             for column in ("client_key_id", "client_key_name"):
                 if column not in columns:
@@ -350,6 +353,8 @@ class MetricsStore:
                     "door": "TEXT",
                     "characters": "INTEGER",
                     "audio_seconds": "REAL",
+                    # v8: the image count (P4).
+                    "images": "INTEGER",
                 },
                 "attempt": {
                     "retry_disposition": "TEXT",
@@ -511,8 +516,8 @@ class MetricsStore:
                     " tier, total_ms, waited_ms, swapped_in, streamed, prompt_tokens,"
                     " completion_tokens, outcome, routing_ms, refreshed, strategy,"
                     " client_key_id, client_key_name, correlation_id, elapsed_ms,"
-                    " door, characters, audio_seconds)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " door, characters, audio_seconds, images)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         _iso(row.started_at),
                         row.requested_model,
@@ -536,6 +541,7 @@ class MetricsStore:
                         row.door,
                         row.characters,
                         row.audio_seconds,
+                        row.images,
                     ),
                 )
                 request_id = cursor.lastrowid
@@ -987,7 +993,7 @@ class MetricsStore:
                        total_ms, waited_ms, swapped_in, streamed, prompt_tokens,
                        completion_tokens, outcome, routing_ms, refreshed, strategy,
                        client_key_id, client_key_name, correlation_id, elapsed_ms,
-                       door, characters, audio_seconds
+                       door, characters, audio_seconds, images
                 FROM request r {clause}
                 ORDER BY id DESC LIMIT ?
                 """,
@@ -1101,6 +1107,7 @@ class MetricsStore:
                 "door": r[20],
                 "characters": r[21],
                 "audioSeconds": r[22],
+                "images": r[23],
                 "tries": tries[r[0]],
                 "candidates": considered[r[0]],
             }

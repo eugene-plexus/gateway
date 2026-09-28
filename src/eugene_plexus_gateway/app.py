@@ -257,6 +257,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "/v1/systemone",
             "/v1/responses",
             "/v1/audio/speech",
+            # P4: a generation is a small JSON body; variations only refuse.
+            "/v1/images/generations",
+            "/v1/images/variations",
         },
         driver=False,
         # P3b: OpenAI's 25 MiB upload plus the form's other fields. The
@@ -264,6 +267,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         limits={
             "/v1/audio/transcriptions": 26 * 1024 * 1024,
             "/v1/audio/translations": 26 * 1024 * 1024,
+            # P4: 25 MiB of images, as multipart or as base64 data: URLs in
+            # JSON (33.4 MiB); the route checks the images themselves.
+            "/v1/images/edits": 36 * 1024 * 1024,
         },
     )
     return app
