@@ -1490,8 +1490,8 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
     """Text in, vectors out.
 
     **The one place in this gateway where a slot does not cascade.**
-    `pick_embedding` hands back a client over replicas of the requested
-    model and nothing else, so a `modelSlots` fallback to a different
+    `pick_embedding` hands back a client over replicas of one model (the
+    slot's first) and nothing else, so a `modelSlots` fallback to a different
     target cannot run here. Vectors from two models occupy different
     spaces; substituting one for the other writes noise into the
     caller's vector store with a 200 and no marker, and the damage
@@ -2031,7 +2031,7 @@ async def create_decision(request: Request, body: SystemOneRequest) -> Any:
         # advertised concurrency ceiling. The second is a 503 with
         # retry semantics, never a queue: queued work on a single-slot
         # backend is invisible over-admission.
-        if [b for b in resolution.eligible_backends() if b.decides]:
+        if table.deciders(resolution):
             return _error(
                 code=503,
                 message=(

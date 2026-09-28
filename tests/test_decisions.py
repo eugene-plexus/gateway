@@ -32,9 +32,9 @@ def _decider(name: str, model_id: str, *, max_concurrent: int | None = 1) -> Fak
     )
 
 
-def _app(*drivers: FakeDriverClient, settings):  # type: ignore[no-untyped-def]
+def _app(*drivers: FakeDriverClient, settings, slots=None):  # type: ignore[no-untyped-def]
     app = create_app(settings=settings)
-    table = make_routing_table(slots=[])
+    table = make_routing_table(slots=slots or [])
     install_snapshot(table, *drivers)
     app.state.routing = table
     return app
@@ -285,6 +285,34 @@ def test_replicas_of_one_decision_model_fail_over(settings) -> None:  # type: ig
     # The one question tiered failover must never answer wrongly here:
     # the other MODEL was never asked.
     assert other_model.decide_calls == 0
+
+
+_TRIAGE = [{"model": "triage", "targets": ["tickets", "invoices"]}]
+_ONE_QUESTION = {"state": "x", "questions": {"q": {"type": "noul", "instructions": "?"}}}
+
+
+def test_a_slot_alias_decides_with_its_first_model(settings) -> None:  # type: ignore[no-untyped-def]
+    """An alias is its first target, as for speech and embeddings; the
+    request's own name matched no backend and every alias was a 503."""
+    first = _decider("tickets-driver", "tickets", max_concurrent=None)
+    second = _decider("invoices-driver", "invoices", max_concurrent=None)
+    with TestClient(_app(first, second, settings=settings, slots=_TRIAGE)) as client:
+        response = client.post("/v1/systemone", json={"model": "triage", **_ONE_QUESTION})
+    assert response.status_code == 200, response.text
+    assert first.decide_calls == 1
+    assert second.decide_calls == 0
+
+
+def test_an_alias_whose_first_model_is_missing_is_not_ready_not_busy(settings) -> None:  # type: ignore[no-untyped-def]
+    """*All busy* and *none ready* are told apart from the same set the
+    pick uses. Read across every tier, the idle SECOND model made a
+    missing first one read as a concurrency ceiling."""
+    second = _decider("invoices-driver", "invoices", max_concurrent=None)
+    with TestClient(_app(second, settings=settings, slots=_TRIAGE)) as client:
+        response = client.post("/v1/systemone", json={"model": "triage", **_ONE_QUESTION})
+    assert response.status_code == 503, response.text
+    assert "concurrency ceiling" not in response.text
+    assert second.decide_calls == 0
 
 
 def test_models_listing_marks_the_decision_surface(settings) -> None:  # type: ignore[no-untyped-def]

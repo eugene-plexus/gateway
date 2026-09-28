@@ -492,6 +492,24 @@ class Resolution:
     def eligible_backends(self) -> list[_Backend]:
         return [b for t in self.tiers for b in t.eligible()]
 
+    def first_model(self) -> list[_Backend]:
+        """The eligible replicas of ONE model: the slot's first.
+
+        For a model requested by its own name that is the model; for a
+        slot alias (`vectors -> [a, b]`) it is `a`. The doors that must
+        never cross models -- embeddings, speech, decisions -- choose
+        from this and nothing else, so a first model that is down is
+        down rather than replaced by `b`.
+
+        Matching the request's own name instead answered every alias
+        with a 503, since no backend's public id is the alias: speech
+        was fixed at P3a, embeddings and decisions here.
+        """
+        first = self.tiers[0] if self.tiers else None
+        if first is None:
+            return []
+        return [b for b in first.eligible() if b.public_id == first.target]
+
     def runtimes(self) -> list[_RuntimeFacts]:
         """Distinct runtimes behind this slot, in tier order.
 
@@ -1673,13 +1691,11 @@ class RoutingTable:
         someone editing the cascade logic.
 
         Replicas of one model still balance and fail over exactly as
-        they do for chat -- those are interchangeable by definition.
+        they do for chat -- those are interchangeable by definition. The
+        one model is `Resolution.first_model`'s: a slot alias embeds with
+        its first target.
         """
-        eligible = [
-            b
-            for b in resolution.eligible_backends()
-            if b.embeds and b.public_id == resolution.model
-        ]
+        eligible = [b for b in resolution.first_model() if b.embeds]
         if not eligible:
             return None
         ordered = [b.client for b in self._order(resolution.model, eligible)]
@@ -1699,10 +1715,7 @@ class RoutingTable:
         their intersection), and a second copy of that rule answered a
         503 "not ready" the one time it was the only copy (P3a sabotage).
         """
-        first = resolution.tiers[0] if resolution.tiers else None
-        if first is None:
-            return None
-        eligible = [b for b in first.eligible() if b.speaks and b.public_id == first.target]
+        eligible = [b for b in resolution.first_model() if b.speaks]
         if not eligible:
             return None
         ordered = [b.client for b in self._order(resolution.model, eligible)]
@@ -1754,6 +1767,13 @@ class RoutingTable:
                     seen.setdefault(voice, None)
         return list(seen) if listed else None
 
+    @staticmethod
+    def deciders(resolution: Resolution) -> list[_Backend]:
+        """The backends a decision may go to before the concurrency
+        ceiling is applied -- what the route asks to tell *all busy*
+        from *none ready*, so both answers read the same set."""
+        return [b for b in resolution.first_model() if b.decides]
+
     def pick_decision(self, resolution: Resolution) -> TieredClient | None:
         """`pick_embedding`'s single-model tier, for typed decisions.
 
@@ -1769,12 +1789,11 @@ class RoutingTable:
         whole of someone else's decision, which is the over-admission a
         non-cancellable engine cannot absorb. All-at-capacity is a None
         the route reports as busy-retryable, never a queue.
+
+        The one model is `Resolution.first_model`'s, so a slot alias
+        decides with its first target.
         """
-        eligible = [
-            b
-            for b in resolution.eligible_backends()
-            if b.decides and b.public_id == resolution.model
-        ]
+        eligible = self.deciders(resolution)
         if not eligible:
             return None
         free = [

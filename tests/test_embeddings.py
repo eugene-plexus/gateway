@@ -194,6 +194,54 @@ def test_replicas_of_the_SAME_model_still_fail_over(settings) -> None:  # type: 
     assert response.json()["x_eugene_plexus"]["attempts"] == 2
 
 
+def test_a_slot_alias_embeds_with_its_first_model(settings) -> None:  # type: ignore[no-untyped-def]
+    """An alias is its first target. Matching the request's own name
+    instead answered every alias 503, because no backend's id IS the
+    alias -- speech had the same defect and was fixed at P3a."""
+    first = _embedder("primary", "nomic-embed-text")
+    second = _embedder("secondary", "all-minilm")
+    app = _app(
+        first,
+        second,
+        settings=settings,
+        slots=[{"model": "vectors", "targets": ["nomic-embed-text", "all-minilm"]}],
+    )
+    with TestClient(app) as client:
+        response = client.post("/v1/embeddings", json={"model": "vectors", "input": "a"})
+
+    assert response.status_code == 200, response.text
+    assert first.embed_calls == 1
+    assert second.embed_calls == 0
+
+
+def test_a_slot_aliass_first_model_down_is_not_replaced_by_its_second(settings) -> None:  # type: ignore[no-untyped-def]
+    """The fix must not reopen the cascade: the alias's second target is
+    a different vector space, so a dead first model fails the request."""
+    dead = _embedder("primary", "nomic-embed-text")
+    dead.embed_error = DriverError(
+        driver_name="primary",
+        driver_url="http://primary",
+        status_code=503,
+        problem=Problem(
+            type="about:blank", title="Not started", status=503, retryDisposition="safe"
+        ),
+        raw_body="down",
+    )
+    other = _embedder("secondary", "all-minilm")
+    app = _app(
+        dead,
+        other,
+        settings=settings,
+        slots=[{"model": "vectors", "targets": ["nomic-embed-text", "all-minilm"]}],
+    )
+    with TestClient(app) as client:
+        response = client.post("/v1/embeddings", json={"model": "vectors", "input": "a"})
+
+    assert response.status_code != 200, "it served vectors from the wrong model"
+    assert dead.embed_calls == 1
+    assert other.embed_calls == 0
+
+
 # --------------------------------------------------------------------- #
 # surfaces
 # --------------------------------------------------------------------- #
