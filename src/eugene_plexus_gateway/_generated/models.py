@@ -2081,7 +2081,7 @@ class Error1(BaseModel):
     )
     type: str = Field(
         ...,
-        description="OpenAI-style class, e.g. `invalid_request_error`. The\ngateway also emits `upstream_error`, `timeout`,\n`service_unavailable`, `client_disconnected` and —\nsince 2026-09-19 — **`upstream_auth_error`**, which is\nthe one that says the fault is ours rather than the\ncaller's: a driver refused the gateway's credential.\n",
+        description="OpenAI-style class, e.g. `invalid_request_error`. The\ngateway also emits `upstream_error`, `timeout`,\n`service_unavailable`, `client_disconnected` and —\nsince 2026-09-19 — **`upstream_auth_error`**, which is\nthe one that says the fault is ours rather than the\ncaller's: a driver refused the gateway's credential,\nor (since 2026-09-28) a provider refused a driver's own\nkey.\n",
     )
     param: str | None = None
     code: str | None = None

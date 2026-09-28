@@ -2468,7 +2468,9 @@ def _driver_failure(e: DriverError) -> _Failure:
     from ..driver_client import retry_disposition
 
     failure = _driver_failure_status(e)
-    if retry_disposition(e) == "indeterminate":
+    # The driver's own detail already says it when the outcome is unknown;
+    # saying it twice in one message was measured live (2026-09-28).
+    if retry_disposition(e) == "indeterminate" and "Outcome unknown" not in failure.message:
         failure = replace(
             failure,
             message=failure.message
@@ -2493,6 +2495,23 @@ def _driver_failure_status(e: DriverError) -> _Failure:
     upstream = e.status_code
     detail = e.problem.detail if e.problem is not None and e.problem.detail else str(e)
 
+    if e.problem is not None and str(e.problem.type or "").endswith("#backend-credential-refused"):
+        # **The hop past the driver, since 2026-09-28.** The provider
+        # behind this driver refused the driver's OWN key -- a 401, a 402
+        # with no credit, a 403 that is not about the content. Measured
+        # live against OpenRouter, it arrived as the caller's 400. Same
+        # answer as a driver refusing the gateway's credential below, for
+        # the same reason: the request was fine and the install is not.
+        # The driver does not know its own name, so the name and URL are
+        # added here; its detail already says what failed and what to do.
+        return _Failure(
+            code=502,
+            message=(
+                f"The driver {e.driver_name!r} at {e.driver_url} could not use its provider: "
+                f"{detail} That driver's key is under Config -> {e.driver_name}."
+            ),
+            error_type="upstream_auth_error",
+        )
     if upstream == 504:
         # The driver's own deadline fired. Not folded into the 502,
         # because 502 is what the cascade says when every backend was

@@ -363,3 +363,177 @@ def test_the_anthropic_door_reports_a_driver_401_as_api_error(settings: Settings
 
     assert r.status_code == 502
     assert r.json()["error"]["type"] == "api_error"
+
+
+# --------------------------------------------------------------------------- #
+# a provider that refuses a DRIVER's own key is not the caller's bad request
+# --------------------------------------------------------------------------- #
+
+#: What the driver sends since 2026-09-28 for OpenRouter's 401 on a bad key
+#: (measured live; before, the same refusal was the caller's 400).
+PROVIDER_REFUSED_DETAIL = (
+    "The backend refused this driver's credential (its API key; HTTP 401): systemone_http "
+    'returned 401: {"error":{"message":"User not found.","code":401}} Nothing is wrong with '
+    "the request. Set a working API key on this driver."
+)
+
+
+def _provider_refused(
+    name: str = "jev-driver@amish", url: str = "http://192.0.2.9:8081"
+) -> DriverError:
+    return DriverError(
+        driver_name=name,
+        driver_url=url,
+        status_code=502,
+        problem=Problem(
+            type="https://github.com/eugene-plexus/inference-driver#backend-credential-refused",
+            title="Backend refused this driver's credential",
+            status=502,
+            detail=PROVIDER_REFUSED_DETAIL,
+            retryDisposition="terminal",
+        ),
+        raw_body="{}",
+    )
+
+
+def test_a_provider_refusing_the_drivers_key_is_not_blamed_on_the_caller(
+    settings: Settings,
+) -> None:
+    """The reproduction, at the gateway: the driver's Problem is the one it
+    now sends, and the caller must read our fault, the driver and the fix."""
+    fake = FakeDriverClient(
+        name="jev-driver@amish", base_url="http://192.0.2.9:8081", model_id=MODEL
+    )
+    fake.generate_error = _provider_refused()
+    with TestClient(_app_with(settings, fake)) as c:
+        r = c.post("/v1/chat/completions", json=_chat())
+
+    assert r.status_code == 502
+    error = r.json()["error"]
+    assert error["type"] == "upstream_auth_error"
+    message = error["message"]
+    assert "jev-driver@amish" in message and "192.0.2.9:8081" in message
+    assert "User not found." in message  # the provider's own words
+    assert "Set a working API key on this driver" in message
+    assert "Config -> jev-driver@amish" in message
+    assert "Every backend" not in message  # one backend, not a lost cascade
+
+
+def test_a_provider_refusal_does_not_cascade(settings: Settings) -> None:
+    """What we SAY changed; what we DO did not: the 4xx non-cascade rule
+    is older than this, and a message fix must not widen the cascade."""
+    first = FakeDriverClient(name="a", base_url="http://a", model_id=MODEL)
+    first.generate_error = _provider_refused("a", "http://a")
+    second = FakeDriverClient(name="b", base_url="http://b", model_id=MODEL)
+    second.responses = ["should never be reached"]
+
+    with TestClient(_app_with(settings, first, second)) as c:
+        r = c.post("/v1/chat/completions", json=_chat())
+
+    assert r.status_code == 502
+    assert r.json()["error"]["type"] == "upstream_auth_error"
+    assert second.calls == []
+
+
+def test_a_provider_refusal_does_not_trip_the_breaker(settings: Settings) -> None:
+    """A counted failure opens the breaker at once, after which every
+    caller would read a generic 'backends cooling down' instead of the
+    cause. A key that cannot work is not a backend that is down."""
+    fake = FakeDriverClient(name="a", base_url="http://a", model_id=MODEL)
+    fake.generate_error = _provider_refused("a", "http://a")
+    with TestClient(_app_with(settings, fake)) as c:
+        answers = [c.post("/v1/chat/completions", json=_chat()) for _ in range(3)]
+
+    assert [r.status_code for r in answers] == [502, 502, 502]
+    assert all(r.json()["error"]["type"] == "upstream_auth_error" for r in answers)
+
+
+def test_the_decision_door_reports_a_provider_refusal_the_same_way(settings: Settings) -> None:
+    """Hosted Jev with a bad key is where this was measured."""
+    fake = FakeDriverClient(
+        name="jev-driver", base_url="http://192.0.2.9:8081", model_id="jev", supports_decisions=True
+    )
+    fake.decide_error = _provider_refused("jev-driver", "http://192.0.2.9:8081")
+    with TestClient(_app_with(settings, fake)) as c:
+        r = c.post(
+            "/v1/systemone",
+            json={
+                "model": "jev",
+                "state": "x",
+                "questions": {"q": {"type": "noul", "instructions": "?"}},
+            },
+        )
+
+    assert r.status_code == 502, r.text
+    assert r.json()["error"]["type"] == "upstream_auth_error"
+    assert "jev-driver" in r.json()["error"]["message"]
+
+
+def test_the_anthropic_door_reports_a_provider_refusal_as_api_error(settings: Settings) -> None:
+    fake = FakeDriverClient(name="a", base_url="http://a", model_id=MODEL)
+    fake.generate_error = _provider_refused("a", "http://a")
+    with TestClient(_app_with(settings, fake)) as c:
+        r = c.post(
+            "/v1/messages",
+            json={
+                "model": MODEL,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert r.status_code == 502
+    assert r.json()["error"]["type"] == "api_error"
+    assert "User not found." in r.json()["error"]["message"]
+
+
+def test_a_real_backend_rejection_is_still_the_callers_400(settings: Settings) -> None:
+    """The pair: a driver 400 is still the caller's. Only the driver's
+    credential-refused type moved, so a check set that moved every 4xx
+    would fail here."""
+    fake = FakeDriverClient(name="a", base_url="http://a", model_id=MODEL)
+    fake.generate_error = DriverError(
+        driver_name="a",
+        driver_url="http://a",
+        status_code=400,
+        problem=Problem(
+            type="https://github.com/eugene-plexus/inference-driver#backend-rejected-request",
+            title="Backend rejected the request",
+            status=400,
+            detail="openai_compat_http returned 400: prompt is 15010 tokens, n_ctx is 512",
+            retryDisposition="terminal",
+        ),
+        raw_body="{}",
+    )
+    with TestClient(_app_with(settings, fake)) as c:
+        r = c.post("/v1/chat/completions", json=_chat())
+
+    assert r.status_code == 400
+    assert r.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_outcome_unknown_is_said_once(settings: Settings) -> None:
+    """Measured live: the driver's detail said it and the gateway said it
+    again, two sentences apart, in one message."""
+    fake = FakeDriverClient(name="a", base_url="http://a", model_id=MODEL)
+    fake.generate_error = DriverError(
+        driver_name="a",
+        driver_url="http://a",
+        status_code=502,
+        problem=Problem(
+            type="https://github.com/eugene-plexus/inference-driver#backend-error",
+            title="Backend error",
+            status=502,
+            detail=(
+                "systemone_http returned 503: upstream connect error. Outcome unknown: work may "
+                "have occurred. Eugene will not automatically replay this request."
+            ),
+            retryDisposition="indeterminate",
+        ),
+        raw_body="{}",
+    )
+    with TestClient(_app_with(settings, fake)) as c:
+        r = c.post("/v1/chat/completions", json=_chat())
+
+    assert r.status_code == 502
+    assert r.json()["error"]["message"].count("Outcome unknown") == 1
