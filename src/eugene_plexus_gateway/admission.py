@@ -207,18 +207,25 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
 
     async def confirm(backend: Any) -> Any:
         try:
+            model = backend.model.id if backend.model is not None else None
             async with semaphore, asyncio.timeout(4):
-                info = await backend.client.info()
+                # This candidate's entry alone (P1): an account would
+                # otherwise re-read every model it lists, on every request
+                # that carries a setting.
+                info = await backend.client.info(model=model)
             if info.runtime != backend.info.runtime:
                 return None  # cached runtime facts must not wake a replacement
-            caps = info.capabilities
+            entry = next((m for m in info.models or [] if m.id == model), None)
+            if entry is None:
+                return None  # the model left the driver since the last refresh
+            caps = entry.capabilities
             if settings and (
                 caps is None or not settings.issubset(set(caps.supportedSettings or []))
             ):
                 return None
             if tools and (caps is None or caps.toolCalling is not True):
                 return None
-            return replace(backend, info=info)
+            return replace(backend, info=info.model_copy(update={"models": None}), model=entry)
         except Exception:
             return None
 

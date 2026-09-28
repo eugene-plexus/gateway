@@ -24,7 +24,9 @@ from eugene_plexus_gateway._generated.driver_models import (
     BackendKind,
     Capabilities,
     DecisionCapability,
+    DriverCatalogue,
     DriverInfo,
+    DriverModel,
     FinishReason,
     GenerateRequest,
     GenerateResponse,
@@ -41,6 +43,7 @@ from eugene_plexus_gateway.driver_client import DriverError, StreamEvent
 from eugene_plexus_gateway.routing import (
     RoutingTable,
     _Backend,
+    _Outdated,
     _RuntimeFacts,
     _Snapshot,
     _Unreachable,
@@ -66,8 +69,19 @@ class FakeDriverClient:
         supports_embeddings: bool = False,
         supports_decisions: bool = False,
         decision_max_concurrent: int | None = None,
+        models: list[str] | None = None,
+        account: bool = False,
+        outdated: bool = False,
     ) -> None:
         self.name = name
+        #: Several models on one driver (P1). None is the single-model
+        #: driver every test before P1 used, serving `model_id`.
+        self.models = models
+        #: A provider account: the gateway prefixes each id with `name/`.
+        self.account = account
+        #: Answer `/v1/info` in the shape from before P1.
+        self.outdated = outdated
+        self.info_calls: list[dict[str, Any]] = []
         self.base_url = base_url
         self.backend = backend
         self.model_id = model_id
@@ -165,8 +179,7 @@ class FakeDriverClient:
             supportedSettings=list(self.supported_settings),
             maxContextTokens=self.max_context_tokens,
             toolCalling=self.supports_tools,
-            embeddings=self.supports_embeddings or None,
-            chatCapable=not self.supports_decisions,
+            imageInput=False,
             decision=(
                 DecisionCapability(
                     kinds=[DecisionKindEnum.noul, DecisionKindEnum.choice, DecisionKindEnum.score],
@@ -176,19 +189,48 @@ class FakeDriverClient:
                 else None
             ),
         )
+        # The driver's own reading of what it used to report as
+        # `embeddings` and `chatCapable`, now `surfaces` per model.
+        surfaces = (
+            ["decisions"]
+            if self.supports_decisions
+            else ["embeddings"]
+            if self.supports_embeddings
+            else ["chat"]
+        )
+        ids = self.models if self.models is not None else ([self.model_id] if self.model_id else [])
+        served = [
+            DriverModel(id=i, surfaces=list(surfaces), capabilities=capabilities.model_copy())
+            for i in ids
+        ]
+        if self.outdated:
+            return DriverInfo.model_validate(
+                {
+                    "backend": self.backend.value,
+                    "provider": self.provider,
+                    "runtime": self.runtime,
+                    "version": "0.0.0-pre-p1",
+                }
+            )
         return DriverInfo(
             backend=self.backend,
             provider=self.provider,
-            modelId=self.model_id,
+            models=served,
+            catalogue=DriverCatalogue(source="openrouter", total=len(ids), exposed=len(ids))
+            if self.account
+            else None,
             runtime=self.runtime,
-            capabilities=capabilities,
             version="0.0.0-fake",
         )
 
-    async def info(self) -> DriverInfo:
+    async def info(self, *, models: bool = True, model: str | None = None) -> DriverInfo:
+        self.info_calls.append({"models": models, "model": model})
         if self.info_error is not None:
             raise self.info_error
-        return self.describe()
+        described = self.describe()
+        if model is not None and described.models is not None:
+            described.models = [m for m in described.models if m.id == model]
+        return described
 
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
         self.calls.append(request)
@@ -202,7 +244,7 @@ class FakeDriverClient:
                 toolCalls=self.tool_calls,
                 finishReason=FinishReason.tool_calls,
                 backend=self.backend,
-                modelId=self.model_id,
+                modelId=request.model or self.model_id,
                 usage=self.usage,
                 latencyMs=1,
             )
@@ -213,7 +255,7 @@ class FakeDriverClient:
             finishReason=self.finish_reason,
             stopSequence=self.stop_sequence,
             backend=self.backend,
-            modelId=self.model_id,
+            modelId=request.model or self.model_id,
             usage=self.usage,
             latencyMs=1,
         )
@@ -260,7 +302,7 @@ class FakeDriverClient:
         seed = float(len(self.name))
         return EmbedResponse(
             embeddings=[[seed + i for i in range(4)] for _ in request.input],
-            modelId=self.model_id,
+            modelId=request.model or self.model_id,
             backend=self.backend,
             usage=self.usage,
             latencyMs=1,
@@ -312,7 +354,7 @@ class FakeDriverClient:
                 )
         return DecisionResponse(
             answers=answers,
-            modelId=self.model_id,
+            modelId=request.model or self.model_id,
             reportedModel=f"<{self.name} reported>",
             backend=self.backend,
             usage=self.usage,
@@ -366,7 +408,7 @@ class FakeDriverClient:
                     toolCalls=self.tool_calls,
                     finishReason=FinishReason.tool_calls,
                     backend=self.backend,
-                    modelId=self.model_id,
+                    modelId=request.model or self.model_id,
                     usage=self.usage,
                     latencyMs=1,
                 ),
@@ -394,7 +436,7 @@ class FakeDriverClient:
                 stopSequence=self.stop_sequence,
                 finishReason=self.finish_reason,
                 backend=self.backend,
-                modelId=self.model_id,
+                modelId=request.model or self.model_id,
                 usage=self.usage,
                 latencyMs=1,
             ),
@@ -478,17 +520,31 @@ def install_snapshot(
     facts = {(r.node, r.name): r for r in (runtimes or [])}
     snapshot = _Snapshot(runtimes=facts, agents={None: table._agent_url})
     for fake in fakes:
+        info = fake.describe()
+        if info.models is None:
+            snapshot.outdated.append(
+                _Outdated(
+                    name=fake.name,
+                    url=fake.base_url,
+                    node=fake.node,
+                    version=info.version,
+                    model_id=fake.model_id,
+                )
+            )
+            continue
         backend = _Backend(
             name=fake.name,
             url=fake.base_url,
             client=fake,  # type: ignore[arg-type]
-            info=fake.describe(),
+            info=info,
             node=fake.node,
-            runtime=facts.get((fake.node, fake.runtime)) if fake.runtime else None,
+            stopping=table._stopping,
         )
         snapshot.reachable.append(backend)
-        if fake.model_id:
-            snapshot.by_model.setdefault(fake.model_id, []).append(backend)
+        # The production expansion, not a copy of it: one candidate per
+        # model, prefixed for an account, joined to its runtime by name.
+        # No alias fallback, as this helper never had one.
+        table._expand(backend, snapshot, facts, {})
     for name, error in (unreachable or {}).items():
         snapshot.unreachable.append(_Unreachable(name=name, url=f"http://{name}.fake", error=error))
     # `(node, name)`, as the real refresh sorts: two replicas of one

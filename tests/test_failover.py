@@ -151,7 +151,7 @@ async def test_info_failover_returns_first_reachable() -> None:
 
     info = await _slot(primary, backup).info()
 
-    assert info.modelId == "backup-model"
+    assert [m.id for m in info.models or []] == ["backup-model"]
 
 
 async def test_empty_candidates_rejected() -> None:

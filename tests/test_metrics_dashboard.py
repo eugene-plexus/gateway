@@ -21,6 +21,8 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from eugene_plexus_gateway.metrics import SCHEMA_VERSION
+
 from .test_metrics import (  # noqa: F401  (fixtures resolve by name)
     _drain,
     _row,
@@ -226,8 +228,9 @@ def test_a_v4_store_migrates_in_place(tmp_path: Path) -> None:
                     "SELECT value FROM meta WHERE key = 'schema_version'"
                 ).fetchone()
                 columns = {r[1] for r in conn.execute("PRAGMA table_info(attempt)")}
-            assert version == ("5",)
+            assert version == (str(SCHEMA_VERSION),)
             assert "first_ms" in columns
+            assert "model" in columns
         finally:
             await store.aclose()
 

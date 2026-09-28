@@ -188,7 +188,7 @@ class DriverClient(Protocol):
     #: §6.1 #8). Optional, so a fake in a single-host test needs nothing.
     node: str | None
 
-    async def info(self) -> DriverInfo: ...
+    async def info(self, *, models: bool = True, model: str | None = None) -> DriverInfo: ...
     async def generate(self, request: GenerateRequest) -> GenerateResponse: ...
     async def embed(self, request: EmbedRequest) -> EmbedResponse: ...
 
@@ -253,6 +253,7 @@ class RoutingHooks(Protocol):
         retry_disposition: str | None = None,
         usage: Any = None,
         first_ms: int | None = None,
+        model: str | None = None,
     ) -> None: ...
 
 
@@ -270,6 +271,7 @@ class HttpDriverClient:
     ) -> None:
         self.name = name
         self.circuit = Circuit()
+        self.legacy_model_id: str | None = None
         self.base_url = base_url.rstrip("/")
         #: Which machine's agent reported this driver. Carried so
         #: `TieredClient` can hand it to the routing hooks, whose
@@ -298,10 +300,24 @@ class HttpDriverClient:
             auth=auth,
         )
 
-    async def info(self) -> DriverInfo:
-        response = await self._client.get("/v1/info")
+    async def info(self, *, models: bool = True, model: str | None = None) -> DriverInfo:
+        """The driver's `/v1/info`. `models=False` leaves an account's list
+        out; `model=` narrows it to one entry -- the per-request re-check,
+        which must not re-read six hundred entries to confirm one."""
+        params: dict[str, str] = {}
+        if not models:
+            params["models"] = "false"
+        if model is not None:
+            params["model"] = model
+        response = await self._client.get("/v1/info", params=params or None)
         response.raise_for_status()
-        return DriverInfo.model_validate(response.json())
+        body = response.json()
+        # A driver from before P1 answers with one `modelId` and no
+        # `models`; kept so the console can say which model went missing.
+        self.legacy_model_id = (
+            body.get("modelId") if isinstance(body, dict) and "models" not in body else None
+        )
+        return DriverInfo.model_validate(body)
 
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
         payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
@@ -495,6 +511,95 @@ class HttpDriverClient:
         await self._client.aclose()
 
 
+class BoundClient:
+    """One model on one driver: what a tier holds since P1 (2026-09-27).
+
+    A driver can serve many models now -- a provider account serves every
+    model its backend lists -- so a routing candidate is `(node, driver,
+    model)`, not `(node, driver)`. This wraps the driver's one long-lived
+    HTTP client and does three things on every call:
+
+    * **names the model**, unprefixed, on the request, so the driver asks
+      its backend for the model this candidate is and not for whatever it
+      holds;
+    * **publishes the answer under the public id** -- `openrouter/x`, where
+      the driver said `x` -- so a caller sees the name it asked for;
+    * **owns its own circuit**, so a failing model cools down alone rather
+      than taking the other models of its account with it.
+
+    Cached by the routing table across refreshes, like the client it
+    wraps, so its circuit survives them. It never closes the inner client:
+    the table owns that.
+    """
+
+    def __init__(self, inner: DriverClient, *, model: str, public_model: str) -> None:
+        self._inner = inner
+        self.name = inner.name
+        self.base_url = inner.base_url
+        self.node: str | None = getattr(inner, "node", None)
+        #: The driver's own id for this model -- what a request names.
+        self.model = model
+        #: The id callers use -- `<driver>/<model>` for an account.
+        self.public_model = public_model
+        self.circuit = Circuit()
+        # Mirrors TieredClient's surface, as HttpDriverClient does.
+        self.attempts = 1
+        self.served_by: str | None = inner.name
+        self.served_by_node: str | None = self.node
+        self.served_model: str | None = public_model
+        self.tier = 1
+
+    def _bind[R: (GenerateRequest, EmbedRequest, DecisionRequest)](self, request: R) -> R:
+        return request.model_copy(update={"model": self.model})
+
+    def _publish(self, reported: str | None) -> str | None:
+        """The driver's name for the model, as callers know it."""
+        if reported is None or reported == self.model:
+            return self.public_model
+        return reported
+
+    async def info(self, *, models: bool = True, model: str | None = None) -> DriverInfo:
+        info = self._inner.info
+        try:
+            return await info(models=models, model=model)
+        except TypeError:
+            # A test double from before the parameters existed.
+            return await info()
+
+    async def generate(self, request: GenerateRequest) -> GenerateResponse:
+        result = await self._inner.generate(self._bind(request))
+        result.modelId = self._publish(result.modelId)
+        return result
+
+    async def embed(self, request: EmbedRequest) -> EmbedResponse:
+        result = await self._inner.embed(self._bind(request))
+        result.modelId = self._publish(result.modelId)
+        return result
+
+    async def decide(self, request: DecisionRequest) -> DecisionResponse:
+        result = await self._inner.decide(self._bind(request))
+        result.modelId = self._publish(result.modelId)
+        return result
+
+    async def count_tokens(self, request: GenerateRequest) -> int:
+        return await self._inner.count_tokens(self._bind(request))
+
+    async def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]:
+        events = self._inner.stream(self._bind(request))
+        try:
+            async for event in events:
+                if event.done and event.result is not None:
+                    event.result.modelId = self._publish(event.result.modelId)
+                yield event
+        finally:
+            closer = getattr(events, "aclose", None)
+            if closer is not None:
+                await closer()
+
+    async def aclose(self) -> None:
+        """Nothing: the inner client is the routing table's to close."""
+
+
 def retry_disposition(exc: BaseException) -> str:
     if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
         return "safe"
@@ -580,13 +685,16 @@ class TieredClient:
         #: the name alone no longer identifies one: two machines running
         #: one model give two drivers with one name (R1.6).
         self.served_by_node: str | None = None
+        #: The published id of the model that answered -- a slot's target,
+        #: prefixed for an account. Set with `served_by`.
+        self.served_model: str | None = None
         self.tier = 0
 
     @property
     def candidates(self) -> list[DriverClient]:
         return [c for tier in self._tiers for c in tier]
 
-    async def info(self) -> DriverInfo:
+    async def info(self, *, models: bool = True, model: str | None = None) -> DriverInfo:
         """Report the first reachable backend's `/v1/info`.
 
         Mirrors generate()'s failover so the admin drivers listing
@@ -595,7 +703,7 @@ class TieredClient:
         last_exc: Exception | None = None
         for index, candidate in enumerate(self.candidates):
             try:
-                return await candidate.info()
+                return await candidate.info(models=models, model=model)
             except Exception as exc:
                 if not _is_cascade_eligible(exc):
                     raise
@@ -638,6 +746,7 @@ class TieredClient:
                         self._hooks.on_attempt_end(
                             driver,
                             node=node,
+                            model=getattr(candidate, "public_model", None),
                             runtime=runtime,
                             served=False,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
@@ -662,12 +771,14 @@ class TieredClient:
                         self._hooks.on_attempt_end(
                             driver,
                             node=node,
+                            model=getattr(candidate, "public_model", None),
                             runtime=runtime,
                             served=True,
                             usage=result.usage,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                         )
                     self.served_by = driver
+                    self.served_model = getattr(candidate, "public_model", None)
                     self.served_by_node = node
                     self.tier = tier_index + 1
                     return result
@@ -719,6 +830,7 @@ class TieredClient:
                         self._hooks.on_attempt_end(
                             driver,
                             node=node,
+                            model=getattr(candidate, "public_model", None),
                             runtime=runtime,
                             served=False,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
@@ -736,12 +848,14 @@ class TieredClient:
                         self._hooks.on_attempt_end(
                             driver,
                             node=node,
+                            model=getattr(candidate, "public_model", None),
                             runtime=runtime,
                             served=True,
                             usage=result.usage,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                         )
                     self.served_by = driver
+                    self.served_model = getattr(candidate, "public_model", None)
                     self.served_by_node = node
                     self.tier = tier_index + 1
                     return result
@@ -787,6 +901,7 @@ class TieredClient:
                         self._hooks.on_attempt_end(
                             driver,
                             node=node,
+                            model=getattr(candidate, "public_model", None),
                             runtime=runtime,
                             served=False,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
@@ -804,12 +919,14 @@ class TieredClient:
                         self._hooks.on_attempt_end(
                             driver,
                             node=node,
+                            model=getattr(candidate, "public_model", None),
                             runtime=runtime,
                             served=True,
                             usage=result.usage,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                         )
                     self.served_by = driver
+                    self.served_model = getattr(candidate, "public_model", None)
                     self.served_by_node = node
                     self.tier = tier_index + 1
                     return result
@@ -908,6 +1025,7 @@ class TieredClient:
                         self._hooks.on_attempt_end(
                             driver,
                             node=node,
+                            model=getattr(candidate, "public_model", None),
                             runtime=runtime,
                             served=False,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
@@ -945,6 +1063,7 @@ class TieredClient:
                         self._hooks.on_attempt_end(
                             driver,
                             node=node,
+                            model=getattr(candidate, "public_model", None),
                             runtime=runtime,
                             # A stream that stopped without a `done`
                             # event did not serve this request, however
@@ -963,6 +1082,7 @@ class TieredClient:
                             first_ms=first_ms,
                         )
                     self.served_by = driver
+                    self.served_model = getattr(candidate, "public_model", None)
                     self.served_by_node = node
                     self.tier = tier_index + 1
                     return
@@ -995,6 +1115,7 @@ class TieredClient:
                         self._hooks.on_attempt_end(
                             driver,
                             node=node,
+                            model=getattr(candidate, "public_model", None),
                             runtime=runtime,
                             served=False,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
@@ -1096,6 +1217,7 @@ class TieredClient:
                 last = exc
                 continue
             self.served_by, self.served_by_node = candidate.name, candidate.node
+            self.served_model = getattr(candidate, "public_model", None)
             return count
         if last is None:  # pragma: no cover - pick() never builds an empty slot
             raise ValueError(f"driver slot {self.name!r} has no backend to count with")

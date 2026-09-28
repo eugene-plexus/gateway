@@ -130,7 +130,7 @@ class OneAgent:
                 json={
                     "backend": "openai_compat_http",
                     "version": "0.1.0",
-                    "modelId": MODEL,
+                    "models": [{"id": MODEL, "surfaces": ["chat"]}],
                     "runtime": RUNTIME,
                 },
             )
@@ -209,7 +209,7 @@ async def test_a_failed_components_read_does_not_close_a_client_in_use(agent: On
     # Not "the dict still has an entry" — the object a request is using
     # still works. A closed httpx client raises on its next send.
     info = await in_flight.info()
-    assert info.modelId == MODEL
+    assert [m.id for m in info.models or []] == [MODEL]
 
 
 async def test_a_successful_read_that_drops_a_driver_still_closes_its_client(
@@ -387,7 +387,7 @@ class TwoNodes:
                 json={
                     "backend": "openai_compat_http",
                     "version": "0.1.0",
-                    "modelId": model,
+                    "models": [{"id": model, "surfaces": ["chat"]}],
                     "runtime": f"{node}-runtime",
                 },
             )

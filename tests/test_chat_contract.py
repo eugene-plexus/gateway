@@ -56,9 +56,7 @@ def test_limit_on_driver_wire(app: FastAPI, field: str, stream: bool, fallback: 
 
     clients = []
     for backend in table.resolve("alias").backends():
-        client = HttpDriverClient(
-            name=backend.name, base_url=f"http://{backend.info.modelId}.invalid"
-        )
+        client = HttpDriverClient(name=backend.name, base_url=f"http://{backend.public_id}.invalid")
         client._client = httpx.AsyncClient(
             base_url=client.base_url, transport=httpx.MockTransport(wire)
         )

@@ -45,8 +45,9 @@ class VisionDriver(FakeDriverClient):
         info = super().describe()
         # Added to what the fake already advertises: replacing it would drop
         # `supportedSettings`, and admission would refuse `max_tokens`.
-        base = info.capabilities or Capabilities()
-        info.capabilities = base.model_copy(update={"imageInput": True})
+        for model in info.models or []:
+            base = model.capabilities or Capabilities()
+            model.capabilities = base.model_copy(update={"imageInput": True})
         return info
 
 

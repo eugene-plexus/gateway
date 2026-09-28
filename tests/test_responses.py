@@ -128,8 +128,9 @@ def turn_two(output: Any = "hi\r\n") -> dict[str, Any]:
 class VisionDriver(FakeDriverClient):
     def describe(self):  # type: ignore[no-untyped-def]
         info = super().describe()
-        base = info.capabilities or Capabilities()
-        info.capabilities = base.model_copy(update={"imageInput": True})
+        for model in info.models or []:
+            base = model.capabilities or Capabilities()
+            model.capabilities = base.model_copy(update={"imageInput": True})
         return info
 
 

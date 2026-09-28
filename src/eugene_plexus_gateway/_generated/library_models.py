@@ -483,6 +483,16 @@ class ConfigValueType(StrEnum):
     password a password input, and must not display a redacted
     entry as though its password were empty.
 
+    `string_list` (P1, 2026-09-27) is an ordered JSON array of
+    strings with no further meaning to the type: a list of plain
+    values the field's own description explains. Its first users are
+    the inference-driver's `catalogueInclude` and `catalogueExclude`,
+    model-id patterns for a provider account. It exists for the
+    reason `url_list` does: a comma-separated text field is a bug
+    report, and reusing `path_list` or `url_list` would tell every UI
+    to open a directory picker or an address field. UIs render it as
+    an add/remove list of text fields.
+
     """
 
     string = 'string'
@@ -502,6 +512,7 @@ class ConfigValueType(StrEnum):
     path_mappings = 'path_mappings'
     library_folders = 'library_folders'
     share_credentials = 'share_credentials'
+    string_list = 'string_list'
 
 
 class ConfigFieldShowWhen(BaseModel):

@@ -101,7 +101,7 @@ async def test_config(
     async def probe(
         client: httpx.AsyncClient, node: str | None, name: str, base_url: str
     ) -> tuple[str, str | None, str | None]:
-        """Returns (name, error-or-None, modelId-or-None)."""
+        """Returns (name, error-or-None, what-it-serves-or-None)."""
         headers = await outbound.headers(recipients[node]) if outbound is not None else {}
         try:
             response = await client.get(base_url.rstrip("/") + "/v1/info", headers=headers)
@@ -109,8 +109,20 @@ async def test_config(
             info = response.json()
         except Exception as e:
             return name, f"{name} ({base_url}/v1/info) — {e}", None
-        model_id = info.get("modelId") if isinstance(info, dict) else None
-        return name, None, model_id if isinstance(model_id, str) else None
+        if not isinstance(info, dict):
+            return name, None, None
+        served = info.get("models")
+        if not isinstance(served, list):
+            # A driver from before P1: one `modelId`, and nothing the
+            # gateway will route to until its machine is updated.
+            legacy = info.get("modelId")
+            return name, f"{name} is outdated ({legacy or 'no model'}); update its machine", None
+        ids = [m.get("id") for m in served if isinstance(m, dict) and isinstance(m.get("id"), str)]
+        if not ids:
+            return name, None, None
+        if info.get("catalogue") is not None:
+            return name, None, f"{name}/ ({len(ids)} models)"
+        return name, None, ids[0] if len(ids) == 1 else f"{len(ids)} models"
 
     # ONE client for every probe, not one each. These run concurrently
     # under `gather`, so a per-probe client made an N-driver install pay
@@ -136,9 +148,9 @@ async def test_config(
     if models:
         summary += f"; serving {', '.join(models)}"
     if unnamed:
-        # Reachable but not routable: no model id means no key to route
+        # Reachable but not routable: no model means no key to route
         # on. Worth saying, because everything else looks fine.
-        summary += f"; {', '.join(unnamed)} reported no modelId and will not be routable"
+        summary += f"; {', '.join(unnamed)} serve no models and will not be routable"
     return ConfigTestResult(
         ok=True,
         component="gateway",

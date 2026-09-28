@@ -13,7 +13,7 @@ from typing import Any
 import httpx
 import pytest
 
-from eugene_plexus_gateway.driver_client import HttpDriverClient
+from eugene_plexus_gateway.driver_client import BoundClient, HttpDriverClient
 from eugene_plexus_gateway.routing import RoutingTable
 
 
@@ -36,13 +36,14 @@ def _info(
     context: int | None = None,
     upstream: str | None = None,
 ) -> dict[str, Any]:
-    body: dict[str, Any] = {"backend": "openai_compat_http", "version": "0.1.0"}
+    body: dict[str, Any] = {"backend": "openai_compat_http", "version": "0.1.0", "models": []}
     if model_id is not None:
-        body["modelId"] = model_id
-    if upstream is not None:
-        body["upstreamModelId"] = upstream
-    if context is not None:
-        body["capabilities"] = {"maxContextTokens": context}
+        model: dict[str, Any] = {"id": model_id, "surfaces": ["chat"]}
+        if upstream is not None:
+            model["upstreamId"] = upstream
+        if context is not None:
+            model["capabilities"] = {"maxContextTokens": context}
+        body["models"] = [model]
     return body
 
 
@@ -181,7 +182,12 @@ async def test_one_driver_resolves_to_a_one_candidate_slot(route_http: Any) -> N
     client = table.pick(table.resolve("qwen"))
     assert client is not None
     assert len(client.candidates) == 1
-    assert isinstance(client.candidates[0], HttpDriverClient)
+    # One model on the driver's one HTTP client (P1): the candidate names
+    # its model on every call and cools down on its own.
+    candidate = client.candidates[0]
+    assert isinstance(candidate, BoundClient)
+    assert isinstance(candidate._inner, HttpDriverClient)
+    assert candidate.model == "qwen" and candidate.public_model == "qwen"
     await table.aclose()
 
 

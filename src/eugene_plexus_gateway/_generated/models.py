@@ -465,6 +465,16 @@ class ConfigValueType(StrEnum):
     password a password input, and must not display a redacted
     entry as though its password were empty.
 
+    `string_list` (P1, 2026-09-27) is an ordered JSON array of
+    strings with no further meaning to the type: a list of plain
+    values the field's own description explains. Its first users are
+    the inference-driver's `catalogueInclude` and `catalogueExclude`,
+    model-id patterns for a provider account. It exists for the
+    reason `url_list` does: a comma-separated text field is a bug
+    report, and reusing `path_list` or `url_list` would tell every UI
+    to open a directory picker or an address field. UIs render it as
+    an add/remove list of text fields.
+
     """
 
     string = 'string'
@@ -484,6 +494,7 @@ class ConfigValueType(StrEnum):
     path_mappings = 'path_mappings'
     library_folders = 'library_folders'
     share_credentials = 'share_credentials'
+    string_list = 'string_list'
 
 
 class ConfigFieldShowWhen(BaseModel):
@@ -1421,6 +1432,21 @@ class EmbeddingUsage(BaseModel):
     total_tokens: int | None = Field(None, ge=0)
 
 
+class OutdatedDriver(BaseModel):
+    name: str = Field(..., description="The driver's name, as its agent declares it.")
+    node: str | None = Field(
+        None, description='The machine it runs on; null on a standalone install.'
+    )
+    url: AnyUrl | None = None
+    version: str | None = Field(
+        None, description="The driver's own version, as it reported it."
+    )
+    modelId: str | None = Field(
+        None,
+        description='The one model it said it serves, so the console can name what is missing.',
+    )
+
+
 class Source(StrEnum):
     """
     `config` — the `controlUrl` config field, set by an operator
@@ -1473,6 +1499,10 @@ class ControlRootView(BaseModel):
 
 class RoutingBackendView(BaseModel):
     driver: str
+    model: str | None = Field(
+        None,
+        description="The driver's own id for the model this row serves: the tier's\ntarget for a single-model driver, and the target without its\n`<driver>/` prefix for an account.\n",
+    )
     url: AnyUrl | None = None
     eligible: bool = Field(
         ..., description='Whether a request could be sent here right now.'
@@ -1497,7 +1527,8 @@ class RoutingBackendView(BaseModel):
         description="The agent's `RuntimeStatus` for that runtime, as a string —\nthe agent owns the enum.\n",
     )
     node: str | None = Field(
-        None, description='The node the runtime runs on, when the agent reports one.'
+        None,
+        description="The machine the driver runs on. Was the runtime's node only,\nwhich left a cloud driver's row with none although its agent\nis known.\n",
     )
     stop_reason: str | None = Field(
         None,
@@ -2175,6 +2206,10 @@ class MetricAttempt(BaseModel):
     promptTokens: int | None = Field(None, ge=0)
     completionTokens: int | None = Field(None, ge=0)
     driver: str
+    model: str | None = Field(
+        None,
+        description="The published id of the model this attempt asked for — a\nslot's target, prefixed for an account — since one account's\ndriver serves hundreds. Null on rows recorded before metrics\nschema v6.\n",
+    )
     runtime: str | None = None
     node: str | None = None
     backend: BackendKind | None = None
@@ -2279,7 +2314,34 @@ class DriverHealth(BaseModel):
     reachable: bool
     url: AnyUrl | None = Field(None, description='How the gateway reaches this driver.')
     backend: BackendKind | None = None
-    modelId: str | None = None
+    node: str | None = Field(
+        None,
+        description='The machine this driver runs on, as the agent that declares\nit names it. Null on a standalone install whose agent has no\nnode name yet.\n',
+    )
+    modelId: str | None = Field(
+        None,
+        description='The one model a single-model driver serves, as published.\nAbsent for an account (see `account`) and for a driver\nserving nothing yet.\n',
+    )
+    modelCount: int | None = Field(
+        None,
+        description='How many models this driver serves (`DriverInfo.models`).\nOne for a single-model driver; hundreds for an aggregator\naccount. Absent for an outdated driver.\n',
+        ge=0,
+    )
+    account: bool | None = Field(
+        None,
+        description='True when the driver is a provider account, whose models are\npublished as `<name>/<model id>`.\n',
+    )
+    catalogueRefreshedAt: AwareDatetime | None = Field(
+        None, description="When the account's model list in force was read."
+    )
+    catalogueError: str | None = Field(
+        None,
+        description="Why the account's most recent catalogue read failed, in the\nbackend's words. The previous list stays in force.\n",
+    )
+    outdated: bool | None = Field(
+        None,
+        description='True when the driver answered `/v1/info` without a `models`\nlist: a driver from before P1, on a machine that has not\nbeen updated. It routes nothing until updated, and appears\nin `RoutingTableView.outdated_drivers`.\n',
+    )
     runtime: str | None = Field(
         None,
         description='The supervised engine runtime this driver follows, straight\noff its `/v1/info`. Absent for a backend that is not a\nruntime this install supervises.\n\nCarried up because it answers the one question this panel\ncould not previously answer: a driver that is reachable but\nserves nothing, next to a runtime that is `ready` and\nrouted to by nobody, is the visible shape of a\nmis-wired install.\n',
@@ -2437,7 +2499,7 @@ class Model(BaseModel):
 
     id: str = Field(
         ...,
-        description="What the client puts in `ChatCompletionRequest.model`. For a\nlocal runtime this is its `modelAlias`, which defaults to\nthe model's own filename — so the name a user sees is the\nname of the file they downloaded.\n",
+        description="What the client puts in `ChatCompletionRequest.model`. For a\nlocal runtime this is its `modelAlias`, which defaults to\nthe model's own filename — so the name a user sees is the\nname of the file they downloaded. For a provider account\nit is `<driver name>/<the provider's id>`\n(`openrouter/anthropic/claude-opus-5.5`, `ollama/qwen3:8b`),\nso two accounts never collide and one model through two\nproviders stays two ids.\n\nListed only when a door serves one of the model's surfaces\n(P1-4): an account's speech, image, video and transcription\nmodels appear as their doors are built, under the ids they\nalready have.\n",
     )
     object: Literal['model']
     created: int | None = Field(
@@ -3282,6 +3344,10 @@ class RoutingTableView(BaseModel):
     slots: list[RoutingSlotView]
     unreachable_drivers: list[str] | None = Field(
         None, description='Drivers in the topology that did not answer `/v1/info`.'
+    )
+    outdated_drivers: list[OutdatedDriver] | None = Field(
+        None,
+        description='Drivers that answered `/v1/info` in the shape from before P1\n(a single `modelId`, no `models`). The gateway routes nothing\nto one: it would ignore the `model` a request names and\nanswer with its own. Listed so the console can say which\nmachine to update, rather than a model silently vanishing\nafter its gateway was updated and its worker was not.\n',
     )
     control_root: ControlRootView | None = None
 

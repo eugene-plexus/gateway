@@ -132,10 +132,11 @@ def test_capability_ineligible_fallback_receives_no_application_content(setup, m
     driver.supports_tools = fallback.supports_tools = True
     install_snapshot(app.state.routing, driver, fallback)
     info = fallback.describe()
+    caps = info.models[0].capabilities
     if missing == "tools":
-        info.capabilities.toolCalling = False
+        caps.toolCalling = False
     else:
-        info.capabilities.supportedSettings = None
+        caps.supportedSettings = None
     fallback.describe = lambda: info
     if missing != "changed":
         install_snapshot(app.state.routing, driver, fallback)

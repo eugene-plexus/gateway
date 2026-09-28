@@ -374,10 +374,7 @@ def _any_backend_carries_tools(resolution: Resolution) -> bool:
     to refuse a request outright. Refusing when one capable backend
     exists would fail a request that would have worked.
     """
-    return any(
-        b.info.capabilities is not None and bool(b.info.capabilities.toolCalling)
-        for b in resolution.backends()
-    )
+    return any(b.caps is not None and bool(b.caps.toolCalling) for b in resolution.backends())
 
 
 def _tools_unsupported(model: str) -> _Failure:
@@ -400,6 +397,25 @@ def _tools_unsupported(model: str) -> _Failure:
         ),
         error_type="invalid_request_error",
         param="tools",
+    )
+
+
+def _no_door_yet(model: str, surfaces: Sequence[str], *, wanted: str) -> _Failure:
+    """400 for a model whose only uses have no door here yet (P1-4).
+
+    An account's speech, image or video model is on its driver's list and
+    off `GET /v1/models` until its door is built. Named for what it is
+    rather than passed down to fail as whatever the provider says about a
+    chat request to a text-to-speech model.
+    """
+    return _Failure(
+        code=400,
+        message=(
+            f"The model {model!r} serves {', '.join(surfaces)}, which this gateway has no "
+            f"door for yet, and not {wanted}. It is not listed on GET /v1/models until it has."
+        ),
+        error_type="invalid_request_error",
+        param="model",
     )
 
 
@@ -560,6 +576,8 @@ async def _prepare(
         if surfaces == ["decisions"]:
             instead = "/v1/systemone"
         return _wrong_surface(body.model, surfaces, wanted=surface, instead=instead)
+    if not surfaces and (reported := resolution.reported_surfaces()):
+        return _no_door_yet(body.model, reported, wanted=surface)
 
     # **Refused here, never stripped.** Checked before a backend is
     # picked, because the answer must not depend on which replica the
@@ -1097,6 +1115,8 @@ async def count_anthropic_message_tokens(request: Request) -> Any:
         return _wrong_surface(
             body.model, surfaces, wanted="chat", instead="/v1/embeddings"
         ).as_anthropic()
+    if not surfaces and (reported := resolution.reported_surfaces()):
+        return _no_door_yet(body.model, reported, wanted="chat").as_anthropic()
     if body.tools and not _any_backend_carries_tools(resolution):
         return _tools_unsupported(body.model).as_anthropic()
     if has_images(body.messages):
@@ -1383,6 +1403,8 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
         return _wrong_surface(
             body.model, surfaces, wanted="embeddings", instead="/v1/chat/completions"
         ).as_openai()
+    if not surfaces and (reported := resolution.reported_surfaces()):
+        return _no_door_yet(body.model, reported, wanted="embeddings").as_openai()
 
     # `oneOf: [string, array]` generates `str | Input`, where `Input` is
     # a RootModel wrapping the list -- so the array case needs `.root`
@@ -1522,6 +1544,8 @@ async def create_decision(request: Request, body: SystemOneRequest) -> Any:
         return _wrong_surface(
             body.model, surfaces, wanted="decisions", instead="/v1/chat/completions"
         ).as_openai()
+    if not surfaces and (reported := resolution.reported_surfaces()):
+        return _no_door_yet(body.model, reported, wanted="decisions").as_openai()
 
     raw = await request.json()
     store = _store(request)

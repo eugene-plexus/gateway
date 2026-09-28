@@ -46,7 +46,8 @@ def request(url=None, *, count=1, role="user", stream=False):
 class VisionDriver(FakeDriverClient):
     def describe(self):
         info = super().describe()
-        info.capabilities = Capabilities(imageInput=True)
+        for model in info.models or []:
+            model.capabilities = Capabilities(imageInput=True)
         return info
 
 

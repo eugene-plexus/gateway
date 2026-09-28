@@ -40,12 +40,21 @@ async def _driver_health(client: DriverClient) -> DriverHealth:
         # expects gateway.yaml's BackendKind. Same wire values, distinct
         # generated classes — bridge via .value.
         backend = BackendKind(info.backend.value)
+        served = info.models
+        account = info.catalogue is not None
         return DriverHealth(
             name=client.name,
             reachable=True,
             url=base_url,  # type: ignore[arg-type]
             backend=backend,
-            modelId=info.modelId,
+            # A probe of a URL an operator typed, so no name to prefix
+            # with: an account's count, or a single model's own id.
+            modelId=served[0].id if served and len(served) == 1 and not account else None,
+            modelCount=len(served) if served is not None else None,
+            account=account,
+            catalogueRefreshedAt=info.catalogue.refreshedAt if info.catalogue else None,
+            catalogueError=info.catalogue.error if info.catalogue else None,
+            outdated=served is None,
             runtime=info.runtime,
             version=info.version,
         )

@@ -51,6 +51,9 @@ class _FakeInstall(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self) -> None:
+        # A real driver reads `?model=` and `?models=`; the path is what
+        # this fixture routes on.
+        self.path = self.path.split("?", 1)[0]
         if self.path == "/v1/components":
             self._send(
                 200,
@@ -77,21 +80,26 @@ class _FakeInstall(BaseHTTPRequestHandler):
                 {
                     "backend": "openai_compat_http",
                     "provider": "local",
-                    "modelId": MODEL,
-                    "capabilities": {
-                        "streaming": True,
-                        "maxContextTokens": 8192,
-                        "supportedSettings": [
-                            "maxTokens",
-                            "temperature",
-                            "topP",
-                            "seed",
-                            "stop",
-                            "tools",
-                            "toolChoice",
-                            "responseFormat",
-                        ],
-                    },
+                    "models": [
+                        {
+                            "id": MODEL,
+                            "surfaces": ["chat"],
+                            "capabilities": {
+                                "streaming": True,
+                                "maxContextTokens": 8192,
+                                "supportedSettings": [
+                                    "maxTokens",
+                                    "temperature",
+                                    "topP",
+                                    "seed",
+                                    "stop",
+                                    "tools",
+                                    "toolChoice",
+                                    "responseFormat",
+                                ],
+                            },
+                        }
+                    ],
                     "version": "0.1.0-fake",
                 },
             )

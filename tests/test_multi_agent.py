@@ -45,7 +45,7 @@ def _info(model_id: str, runtime: str | None) -> dict[str, Any]:
     body: dict[str, Any] = {
         "backend": "openai_compat_http",
         "version": "0.1.0",
-        "modelId": model_id,
+        "models": [{"id": model_id, "surfaces": ["chat"]}],
     }
     if runtime is not None:
         body["runtime"] = runtime

@@ -55,19 +55,20 @@ import time
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 
-from ._generated.driver_models import DriverInfo
+from ._generated.driver_models import Capabilities, DriverInfo, DriverModel
 from ._generated.models import (
     BackendKind,
     ControlRootView,
     DriverHealth,
     Model,
     ModelRoutingInfo,
+    OutdatedDriver,
     RoutingBackendView,
     RoutingSlotView,
     RoutingTableView,
@@ -76,9 +77,10 @@ from ._generated.models import (
 )
 from ._http import internal_client
 from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS
-from .driver_client import DriverClient, HttpDriverClient, TieredClient
+from .driver_client import BoundClient, DriverClient, HttpDriverClient, TieredClient
 from .driver_client import Key as DriverKey
 from .metrics import AttemptRow, CandidateRow
+from .model_patterns import permits
 from .outbound import RECIPIENT_CONTROL, Outbound
 
 # Deadline for one topology read (an agent's `/v1/components`, a control
@@ -220,6 +222,12 @@ class _Backend:
     node: str | None = None
     runtime: _RuntimeFacts | None = None
     stopping: Mapping[Key, int] = field(default_factory=dict)
+    #: The one model this candidate is, off the driver's `models[]` (P1).
+    #: None only on the driver-level entries in `_Snapshot.reachable`,
+    #: which describe a driver rather than something to route to.
+    model: DriverModel | None = None
+    #: What callers name: the model's id, or `<driver>/<id>` for an account.
+    public_id: str = ""
     """The routing table's own reservation counter, shared by reference
     with every backend in the snapshot — so a runtime the lifecycle
     manager is *in the middle of stopping* stops being routable at the
@@ -258,50 +266,51 @@ class _Backend:
         return f"runtime {self.runtime.name!r} is {self.runtime.status or 'unknown'}"
 
     @property
-    def embeds(self) -> bool:
-        """Whether this backend serves the embeddings surface.
+    def caps(self) -> Capabilities | None:
+        """This model's capabilities -- per model since P1, because an
+        account's six hundred models do not share one answer."""
+        return self.model.capabilities if self.model is not None else None
 
-        The driver determines it from the backend and reports it on
-        `/v1/info`; absent reads as False, which is the honest default
-        for a capability nobody has confirmed."""
-        caps = self.info.capabilities
-        return caps is not None and bool(caps.embeddings)
+    @property
+    def surfaces(self) -> list[str]:
+        """What requests this model answers, off its `models[]` entry.
+
+        Replaces reading `embeddings` and `chatCapable` off the driver as a
+        whole. A surface this gateway has never heard of is simply not one
+        of the three below, which is how a newer driver's new word cannot
+        unroute an older gateway's models.
+        """
+        return list(self.model.surfaces) if self.model is not None else []
+
+    @property
+    def embeds(self) -> bool:
+        """Whether this model serves the embeddings surface."""
+        return "embeddings" in self.surfaces
 
     @property
     def chats(self) -> bool:
-        """Whether this backend serves chat completions.
+        """Whether this model serves chat completions.
 
-        **Not simply `not embeds`.** Measured: an Ollama runner is one
-        or the other, but `llama-server` given `--embedding` still
-        serves chat perfectly well. A backend that says nothing about
-        embeddings is a chat backend, which is every driver that existed
-        before this surface did -- so the default has to be True or
-        re-pinning would silently unroute every model in the install.
-
-        Since B2 a backend can also say so outright: a decision driver
-        reports `chatCapable: false`, and routing a conversation to it
-        would die as a protocol error inside a backend that never spoke
-        chat. Absent still reads as chat-capable, so nothing that
-        predates the field changes meaning.
+        The driver decides it now, per model: a single-model driver
+        reports `chat` unless its backend embeds (an Ollama runner is one
+        or the other) or it is a decision engine, which is exactly the
+        reading this gateway used to make of `embeddings` and
+        `chatCapable`; an account takes it from the provider's listing.
         """
-        caps = self.info.capabilities
-        if caps is not None and caps.chatCapable is False:
-            return False
-        return not self.embeds or caps is None
+        return "chat" in self.surfaces
 
     @property
     def decides(self) -> bool:
-        """Whether this backend answers typed decisions (POST /v1/decide).
-
-        Present-or-absent on `/v1/info`, exactly like `embeddings` --
-        its absence is the honest default for every backend that
-        predates the surface."""
-        caps = self.info.capabilities
-        return caps is not None and caps.decision is not None
+        """Whether this model answers typed decisions (POST /v1/decide)."""
+        return (
+            "decisions" in self.surfaces
+            and self.caps is not None
+            and (self.caps.decision is not None)
+        )
 
     @property
     def decision_max_concurrent(self) -> int | None:
-        caps = self.info.capabilities
+        caps = self.caps
         if caps is None or caps.decision is None:
             return None
         return caps.decision.maxConcurrent
@@ -320,6 +329,24 @@ class _Unreachable:
     name: str
     url: str
     error: str
+    node: str | None = None
+
+
+@dataclass
+class _Outdated:
+    """A driver that answered `/v1/info` in the shape from before P1.
+
+    It reports one `modelId` and no `models`, so it would ignore the
+    `model` a request names and answer with its own -- which is why it is
+    routed nothing, and named here so the console can say which machine to
+    update rather than letting a model silently vanish.
+    """
+
+    name: str
+    url: str
+    node: str | None
+    version: str | None
+    model_id: str | None
 
 
 @dataclass(frozen=True)
@@ -345,8 +372,12 @@ class _Snapshot:
     request never sees a half-rebuilt table."""
 
     by_model: dict[str, list[_Backend]] = field(default_factory=dict)
+    #: One entry per driver that answered, describing the DRIVER (its
+    #: `model` is None). Routing reads `by_model`; this is for the admin
+    #: views and for finding the runtime behind a driver.
     reachable: list[_Backend] = field(default_factory=list)
     unreachable: list[_Unreachable] = field(default_factory=list)
+    outdated: list[_Outdated] = field(default_factory=list)
     # Keyed by `(node, runtime name)`. Neither half is unique on its
     # own: an alias is shared by every replica of a model, and a NAME is
     # shared by the same model launched on two machines -- see `Key`.
@@ -387,7 +418,10 @@ class Resolution:
                     [
                         b
                         for b in t.backends
-                        if (allowed is None or (t.target in allowed and b.info.modelId in allowed))
+                        if (
+                            allowed is None
+                            or (permits(allowed, t.target) and permits(allowed, b.public_id))
+                        )
                         and (
                             not local_only
                             or (b.info.locality == "local" and b.info.localOnlyEnforced is True)
@@ -405,6 +439,15 @@ class Resolution:
             + (["embeddings"] if any(b.embeds for b in backends) else [])
             + (["decisions"] if any(b.decides for b in backends) else [])
         )
+
+    def reported_surfaces(self) -> list[str]:
+        """Every surface this slot's models report, including the ones no
+        door here serves yet (speech, image, ...), for a refusal to name."""
+        seen: dict[str, None] = {}
+        for backend in self.backends():
+            for surface in backend.surfaces:
+                seen.setdefault(surface, None)
+        return list(seen)
 
     def has_backends(self) -> bool:
         return any(t.backends for t in self.tiers)
@@ -482,6 +525,10 @@ class RoutingTable:
         # throw away the connection pool and leak sockets. The node is in
         # the key because the name is not unique across machines.
         self._clients: dict[tuple[str | None, str, str], HttpDriverClient] = {}
+        # One `BoundClient` per model a driver serves, by
+        # (node, name, url, driver's model id), kept across refreshes so
+        # each model's circuit -- its cooldown -- survives them.
+        self._bound: dict[tuple[str | None, str, str, str], BoundClient] = {}
         #: The one client this table reads topology with -- five to seven
         #: GETs per refresh, every 15 s, and again inside whatever request
         #: triggered `refresh_if_stale`. Built once here rather than per
@@ -883,6 +930,9 @@ class RoutingTable:
                 log.info("driver %r left the topology; closing its client", client_key[1])
                 with contextlib.suppress(BaseException):
                     await client.aclose()
+        for bound_key in list(self._bound):
+            if bound_key[:3] not in live_keys:
+                self._bound.pop(bound_key, None)
 
         results = await asyncio.gather(
             *(self._probe(node, name, url) for node, name, url in entries),
@@ -896,6 +946,23 @@ class RoutingTable:
                 continue
             if isinstance(probe, _Unreachable):
                 snapshot.unreachable.append(probe)
+                continue
+            if probe.info.models is None:
+                # **A driver from before P1.** It would ignore the `model`
+                # a request names and answer with its one model, so it is
+                # routed nothing -- and named, with its machine, so the
+                # console says to update it rather than a model silently
+                # vanishing after the gateway was updated first.
+                legacy = getattr(probe.client, "legacy_model_id", None)
+                snapshot.outdated.append(
+                    _Outdated(
+                        name=probe.name,
+                        url=probe.url,
+                        node=probe.node,
+                        version=probe.info.version,
+                        model_id=legacy if isinstance(legacy, str) else None,
+                    )
+                )
                 continue
             snapshot.reachable.append(probe)
 
@@ -913,38 +980,13 @@ class RoutingTable:
                 alias_key = (facts.node, facts.alias)
                 by_alias[alias_key] = None if alias_key in by_alias else facts
 
-        for backend in snapshot.reachable:
-            model_id = backend.info.modelId
-            if not model_id:
-                # A driver that won't say what it serves cannot be routed
-                # to — there is no key to route on. Its health still shows
-                # up on the admin surface.
-                log.debug(
-                    "driver %r reports no modelId; not routable (it is probably in degraded mode)",
-                    backend.name,
-                )
-                continue
-            if backend.info.runtime:
-                # **On this driver's own node.** `/v1/info` reports a
-                # bare name, and a bare name matches a replica on another
-                # machine just as well -- which is how a driver on node A
-                # came to follow node B's runtime and read its status.
-                backend.runtime = runtimes.get((backend.node, backend.info.runtime))
-                if backend.runtime is None:
-                    # Raised from DEBUG (M7's record asked for this):
-                    # "routable on faith" is the eligibility rule saying
-                    # yes to an engine whose state it does not know, and
-                    # it is worth a line an operator will see.
-                    log.warning(
-                        "driver %r on node %r follows runtime %r, which that node does not "
-                        "report; treating it as routable on faith",
-                        backend.name,
-                        backend.node,
-                        backend.info.runtime,
-                    )
-            else:
-                backend.runtime = by_alias.get((backend.node, model_id))
-            snapshot.by_model.setdefault(model_id, []).append(backend)
+        seen_bound: set[tuple[str | None, str, str, str]] = set()
+        for driver in snapshot.reachable:
+            seen_bound |= self._expand(driver, snapshot, runtimes, by_alias)
+        # A model an account no longer lists takes its circuit with it.
+        for bound_key in list(self._bound):
+            if bound_key not in seen_bound:
+                self._bound.pop(bound_key, None)
 
         # Stable base order per model; the balancer rotates from here.
         # By `(node, name)`, because the names of two replicas of one
@@ -968,13 +1010,93 @@ class RoutingTable:
         self._snapshot = snapshot
         log.debug(
             "routing table refreshed: %d model(s) across %d reachable driver(s), "
-            "%d unreachable, %d runtime(s), %d agent(s)",
+            "%d unreachable, %d outdated, %d runtime(s), %d agent(s)",
             len(snapshot.by_model),
             len(snapshot.reachable),
             len(snapshot.unreachable),
+            len(snapshot.outdated),
             len(snapshot.runtimes),
             len(snapshot.agents),
         )
+
+    def _expand(
+        self,
+        driver: _Backend,
+        snapshot: _Snapshot,
+        runtimes: dict[Key, _RuntimeFacts],
+        by_alias: dict[Key, _RuntimeFacts | None],
+    ) -> set[tuple[str | None, str, str, str]]:
+        """One driver's `models[]`, as routing candidates in `by_model`.
+
+        Answers with the bound-client keys it used, so the refresh can drop
+        the circuits of models that are gone. The test fixtures call this
+        too, rather than keeping a copy of the join that can drift from it
+        -- which is what the previous one did for three weeks (R1.6).
+        """
+        used: set[tuple[str | None, str, str, str]] = set()
+        served = list(driver.info.models or [])
+        # The list is read here once; every candidate shares the
+        # driver-level facts without it, so an account's six hundred
+        # candidates do not each carry six hundred entries.
+        light = driver.info.model_copy(update={"models": None})
+        driver.info = light
+        if not served:
+            # Serving nothing is a real answer -- a driver with no model
+            # chosen, or an account whose list could not be read -- and
+            # there is no key to route on. Its health still shows on the
+            # admin surface.
+            log.debug("driver %r serves no models right now", driver.name)
+            return used
+        account = light.catalogue is not None
+        for entry in served:
+            # **The gateway adds the prefix, because a driver does not know
+            # its own name** (P1-1). One upstream model through two
+            # accounts is two ids; the same account name on two machines is
+            # one account, a replica per model.
+            public = f"{driver.name}/{entry.id}" if account else entry.id
+            bound_key = (driver.node, driver.name, driver.url, entry.id)
+            used.add(bound_key)
+            bound = self._bound.get(bound_key)
+            if bound is None or bound.public_model != public or bound._inner is not driver.client:
+                bound = BoundClient(driver.client, model=entry.id, public_model=public)
+                self._bound[bound_key] = bound
+            backend = replace(driver, client=bound, model=entry, public_id=public)
+            self._join_runtime(backend, runtimes, by_alias)
+            if driver.runtime is None and backend.runtime is not None:
+                # The driver-level entry in `reachable` is what the attempt
+                # hooks look a runtime up on; a companion's one model tells
+                # it which runtime it fronts.
+                driver.runtime = backend.runtime
+            snapshot.by_model.setdefault(public, []).append(backend)
+        return used
+
+    def _join_runtime(
+        self,
+        backend: _Backend,
+        runtimes: dict[Key, _RuntimeFacts],
+        by_alias: dict[Key, _RuntimeFacts | None],
+    ) -> None:
+        """Join one candidate to the engine runtime behind its driver."""
+        if backend.info.runtime:
+            # **On this driver's own node.** `/v1/info` reports a
+            # bare name, and a bare name matches a replica on another
+            # machine just as well -- which is how a driver on node A
+            # came to follow node B's runtime and read its status.
+            backend.runtime = runtimes.get((backend.node, backend.info.runtime))
+            if backend.runtime is None:
+                # Raised from DEBUG (M7's record asked for this):
+                # "routable on faith" is the eligibility rule saying
+                # yes to an engine whose state it does not know, and
+                # it is worth a line an operator will see.
+                log.warning(
+                    "driver %r on node %r follows runtime %r, which that node does not "
+                    "report; treating it as routable on faith",
+                    backend.name,
+                    backend.node,
+                    backend.info.runtime,
+                )
+        else:
+            backend.runtime = by_alias.get((backend.node, backend.public_id))
 
     async def _fetch_agent(
         self, node: str | None, url: str
@@ -1164,7 +1286,7 @@ class RoutingTable:
         try:
             info = await client.info()
         except (httpx.HTTPError, ValueError) as e:
-            return _Unreachable(name=name, url=url, error=str(e))
+            return _Unreachable(name=name, url=url, error=str(e), node=node)
         # The reservation map is passed BY REFERENCE: every backend in
         # every snapshot reads the one the table owns, so a stop taken
         # after this refresh is visible to a backend built before it.
@@ -1220,6 +1342,7 @@ class RoutingTable:
         retry_disposition: str | None = None,
         usage: Any = None,
         first_ms: int | None = None,
+        model: str | None = None,
     ) -> None:
         key: Key = (node, driver)
         self._inflight[key] = max(0, self._inflight.get(key, 0) - 1)
@@ -1233,6 +1356,7 @@ class RoutingTable:
         self._note_attempt(
             AttemptRow(
                 driver=driver,
+                model=model,
                 elapsed_ms=elapsed_ms,
                 served=served,
                 # The row keeps the NAMES, which is what the contract and
@@ -1491,8 +1615,7 @@ class RoutingTable:
             eligible = [
                 b
                 for b in tier.eligible()
-                if not images
-                or (b.info.capabilities is not None and b.info.capabilities.imageInput is True)
+                if not images or (b.caps is not None and b.caps.imageInput is True)
             ]
             # An empty tier stays in the list, so the response's `tier`
             # counts the slot's tiers rather than the eligible ones.
@@ -1518,7 +1641,7 @@ class RoutingTable:
         eligible = [
             b
             for b in resolution.eligible_backends()
-            if b.embeds and b.info.modelId == resolution.model
+            if b.embeds and b.public_id == resolution.model
         ]
         if not eligible:
             return None
@@ -1544,7 +1667,7 @@ class RoutingTable:
         eligible = [
             b
             for b in resolution.eligible_backends()
-            if b.decides and b.info.modelId == resolution.model
+            if b.decides and b.public_id == resolution.model
         ]
         if not eligible:
             return None
@@ -1627,7 +1750,7 @@ class RoutingTable:
         for backend in self._matching(model, driver, node):
             if backend.runtime is not None and backend.runtime.context_length:
                 return backend.runtime.context_length
-            caps = backend.info.capabilities
+            caps = backend.caps
             if caps is not None and caps.maxContextTokens:
                 return caps.maxContextTokens
             return None
@@ -1702,10 +1825,17 @@ class RoutingTable:
         """
         out: list[Model] = []
         for model_id in self.known_models():
-            if allowed is not None and model_id not in allowed:
+            if not permits(allowed, model_id):
                 continue
             resolution = self.resolve(model_id).restricted(allowed, local_only=local_only)
             if not resolution.has_backends():
+                continue
+            if not resolution.surfaces():
+                # **Listed once a door serves it** (P1-4). An account's
+                # speech, image and video models have no door here yet;
+                # they appear under the ids they already have as P3-P5
+                # add them, and meanwhile do not fill every client's
+                # chat picker.
                 continue
             backends = resolution.backends()
             providers = {b.info.provider for b in backends if b.info.provider}
@@ -1725,9 +1855,7 @@ class RoutingTable:
                         context_length=_smallest_context(backends),
                         tool_calling=_all_carry_tools(backends),
                         image_input=any(
-                            b.info.capabilities is not None
-                            and b.info.capabilities.imageInput is True
-                            for b in backends
+                            b.caps is not None and b.caps.imageInput is True for b in backends
                         ),
                         tiers=[[b.name for b in t.backends] for t in resolution.tiers],
                         ready_backends=len(eligible),
@@ -1739,27 +1867,53 @@ class RoutingTable:
 
     def as_driver_health(self) -> list[DriverHealth]:
         """Per-driver snapshot for the admin surface, reachable first."""
-        out = [
-            DriverHealth(
-                name=b.name,
-                reachable=True,
-                url=b.url,  # type: ignore[arg-type]
-                backend=_backend_kind(b),
-                modelId=b.info.modelId,
-                # Straight off the driver's /v1/info: which supervised
-                # runtime it follows. A reachable driver serving nothing,
-                # next to a `ready` runtime routed to by nobody, is the
-                # visible shape of a mis-wired install.
-                runtime=b.info.runtime,
-                version=b.info.version,
+        served: dict[Key, list[_Backend]] = {}
+        for backends in self._snapshot.by_model.values():
+            for backend in backends:
+                served.setdefault(backend.key, []).append(backend)
+        out: list[DriverHealth] = []
+        for b in sorted(self._snapshot.reachable, key=lambda b: (b.name, b.node or "")):
+            catalogue = b.info.catalogue
+            models = served.get(b.key, [])
+            out.append(
+                DriverHealth(
+                    name=b.name,
+                    reachable=True,
+                    url=b.url,  # type: ignore[arg-type]
+                    backend=_backend_kind(b),
+                    node=b.node,
+                    modelId=models[0].public_id if catalogue is None and len(models) == 1 else None,
+                    modelCount=len(models),
+                    account=catalogue is not None,
+                    catalogueRefreshedAt=catalogue.refreshedAt if catalogue else None,
+                    catalogueError=catalogue.error if catalogue else None,
+                    outdated=False,
+                    # Straight off the driver's /v1/info: which supervised
+                    # runtime it follows. A reachable driver serving
+                    # nothing, next to a `ready` runtime routed to by
+                    # nobody, is the visible shape of a mis-wired install.
+                    runtime=b.info.runtime,
+                    version=b.info.version,
+                )
             )
-            for b in sorted(self._snapshot.reachable, key=lambda b: b.name)
+        out += [
+            DriverHealth(
+                name=o.name,
+                reachable=True,
+                url=o.url,  # type: ignore[arg-type]
+                node=o.node,
+                modelId=o.model_id,
+                outdated=True,
+                version=o.version,
+            )
+            for o in sorted(self._snapshot.outdated, key=lambda o: (o.name, o.node or ""))
         ]
         out += [
             DriverHealth(
                 name=u.name,
                 reachable=False,
                 url=u.url,  # type: ignore[arg-type]
+                node=u.node,
                 error=u.error,
             )
             for u in sorted(self._snapshot.unreachable, key=lambda u: u.name)
@@ -1790,6 +1944,18 @@ class RoutingTable:
             load_balancing=str(self._strategy() or LEAST_BUSY),
             slots=slots,
             unreachable_drivers=sorted(u.name for u in self._snapshot.unreachable),
+            outdated_drivers=[
+                OutdatedDriver.model_validate(
+                    {
+                        "name": o.name,
+                        "node": o.node,
+                        "url": o.url,
+                        "version": o.version,
+                        "modelId": o.model_id,
+                    }
+                )
+                for o in sorted(self._snapshot.outdated, key=lambda o: (o.name, o.node or ""))
+            ],
             control_root=self._control_root_view(),
         )
 
@@ -1815,6 +1981,7 @@ class RoutingTable:
         facts = backend.runtime
         return RoutingBackendView(
             driver=backend.name,
+            model=backend.model.id if backend.model is not None else None,
             url=backend.url,  # type: ignore[arg-type]
             eligible=backend.eligible,
             ineligible_reason=backend.ineligible_reason,
@@ -1822,7 +1989,7 @@ class RoutingTable:
             parallel_slots=backend.parallel_slots,
             runtime=facts.name if facts else None,
             runtime_status=facts.status if facts else None,
-            node=facts.node if facts else None,
+            node=facts.node if facts else backend.node,
             stop_reason=facts.stop_reason if facts else None,
             idle_unload_seconds=facts.idle_unload_seconds if facts else None,
             start_on_demand=facts.start_on_demand if facts else None,
@@ -1856,9 +2023,7 @@ def _all_carry_tools(backends: list[_Backend]) -> bool:
     """
     if not backends:
         return False
-    return all(
-        b.info.capabilities is not None and bool(b.info.capabilities.toolCalling) for b in backends
-    )
+    return all(b.caps is not None and bool(b.caps.toolCalling) for b in backends)
 
 
 def _smallest_context(backends: list[_Backend]) -> int | None:
@@ -1875,9 +2040,7 @@ def _smallest_context(backends: list[_Backend]) -> int | None:
     agent after it loaded — would report nothing.
     """
     lengths = [
-        b.info.capabilities.maxContextTokens
-        for b in backends
-        if b.info.capabilities is not None and b.info.capabilities.maxContextTokens
+        b.caps.maxContextTokens for b in backends if b.caps is not None and b.caps.maxContextTokens
     ]
     lengths += [
         b.runtime.context_length

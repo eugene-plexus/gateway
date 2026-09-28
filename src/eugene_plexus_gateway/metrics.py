@@ -50,7 +50,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Bounded because the alternative to dropping rows is stalling
 # completions, and that trade is never worth making. Sized so a burst
@@ -99,6 +99,10 @@ class AttemptRow:
     driver: str
     elapsed_ms: int
     served: bool
+    #: The published id of the model this attempt asked for (v6, P1): one
+    #: account's driver serves hundreds, so the driver alone no longer
+    #: says what was tried.
+    model: str | None = None
     runtime: str | None = None
     node: str | None = None
     backend: str | None = None
@@ -184,6 +188,7 @@ CREATE TABLE IF NOT EXISTS attempt (
     request_id INTEGER NOT NULL REFERENCES request (id) ON DELETE CASCADE,
     seq        INTEGER NOT NULL,
     driver     TEXT    NOT NULL,
+    model      TEXT,
     runtime    TEXT,
     node       TEXT,
     backend    TEXT,
@@ -324,7 +329,7 @@ class MetricsStore:
         conn.commit()
 
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        if row is not None and int(row[0]) in (2, 3, 4):
+        if row is not None and int(row[0]) in (2, 3, 4, 5):
             columns = {r[1] for r in conn.execute("PRAGMA table_info(request)")}
             for column in ("client_key_id", "client_key_name"):
                 if column not in columns:
@@ -340,6 +345,8 @@ class MetricsStore:
                     # in place — the existence check makes this idempotent
                     # whatever version the file starts at.
                     "first_ms": "INTEGER",
+                    # v6: the model an attempt asked for (P1).
+                    "model": "TEXT",
                 },
             }.items():
                 existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -514,15 +521,16 @@ class MetricsStore:
                 )
                 request_id = cursor.lastrowid
                 conn.executemany(
-                    "INSERT INTO attempt (request_id, seq, driver, runtime, node, backend,"
-                    " elapsed_ms, served, error, backend_ms, retry_disposition, usage_known,"
-                    " prompt_tokens, completion_tokens, first_ms)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO attempt (request_id, seq, driver, model, runtime, node,"
+                    " backend, elapsed_ms, served, error, backend_ms, retry_disposition,"
+                    " usage_known, prompt_tokens, completion_tokens, first_ms)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         (
                             request_id,
                             seq,
                             a.driver,
+                            a.model,
                             a.runtime,
                             a.node,
                             a.backend,
@@ -992,11 +1000,12 @@ class MetricsStore:
                 prompt_tokens,
                 completion_tokens,
                 first_ms,
+                model,
             ) in conn.execute(
                 f"""
                 SELECT request_id, driver, runtime, node, backend, elapsed_ms, served,
                        error, backend_ms, retry_disposition, usage_known,
-                       prompt_tokens, completion_tokens, first_ms
+                       prompt_tokens, completion_tokens, first_ms, model
                 FROM attempt WHERE request_id IN ({placeholders}) ORDER BY request_id, seq
                 """,
                 ids,
@@ -1004,6 +1013,7 @@ class MetricsStore:
                 tries[request_id].append(
                     {
                         "driver": driver,
+                        "model": model,
                         "runtime": runtime,
                         "node": node,
                         "backend": backend,
