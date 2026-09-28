@@ -113,6 +113,9 @@ class StreamEvent:
     delta, and validating a *fragment* against the whole-call shape
     would reject the normal case -- `id` and `name` arrive once, and
     `arguments` arrives split at arbitrary points."""
+    audio: dict[str, Any] | None = None
+    """A fragment of a spoken answer (P2b), as the driver's `AudioDelta`
+    (camelCase, parsed JSON). Output like text, so a commit point."""
     progress: dict[str, Any] | None = None
     """What the backend is doing while it produces no output, as the
     driver's `StreamProgress` (camelCase, parsed JSON). **Not output**:
@@ -502,6 +505,10 @@ class HttpDriverClient:
                 reasoning = parsed.get("reasoning")
                 if isinstance(reasoning, str) and reasoning:
                     yield StreamEvent(reasoning=reasoning)
+                    continue
+                audio = parsed.get("audio")
+                if isinstance(audio, dict) and audio:
+                    yield StreamEvent(audio=audio)
                     continue
                 text = parsed.get("text")
                 if isinstance(text, str) and text:

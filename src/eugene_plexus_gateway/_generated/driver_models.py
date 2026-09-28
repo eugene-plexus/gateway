@@ -106,6 +106,37 @@ class InputFile(BaseModel):
     )
 
 
+class AudioOutputFormat(StrEnum):
+    """
+    The formats OpenAI's chat audio output names (P2b, 2026-09-28).
+
+    **Asked for, only `wav` and `pcm16` can be served**, because
+    every audio-output model behind an account answers audio only
+    when streamed and only as `pcm16` (measured 2026-09-28, OpenAI's
+    own 400: *"Supported values are: 'pcm16'"*). A non-streamed
+    answer is the stream assembled, and `wav` is that with a WAV
+    header; a streamed answer is `pcm16`. The other four would need a
+    transcoder and are refused, naming the two that work (P2-1).
+
+    **Reported, it is what the bytes are, not what was asked.**
+    Lyria answers MP3 whatever it is asked for (measured), so its
+    audio is labelled `mp3` from its own header (P2-2). `pcm16` is
+    raw little-endian 16-bit mono samples with no header, at the
+    24 kHz OpenAI documents.
+
+    Named rather than inline so a later inline enum cannot rename it
+    (S6's `Source1`).
+
+    """
+
+    wav = 'wav'
+    mp3 = 'mp3'
+    flac = 'flac'
+    opus = 'opus'
+    aac = 'aac'
+    pcm16 = 'pcm16'
+
+
 class BackendKind(StrEnum):
     """
     Which wire protocol an inference-driver instance speaks to its
@@ -1079,6 +1110,82 @@ class FinishReason(StrEnum):
     error = 'error'
 
 
+class AudioOutputRequest(BaseModel):
+    """
+    Answer with audio as well as text (P2b, 2026-09-28): the chat
+    door's `modalities` including `audio`, with its `audio` object.
+    Sent only to a model whose capabilities say `audioOutput`; any
+    other is refused with 400 before anything is forwarded.
+
+    **Upstream it is always a stream of `pcm16`**, whichever door
+    asked: every audio-output model behind an account answers audio
+    only that way (measured 2026-09-28). `POST /v1/generate`
+    assembles the stream into one `GeneratedAudio`; asked for `wav`,
+    it adds the header. It refuses any other `format` with 400,
+    naming `wav` and `pcm16`. `POST /v1/generate/stream` carries
+    `pcm16` only and refuses the rest the same way, as OpenAI itself
+    does.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    voice: str = Field(
+        ...,
+        description="The voice, in the provider's own names (`alloy`, `coral`,\n...). Passed through; a model with no voices (Lyria)\nignores it.\n",
+        max_length=64,
+        min_length=1,
+    )
+    format: AudioOutputFormat
+
+
+class GeneratedAudio(BaseModel):
+    """
+    The audio of a `POST /v1/generate` answer, assembled from the
+    stream the backend sent.
+
+    """
+
+    data: str = Field(..., description="The whole answer's audio, base64-encoded.")
+    format: AudioOutputFormat = Field(
+        ...,
+        description="What `data` is, read from its bytes: `mp3` for an ID3 tag or\nframe sync, `wav` for a RIFF/WAVE header (including one this\ndriver added), `pcm16` for headerless samples. **Not what\nwas asked** when the backend sent something else: Lyria's\nMP3 is `mp3` (P2-2).\n",
+    )
+    id: str | None = Field(
+        None, description="The backend's id for the audio, when it gives one."
+    )
+    transcript: str | None = Field(
+        None,
+        description="What the audio says, when the backend reports it. A speech\nmodel's spoken answer is here, not in `content`.\n",
+    )
+    expiresAt: int | None = Field(
+        None,
+        description='Unix seconds after which the backend forgets the audio, when\nit says. Nothing here stores it; see the chat door.\n',
+    )
+
+
+class AudioDelta(BaseModel):
+    """
+    A fragment of the answer's audio on the stream. `data` fragments
+    concatenate, after base64 decoding each one, into the whole
+    answer. `id`, `format` and `expiresAt` arrive once; `transcript`
+    arrives in fragments, like `text`.
+
+    """
+
+    data: str | None = Field(
+        None, description='A fragment of the audio, base64-encoded on its own.'
+    )
+    format: AudioOutputFormat | None = Field(
+        None,
+        description="On the first fragment carrying `data`: what the bytes are,\nread from them (`pcm16`, or Lyria's `mp3`).\n",
+    )
+    id: str | None = None
+    transcript: str | None = None
+    expiresAt: int | None = None
+
+
 class Stage(StrEnum):
     """
     `prompt`: reading the prompt, with the token counts below.
@@ -1427,6 +1534,10 @@ class Capabilities(BaseModel):
         None,
         description="Whether the model is confirmed to read a `file` part (PDF).\nThe same rule as `audioInput`. From `file` in the account's\n`input_modalities`; no local engine reads one today, so a\nsingle-model driver reports false.\n",
     )
+    audioOutput: bool | None = Field(
+        None,
+        description="Whether the model is confirmed to answer with audio\n(`GenerateRequest.audioOutput`). From `audio` in the\naccount's `output_modalities`; no local engine or CLI speaks,\nso they report false. Unknown is false, as for the inputs.\n\n**Not from `supported_parameters`** (A2's setting list): no\naudio-output model on OpenRouter lists `modalities` or\n`audio` there (measured 2026-09-28), so routing by it would\nroute nothing. Added 2026-09-28 (P2b).\n",
+    )
     toolCalling: bool | None = Field(
         None,
         description='Whether this driver can carry `tools` to its backend and\nreport `toolCalls` back.\n\nThe gateway reads it to answer a question a harness\ncannot otherwise ask: a plain answer where a tool call\nwas expected looks identical whether the model declined\nor the backend never saw the tools. A driver that says\n`false` here is failed at the front door with a reason\ninstead.\n',
@@ -1621,8 +1732,8 @@ class DirectoryEntry(BaseModel):
 
 class StreamToken(BaseModel):
     """
-    One `event: token` payload. Exactly one of `text`, `reasoning`
-    or `toolCalls` is set.
+    One `event: token` payload. Exactly one of `text`, `reasoning`,
+    `toolCalls` or `audio` is set.
 
     A reasoning frame is output like any other: it is the first
     thing a reasoning model produces, so it is also the commit point
@@ -1640,6 +1751,7 @@ class StreamToken(BaseModel):
         None,
         description='Fragments of one or more tool calls, accumulated by `index`.\n',
     )
+    audio: AudioDelta | None = None
 
 
 class Tool(BaseModel):
@@ -1863,6 +1975,7 @@ class GenerateResponse(BaseModel):
         ...,
         description="**`content_filter` is separate from `error` since\n2026-09-19**, and the two were one value for the same\nreason `tool_calls` was folded into `stop` before step 6:\nthe map had a row for a state nobody had a use for yet, so\nthe state was reported as its nearest neighbour.\n\nA filtered answer is not a backend error — nothing broke,\nthe backend did exactly what it was configured to do — and\nit is not a natural end either, which is what the caller\nsaw. `error` means the generation was truncated because\nsomething failed mid-stream; `content_filter` means a\nclassifier stopped it on purpose. OpenAI and Anthropic each\nhave their own name for this state and the gateway renders\nit in the caller's vocabulary, so a client that switches on\nthe field gets the vendor value it already understands.\n",
     )
+    audio: GeneratedAudio | None = None
     usage: Usage | None = None
     requestId: UUID | None = None
     backend: BackendKind | None = None
@@ -2008,6 +2121,7 @@ class GenerateRequest(BaseModel):
         description='`none`, `auto`, `required`, or an object naming one\nfunction. Passed through.\n',
     )
     responseFormat: ResponseFormat | None = None
+    audioOutput: AudioOutputRequest | None = None
     reportProgress: bool | None = Field(
         False,
         description="On `POST /v1/generate/stream` only: emit `event: progress`\nframes saying what the backend is doing when it is not yet,\nor not at the moment, producing output -- see\n`StreamProgress` for what each backend reports. Ignored by\n`POST /v1/generate`. Not an output setting: it changes what\nthe stream says about the work, never what the model says.\n\nllama.cpp's own `return_progress` flag is sent only once the\nbackend has answered as `llama-server` (its `/props`), since\na hosted API refuses a field it does not know.\n\n**The 200 commits at the first progress frame**, where it\notherwise commits at the first token, so a backend that\nfails partway through reading the prompt fails as an\n`event: error` frame instead of a status code. That is why\nit is asked for rather than sent by default.\n",

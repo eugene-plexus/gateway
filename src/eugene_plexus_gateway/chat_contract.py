@@ -104,6 +104,15 @@ def parse_request(raw: Any, *, max_images: int = DEFAULT_MAX_IMAGES) -> ChatComp
                 raise Refusal(f"stream_options.{flag}", "must be a boolean")
         if body.get("stream") is not True:
             raise Refusal("stream_options", "requires stream true")
+    # Before the schema, so `{"id": ...}` -- the shape OpenAI takes here --
+    # is told why rather than which of the response's fields it lacks.
+    for index, message in enumerate(body.get("messages") or []):
+        if isinstance(message, dict) and "audio" in message:
+            raise Refusal(
+                f"messages[{index}].audio",
+                "names stored audio, and this install keeps none; send the "
+                "transcript as content instead",
+            )
     try:
         parsed = ChatCompletionRequest.model_validate(body)
     except ValidationError as exc:
@@ -130,7 +139,46 @@ def parse_request(raw: Any, *, max_images: int = DEFAULT_MAX_IMAGES) -> ChatComp
         validate_messages(parsed.messages, max_images)
     except ImageRefusal as exc:
         raise Refusal(exc.field, exc.reason) from None
+    _check_audio_output(parsed)
     return parsed
+
+
+def wants_audio(parsed: ChatCompletionRequest) -> bool:
+    """Whether the caller asked for a spoken answer (P2b)."""
+    return parsed.modalities is not None and any(m.value == "audio" for m in parsed.modalities)
+
+
+def _check_audio_output(parsed: ChatCompletionRequest) -> None:
+    """`modalities` and `audio` agree, and the format is one we can serve.
+
+    Every audio-output model behind an account answers audio only on a
+    stream and only as `pcm16` (measured 2026-09-28). A non-streamed answer
+    is that stream assembled, so it can be `pcm16` or, with a header,
+    `wav`; a streamed one is `pcm16`. The rest would need a transcoder and
+    are refused, naming what works (P2-1), rather than answered in a
+    format the caller did not ask for.
+    """
+    asked = wants_audio(parsed)
+    if parsed.audio is not None and not asked:
+        raise Refusal("audio", 'is set but modalities does not include "audio"')
+    if not asked:
+        return
+    if parsed.audio is None:
+        raise Refusal(
+            "audio", 'is required when modalities includes "audio": send voice and format'
+        )
+    fmt = parsed.audio.format.value
+    if parsed.stream and fmt != "pcm16":
+        raise Refusal(
+            "audio.format",
+            f"cannot be {fmt} on a stream: backends stream audio as pcm16 only, so ask for pcm16",
+        )
+    if not parsed.stream and fmt not in ("wav", "pcm16"):
+        raise Refusal(
+            "audio.format",
+            f"cannot be {fmt}: backends answer audio as a pcm16 stream, which this gateway "
+            "returns as wav or pcm16; ask for one of those",
+        )
 
 
 def request_body_schema() -> dict[str, Any]:

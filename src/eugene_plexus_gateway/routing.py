@@ -208,8 +208,16 @@ class _RuntimeFacts:
 
 
 #: Which capability confirms each kind of attachment.
-_INPUT_FLAGS = {"image": "imageInput", "audio": "audioInput", "file": "fileInput"}
+#: `audio_output` is not an input, but it is routed the same way (P2b):
+#: a model that does not confirm it is never asked to speak.
+_INPUT_FLAGS = {
+    "image": "imageInput",
+    "audio": "audioInput",
+    "file": "fileInput",
+    "audio_output": "audioOutput",
+}
 _IMAGE, _AUDIO, _FILE = frozenset({"image"}), frozenset({"audio"}), frozenset({"file"})
+_SPEAKS = frozenset({"audio_output"})
 
 
 def takes(caps: Capabilities | None, needs: frozenset[str]) -> bool:
@@ -1873,6 +1881,7 @@ class RoutingTable:
                         image_input=any(takes(b.caps, _IMAGE) for b in backends),
                         audio_input=any(takes(b.caps, _AUDIO) for b in backends),
                         file_input=any(takes(b.caps, _FILE) for b in backends),
+                        audio_output=any(takes(b.caps, _SPEAKS) for b in backends),
                         tiers=[[b.name for b in t.backends] for t in resolution.tiers],
                         ready_backends=len(eligible),
                         on_demand=not eligible and bool(resolution.startable()),

@@ -39,25 +39,30 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from .. import admission, anthropic, chat_contract, decisions, responses
+from .._generated.driver_models import AudioOutputFormat as DriverAudioOutputFormat
 from .._generated.driver_models import (
-    DecisionQuestion as DriverDecisionQuestion,
-)
-from .._generated.driver_models import (
-    DecisionRequest as DriverDecisionRequest,
-)
-from .._generated.driver_models import (
+    AudioOutputRequest,
     EmbedRequest,
     GenerateRequest,
     GenerateResponse,
     Message,
     Role,
 )
+from .._generated.driver_models import (
+    DecisionQuestion as DriverDecisionQuestion,
+)
+from .._generated.driver_models import (
+    DecisionRequest as DriverDecisionRequest,
+)
 from .._generated.driver_models import NamedToolChoice as DriverNamedToolChoice
 from .._generated.driver_models import ResponseFormat as DriverResponseFormat
 from .._generated.driver_models import Tool as DriverTool
 from .._generated.driver_models import ToolChoice as DriverToolChoice
 from .._generated.models import (
+    AudioOutputFormat,
     BackendKind,
+    ChatCompletionAudio,
+    ChatCompletionAudioDelta,
     ChatCompletionChoice,
     ChatCompletionChunk,
     ChatCompletionChunkChoice,
@@ -594,6 +599,9 @@ async def _prepare(
     # with a startable runtime is awaited rather than skipped — see the
     # lifecycle module.
     needs = attachment_kinds(body.messages)
+    if chat_contract.wants_audio(body):
+        # Routed like an attachment: only to a model that confirms it.
+        needs = needs | {"audio_output"}
     wake: WakeResult | None = None
     client = table.pick(resolution, needs=needs)
     if client is None and await table.refresh_if_stale():
@@ -1672,6 +1680,12 @@ _UNCONFIRMED_INPUT = {
         "file_input",
         "the file was not discarded",
     ),
+    "audio_output": (
+        "audio output",
+        "Select a model that speaks.",
+        "audio_output",
+        "nothing was sent",
+    ),
 }
 
 
@@ -1788,6 +1802,13 @@ def _to_generate_request(
         frequencyPenalty=body.frequency_penalty,
         presencePenalty=body.presence_penalty,
         parallelToolCalls=body.parallel_tool_calls,
+        # A spoken answer (P2b). The driver asks the backend for a pcm16
+        # stream whatever the format; this format says what to make of it.
+        audioOutput=AudioOutputRequest(
+            voice=body.audio.voice, format=DriverAudioOutputFormat(body.audio.format.value)
+        )
+        if body.audio is not None and chat_contract.wants_audio(body)
+        else None,
         # Asked for by the caller and only then: a progress chunk has no
         # choices, and an OpenAI client that was not expecting one should
         # never see it. `stream_options` without `stream: true` is refused
@@ -2125,6 +2146,38 @@ def _routing_info(
     )
 
 
+def _to_openai_audio(response: GenerateResponse) -> ChatCompletionAudio | None:
+    """The driver's assembled clip as OpenAI's `message.audio`, with the
+    format the bytes are rather than the one asked (P2-2)."""
+    clip = response.audio
+    if clip is None:
+        return None
+    return ChatCompletionAudio(
+        id=clip.id,
+        data=clip.data,
+        format=AudioOutputFormat(clip.format.value),
+        transcript=clip.transcript,
+        expires_at=clip.expiresAt,
+    )
+
+
+def _to_openai_audio_delta(fragment: dict[str, Any]) -> ChatCompletionAudioDelta:
+    """A driver `AudioDelta` (camelCase JSON) as OpenAI's `delta.audio`."""
+    fmt = fragment.get("format")
+    expires = fragment.get("expiresAt")
+    return ChatCompletionAudioDelta(
+        id=fragment.get("id") if isinstance(fragment.get("id"), str) else None,
+        data=fragment.get("data") if isinstance(fragment.get("data"), str) else None,
+        format=AudioOutputFormat(fmt)
+        if isinstance(fmt, str) and fmt in AudioOutputFormat._value2member_map_
+        else None,
+        transcript=fragment.get("transcript")
+        if isinstance(fragment.get("transcript"), str)
+        else None,
+        expires_at=expires if isinstance(expires, int) and not isinstance(expires, bool) else None,
+    )
+
+
 def _to_chat_completion(
     body: ChatCompletionRequest,
     response: GenerateResponse,
@@ -2158,6 +2211,7 @@ def _to_chat_completion(
                     # nothing to say why.
                     reasoning_content=response.reasoning,
                     tool_calls=_to_openai_tool_calls(response.toolCalls),
+                    audio=_to_openai_audio(response),
                 ),
                 finish_reason=_finish_reason(response),
             )
@@ -2310,6 +2364,17 @@ async def _stream_completion(
                     yield frame(
                         envelope(
                             delta=Delta(reasoning_content=event.reasoning),
+                            finish=None,
+                            model=body.model,
+                        )
+                    )
+                    continue
+                if event.audio:
+                    # A fragment of the spoken answer (P2b), forwarded as
+                    # it lands. Past the commit point like any output.
+                    yield frame(
+                        envelope(
+                            delta=Delta(audio=_to_openai_audio_delta(event.audio)),
                             finish=None,
                             model=body.model,
                         )

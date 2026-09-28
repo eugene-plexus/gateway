@@ -144,6 +144,37 @@ class InputFile(BaseModel):
     )
 
 
+class AudioOutputFormat(StrEnum):
+    """
+    The formats OpenAI's chat audio output names (P2b, 2026-09-28).
+
+    **Asked for, only `wav` and `pcm16` can be served**, because
+    every audio-output model behind an account answers audio only
+    when streamed and only as `pcm16` (measured 2026-09-28, OpenAI's
+    own 400: *"Supported values are: 'pcm16'"*). A non-streamed
+    answer is the stream assembled, and `wav` is that with a WAV
+    header; a streamed answer is `pcm16`. The other four would need a
+    transcoder and are refused, naming the two that work (P2-1).
+
+    **Reported, it is what the bytes are, not what was asked.**
+    Lyria answers MP3 whatever it is asked for (measured), so its
+    audio is labelled `mp3` from its own header (P2-2). `pcm16` is
+    raw little-endian 16-bit mono samples with no header, at the
+    24 kHz OpenAI documents.
+
+    Named rather than inline so a later inline enum cannot rename it
+    (S6's `Source1`).
+
+    """
+
+    wav = 'wav'
+    mp3 = 'mp3'
+    flac = 'flac'
+    opus = 'opus'
+    aac = 'aac'
+    pcm16 = 'pcm16'
+
+
 class ComponentKind(StrEnum):
     """
     Which Eugene Plexus component class a topology entry
@@ -1086,6 +1117,10 @@ class ModelRoutingInfo(BaseModel):
         None,
         description='At least one backend confirms file (PDF) input for this\nmodel, with the same routing rule. Added 2026-09-28 (P2).\n',
     )
+    audio_output: bool | None = Field(
+        None,
+        description='At least one backend confirms this model answers with audio.\nA request with `modalities` including `audio` routes only to\nthose backends, including fallback. Added 2026-09-28 (P2b).\n',
+    )
     tool_calling: bool | None = Field(
         None,
         description='Whether a request for this model may carry `tools`.\n\n**True only when every backend serving it can**, by the same\nreasoning as `context_length` above: a request may land on\nany of them, so the honest answer is the weakest one. A\nharness can read this and pick a model rather than discover\nthe limit as a 400 halfway through a task.\n',
@@ -1143,6 +1178,81 @@ class ToolChoice(StrEnum):
     none = 'none'
     auto = 'auto'
     required = 'required'
+
+
+class ChatModality(StrEnum):
+    """
+    One part of what the answer is made of. Named rather than inline
+    so a later inline enum cannot rename it (S6's `Source1`).
+
+    """
+
+    text = 'text'
+    audio = 'audio'
+
+
+class ChatAudioRequest(BaseModel):
+    """
+    The spoken answer's voice and format, with `modalities`
+    including `audio`; refused without it, rather than ignored.
+    `format` is `wav` or `pcm16` for a non-streamed request and
+    `pcm16` for a streamed one; the others are refused (see the
+    operation).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    voice: str = Field(
+        ...,
+        description="The provider's voice name (`alloy`, `coral`, ...), passed\nthrough. A model with no voices (Lyria) ignores it.\n",
+        max_length=64,
+        min_length=1,
+    )
+    format: AudioOutputFormat
+
+
+class ChatCompletionAudio(BaseModel):
+    """
+    The spoken answer, on a response's `message.audio`: OpenAI's
+    shape, plus `format`, which says what `data` is. **Refused on a
+    request message**, where OpenAI takes `{id}` to name stored
+    audio; this install stores none.
+
+    """
+
+    id: str | None = Field(
+        None, description="The backend's id for the audio, when it gives one."
+    )
+    data: str = Field(..., description='The audio, base64-encoded.')
+    format: AudioOutputFormat = Field(
+        ...,
+        description="**Not OpenAI's field, and added because OpenAI's shape\ncannot say this:** what `data` is, read from its bytes.\nLyria answers MP3 when asked for WAV (measured), and\npresenting MP3 bytes as the WAV that was asked for would be\na lie a player discovers first (P2-2).\n",
+    )
+    transcript: str | None = Field(
+        None,
+        description="What the audio says. The answer's text is here, not in `content`.",
+    )
+    expires_at: int | None = Field(
+        None,
+        description='Unix seconds the backend says it keeps the audio until.\nNothing here keeps it.\n',
+    )
+
+
+class ChatCompletionAudioDelta(BaseModel):
+    """
+    A fragment of the spoken answer. Decode each `data` fragment
+    from base64 and concatenate the bytes. `id`, `format` and
+    `expires_at` arrive once; `transcript` arrives in fragments.
+
+    """
+
+    id: str | None = None
+    data: str | None = None
+    format: AudioOutputFormat | None = None
+    transcript: str | None = None
+    expires_at: int | None = None
 
 
 class Role1(StrEnum):
@@ -2586,7 +2696,8 @@ class Delta(BaseModel):
     """
     Incremental payload. The first chunk carries `role`;
     subsequent chunks carry `content` fragments, `tool_calls`
-    fragments, or neither on the terminal chunk.
+    fragments, `audio` fragments, or neither on the terminal
+    chunk.
 
     """
 
@@ -2600,13 +2711,14 @@ class Delta(BaseModel):
         None,
         description='Tool-call fragments. Each carries an `index` and the\ncaller accumulates by it: `id` and `function.name`\narrive once, `function.arguments` arrives as a string\nsplit across any number of frames. A single frame is\n**not** parseable JSON and was never meant to be.\n',
     )
+    audio: ChatCompletionAudioDelta | None = None
 
 
 class ChatCompletionChunkChoice(BaseModel):
     index: int
     delta: Delta = Field(
         ...,
-        description='Incremental payload. The first chunk carries `role`;\nsubsequent chunks carry `content` fragments, `tool_calls`\nfragments, or neither on the terminal chunk.\n',
+        description='Incremental payload. The first chunk carries `role`;\nsubsequent chunks carry `content` fragments, `tool_calls`\nfragments, `audio` fragments, or neither on the terminal\nchunk.\n',
     )
     finish_reason: FinishReason1 | None = Field(
         None, description='Null until the terminal chunk.'
@@ -3277,6 +3389,10 @@ class ChatCompletionMessage(BaseModel):
         None,
         description='Required on a **tool** message: which call in the preceding\nassistant turn this is the result of. `content` is the\nresult, as a string — the caller serializes it.\n',
     )
+    audio: ChatCompletionAudio | None = Field(
+        None,
+        description='On a response: the spoken answer (P2b). On a request:\nrefused with a 400, since it would name stored audio.\n',
+    )
 
 
 class ChatCompletionChoice(BaseModel):
@@ -3427,6 +3543,12 @@ class ChatCompletionRequest(BaseModel):
         description='Whether the model may request several tools in one turn.\nCarried when set and left absent when not, because the\nbackends disagree about the default -- llama.cpp assumes\nfalse, OpenAI true -- and filling one in would change what\none of them already does.\n',
     )
     response_format: ResponseFormat | None = None
+    modalities: list[ChatModality] | None = Field(
+        None,
+        description='What the answer is made of. `["text"]` is the default;\n`["text", "audio"]` asks for a spoken answer and needs\n`audio`. Routes only to a model that confirms audio output.\nAdded 2026-09-28 (P2b).\n',
+        min_length=1,
+    )
+    audio: ChatAudioRequest | None = None
 
 
 class ChatCompletionResponse(BaseModel):

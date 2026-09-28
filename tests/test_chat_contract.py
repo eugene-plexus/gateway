@@ -138,7 +138,10 @@ def test_conflicting_limits(client: TestClient, fake_driver: FakeDriverClient) -
         # these two are still consequential and still have nowhere to go.
         ({"top_logprobs": 2}, "top_logprobs"),
         ({"logit_bias": {"1": -100}}, "logit_bias"),
-        ({"modalities": ["text", "audio"]}, "modalities"),
+        # Refused as `modalities` until P2b (2026-09-28); audio output is
+        # served now, so what is missing is the `audio` object that says
+        # which voice and format -- still refused, naming that.
+        ({"modalities": ["text", "audio"]}, "audio"),
         ({"n": 2}, "n"),
         ({"logprobs": True}, "logprobs"),
         ({"store": True}, "store"),

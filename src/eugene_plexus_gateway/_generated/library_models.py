@@ -129,6 +129,37 @@ class InputFile(BaseModel):
     )
 
 
+class AudioOutputFormat(StrEnum):
+    """
+    The formats OpenAI's chat audio output names (P2b, 2026-09-28).
+
+    **Asked for, only `wav` and `pcm16` can be served**, because
+    every audio-output model behind an account answers audio only
+    when streamed and only as `pcm16` (measured 2026-09-28, OpenAI's
+    own 400: *"Supported values are: 'pcm16'"*). A non-streamed
+    answer is the stream assembled, and `wav` is that with a WAV
+    header; a streamed answer is `pcm16`. The other four would need a
+    transcoder and are refused, naming the two that work (P2-1).
+
+    **Reported, it is what the bytes are, not what was asked.**
+    Lyria answers MP3 whatever it is asked for (measured), so its
+    audio is labelled `mp3` from its own header (P2-2). `pcm16` is
+    raw little-endian 16-bit mono samples with no header, at the
+    24 kHz OpenAI documents.
+
+    Named rather than inline so a later inline enum cannot rename it
+    (S6's `Source1`).
+
+    """
+
+    wav = 'wav'
+    mp3 = 'mp3'
+    flac = 'flac'
+    opus = 'opus'
+    aac = 'aac'
+    pcm16 = 'pcm16'
+
+
 class BackendKind(StrEnum):
     """
     Which wire protocol an inference-driver instance speaks to its
