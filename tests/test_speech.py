@@ -8,6 +8,7 @@ are the OpenAI SDK's, captured 2026-09-28
 
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -205,6 +206,35 @@ def test_after_the_first_byte_a_failure_ends_the_audio_and_does_not_cascade(
     assert all(r.status_code == 200 for r in cut)
     # A replica that failed after its first byte did not hand over to the other.
     assert len(breaks.spoken) + len(spare.spoken) == 4
+
+
+def _rows(client: TestClient) -> list[dict[str, Any]]:
+    for _ in range(50):
+        rows = client.get("/v1/metrics/requests").json()["requests"]
+        if rows:
+            return rows
+        time.sleep(0.02)
+    return []
+
+
+def test_a_served_clip_is_retained_as_served(settings: Settings) -> None:
+    """Left to the admission middleware's fallback row, which knows only
+    embeddings, every served clip was retained as an error with no served
+    model (the P3a acceptance run found it)."""
+    voice = Speaker(name="a", model_id="narrator")
+    with serve(settings, voice) as client:
+        assert client.post("/v1/audio/speech", json=speech()).status_code == 200
+        [row] = _rows(client)
+    assert (row["outcome"], row["servedModel"], row["streamed"]) == ("served", "narrator", True)
+    assert [t["served"] for t in row["tries"]] == [True]
+
+
+def test_a_failed_clip_is_retained_as_an_error_with_its_attempt(settings: Settings) -> None:
+    dead = Speaker(name="a", model_id="narrator", fail=httpx.ConnectError("refused"))
+    with serve(settings, dead) as client:
+        assert client.post("/v1/audio/speech", json=speech()).status_code >= 500
+        [row] = _rows(client)
+    assert row["outcome"] == "error" and [t["served"] for t in row["tries"]] == [False]
 
 
 def test_a_chat_model_is_refused_at_the_speech_door(settings: Settings) -> None:

@@ -98,6 +98,7 @@ from .._generated.models import (
     Role1,
     Role2,
     SpeechFormat,
+    SpeechRequest,
     StreamProgress,
     SystemOneAnswer,
     SystemOneRequest,
@@ -175,7 +176,7 @@ class _Recording:
 
 def _record(
     rec: _Recording,
-    body: ChatCompletionRequest,
+    body: ChatCompletionRequest | SpeechRequest,
     tries: list[AttemptRow],
     *,
     served_model: str | None = None,
@@ -1663,57 +1664,76 @@ async def create_speech(request: Request) -> Any:
     if isinstance(client, TieredClient):
         client.authorize_attempt = admission.before_attempt
 
-    events = client.speak(
-        SpeakRequest(
-            input=body.input,
-            voice=body.voice,
-            format=DriverSpeechFormat(fmt.value),
-            speed=body.speed,
-            instructions=body.instructions,
-            localOnly=admission.local_only(),
-            requestId=admission.request_id(),
+    # Recorded by this route, at the end of the audio. Left to the admission
+    # middleware, whose fallback row knows only embeddings, every served
+    # clip was retained as an error with no served model (P3a acceptance).
+    # The middleware's attempt list outlives this function, which returns
+    # before the stream is read, so the rows made while streaming land in
+    # `tries` too.
+    rec = _Recording(metrics=_metrics(request), started=time.perf_counter(), streamed=True)
+    with collect_attempts() as tries:
+        events = client.speak(
+            SpeakRequest(
+                input=body.input,
+                voice=body.voice,
+                format=DriverSpeechFormat(fmt.value),
+                speed=body.speed,
+                instructions=body.instructions,
+                localOnly=admission.local_only(),
+                requestId=admission.request_id(),
+            )
         )
-    )
-    try:
-        media = await serve_while_connected(request, anext(events), what="speech")
-    except ClientGone:
-        await events.aclose()
-        return _error(
-            code=499,
-            message="The client disconnected; the backend call was cancelled.",
-            error_type="client_disconnected",
-        )
-    except DriverError as e:
-        return _driver_failure(e).as_openai()
-    except httpx.TimeoutException as e:
-        return _error(
-            code=504,
-            message=(
-                f"No backend serving {body.model!r} began speaking within the gateway's "
-                f"requestTimeoutSeconds ({_timeout_seconds(_store(request)):g}s). "
-                f"({type(e).__name__})"
-            ),
-            error_type="timeout",
-        )
-    except httpx.HTTPError as e:
-        return _error(
-            code=502,
-            message=f"A backend serving {body.model!r} failed ({type(e).__name__}).",
-            error_type="upstream_error",
-        )
-
-    async def audio() -> AsyncIterator[bytes]:
         try:
-            async for chunk in events:
-                if isinstance(chunk, bytes):
-                    yield chunk
-        except (DriverError, httpx.HTTPError) as e:
-            # The 200 and some audio are out; the stream just ends.
-            log.warning("speech for %r failed mid-stream: %s", body.model, e)
-        finally:
+            media = await serve_while_connected(request, anext(events), what="speech")
+        except ClientGone:
             await events.aclose()
+            _record(rec, body, tries)
+            return _error(
+                code=499,
+                message="The client disconnected; the backend call was cancelled.",
+                error_type="client_disconnected",
+            )
+        except DriverError as e:
+            _record(rec, body, tries)
+            return _driver_failure(e).as_openai()
+        except httpx.TimeoutException as e:
+            _record(rec, body, tries)
+            return _error(
+                code=504,
+                message=(
+                    f"No backend serving {body.model!r} began speaking within the gateway's "
+                    f"requestTimeoutSeconds ({_timeout_seconds(_store(request)):g}s). "
+                    f"({type(e).__name__})"
+                ),
+                error_type="timeout",
+            )
+        except httpx.HTTPError as e:
+            _record(rec, body, tries)
+            return _error(
+                code=502,
+                message=f"A backend serving {body.model!r} failed ({type(e).__name__}).",
+                error_type="upstream_error",
+            )
 
-    return StreamingResponse(audio(), media_type=str(media))
+        async def audio() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in events:
+                    if isinstance(chunk, bytes):
+                        yield chunk
+            except (DriverError, httpx.HTTPError) as e:
+                # The 200 and some audio are out; the stream just ends.
+                log.warning("speech for %r failed mid-stream: %s", body.model, e)
+            finally:
+                await events.aclose()
+                _record(
+                    rec,
+                    body,
+                    tries,
+                    served_model=getattr(client, "served_model", None),
+                    tier=getattr(client, "tier", 1),
+                )
+
+        return StreamingResponse(audio(), media_type=str(media))
 
 
 # --------------------------------------------------------------------------- #
