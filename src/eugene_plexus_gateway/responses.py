@@ -35,11 +35,16 @@ from . import chat_contract, images
 from ._generated.models import (
     ChatCompletionMessage,
     ChatCompletionRequest,
+    FileContentPart,
     Function,
     FunctionCall,
     FunctionDefinition,
     ImageContentPart,
     ImageUrl,
+    InputAudio,
+    InputAudioContentPart,
+    InputAudioFormat,
+    InputFile,
     NamedToolChoice,
     ResponseFormat,
     ResponseJsonSchema,
@@ -452,6 +457,63 @@ def _image_part(
     return ImageContentPart(type="image_url", image_url=ImageUrl(url=url))
 
 
+def _file_part(
+    part: Mapping[str, Any], where: str, budget: images.ImageBudget, ignored: list[str]
+) -> FileContentPart:
+    """An `input_file` as the chat door's `file` part: an inline PDF only.
+
+    A `file_id` names OpenAI's store and a `file_url` is never fetched, for
+    the reasons an image's are not. `detail` is OpenAI's rendering choice;
+    other than `auto` it is named on the ignored-settings header.
+    """
+    if part.get("file_id"):
+        raise Refusal(
+            f"{where}.file_id: file ids name a store that exists only at OpenAI; send the file "
+            "inline as file_data.",
+            param="input",
+        )
+    if part.get("file_url"):
+        raise Refusal(
+            f"{where}.file_url: URLs are not fetched; send the file inline as file_data.",
+            param="input",
+        )
+    if part.get("detail") not in (None, "auto"):
+        ignored.append("input_file.detail")
+    filename = part.get("filename")
+    try:
+        url = budget.admit_file({"file_data": part.get("file_data")}, where)
+    except images.ImageRefusal as e:
+        raise Refusal(str(e), param="input") from None
+    return FileContentPart(
+        type="file",
+        file=InputFile(
+            filename=filename[:255] if isinstance(filename, str) and filename else None,
+            file_data=url,
+        ),
+    )
+
+
+def _audio_part(
+    part: Mapping[str, Any], where: str, budget: images.ImageBudget
+) -> InputAudioContentPart:
+    """An `input_audio` part, the chat door's shape exactly: WAV or MP3."""
+    audio = part.get("input_audio")
+    data = audio.get("data") if isinstance(audio, Mapping) else None
+    fmt = audio.get("format") if isinstance(audio, Mapping) else None
+    if not isinstance(data, str) or fmt not in ("wav", "mp3"):
+        raise Refusal(
+            f"{where}.input_audio: needs base64 `data` and a `format` of wav or mp3.",
+            param="input",
+        )
+    try:
+        budget.admit_audio(data, fmt, f"{where}.input_audio")
+    except images.ImageRefusal as e:
+        raise Refusal(str(e), param="input") from None
+    return InputAudioContentPart(
+        type="input_audio", input_audio=InputAudio(data=data, format=InputAudioFormat(fmt))
+    )
+
+
 def _text(value: Any, where: str) -> str:
     if not isinstance(value, str):
         raise Refusal(f"{where}.text: must be a string.", param="input")
@@ -465,7 +527,7 @@ def _content_parts(
     role: str,
     budget: images.ImageBudget,
     ignored: list[str],
-) -> list[TextContentPart | ImageContentPart]:
+) -> list[TextContentPart | ImageContentPart | FileContentPart | InputAudioContentPart]:
     """A message's content as ordered text and image parts."""
     if content is None:
         return []
@@ -473,7 +535,7 @@ def _content_parts(
         return [TextContentPart(type="text", text=content)] if content else []
     if not isinstance(content, list):
         raise Refusal(f"{where}.content: must be a string or a list.", param="input")
-    parts: list[TextContentPart | ImageContentPart] = []
+    parts: list[TextContentPart | ImageContentPart | FileContentPart | InputAudioContentPart] = []
     for index, part in enumerate(content):
         at = f"{where}.content[{index}]"
         if not isinstance(part, Mapping):
@@ -493,20 +555,26 @@ def _content_parts(
                 raise Refusal(f"{at}: images are accepted on user messages only.", param="input")
             parts.append(_image_part(part, at, budget, ignored))
         elif kind in ("input_file", "input_audio"):
-            raise Refusal(
-                f"{at}: this gateway cannot carry an {kind} part. It routes to local engines, "
-                "and answering without it would answer a different question than the one asked.",
-                param="input",
+            if role != "user":
+                raise Refusal(
+                    f"{at}: attachments are accepted on user messages only.", param="input"
+                )
+            parts.append(
+                _file_part(part, at, budget, ignored)
+                if kind == "input_file"
+                else _audio_part(part, at, budget)
             )
         else:
             raise Refusal(f"{at}: part type {_name(kind)} is not supported.", param="input")
     return parts
 
 
-def _joined(parts: list[TextContentPart | ImageContentPart]) -> Any:
+def _joined(
+    parts: list[TextContentPart | ImageContentPart | FileContentPart | InputAudioContentPart],
+) -> Any:
     """A string when the parts are all text, ordered parts when a picture is
     among them. Adjacent text joins with a blank line, as on `/v1/messages`."""
-    merged: list[TextContentPart | ImageContentPart] = []
+    merged: list[TextContentPart | ImageContentPart | FileContentPart | InputAudioContentPart] = []
     for part in parts:
         previous = merged[-1] if merged else None
         if isinstance(part, TextContentPart) and isinstance(previous, TextContentPart):
@@ -520,7 +588,9 @@ def _joined(parts: list[TextContentPart | ImageContentPart]) -> Any:
     return merged
 
 
-def _as_parts(content: Any) -> list[TextContentPart | ImageContentPart]:
+def _as_parts(
+    content: Any,
+) -> list[TextContentPart | ImageContentPart | FileContentPart | InputAudioContentPart]:
     """A built message's content back as parts. Pydantic wraps it -- the
     content and each part are root models once validated -- so unwrap both."""
     content = getattr(content, "root", content)
@@ -569,12 +639,16 @@ class _Conversation:
         self.budget = budget
         self.ignored = ignored
         self.messages: list[ChatCompletionMessage] = []
-        self._parts: list[TextContentPart | ImageContentPart] = []
+        self._parts: list[
+            TextContentPart | ImageContentPart | FileContentPart | InputAudioContentPart
+        ] = []
         self._calls: list[ToolCall] = []
         self._reasoning: list[str] = []
         self._assistant = False
         #: Pictures a tool returned, carried on the next user message.
-        self._hoisted: list[TextContentPart | ImageContentPart] = []
+        self._hoisted: list[
+            TextContentPart | ImageContentPart | FileContentPart | InputAudioContentPart
+        ] = []
 
     def _flush_assistant(self) -> None:
         if not self._assistant:
@@ -596,7 +670,11 @@ class _Conversation:
             pictures, self._hoisted = self._hoisted, []
             self._append(Role1.user, pictures)
 
-    def _append(self, role: Role1, parts: list[TextContentPart | ImageContentPart]) -> None:
+    def _append(
+        self,
+        role: Role1,
+        parts: list[TextContentPart | ImageContentPart | FileContentPart | InputAudioContentPart],
+    ) -> None:
         if not parts:
             return
         previous = self.messages[-1] if self.messages else None
@@ -693,7 +771,8 @@ class _Conversation:
             raise Refusal(f"{where}.call_id: required.", param="input")
         output = item.get("output")
         texts: list[str] = []
-        pictures: list[ImageContentPart] = []
+        pictures: list[ImageContentPart | FileContentPart] = []
+        moved: list[str] = []
         if isinstance(output, str):
             texts.append(output)
         elif isinstance(output, list):
@@ -706,21 +785,18 @@ class _Conversation:
                     texts.append(_text(part.get("text"), at))
                 elif kind == "input_image":
                     pictures.append(_image_part(part, at, self.budget, self.ignored))
+                    moved.append("image")
+                elif kind == "input_file":
+                    pictures.append(_file_part(part, at, self.budget, self.ignored))
+                    moved.append("file")
                 else:
                     raise Refusal(f"{at}: part type {_name(kind)} is not supported.", param="input")
         elif output is not None:
             raise Refusal(f"{where}.output: must be a string or a list.", param="input")
         text = "\n".join(t for t in texts if t)
         if pictures:
-            many = len(pictures) > 1
-            note = (
-                f"[The tool returned {len(pictures)} images; they are attached to the next user "
-                "message.]"
-                if many
-                else "[The tool returned an image; it is attached to the next user message.]"
-            )
+            note, label = images.moved_note(moved)
             text = f"{text}\n{note}" if text else note
-            label = "The images" if many else "The image"
             self._hoisted.append(
                 TextContentPart(type="text", text=f"{label} returned by tool call {call_id}:")
             )

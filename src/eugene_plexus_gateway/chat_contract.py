@@ -24,6 +24,26 @@ def _field_name(name: str) -> str:
     return name if re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]{0,63}", name) else "unknown_field"
 
 
+def _most_specific(errors: list[Any]) -> tuple[Any, ...]:
+    """The location of the error the caller meant, in their own field names.
+
+    A content part is a union, and Pydantic reports one error per branch:
+    the first is `content.str` whatever was wrong, which named no field at
+    all when an `input_audio` carried a bad `format` (2026-09-28). The
+    branch whose `type` literal matched is the one the caller wrote, so
+    the others are set aside and the deepest remaining error is named,
+    without the generated class names Pydantic threads through the path.
+    """
+    mismatched = [
+        e["loc"][:-1] for e in errors if e["type"] == "literal_error" and e["loc"][-1] == "type"
+    ]
+    meant = [e for e in errors if not any(e["loc"][: len(b)] == b for b in mismatched)]
+    loc = max(meant or errors, key=lambda e: len(e["loc"]))["loc"]
+    return tuple(
+        p for p in loc if not (isinstance(p, str) and (re.fullmatch(r"[A-Z]\w*", p) or "[" in p))
+    )
+
+
 def _check_objects(raw: Any, parsed: Any, path: str = "") -> None:
     """Check typed objects, leaving arbitrary tool/response JSON Schemas intact."""
     if isinstance(parsed, RootModel):
@@ -88,7 +108,7 @@ def parse_request(raw: Any, *, max_images: int = DEFAULT_MAX_IMAGES) -> ChatComp
         parsed = ChatCompletionRequest.model_validate(body)
     except ValidationError as exc:
         # Do not return Pydantic's input/ctx or interpolate the invalid value.
-        parts = exc.errors(include_input=False, include_context=False)[0]["loc"]
+        parts = _most_specific(exc.errors(include_input=False, include_context=False))
         where = ".".join(_field_name(p) if isinstance(p, str) else str(p) for p in parts)
         raise Refusal(where or "body", "has an invalid or missing value") from None
     _check_objects(body, parsed)

@@ -383,6 +383,11 @@ def test_an_image_on_an_assistant_turn_is_refused(settings: Settings) -> None:
     assert "messages.1.content.0" in refused(settings, request)
 
 
-def test_a_document_block_is_still_refused(settings: Settings) -> None:
-    block = {"type": "document", "source": {"type": "base64", "media_type": "application/pdf"}}
-    assert "document" in refused(settings, claude_code_read([block]))
+def test_a_document_the_door_cannot_read_is_refused(settings: Settings) -> None:
+    """Refused wholesale until 2026-09-28; a base64 PDF is carried since P2
+    (`test_attachments.py`). A URL is still never fetched."""
+    block = {"type": "document", "source": {"type": "url", "url": "http://169.254.169.254/x.pdf"}}
+    message = refused(settings, claude_code_read([block]))
+    assert "messages.2.content.0.content.0" in message
+    assert "not fetched" in message
+    assert "169.254" not in message, "a caller's URL is never reflected"

@@ -111,6 +111,39 @@ class ImageContentPart(BaseModel):
     image_url: ImageUrl
 
 
+class InputAudioFormat(StrEnum):
+    """
+    OpenAI's two input formats, which `llama-server` also reads.
+    OpenRouter accepts more; they are refused rather than passed to
+    a backend that may not. Named rather than inline so a later
+    inline enum cannot rename it (S6's `Source1`).
+
+    """
+
+    wav = 'wav'
+    mp3 = 'mp3'
+
+
+class InputFile(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    filename: str | None = Field(
+        None,
+        description='The name the model is shown. Optional; forwarded when set.\n',
+        max_length=255,
+    )
+    file_data: str | None = Field(
+        None,
+        description='The file as a `data:application/pdf;base64,...` URL, at most\n10 MiB decoded, beginning `%PDF-`. Bare base64 is accepted\nand carried as that data URL, because OpenAI\'s own schema\ndescribes it as base64 while OpenRouter refuses anything but\nthe URL (measured 2026-09-28: *"Invalid content"*).\n',
+        max_length=13981100,
+    )
+    file_id: str | None = Field(
+        None,
+        description="Refused with a 400. It names a file uploaded to one\nprovider's store, which this install does not have; send\n`file_data`.\n",
+    )
+
+
 class ComponentKind(StrEnum):
     """
     Which Eugene Plexus component class a topology entry
@@ -1045,6 +1078,14 @@ class ModelRoutingInfo(BaseModel):
         None,
         description='At least one backend confirms image input for its loaded model.\nImage requests route only to those backends, including fallback.\nInline PNG/JPEG only; see MessageContent for request limits.\n',
     )
+    audio_input: bool | None = Field(
+        None,
+        description='At least one backend confirms audio input for this model. A\nrequest carrying `input_audio` routes only to those backends,\nincluding fallback. Added 2026-09-28 (P2).\n',
+    )
+    file_input: bool | None = Field(
+        None,
+        description='At least one backend confirms file (PDF) input for this\nmodel, with the same routing rule. Added 2026-09-28 (P2).\n',
+    )
     tool_calling: bool | None = Field(
         None,
         description='Whether a request for this model may carry `tools`.\n\n**True only when every backend serving it can**, by the same\nreasoning as `context_length` above: a request may land on\nany of them, so the honest answer is the weakest one. A\nharness can read this and pick a model rather than discover\nthe limit as a 400 halfway through a task.\n',
@@ -1567,7 +1608,8 @@ class AnthropicContentBlock(BaseModel):
     we do not own.
 
     The variants this gateway carries: `text` (`text`), `image`
-    (`source`, base64 only -- see the endpoint), `tool_use`
+    (`source`, base64 only -- see the endpoint), `document`
+    (`source`, a base64 PDF or plain text; `title`), `tool_use`
     (`id`, `name`, `input`), `tool_result` (`tool_use_id`,
     `content`, `is_error`), and `thinking` (`thinking`,
     `signature`) -- returned ahead of the answer when the request
@@ -1575,11 +1617,11 @@ class AnthropicContentBlock(BaseModel):
     turn's reasoning. `redacted_thinking` is accepted on the way in
     and dropped.
 
-    The variant it refuses with a 400: `document`. Refused rather
-    than dropped because a model that never received the document
-    is not answering the question that was asked. `image` was
-    refused on the same reasoning until 2026-09-23, when it began
-    to be carried to backends that confirm image input.
+    `document` was refused with a 400 until 2026-09-28, and `image`
+    until 2026-09-23, on one reasoning: a model that never received
+    the attachment is not answering the question that was asked.
+    Each began to be carried once a backend that confirms that input
+    could be routed to.
 
     """
 
@@ -1587,7 +1629,8 @@ class AnthropicContentBlock(BaseModel):
         extra='allow',
     )
     type: str = Field(
-        ..., description='`text`, `tool_use`, `tool_result`, `image`, `document`, …'
+        ...,
+        description='`text`, `tool_use`, `tool_result`, `image`, `document`, `thinking`, …',
     )
     text: str | None = None
     id: str | None = Field(
@@ -2350,6 +2393,33 @@ class DriverHealth(BaseModel):
     error: str | None = Field(None, description='Populated when `reachable: false`.')
 
 
+class InputAudio(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    data: str = Field(
+        ...,
+        description="The audio, base64-encoded, with no `data:` prefix (OpenAI's\nshape). At most 10 MiB decoded. Checked against `format`:\na WAV must begin `RIFF....WAVE` and an MP3 with an ID3 tag\nor a frame sync, so a mislabelled clip is refused here\nrather than as whatever the provider happens to say.\n",
+        max_length=13981016,
+    )
+    format: InputAudioFormat
+
+
+class FileContentPart(BaseModel):
+    """
+    A document the model reads, in OpenAI's chat shape. PDF only.
+    Carried only to a model whose backend confirms file input
+    (`capabilities.fileInput`).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    type: Literal['file']
+    file: InputFile
+
+
 class ComputeDevice(BaseModel):
     """
     One compute device on one host, as that host's agent detected it.
@@ -2952,12 +3022,20 @@ class DriversInfo(BaseModel):
     )
 
 
-class MessageContent1(RootModel[list[TextContentPart | ImageContentPart]]):
-    root: list[TextContentPart | ImageContentPart] = Field(
-        ...,
-        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n",
-        min_length=1,
+class InputAudioContentPart(BaseModel):
+    """
+    A recording the model hears, in OpenAI's chat shape. Carried only
+    to a model whose backend confirms audio input
+    (`capabilities.audioInput`); nothing else is asked, so a model
+    that cannot hear it never answers as though it had.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
     )
+    type: Literal['input_audio']
+    input_audio: InputAudio
 
 
 class DirectoryListing(BaseModel):
@@ -3002,48 +3080,6 @@ class ModelList(BaseModel):
     data: list[Model]
 
 
-class ChatCompletionMessage(BaseModel):
-    """
-    OpenAI-shaped chat message. Intentionally *not* the shared
-    `Message` schema: this one is on a wire contract we do not own,
-    so it carries exactly OpenAI's fields and nothing of ours.
-    Leaking a house field like `timestamp` into a payload an OpenAI
-    SDK parses is how "compatible" quietly stops being true.
-
-    """
-
-    role: Role1 = Field(
-        ...,
-        description="`developer` is OpenAI's newer name for the instruction role,\nsent by current SDKs and frameworks when they target a\nreasoning model. It reaches the backend as `system`, in\nplace -- local chat templates know only `system`, and the\ntwo mean the same thing to a model that is not OpenAI's.\nRefused with a 400 until 2026-09-23.\n",
-    )
-    content: str | MessageContent1 | None = Field(
-        None,
-        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n",
-    )
-    reasoning_content: str | None = Field(
-        None,
-        description="**On a response:** the model's reasoning for this turn, when\nthe backend reported it separately from `content`. The name\nis DeepSeek's and llama.cpp's, and the one OpenAI-compatible\nclients already parse (vLLM's `reasoning` is normalised to\nit). Absent when there was none or when the serving driver's\n`thinkingMode` is `off`.\n\n**On a request:** accepted on an `assistant` message and\nhanded back to the backend, so a tool loop resumes with the\nmodel's own earlier thinking -- a client that appends the\nresponse message verbatim sends it back, and llama.cpp\nrenders it into the prompt for templates that keep it.\n\nAdded 2026-09-23. Before it every token of a reasoning\nmodel's thinking was discarded one hop down, so a model that\nspent its whole budget thinking answered with an empty\n`content` and `finish_reason: length`, with nothing to say\nwhy.\n",
-    )
-    name: str | None = Field(None, description='Optional participant name, per OpenAI.')
-    tool_calls: list[ToolCall] | None = Field(
-        None,
-        description='Set on an **assistant** message, naming the tools the model\nchose to call. The caller executes them and replies with one\n`tool` message per call, each carrying the matching\n`tool_call_id`.\n',
-    )
-    tool_call_id: str | None = Field(
-        None,
-        description='Required on a **tool** message: which call in the preceding\nassistant turn this is the result of. `content` is the\nresult, as a string — the caller serializes it.\n',
-    )
-
-
-class ChatCompletionChoice(BaseModel):
-    index: int
-    message: ChatCompletionMessage
-    finish_reason: FinishReason = Field(
-        ...,
-        description='`stop` for a natural end or a matched stop sequence,\n`length` for hitting the token cap, `tool_calls` when the\nmodel stopped because it wants one or more tools run,\n`content_filter` when a safety classifier stopped it.\n\n**`content_filter` is OpenAI\'s own value and is carried\nsince 2026-09-19.** Before that the chain was\n`content_filter` → the driver\'s `error` → `stop`, so a\nfiltered answer arrived as a natural end and a caller had\nno way to tell a refusal from a reply. The same mistake as\n`tool_calls` → `stop` before 2026-09-11, one value along:\na state with no row of its own reported as its nearest\nneighbour.\n\nUntil 2026-09-11 this enum was `stop` and `length` only, and\nits description said so in as many words — "OpenAI\'s two\nvalues for a completion **without** tool calls". That\nsentence was the single occurrence of the string "tool"\nanywhere in this contract or the driver\'s, and it was an\naccurate description of a control plane no agent harness\ncould use.\n',
-    )
-
-
 class ChatCompletionChunk(BaseModel):
     """
     One SSE frame of a streaming completion.
@@ -3078,10 +3114,10 @@ class AnthropicMessagesRequest(BaseModel):
     are accepted with a response header naming ignored settings;
     `thinking` chooses whether reasoning is returned. Metadata is
     discarded. Unknown top-level settings are explicitly rejected.
-    This is a text, image and tool translation, not full parity.
+    This is a text, image, document and tool translation, not full parity.
 
     Consequently **this schema does not decide what is refused**.
-    The refusals — document blocks, server-side tools,
+    The refusals — documents it cannot carry, server-side tools,
     `mcp_servers`, more than four `stop_sequences` — are enforced
     against the raw request body by the implementation, with a 400
     naming the field, because a model that ignores extra keys cannot
@@ -3171,6 +3207,87 @@ class AnthropicCountTokensRequest(BaseModel):
     tool_choice: AnthropicToolChoice | None = None
 
 
+class RoutingTableView(BaseModel):
+    """
+    The gateway's resolved routing table, as of the last refresh.
+    The same snapshot requests are routed from, opened up so an
+    operator can see why a request went where it did.
+
+    """
+
+    refreshed_at: AwareDatetime
+    load_balancing: str | None = Field(
+        None, description='The strategy in effect — the `loadBalancing` config value.'
+    )
+    slots: list[RoutingSlotView]
+    unreachable_drivers: list[str] | None = Field(
+        None, description='Drivers in the topology that did not answer `/v1/info`.'
+    )
+    outdated_drivers: list[OutdatedDriver] | None = Field(
+        None,
+        description='Drivers that answered `/v1/info` in the shape from before P1\n(a single `modelId`, no `models`). The gateway routes nothing\nto one: it would ignore the `model` a request names and\nanswer with its own. Listed so the console can say which\nmachine to update, rather than a model silently vanishing\nafter its gateway was updated and its worker was not.\n',
+    )
+    control_root: ControlRootView | None = None
+
+
+class MessageContent1(
+    RootModel[
+        list[
+            TextContentPart | ImageContentPart | InputAudioContentPart | FileContentPart
+        ]
+    ]
+):
+    root: list[
+        TextContentPart | ImageContentPart | InputAudioContentPart | FileContentPart
+    ] = Field(
+        ...,
+        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
+        min_length=1,
+    )
+
+
+class ChatCompletionMessage(BaseModel):
+    """
+    OpenAI-shaped chat message. Intentionally *not* the shared
+    `Message` schema: this one is on a wire contract we do not own,
+    so it carries exactly OpenAI's fields and nothing of ours.
+    Leaking a house field like `timestamp` into a payload an OpenAI
+    SDK parses is how "compatible" quietly stops being true.
+
+    """
+
+    role: Role1 = Field(
+        ...,
+        description="`developer` is OpenAI's newer name for the instruction role,\nsent by current SDKs and frameworks when they target a\nreasoning model. It reaches the backend as `system`, in\nplace -- local chat templates know only `system`, and the\ntwo mean the same thing to a model that is not OpenAI's.\nRefused with a 400 until 2026-09-23.\n",
+    )
+    content: str | MessageContent1 | None = Field(
+        None,
+        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
+    )
+    reasoning_content: str | None = Field(
+        None,
+        description="**On a response:** the model's reasoning for this turn, when\nthe backend reported it separately from `content`. The name\nis DeepSeek's and llama.cpp's, and the one OpenAI-compatible\nclients already parse (vLLM's `reasoning` is normalised to\nit). Absent when there was none or when the serving driver's\n`thinkingMode` is `off`.\n\n**On a request:** accepted on an `assistant` message and\nhanded back to the backend, so a tool loop resumes with the\nmodel's own earlier thinking -- a client that appends the\nresponse message verbatim sends it back, and llama.cpp\nrenders it into the prompt for templates that keep it.\n\nAdded 2026-09-23. Before it every token of a reasoning\nmodel's thinking was discarded one hop down, so a model that\nspent its whole budget thinking answered with an empty\n`content` and `finish_reason: length`, with nothing to say\nwhy.\n",
+    )
+    name: str | None = Field(None, description='Optional participant name, per OpenAI.')
+    tool_calls: list[ToolCall] | None = Field(
+        None,
+        description='Set on an **assistant** message, naming the tools the model\nchose to call. The caller executes them and replies with one\n`tool` message per call, each carrying the matching\n`tool_call_id`.\n',
+    )
+    tool_call_id: str | None = Field(
+        None,
+        description='Required on a **tool** message: which call in the preceding\nassistant turn this is the result of. `content` is the\nresult, as a string — the caller serializes it.\n',
+    )
+
+
+class ChatCompletionChoice(BaseModel):
+    index: int
+    message: ChatCompletionMessage
+    finish_reason: FinishReason = Field(
+        ...,
+        description='`stop` for a natural end or a matched stop sequence,\n`length` for hitting the token cap, `tool_calls` when the\nmodel stopped because it wants one or more tools run,\n`content_filter` when a safety classifier stopped it.\n\n**`content_filter` is OpenAI\'s own value and is carried\nsince 2026-09-19.** Before that the chain was\n`content_filter` → the driver\'s `error` → `stop`, so a\nfiltered answer arrived as a natural end and a caller had\nno way to tell a refusal from a reply. The same mistake as\n`tool_calls` → `stop` before 2026-09-11, one value along:\na state with no row of its own reported as its nearest\nneighbour.\n\nUntil 2026-09-11 this enum was `stop` and `length` only, and\nits description said so in as many words — "OpenAI\'s two\nvalues for a completion **without** tool calls". That\nsentence was the single occurrence of the string "tool"\nanywhere in this contract or the driver\'s, and it was an\naccurate description of a control plane no agent harness\ncould use.\n',
+    )
+
+
 class Message(BaseModel):
     """
     A single message in a conversation. Deliberately close to the
@@ -3182,7 +3299,7 @@ class Message(BaseModel):
     role: Role
     content: str | MessageContent1 | None = Field(
         None,
-        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\nJSON bodies are limited to 16 MiB. Remote URLs are never fetched.\n",
+        description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
     )
     toolCalls: list[dict[str, Any]] | None = Field(
         None,
@@ -3327,29 +3444,6 @@ class ChatCompletionResponse(BaseModel):
         None, description='Present on the final chunk only.'
     )
     x_eugene_plexus: CompletionRoutingInfo | None = None
-
-
-class RoutingTableView(BaseModel):
-    """
-    The gateway's resolved routing table, as of the last refresh.
-    The same snapshot requests are routed from, opened up so an
-    operator can see why a request went where it did.
-
-    """
-
-    refreshed_at: AwareDatetime
-    load_balancing: str | None = Field(
-        None, description='The strategy in effect — the `loadBalancing` config value.'
-    )
-    slots: list[RoutingSlotView]
-    unreachable_drivers: list[str] | None = Field(
-        None, description='Drivers in the topology that did not answer `/v1/info`.'
-    )
-    outdated_drivers: list[OutdatedDriver] | None = Field(
-        None,
-        description='Drivers that answered `/v1/info` in the shape from before P1\n(a single `modelId`, no `models`). The gateway routes nothing\nto one: it would ignore the `model` a request names and\nanswer with its own. Listed so the console can say which\nmachine to update, rather than a model silently vanishing\nafter its gateway was updated and its worker was not.\n',
-    )
-    control_root: ControlRootView | None = None
 
 
 AnthropicContentBlock.model_rebuild()

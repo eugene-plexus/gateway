@@ -265,20 +265,23 @@ def test_an_image_that_will_not_decode_is_refused_naming_the_field(settings: Set
     assert not fake.calls, "a refused request must not reach a backend"
 
 
-def test_a_document_block_is_refused(settings: Settings) -> None:
+def test_a_document_source_the_door_cannot_read_is_refused(settings: Settings) -> None:
+    """Every document was refused until 2026-09-28. A base64 PDF and a text
+    source are carried since P2; a `content` source is not."""
     fake = FakeDriverClient(name="d1", model_id=MODEL)
     request = body(
         messages=[
             {
                 "role": "user",
-                "content": [{"type": "document", "source": {"type": "text", "data": "x"}}],
+                "content": [{"type": "document", "source": {"type": "content", "content": []}}],
             }
         ]
     )
     with _client(_app_with(settings, fake)) as client:
         r = client.post("/v1/messages", json=request)
     assert r.status_code == 400
-    assert "document" in r.json()["error"]["message"]
+    assert "messages.0.content.0.source" in r.json()["error"]["message"]
+    assert not fake.calls
 
 
 def test_an_image_inside_a_tool_result_is_checked_too(settings: Settings) -> None:

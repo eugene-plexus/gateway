@@ -207,6 +207,19 @@ class _RuntimeFacts:
         return (self.node, self.name)
 
 
+#: Which capability confirms each kind of attachment.
+_INPUT_FLAGS = {"image": "imageInput", "audio": "audioInput", "file": "fileInput"}
+_IMAGE, _AUDIO, _FILE = frozenset({"image"}), frozenset({"audio"}), frozenset({"file"})
+
+
+def takes(caps: Capabilities | None, needs: frozenset[str]) -> bool:
+    """Whether a model's capabilities confirm every attachment kind in `needs`.
+    Unknown is no: an unconfirmed backend is never sent an attachment."""
+    return not needs or (
+        caps is not None and all(getattr(caps, _INPUT_FLAGS[kind]) is True for kind in needs)
+    )
+
+
 @dataclass
 class _Backend:
     """One reachable driver, what it told us it serves, and the runtime
@@ -1602,21 +1615,24 @@ class RoutingTable:
             return rotated
         return sorted(rotated, key=lambda b: self.inflight(b.key) / b.parallel_slots)
 
-    def pick(self, resolution: Resolution, *, images: bool = False) -> TieredClient | None:
+    def pick(
+        self, resolution: Resolution, *, needs: frozenset[str] = frozenset()
+    ) -> TieredClient | None:
         """The client to send a request through, or None when nothing in
         the slot is eligible right now.
 
         Each tier's eligible backends are ordered by the balancer; the
         client walks the first tier, then the next, cascading on
         transport errors, 5xx and timeouts and failing hard on a 4xx.
+
+        `needs` names the attachments the request carries (`image`,
+        `audio`, `file`), and only a backend confirming every one of them
+        is eligible -- in every tier, so a fallback cannot hand the audio
+        to a model that cannot hear it.
         """
         tiers: list[list[DriverClient]] = []
         for tier in resolution.tiers:
-            eligible = [
-                b
-                for b in tier.eligible()
-                if not images or (b.caps is not None and b.caps.imageInput is True)
-            ]
+            eligible = [b for b in tier.eligible() if takes(b.caps, needs)]
             # An empty tier stays in the list, so the response's `tier`
             # counts the slot's tiers rather than the eligible ones.
             tiers.append([b.client for b in self._order(tier.target, eligible)] if eligible else [])
@@ -1854,9 +1870,9 @@ class RoutingTable:
                         surfaces=[Surface(value) for value in resolution.surfaces()],
                         context_length=_smallest_context(backends),
                         tool_calling=_all_carry_tools(backends),
-                        image_input=any(
-                            b.caps is not None and b.caps.imageInput is True for b in backends
-                        ),
+                        image_input=any(takes(b.caps, _IMAGE) for b in backends),
+                        audio_input=any(takes(b.caps, _AUDIO) for b in backends),
+                        file_input=any(takes(b.caps, _FILE) for b in backends),
                         tiers=[[b.name for b in t.backends] for t in resolution.tiers],
                         ready_backends=len(eligible),
                         on_demand=not eligible and bool(resolution.startable()),

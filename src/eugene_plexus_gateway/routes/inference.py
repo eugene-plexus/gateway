@@ -94,10 +94,10 @@ from ..config import ConfigStore
 from ..dependencies import require_authorized
 from ..disconnect import ClientGone, serve_while_connected
 from ..driver_client import DriverClient, DriverError, TieredClient
-from ..images import has_images, max_images
+from ..images import attachment_kinds, max_images
 from ..lifecycle import LifecycleManager, WakeResult
 from ..metrics import AttemptRow, CandidateRow, MetricsStore, RequestRow
-from ..routing import Resolution, RoutingTable, collect_attempts
+from ..routing import Resolution, RoutingTable, collect_attempts, takes
 
 log = logging.getLogger(__name__)
 
@@ -593,15 +593,15 @@ async def _prepare(
     # runtime if the slot has one, wait for it, and try again. A tier
     # with a startable runtime is awaited rather than skipped — see the
     # lifecycle module.
-    images = has_images(body.messages)
+    needs = attachment_kinds(body.messages)
     wake: WakeResult | None = None
-    client = table.pick(resolution, images=images)
+    client = table.pick(resolution, needs=needs)
     if client is None and await table.refresh_if_stale():
         refreshed = True
         resolution = await admission.permitted(table.resolve(body.model), requirements=constraints)
         if not resolution.has_backends():
             return _no_such_model(body.model, table)
-        client = table.pick(resolution, images=images)
+        client = table.pick(resolution, needs=needs)
     # What the balancer saw, read before the wake so the numbers are the
     # ones the decision was made on. Read even when only one backend is
     # eligible; `_record` decides whether it is worth keeping.
@@ -614,18 +614,11 @@ async def _prepare(
                 resolution = await admission.permitted(
                     table.resolve(body.model), requirements=constraints
                 )
-                client = table.pick(resolution, images=images)
+                client = table.pick(resolution, needs=needs)
                 considered = table.candidates_considered(resolution)
         if client is None:
-            if images and resolution.eligible_backends():
-                return _Failure(
-                    code=400,
-                    error_type="invalid_request_error",
-                    param="messages",
-                    message="No ready backend serving this model confirms image input. "
-                    "Select a vision model with its projector loaded. GET /v1/models "
-                    "reports x_eugene_plexus.image_input; images were not discarded.",
-                )
+            if needs and resolution.eligible_backends():
+                return _unconfirmed_input(needs, resolution)
             return _not_ready(resolution, wake)
 
     store = _store(request)
@@ -1119,10 +1112,16 @@ async def count_anthropic_message_tokens(request: Request) -> Any:
         return _no_door_yet(body.model, reported, wanted="chat").as_anthropic()
     if body.tools and not _any_backend_carries_tools(resolution):
         return _tools_unsupported(body.model).as_anthropic()
-    if has_images(body.messages):
+    kinds = attachment_kinds(body.messages)
+    if "image" in kinds:
         return _cannot_count(
             body.model,
             "an image's token cost is decided by the projector when it encodes the picture",
+        )
+    if kinds:
+        return _cannot_count(
+            body.model,
+            "an attachment's token cost is decided by the encoder that reads it",
         )
 
     client = table.pick(resolution)
@@ -1651,6 +1650,58 @@ async def create_decision(request: Request, body: SystemOneRequest) -> Any:
 # --------------------------------------------------------------------------- #
 # translation
 # --------------------------------------------------------------------------- #
+
+
+#: What to tell a caller whose attachment no ready backend confirms, per kind.
+_UNCONFIRMED_INPUT = {
+    "image": (
+        "image input",
+        "Select a vision model with its projector loaded.",
+        "image_input",
+        "images were not discarded",
+    ),
+    "audio": (
+        "audio input",
+        "Select a model that hears audio.",
+        "audio_input",
+        "the audio was not discarded",
+    ),
+    "file": (
+        "file input",
+        "Select a model that reads PDFs.",
+        "file_input",
+        "the file was not discarded",
+    ),
+}
+
+
+def _unconfirmed_input(needs: frozenset[str], resolution: Resolution) -> _Failure:
+    """A 400 naming the attachment kind no ready backend confirms.
+
+    Before anything is forwarded or woken: a model that cannot take the
+    input would answer a question the caller did not ask. When each kind
+    is confirmed somewhere but no one backend takes them all, it says so,
+    since naming either kind alone would send the caller to the wrong fix.
+    """
+    ready = resolution.eligible_backends()
+    missing = [k for k in sorted(needs) if not any(takes(b.caps, frozenset({k})) for b in ready)]
+    if not missing:
+        what = " and ".join(_UNCONFIRMED_INPUT[k][0] for k in sorted(needs))
+        return _Failure(
+            code=400,
+            error_type="invalid_request_error",
+            param="messages",
+            message=f"No ready backend serving this model confirms {what} together. "
+            "GET /v1/models reports each; the attachments were not discarded.",
+        )
+    what, select, field, kept = _UNCONFIRMED_INPUT[missing[0]]
+    return _Failure(
+        code=400,
+        error_type="invalid_request_error",
+        param="messages",
+        message=f"No ready backend serving this model confirms {what}. {select} "
+        f"GET /v1/models reports x_eugene_plexus.{field}; {kept}.",
+    )
 
 
 def _to_generate_request(

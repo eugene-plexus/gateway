@@ -26,7 +26,7 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from typing import Any
 
 from fastapi import Request
@@ -38,10 +38,12 @@ from ._generated.models import (
     AnthropicMessagesRequest,
     ChatCompletionMessage,
     ChatCompletionRequest,
+    FileContentPart,
     Function,
     FunctionDefinition,
     ImageContentPart,
     ImageUrl,
+    InputFile,
     NamedToolChoice,
     Role1,
     Stop,
@@ -248,13 +250,11 @@ async def authorize(request: Request) -> None:
 # Request translation
 # --------------------------------------------------------------------------- #
 
-# Block types this gateway will not carry. Refused rather than dropped,
-# because each changes what the answer would be: a model that never
-# received the document is not answering the question that was asked.
-# `image` left this set on 2026-09-23 -- it is carried now, on the path
-# the OpenAI door's images already take, and a backend that cannot see
-# it is never asked (see `_image_part`).
-_REFUSED_BLOCK_TYPES = {"document"}
+# `image` (2026-09-23) and `document` (2026-09-28) were refused here until
+# each could be carried to a backend that confirms it; a model that never
+# received the attachment is not answering the question that was asked.
+# See `_image_part` and `_document_part`.
+_Part = TextContentPart | ImageContentPart | FileContentPart
 
 # Fields that arrive on every real request and have no equivalent here.
 # Accepted for the measured Claude Code client; A2 reports ignored controls
@@ -406,27 +406,6 @@ def _field(block: Any, name: str) -> Any:
     return getattr(block, name, None)
 
 
-def _refuse_unsupported_blocks(blocks: Iterable[Any], *, where: str) -> None:
-    """Refuse a document anywhere it can appear.
-
-    **Including inside a `tool_result`**, which is the case a check that
-    only walked top-level blocks would pass its own test on and then
-    serve a screenshot-blind answer for.
-    """
-    for block in blocks:
-        kind = _field(block, "type")
-        if kind in _REFUSED_BLOCK_TYPES:
-            raise Refusal(
-                f"This gateway cannot carry an {kind} block ({where}). It routes to local "
-                f"text engines, and answering without the {kind} would answer a different "
-                f"question than the one asked. Send text, or point this client at a model "
-                f"that takes {kind}s."
-            )
-        nested = _field(block, "content")
-        if isinstance(nested, list):
-            _refuse_unsupported_blocks(nested, where=f"{where} -> tool_result")
-
-
 def _system_text(system: Any) -> str | None:
     """Every system block concatenated, in order.
 
@@ -492,33 +471,99 @@ def _image_part(block: Any, where: str, budget: images.ImageBudget) -> ImageCont
     return ImageContentPart(type="image_url", image_url=ImageUrl(url=url))
 
 
-def _tool_result_images(
-    block: Any, where: str, budget: images.ImageBudget
-) -> list[ImageContentPart]:
-    """The pictures a tool returned -- Claude Code's `Read` of an image.
+def _document_part(block: Any, where: str, budget: images.ImageBudget) -> list[_Part]:
+    """An Anthropic `document` block as the parts the OpenAI door carries.
 
-    Captured 2026-09-23: that `tool_result` holds a lone `image` block and
-    no text. An OpenAI `tool` message carries text only and image parts
-    ride on user messages, so they cannot stay where they arrived.
+    A base64 PDF is a file part, and from there the shared path's: the
+    limits, the `%PDF-` check, and routing only to a model that confirms
+    file input. A plain-text source is the text it holds. `title` is the
+    name the model is shown and `context` rides ahead of the document as
+    text, which is what Anthropic says it is for.
+    """
+    source = _field(block, "source")
+    field = f"{where}.source"
+    if _field(block, "citations") and _field(_field(block, "citations"), "enabled"):
+        raise Refusal(
+            f"{where}.citations: this gateway returns no citation blocks, so an answer to "
+            "a request that enabled them would read as uncited. Send the document without "
+            "citations."
+        )
+    title = _field(block, "title")
+    context = _field(block, "context")
+    parts: list[_Part] = []
+    if isinstance(context, str) and context:
+        parts.append(TextContentPart(type="text", text=context))
+    kind = source.get("type") if isinstance(source, Mapping) else None
+    if kind == "base64" and source.get("media_type") == "application/pdf":
+        try:
+            url = budget.admit_file({"file_data": source.get("data")}, field)
+        except images.ImageRefusal as e:
+            raise Refusal(str(e)) from None
+        parts.append(
+            FileContentPart(
+                type="file",
+                file=InputFile(
+                    filename=title[:255] if isinstance(title, str) and title else None,
+                    file_data=url,
+                ),
+            )
+        )
+    elif kind == "text" and isinstance(source.get("data"), str):
+        text = source["data"]
+        parts.append(
+            TextContentPart(
+                type="text", text=f"{title}\n\n{text}" if isinstance(title, str) and title else text
+            )
+        )
+    else:
+        # A URL is never fetched and a Files API id names a store that
+        # exists only at Anthropic; a `content` source is another format
+        # this door does not read.
+        raise Refusal(
+            f"{field}: send the document inline, as a base64 PDF or as plain text. URLs are "
+            "not fetched and file references cannot be resolved here."
+        )
+    return parts
+
+
+def _tool_result_attachments(
+    block: Any, where: str, budget: images.ImageBudget
+) -> tuple[list[_Part], list[str]]:
+    """The pictures and documents a tool returned -- Claude Code's `Read` of
+    an image or a PDF -- and the kind of each.
+
+    Captured 2026-09-23: an image's `tool_result` holds a lone `image`
+    block and no text. An OpenAI `tool` message carries text only and
+    attachments ride on user messages, so they cannot stay where they
+    arrived.
     """
     content = _field(block, "content")
+    parts: list[_Part] = []
+    kinds: list[str] = []
     if not isinstance(content, list):
-        return []
-    return [
-        _image_part(inner, f"{where}.content.{i}", budget)
-        for i, inner in enumerate(content)
-        if _field(inner, "type") == "image"
-    ]
+        return parts, kinds
+    for i, inner in enumerate(content):
+        at = f"{where}.content.{i}"
+        kind = _field(inner, "type")
+        if kind == "image":
+            parts.append(_image_part(inner, at, budget))
+            kinds.append("image")
+        elif kind == "document":
+            document = _document_part(inner, at, budget)
+            parts.extend(document)
+            if any(isinstance(p, FileContentPart) for p in document):
+                kinds.append("file")
+    return parts, kinds
 
 
-def _joined(parts: list[TextContentPart | ImageContentPart]) -> Any:
+def _joined(parts: list[_Part]) -> Any:
     """A turn's content: a string as ever, or ordered parts when it holds a picture.
 
     Adjacent text blocks join with a blank line either way, which is how
     this door has always joined them, so a turn's words read the same to
     the model whether or not an image sits beside them.
     """
-    merged: list[TextContentPart | ImageContentPart] = []
+    merged: list[_Part] = []
     for part in parts:
         previous = merged[-1] if merged else None
         if isinstance(part, TextContentPart) and isinstance(previous, TextContentPart):
@@ -656,13 +701,12 @@ def translate_request(
     budget = images.ImageBudget(max_images)
     for turn_index, turn in enumerate(body.messages):
         blocks = _blocks(turn.content)
-        _refuse_unsupported_blocks(blocks, where=f"{turn.role.value} message")
         role = turn.role.value
 
-        parts: list[TextContentPart | ImageContentPart] = []
-        # Pictures a tool returned, carried on this turn's user message
+        parts: list[_Part] = []
+        # Attachments a tool returned, carried on this turn's user message
         # ahead of the person's own words: they answer the call above.
-        hoisted: list[TextContentPart | ImageContentPart] = []
+        hoisted: list[_Part] = []
         reasoning_parts: list[str] = []
         calls: list[ToolCall] = []
         results: list[ChatCompletionMessage] = []
@@ -680,6 +724,13 @@ def translate_request(
                         f"results, not on a {role} turn."
                     )
                 parts.append(_image_part(block, where, budget))
+            elif kind == "document":
+                if role != "user":
+                    raise Refusal(
+                        f"{where}: documents are accepted on user turns and inside tool "
+                        f"results, not on a {role} turn."
+                    )
+                parts.extend(_document_part(block, where, budget))
             elif kind == "thinking" and turn.role.value == "assistant":
                 # A thinking block we returned, handed back as Anthropic
                 # tells clients to: its text when it was shown, else the
@@ -717,29 +768,21 @@ def translate_request(
                 # the other protocol.
                 call_id = str(_field(block, "tool_use_id") or "")
                 text = _tool_result_text(block)
-                pictures = _tool_result_images(block, where, budget)
-                if pictures and role != "user":
+                moved, kinds = _tool_result_attachments(block, where, budget)
+                if moved and role != "user":
                     raise Refusal(f"{where}: a tool result belongs on a user turn.")
-                if pictures:
+                if kinds:
                     # The tool message still answers its call and says where
-                    # the picture went: a model reading an empty result and
-                    # then an unexplained image cannot tell which call made it.
-                    many = len(pictures) > 1
-                    note = (
-                        f"[The tool returned {len(pictures)} images; they are attached to "
-                        "the next user message.]"
-                        if many
-                        else "[The tool returned an image; it is attached to the next user "
-                        "message.]"
-                    )
+                    # the attachment went (see `images.moved_note`).
+                    note, label = images.moved_note(kinds)
                     text = f"{text}\n{note}" if text else note
-                    label = "The images" if many else "The image"
                     hoisted.append(
                         TextContentPart(
                             type="text", text=f"{label} returned by tool call {call_id}:"
                         )
                     )
-                    hoisted.extend(pictures)
+                if moved:
+                    hoisted.extend(moved)
                 results.append(
                     ChatCompletionMessage(role=Role1.tool, content=text, tool_call_id=call_id)
                 )

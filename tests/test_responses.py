@@ -492,7 +492,9 @@ def test_a_text_only_backend_is_refused_rather_than_answering_blind(settings: Se
     [
         {"type": "input_image", "image_url": "https://example.com/cat.png"},
         {"type": "input_image", "file_id": "file-abc"},
-        {"type": "input_file", "file_data": "JVBERi0="},
+        # An inline PDF is carried since P2 (2026-09-28); a file id and a URL are not.
+        {"type": "input_file", "file_id": "file-abc"},
+        {"type": "input_file", "file_url": "https://example.com/a.pdf"},
     ],
 )
 def test_what_cannot_be_carried_is_refused(settings: Settings, part: dict) -> None:
