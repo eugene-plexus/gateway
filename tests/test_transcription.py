@@ -210,3 +210,25 @@ def test_a_transcription_is_retained_in_seconds_of_audio(settings: Settings) -> 
         [row] = _rows(client)
     assert (row["door"], row["audioSeconds"], row["outcome"]) == ("transcription", 3.5, "served")
     assert row["characters"] is None and row["servedModel"] == "scribe"
+
+
+@pytest.mark.parametrize(
+    ("door", "wanted"),
+    [
+        ("/v1/chat/completions", "/v1/audio/transcriptions"),
+        ("/v1/audio/speech", "/v1/audio/transcriptions"),
+    ],
+)
+def test_a_wrong_door_names_the_models_own(settings: Settings, door: str, wanted: str) -> None:
+    """With five surfaces, one door per caller was wrong for most models: a
+    transcription model sent to chat was told to use /v1/embeddings."""
+    body = (
+        {"model": "scribe", "messages": [{"role": "user", "content": "hi"}]}
+        if door == "/v1/chat/completions"
+        else {"model": "scribe", "input": "hi", "voice": "x"}
+    )
+    with serve(settings, Scribe(name="a", model_id="scribe")) as client:
+        response = client.post(door, json=body)
+    assert response.status_code == 400, response.text
+    message = response.json()["error"]["message"]
+    assert f"Send this request to {wanted} instead" in message, message

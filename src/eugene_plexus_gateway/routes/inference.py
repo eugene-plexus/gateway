@@ -447,6 +447,16 @@ def _no_door_yet(model: str, surfaces: Sequence[str], *, wanted: str) -> _Failur
     )
 
 
+#: The door each surface is served at, so a refusal names the right one.
+_DOORS = {
+    "chat": "/v1/chat/completions",
+    "embeddings": "/v1/embeddings",
+    "decisions": "/v1/systemone",
+    "speech": "/v1/audio/speech",
+    "transcription": "/v1/audio/transcriptions",
+}
+
+
 def _wrong_surface(model: str, surfaces: Sequence[str], *, wanted: str, instead: str) -> _Failure:
     """400 when a model was sent to a surface it does not serve.
 
@@ -455,12 +465,18 @@ def _wrong_surface(model: str, surfaces: Sequence[str], *, wanted: str, instead:
     back as `"nomic-embed-text" does not support chat` or, worse, an
     embedding-shaped nothing. The caller could not tell whether they had
     picked the wrong model or hit a broken install.
+
+    **The doors named are the model's own** (P3b): each caller used to
+    pass one door, the right one while there were two surfaces, and with
+    five a speech model at the chat door was sent to `/v1/embeddings`.
+    `instead` is kept for a surface with no door here.
     """
+    doors = [_DOORS[s] for s in surfaces if s in _DOORS and s != wanted]
     return _Failure(
         code=400,
         message=(
             f"The model {model!r} serves {', '.join(surfaces)} and not {wanted}. "
-            f"Send this request to {instead} instead. "
+            f"Send this request to {' or '.join(doors) or instead} instead. "
             "GET /v1/models reports x_eugene_plexus.surfaces per model."
         ),
         error_type="invalid_request_error",
