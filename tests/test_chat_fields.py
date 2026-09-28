@@ -275,7 +275,9 @@ def test_functions_are_carried_as_tools_and_answered_as_a_function_call(settings
         "type": "function",
         "function": {"name": "get_weather"},
     }
-    assert sent.parallelToolCalls is False
+    # Not sent: a default of ours must not narrow routing to models listing it.
+    assert sent.parallelToolCalls is None
+    assert "parallelToolCalls" not in (sent.callerSettings or [])
     choice = response.json()["choices"][0]
     assert choice["finish_reason"] == "function_call"
     assert choice["message"]["function_call"] == {
@@ -283,6 +285,21 @@ def test_functions_are_carried_as_tools_and_answered_as_a_function_call(settings
         "arguments": '{"city": "Oslo"}',
     }
     assert choice["message"].get("tool_calls") is None
+
+
+def test_functions_reach_a_backend_that_does_not_list_parallel_tool_calls(
+    settings: Settings,
+) -> None:
+    """Found by the P2c acceptance run (2026-09-28): sending
+    `parallel_tool_calls: false` for the old shape made it an explicit
+    setting, and A2 then refused every backend not listing it -- 443 of
+    455 on OpenRouter."""
+    fake = _calling()
+    fake.supported_settings = [s for s in fake.supported_settings if s != "parallelToolCalls"]
+    with serve(settings, fake) as client:
+        response = client.post("/v1/chat/completions", json=chat(functions=[WEATHER]))
+    assert response.status_code == 200, response.text
+    assert response.json()["choices"][0]["finish_reason"] == "function_call"
 
 
 def test_a_streamed_function_call_is_function_call_fragments(settings: Settings) -> None:

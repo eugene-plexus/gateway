@@ -158,8 +158,13 @@ def _translate_functions(body: dict[str, Any]) -> None:
     OpenAI deprecated them for tools, which are the same thing with every
     tool a function; clients built on the old shape still send it. So they
     are carried rather than refused, and `functions` stays on the request
-    as the mark that the answer goes back in the old shape. One call per
-    turn, as the old API gave: `parallel_tool_calls` defaults to false.
+    as the mark that the answer goes back in the old shape. The old API
+    gave one call per turn; if a model asks for more, the first is given.
+
+    **`parallel_tool_calls` is not sent for it.** A first version set it
+    false, which made it an explicit setting, and A2 then routed the
+    request only to models listing `parallel_tool_calls` -- 12 of 455 on
+    OpenRouter (measured). A default of ours must not narrow routing.
     """
     functions = body.get("functions")
     if body.get("function_call") is not None and functions is None:
@@ -176,7 +181,6 @@ def _translate_functions(body: dict[str, Any]) -> None:
             body["tool_choice"] = choice
         elif isinstance(choice, dict):
             body["tool_choice"] = {"type": "function", "function": {"name": choice.get("name")}}
-        body.setdefault("parallel_tool_calls", False)
     # The history, which may be in the old shape whichever the request is:
     # each `function` result answers the assistant `function_call` before
     # it, so they are paired in order and given one id.

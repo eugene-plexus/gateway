@@ -3758,7 +3758,7 @@ class ChatCompletionRequest(BaseModel):
     web_search_options: WebSearchOptions | None = None
     functions: list[FunctionDefinition] | None = Field(
         None,
-        description='**Deprecated by OpenAI; translated, not refused (P2c).** The same\nthing as `tools` with every tool a function, carried as tools.\nThe answer is given back in the deprecated shape too,\n`message.function_call` and `finish_reason: function_call`,\nbecause a client that sends this shape reads that one. One call\nper turn, as the old API had: `parallel_tool_calls` is sent as\nfalse. Refused together with `tools` or `tool_choice`.\n',
+        description='**Deprecated by OpenAI; translated, not refused (P2c).** The same\nthing as `tools` with every tool a function, carried as tools.\nThe answer is given back in the deprecated shape too,\n`message.function_call` and `finish_reason: function_call`,\nbecause a client that sends this shape reads that one. The old\nAPI gave one call per turn; if a model asks for more, the first\nis given. **`parallel_tool_calls` is not sent for it**: set\nfalse, it would be an explicit setting, and A2 would route the\nrequest only to models that list it (12 of 455 on OpenRouter,\nmeasured). Refused together with `tools` or `tool_choice`.\n',
         max_length=128,
     )
     function_call: FunctionCallMode | FunctionCallName | None = Field(
