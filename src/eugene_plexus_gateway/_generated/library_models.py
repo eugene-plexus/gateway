@@ -307,9 +307,11 @@ class BackendKind(StrEnum):
     driver on this protocol serves decisions and not chat; see
     `Capabilities.chatCapable`.
 
-    `elevenlabs_http` is ElevenLabs' own API (P3a, 2026-09-28): speech
-    only, keyed by `xi-api-key`, nothing OpenAI-shaped about it. The
-    driver translates `POST /v1/speak` to its text-to-speech route.
+    `elevenlabs_http` is ElevenLabs' own API (P3a, 2026-09-28): speech,
+    and transcription since P3-1 was taken, keyed by `xi-api-key`,
+    nothing OpenAI-shaped about it. The driver translates `POST
+    /v1/speak` to its text-to-speech route and `POST /v1/transcribe` to
+    its speech-to-text route.
 
     """
 

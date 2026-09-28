@@ -346,6 +346,11 @@ class _Backend:
         return "transcription" in self.surfaces
 
     @property
+    def translates(self) -> bool:
+        """Whether this model serves the translation surface (P3-4)."""
+        return "translation" in self.surfaces
+
+    @property
     def makes_images(self) -> bool:
         """Whether this model serves the image surface (P4)."""
         return "image" in self.surfaces
@@ -518,6 +523,7 @@ class Resolution:
             + (["decisions"] if any(b.decides for b in backends) else [])
             + (["speech"] if any(b.speaks for b in backends) else [])
             + (["transcription"] if any(b.transcribes for b in backends) else [])
+            + (["translation"] if any(b.translates for b in backends) else [])
             + (["image"] if any(b.makes_images for b in backends) else [])
             + (["video"] if any(b.makes_videos for b in backends) else [])
         )
@@ -1769,16 +1775,23 @@ class RoutingTable:
         ordered = [b.client for b in self._order(resolution.model, eligible)]
         return TieredClient(name=resolution.model, tiers=[ordered], hooks=self)
 
-    def pick_transcription(self, resolution: Resolution) -> TieredClient | None:
-        """`pick`'s tiers, holding only backends that transcribe (P3b).
+    def pick_transcription(
+        self, resolution: Resolution, *, translate: bool = False
+    ) -> TieredClient | None:
+        """`pick`'s tiers, holding only backends that transcribe (P3b) --
+        or, with `translate`, translate (P3-4).
 
         Tiers, as chat (§5, call #4): a fallback model's transcript is
-        still a transcript. Every tier is filtered, so a fallback cannot
-        hand the audio to a model that only chats.
+        still a transcript, and its translation a translation. Every tier is
+        filtered, so a fallback cannot hand the audio to a model that only
+        chats, nor a translation to one that would answer in the language
+        spoken.
         """
         tiers: list[list[DriverClient]] = []
         for tier in resolution.tiers:
-            eligible = [b for b in tier.eligible() if b.transcribes]
+            eligible = [
+                b for b in tier.eligible() if (b.translates if translate else b.transcribes)
+            ]
             tiers.append([b.client for b in self._order(tier.target, eligible)] if eligible else [])
         if not any(tiers):
             return None

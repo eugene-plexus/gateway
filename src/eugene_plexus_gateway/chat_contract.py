@@ -186,6 +186,15 @@ _NOT_CARRIED = {
     "known_speaker_references[]": "is not carried: no backend here labels speakers",
 }
 
+#: The OpenAI SDK's translation form is five fields (P3-4). Three of the
+#: transcription form's others are named when sent, since each has a reason.
+_TRANSLATION_CARRIED = {"file", "model", "prompt", "response_format", "temperature"}
+_NOT_TRANSLATED = {
+    "language": "is not taken by a translation: the text is always English",
+    "timestamp_granularities[]": "is not taken by a translation, as OpenAI's is not",
+    "stream": "is not served: the answer is one JSON document",
+}
+
 
 class TooLarge(Refusal):
     """A refusal that is a 413, not a 400."""
@@ -204,11 +213,21 @@ class TranscriptionAsk:
     prompt: str | None
     temperature: float | None
     granularities: list[str]
+    #: `/v1/audio/translations` (P3-4): the text in English.
+    translate: bool = False
 
 
-async def read_transcription(form: Any) -> TranscriptionAsk:
-    """OpenAI's multipart form, refused naming the field, as chat is."""
+async def read_transcription(form: Any, *, translate: bool = False) -> TranscriptionAsk:
+    """OpenAI's multipart form, refused naming the field, as chat is. With
+    `translate`, the translation form: the same minus the language and
+    timestamps, which a translation does not take."""
     for key in form:
+        if translate:
+            if key in _NOT_TRANSLATED:
+                raise Refusal(key.rstrip("[]"), _NOT_TRANSLATED[key])
+            if key not in _TRANSLATION_CARRIED:
+                raise Refusal(_field_name(key), "is not a field of this form")
+            continue
         if key in _NOT_CARRIED:
             raise Refusal(key.rstrip("[]"), _NOT_CARRIED[key])
         if key not in _CARRIED:
@@ -271,6 +290,7 @@ async def read_transcription(form: Any) -> TranscriptionAsk:
         prompt=text("prompt", limit=8192) or None,
         temperature=temperature,
         granularities=granularities,
+        translate=translate,
     )
 
 

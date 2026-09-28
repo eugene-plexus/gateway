@@ -284,9 +284,11 @@ class BackendKind(StrEnum):
     driver on this protocol serves decisions and not chat; see
     `Capabilities.chatCapable`.
 
-    `elevenlabs_http` is ElevenLabs' own API (P3a, 2026-09-28): speech
-    only, keyed by `xi-api-key`, nothing OpenAI-shaped about it. The
-    driver translates `POST /v1/speak` to its text-to-speech route.
+    `elevenlabs_http` is ElevenLabs' own API (P3a, 2026-09-28): speech,
+    and transcription since P3-1 was taken, keyed by `xi-api-key`,
+    nothing OpenAI-shaped about it. The driver translates `POST
+    /v1/speak` to its text-to-speech route and `POST /v1/transcribe` to
+    its speech-to-text route.
 
     """
 
@@ -2141,6 +2143,10 @@ class TranscribeRequest(BaseModel):
     timestampGranularities: list[TimestampGranularity] | None = Field(
         None, description='With `verbose` only, as OpenAI requires.', max_length=2
     )
+    translate: bool | None = Field(
+        False,
+        description="The text in English, whatever was spoken: OpenAI's\n`/v1/audio/translations` (P3-4). Only a model with the\n`translation` surface is asked. Refused with `language` or\n`timestampGranularities`, which that door does not take.\n",
+    )
     requestId: UUID | None = None
 
 
@@ -2554,7 +2560,7 @@ class DriverModel(BaseModel):
     )
     surfaces: list[str] = Field(
         ...,
-        description='Which requests this model answers. The values so far:\n\n* `chat` (`/v1/generate`), `embeddings` (`/v1/embed`),\n  `decisions` (`/v1/decide`), `speech` (`/v1/speak`, P3a),\n  `transcription` (`/v1/transcribe`, P3b), `image`\n  (`/v1/image`, P4) and `video` (`/v1/video`, P5), which have\n  doors;\n* `completion`, `moderation` and `rerank`, which name OpenAI\'s\n  and OpenRouter\'s doors Eugene has not built yet.\n\nAn OpenRouter model whose output is image and text (Gemini\'s\nimage models) serves `image` beside `chat`: its images route\nanswers them too (measured).\n\nA single-model `llama-server` whose projector hears\n(`/props` `modalities.audio`) serves `transcription` beside\n`chat`: its `/v1/audio/transcriptions` answers only then\n(measured).\n\nA driver reports those anyway, so a model\'s id does not\nchange on the day its door arrives, and the gateway lists a\nmodel on `GET /v1/models` only once a door serves one of its\nsurfaces (P1-4).\n\n**Strings, not an enum, on purpose.** A newer driver\nreporting a surface an older gateway has never heard of must\nnot fail that gateway\'s validation of the whole `/v1/info`,\nwhich would make every model on the driver unreachable over\none unknown word. A reader ignores a surface it does not\nknow. Empty only for a model whose kind neither the backend\nnor the driver could decide, which serves nothing.\n\n**Replaces `capabilities.embeddings` and\n`capabilities.chatCapable`**, which said the same thing once\nfor the whole driver. Where they came from still holds for a\nsingle-model driver: `embeddings` is **a property of the\nrunning backend, not of the model**, and not readable from\nanything (`llama-server`\'s `/props` carries no pooling\nfield, and an Ollama runner started for chat refuses with\n*"This server does not support embeddings"*), so it is\ndetermined by trying once and cached for the driver\'s\nlifetime. A System One backend serves `decisions` alone. An\naccount takes each model\'s surfaces from its catalogue.\n',
+        description='Which requests this model answers. The values so far:\n\n* `chat` (`/v1/generate`), `embeddings` (`/v1/embed`),\n  `decisions` (`/v1/decide`), `speech` (`/v1/speak`, P3a),\n  `transcription` (`/v1/transcribe`, P3b), `translation`\n  (`/v1/transcribe` with `translate`, P3-4), `image`\n  (`/v1/image`, P4) and `video` (`/v1/video`, P5), which have\n  doors;\n* `completion`, `moderation` and `rerank`, which name OpenAI\'s\n  and OpenRouter\'s doors Eugene has not built yet.\n\nAn OpenRouter model whose output is image and text (Gemini\'s\nimage models) serves `image` beside `chat`: its images route\nanswers them too (measured).\n\nA single-model `llama-server` whose projector hears\n(`/props` `modalities.audio`) serves `transcription` beside\n`chat`: its `/v1/audio/transcriptions` answers only then\n(measured).\n\nOpenAI\'s `whisper-*` models serve `translation` beside\n`transcription`; nothing else here translates (measured).\nElevenLabs\' `scribe_*` models serve `transcription`, listed\nonly while the key may use speech-to-text (P3-1, as P3-2\nrequires `models_read` for its speech models).\n\nA driver reports those anyway, so a model\'s id does not\nchange on the day its door arrives, and the gateway lists a\nmodel on `GET /v1/models` only once a door serves one of its\nsurfaces (P1-4).\n\n**Strings, not an enum, on purpose.** A newer driver\nreporting a surface an older gateway has never heard of must\nnot fail that gateway\'s validation of the whole `/v1/info`,\nwhich would make every model on the driver unreachable over\none unknown word. A reader ignores a surface it does not\nknow. Empty only for a model whose kind neither the backend\nnor the driver could decide, which serves nothing.\n\n**Replaces `capabilities.embeddings` and\n`capabilities.chatCapable`**, which said the same thing once\nfor the whole driver. Where they came from still holds for a\nsingle-model driver: `embeddings` is **a property of the\nrunning backend, not of the model**, and not readable from\nanything (`llama-server`\'s `/props` carries no pooling\nfield, and an Ollama runner started for chat refuses with\n*"This server does not support embeddings"*), so it is\ndetermined by trying once and cached for the driver\'s\nlifetime. A System One backend serves `decisions` alone. An\naccount takes each model\'s surfaces from its catalogue.\n',
     )
     inputModalities: list[str] | None = Field(
         None,

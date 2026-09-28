@@ -50,9 +50,11 @@ class BackendKind(StrEnum):
     driver on this protocol serves decisions and not chat; see
     `Capabilities.chatCapable`.
 
-    `elevenlabs_http` is ElevenLabs' own API (P3a, 2026-09-28): speech
-    only, keyed by `xi-api-key`, nothing OpenAI-shaped about it. The
-    driver translates `POST /v1/speak` to its text-to-speech route.
+    `elevenlabs_http` is ElevenLabs' own API (P3a, 2026-09-28): speech,
+    and transcription since P3-1 was taken, keyed by `xi-api-key`,
+    nothing OpenAI-shaped about it. The driver translates `POST
+    /v1/speak` to its text-to-speech route and `POST /v1/transcribe` to
+    its speech-to-text route.
 
     """
 
@@ -1211,6 +1213,7 @@ class Surface(StrEnum):
     decisions = 'decisions'
     speech = 'speech'
     transcription = 'transcription'
+    translation = 'translation'
     image = 'image'
     video = 'video'
 
@@ -1236,7 +1239,7 @@ class ModelRoutingInfo(BaseModel):
     )
     surfaces: list[Surface] | None = Field(
         None,
-        description="Which surfaces this model can be sent to. `decisions` means\n`POST /v1/systemone`; a decision-only model lists nothing\nelse, and a chat request naming it is refused with the\ndoor's name. `speech` means `POST /v1/audio/speech` (P3a),\n`transcription` `POST /v1/audio/transcriptions` (P3b), `image`\n`POST /v1/images/generations` and `/edits` (P4), `video`\n`POST /v1/videos` (P5).\n\nOpenAI's own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Measured, not assumed, and the two are not always\ndisjoint**: an Ollama runner started for chat refuses to\nembed, `nomic-embed-text` refuses to chat -- but\n`llama-server` given `--embedding` still serves chat\nperfectly well. Hence a list.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n",
+        description="Which surfaces this model can be sent to. `decisions` means\n`POST /v1/systemone`; a decision-only model lists nothing\nelse, and a chat request naming it is refused with the\ndoor's name. `speech` means `POST /v1/audio/speech` (P3a),\n`transcription` `POST /v1/audio/transcriptions` (P3b),\n`translation` `POST /v1/audio/translations` (P3-4), `image`\n`POST /v1/images/generations` and `/edits` (P4), `video`\n`POST /v1/videos` (P5).\n\nOpenAI's own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Measured, not assumed, and the two are not always\ndisjoint**: an Ollama runner started for chat refuses to\nembed, `nomic-embed-text` refuses to chat -- but\n`llama-server` given `--embedding` still serves chat\nperfectly well. Hence a list.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n",
     )
     image_input: bool | None = Field(
         None,
@@ -1406,6 +1409,36 @@ class TranscriptionResponseFormat(StrEnum):
     verbose_json = 'verbose_json'
     srt = 'srt'
     vtt = 'vtt'
+
+
+class TranslationForm(BaseModel):
+    """
+    The OpenAI SDK's translation form (P3-4): five fields, every other
+    refused naming it.
+
+    """
+
+    file: bytes = Field(..., description='At most 25 MiB.')
+    model: str
+    prompt: str | None = Field(
+        None, description="English text to guide the style, as OpenAI's."
+    )
+    response_format: TranscriptionResponseFormat | None = None
+    temperature: float | None = Field(None, ge=0.0, le=1.0)
+
+
+class Translation(BaseModel):
+    text: str = Field(..., description='The speech, in English.')
+
+
+class TranslationVerbose(BaseModel):
+    task: Literal['translate']
+    language: str | None = Field(
+        None, description='The language of the text, which OpenAI names `english`.'
+    )
+    duration: float | None = None
+    text: str
+    segments: list[dict[str, Any]] | None = None
 
 
 class TranscriptionUsageOut(BaseModel):
@@ -3718,7 +3751,7 @@ class MetricRequest(BaseModel):
     completionTokens: int | None = None
     door: str | None = Field(
         None,
-        description="Which door the request came in by (P3b): `speech`,\n`transcription`, `images` (P4, schema v8) or `videos` (P5,\nschema v9, the submit's row). Null on rows from before schema v7\nand on every other door, whose rows carry tokens.\n",
+        description="Which door the request came in by (P3b): `speech`,\n`transcription`, `translation` (P3-4), `images` (P4, schema v8)\nor `videos` (P5, schema v9, the submit's row). Null on rows from\nbefore schema v7 and on every other door, whose rows carry\ntokens.\n",
     )
     characters: int | None = Field(
         None,
@@ -3726,7 +3759,7 @@ class MetricRequest(BaseModel):
     )
     audioSeconds: float | None = Field(
         None,
-        description='For transcription, the seconds of audio heard, where the backend says.',
+        description='For transcription and translation, the seconds of audio heard, where the backend says.',
     )
     images: int | None = Field(
         None,

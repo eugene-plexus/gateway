@@ -33,17 +33,23 @@ SAID = "The quick brown fox jumps over the lazy dog."
 
 
 class Scribe(FakeDriverClient):
-    """A fake whose model transcribes, as a driver does since P3b."""
+    """A fake whose model transcribes, as a driver does since P3b -- and,
+    with `translates`, translates too, as OpenAI's whisper does (P3-4)."""
 
-    def __init__(self, *, fail: Exception | None = None, **kw: Any) -> None:
+    def __init__(
+        self, *, fail: Exception | None = None, translates: bool = False, **kw: Any
+    ) -> None:
         super().__init__(**kw)
         self.fail = fail
+        self.translates = translates
         self.heard: list[TranscribeRequest] = []
 
     def describe(self):  # type: ignore[no-untyped-def]
         info = super().describe()
         for model in info.models or []:
-            model.surfaces = ["transcription"]
+            model.surfaces = (
+                ["transcription", "translation"] if self.translates else ["transcription"]
+            )
         return info
 
     async def transcribe(self, request: TranscribeRequest) -> TranscribeResponse:
@@ -55,6 +61,7 @@ class Scribe(FakeDriverClient):
             language="english",
             duration=3.5,
             segments=[{"id": 0, "start": 0.0, "end": 3.5, "text": SAID}],
+            words=[{"word": "The", "start": 0.0, "end": 0.2}],
             usage=TranscriptionUsage(seconds=3.5),
             modelId=request.model,
         )
@@ -184,15 +191,101 @@ def test_a_chat_model_is_sent_to_the_chat_door(settings: Settings) -> None:
     assert "/v1/chat/completions" in response.json()["error"]["message"]
 
 
-def test_translation_is_refused_saying_why(settings: Settings) -> None:
-    with serve(settings, Scribe(name="a", model_id="scribe")) as client:
-        response = client.post(
-            "/v1/audio/translations",
-            data={"model": "scribe"},
-            files={"file": ("fox.mp3", FOX, "audio/mpeg")},
-        )
-    assert response.status_code == 400
-    assert "No backend here translates" in response.json()["error"]["message"]
+# --------------------------------------------------------------------------- #
+# /v1/audio/translations (P3-4)
+# --------------------------------------------------------------------------- #
+
+
+def translate(client: TestClient, model: str = "whisper", **fields: Any) -> httpx.Response:
+    files = fields.pop("files", {"file": ("fr.mp3", FOX, "audio/mpeg")})
+    return client.post("/v1/audio/translations", data={"model": model, **fields}, files=files)
+
+
+def test_a_model_that_translates_is_listed_as_translating(settings: Settings) -> None:
+    whisper = Scribe(name="a", model_id="whisper", translates=True)
+    with serve(settings, whisper, Scribe(name="b", model_id="scribe")) as client:
+        models = {m["id"]: m["x_eugene_plexus"] for m in client.get("/v1/models").json()["data"]}
+    assert models["whisper"]["surfaces"] == ["transcription", "translation"]
+    assert models["scribe"]["surfaces"] == ["transcription"]
+
+
+def test_the_sdks_translation_form_is_sent_as_a_translation(settings: Settings) -> None:
+    whisper = Scribe(name="a", model_id="whisper", translates=True)
+    with serve(settings, whisper) as client:
+        response = translate(client, prompt="Foxes.", temperature="0.1")
+    assert response.status_code == 200, response.text
+    assert response.json() == {"text": SAID, "usage": {"type": "duration", "seconds": 3.5}}
+    [sent] = whisper.heard
+    assert sent.translate and base64.b64decode(sent.audio.data) == FOX
+    assert (sent.prompt, sent.temperature, sent.language, sent.timestampGranularities) == (
+        "Foxes.",
+        0.1,
+        None,
+        None,
+    )
+
+
+def test_a_verbose_translation_is_openais_translate_shape(settings: Settings) -> None:
+    whisper = Scribe(name="a", model_id="whisper", translates=True)
+    with serve(settings, whisper) as client:
+        verbose = translate(client, response_format="verbose_json")
+        text = translate(client, response_format="text")
+    assert verbose.status_code == 200, verbose.text
+    body = verbose.json()
+    assert (body["task"], body["language"], body["duration"]) == ("translate", "english", 3.5)
+    assert "words" not in body  # a translation carries segments, never words
+    assert text.headers["content-type"].startswith("text/plain") and text.text == SAID
+
+
+@pytest.mark.parametrize(
+    ("fields", "param", "said"),
+    [
+        ({"language": "fr"}, "language", "always English"),
+        ({"timestamp_granularities[]": "word"}, "timestamp_granularities", "translation"),
+        ({"stream": "true"}, "stream", "one JSON document"),
+        ({"chunking_strategy": "auto"}, "chunking_strategy", "not a field"),
+        ({"response_format": "srt"}, "response_format", "srt"),
+    ],
+)
+def test_what_a_translation_does_not_take_is_refused_naming_the_field(
+    settings: Settings, fields: dict[str, Any], param: str, said: str
+) -> None:
+    whisper = Scribe(name="a", model_id="whisper", translates=True)
+    with serve(settings, whisper) as client:
+        response = translate(client, **fields)
+    assert response.status_code == 400, response.text
+    error = response.json()["error"]
+    assert error["param"] == param and said in error["message"]
+    assert not whisper.heard
+
+
+def test_a_model_that_only_transcribes_is_sent_to_the_transcription_door(
+    settings: Settings,
+) -> None:
+    scribe = Scribe(name="a", model_id="scribe")
+    with serve(settings, scribe) as client:
+        response = translate(client, "scribe")
+    assert response.status_code == 400, response.text
+    assert "/v1/audio/transcriptions" in response.json()["error"]["message"]
+    assert not scribe.heard
+
+
+def test_a_translation_slot_skips_a_model_that_would_answer_in_french(
+    settings: Settings,
+) -> None:
+    """A transcript is not a translation: a fallback tier that only
+    transcribes would answer in the language spoken, with a 200."""
+    scribe = Scribe(name="a", model_id="scribe")
+    dead = Scribe(name="b", model_id="primary", translates=True, fail=httpx.ConnectError("x"))
+    backup = Scribe(name="c", model_id="backup", translates=True)
+    slots = [{"model": "english", "targets": ["scribe", "primary", "backup"]}]
+    with serve(settings, scribe, dead, backup, slots=slots) as client:
+        response = translate(client, "english")
+        rows = _rows(client)
+    assert response.status_code == 200, response.text
+    assert not scribe.heard and dead.heard and backup.heard
+    assert rows[0]["servedModel"] == "backup" and rows[0]["tier"] == 3
+    assert (rows[0]["door"], rows[0]["audioSeconds"]) == ("translation", 3.5)
 
 
 def _rows(client: TestClient) -> list[dict[str, Any]]:

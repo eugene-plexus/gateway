@@ -470,6 +470,7 @@ _DOORS = {
     "decisions": "/v1/systemone",
     "speech": "/v1/audio/speech",
     "transcription": "/v1/audio/transcriptions",
+    "translation": "/v1/audio/translations",
     "image": "/v1/images/generations",
     "video": "/v1/videos",
 }
@@ -1805,20 +1806,21 @@ def _transcription_usage(result: TranscribeResponse) -> dict[str, Any] | None:
     }
 
 
-def _transcription_body(result: TranscribeResponse, fmt: str) -> Any:
+def _transcription_body(result: TranscribeResponse, fmt: str, *, translate: bool = False) -> Any:
     """The answer in the shape `response_format` asked for (P3b): `text` is
-    rendered here, because llama-server refuses it (measured)."""
+    rendered here, because llama-server refuses it (measured). A verbose
+    translation says `task: translate` and carries no words (P3-4)."""
     if fmt == "text":
         return PlainTextResponse(result.text)
     body: dict[str, Any] = {"text": result.text}
     if fmt == "verbose_json":
         body = {
-            "task": "transcribe",
+            "task": "translate" if translate else "transcribe",
             "language": result.language,
             "duration": result.duration,
             "text": result.text,
             "segments": result.segments,
-            "words": result.words,
+            "words": None if translate else result.words,
         }
         body = {k: v for k, v in body.items() if v is not None}
     usage = _transcription_usage(result)
@@ -1835,6 +1837,23 @@ async def create_transcription(request: Request) -> Any:
     tier of the slot, each holding only backends that transcribe, so a
     fallback cannot give the audio to a model that only chats.
     """
+    return await _audio_to_text(request, translate=False)
+
+
+@router.post("/v1/audio/translations", dependencies=_auth)
+async def create_translation(request: Request) -> Any:
+    """Audio in, English text out (P3-4, taken 2026-09-28), OpenAI's form.
+
+    The transcription path with `translate` set: only backends with the
+    `translation` surface are tried, in every tier -- today OpenAI's
+    `whisper-*` alone (measured: its `gpt-4o-*-transcribe` models,
+    OpenRouter and `llama-server` answer this door 404).
+    """
+    return await _audio_to_text(request, translate=True)
+
+
+async def _audio_to_text(request: Request, *, translate: bool) -> Any:
+    surface = "translation" if translate else "transcription"
     try:
         # Cached first, because `form()` consumes the stream without caching
         # it, and `serve_while_connected`'s watcher reads the body again.
@@ -1850,7 +1869,7 @@ async def create_transcription(request: Request) -> Any:
             param="body",
         )
     try:
-        ask = await chat_contract.read_transcription(form)
+        ask = await chat_contract.read_transcription(form, translate=translate)
     except chat_contract.Refusal as exc:
         return _error(
             code=413 if isinstance(exc, chat_contract.TooLarge) else 400,
@@ -1872,16 +1891,16 @@ async def create_transcription(request: Request) -> Any:
     if not resolution.has_backends():
         return _no_such_model(ask.model, table).as_openai()
     surfaces = resolution.surfaces()
-    if surfaces and "transcription" not in surfaces:
+    if surfaces and surface not in surfaces:
         return _wrong_surface(
-            ask.model, surfaces, wanted="transcription", instead="/v1/chat/completions"
+            ask.model, surfaces, wanted=surface, instead="/v1/chat/completions"
         ).as_openai()
     if not surfaces and (reported := resolution.reported_surfaces()):
-        return _no_door_yet(ask.model, reported, wanted="transcription").as_openai()
-    client = table.pick_transcription(resolution)
+        return _no_door_yet(ask.model, reported, wanted=surface).as_openai()
+    client = table.pick_transcription(resolution, translate=translate)
     if client is None and await table.refresh_if_stale():
         resolution = await admission.permitted(table.resolve(ask.model))
-        client = table.pick_transcription(resolution)
+        client = table.pick_transcription(resolution, translate=translate)
     if client is None:
         # No wake, as for embeddings and speech.
         return _not_ready(resolution, None).as_openai()
@@ -1902,7 +1921,7 @@ async def create_transcription(request: Request) -> Any:
                 tries,
                 served_model=getattr(client, "served_model", None) if result else None,
                 tier=getattr(client, "tier", 1) if result else None,
-                door="transcription",
+                door=surface,
                 audio_seconds=seconds,
             )
 
@@ -1924,11 +1943,12 @@ async def create_transcription(request: Request) -> Any:
                             DriverTimestampGranularity(g) for g in ask.granularities
                         ]
                         or None,
+                        translate=translate,
                         localOnly=admission.local_only(),
                         requestId=admission.request_id(),
                     )
                 ),
-                what="a transcription",
+                what=f"a {surface}",
             )
         except ClientGone:
             record()
@@ -1945,7 +1965,8 @@ async def create_transcription(request: Request) -> Any:
             return _error(
                 code=504,
                 message=(
-                    f"No backend serving {ask.model!r} transcribed within the gateway's "
+                    f"No backend serving {ask.model!r} "
+                    f"{'translated' if translate else 'transcribed'} within the gateway's "
                     f"requestTimeoutSeconds ({_timeout_seconds(_store(request)):g}s). "
                     f"({type(e).__name__})"
                 ),
@@ -1959,23 +1980,7 @@ async def create_transcription(request: Request) -> Any:
                 error_type="upstream_error",
             )
         record(result)
-    return _transcription_body(result, ask.response_format)
-
-
-@router.post("/v1/audio/translations", dependencies=_auth)
-async def create_translation(request: Request) -> Any:
-    """Refused (P3-4): only OpenAI's own API translates, and there is no
-    OpenAI key here to verify it against. A 400 that says so, rather than a
-    404 that reads as a typo."""
-    return _error(
-        code=400,
-        message=(
-            "No backend here translates speech: only OpenAI's own API serves "
-            "/v1/audio/translations, and this door is not built (P3-4). Transcribe with "
-            "/v1/audio/transcriptions and translate the text with a chat model."
-        ),
-        error_type="invalid_request_error",
-    )
+    return _transcription_body(result, ask.response_format, translate=translate)
 
 
 # --------------------------------------------------------------------------- #
