@@ -289,3 +289,47 @@ def test_a_non_streamed_completion_has_no_first_token_time(
     assert page["requests"][0]["tries"][0]["firstMs"] is None
     body = metrics_client.get("/v1/metrics").json()
     assert body["groups"][0]["ttftMs"] is None
+
+
+def test_a_v6_store_migrates_in_place_gaining_the_door_and_its_units(tmp_path: Path) -> None:
+    """P3b's v7: an alpha.4 install's metrics keep their rows and gain the
+    door, characters and audio seconds, null on every older row."""
+    path = tmp_path / "m.sqlite3"
+
+    async def build() -> None:
+        store = await _store(path)
+        try:
+            store._insert([_row()])
+        finally:
+            await store.aclose()
+
+    asyncio.run(build())
+
+    conn = sqlite3.connect(path)
+    for column in ("door", "characters", "audio_seconds"):
+        conn.execute(f"ALTER TABLE request DROP COLUMN {column}")
+    conn.execute("UPDATE meta SET value = '6' WHERE key = 'schema_version'")
+    conn.commit()
+    conn.close()
+
+    async def reopen() -> None:
+        store = await _store(path)
+        try:
+            rows, _ = store.requests()
+            assert len(rows) == 1, "migration lost the v6 rows"
+            assert (rows[0]["door"], rows[0]["characters"], rows[0]["audioSeconds"]) == (
+                None,
+                None,
+                None,
+            )
+            with store._reader() as conn:
+                assert conn is not None
+                version = conn.execute(
+                    "SELECT value FROM meta WHERE key = 'schema_version'"
+                ).fetchone()
+            assert version == (str(SCHEMA_VERSION),) == ("7",)
+        finally:
+            await store.aclose()
+
+    asyncio.run(reopen())
+    assert not path.with_suffix(".v6.bak").exists(), "an in-place upgrade renamed the file aside"

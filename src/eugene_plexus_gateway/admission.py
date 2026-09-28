@@ -322,6 +322,8 @@ CLIENT_ADMISSION_PATHS = frozenset(
         # scoped key could speak through any model it was not allowed:
         # the rule above, broken exactly as it describes.
         "/v1/audio/speech",
+        "/v1/audio/transcriptions",
+        "/v1/audio/translations",
     }
 )
 

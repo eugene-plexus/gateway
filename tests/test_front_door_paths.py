@@ -53,7 +53,9 @@ def test_every_route_taking_a_client_key_is_under_client_admission(settings: Set
 
 def test_every_body_taking_route_with_a_client_key_is_bounded(settings: Settings) -> None:
     app = create_app(settings=settings)
-    bounded = next(m.kwargs["paths"] for m in app.user_middleware if m.cls is InferenceBodyLimit)
+    limit = next(m for m in app.user_middleware if m.cls is InferenceBodyLimit)
+    # A door with a limit of its own (P3b's uploads) is bounded too.
+    bounded = set(limit.kwargs["paths"]) | set(limit.kwargs.get("limits") or {})
     missing = sorted(
         r.path
         for r in _client_key_routes(settings)

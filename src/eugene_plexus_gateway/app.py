@@ -259,5 +259,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "/v1/audio/speech",
         },
         driver=False,
+        # P3b: OpenAI's 25 MiB upload plus the form's other fields. The
+        # route checks the file itself against 25 MiB exactly.
+        limits={
+            "/v1/audio/transcriptions": 26 * 1024 * 1024,
+            "/v1/audio/translations": 26 * 1024 * 1024,
+        },
     )
     return app

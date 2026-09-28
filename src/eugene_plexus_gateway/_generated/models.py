@@ -1210,6 +1210,7 @@ class Surface(StrEnum):
     embeddings = 'embeddings'
     decisions = 'decisions'
     speech = 'speech'
+    transcription = 'transcription'
 
 
 class ModelRoutingInfo(BaseModel):
@@ -1233,7 +1234,7 @@ class ModelRoutingInfo(BaseModel):
     )
     surfaces: list[Surface] | None = Field(
         None,
-        description="Which surfaces this model can be sent to. `decisions` means\n`POST /v1/systemone`; a decision-only model lists nothing\nelse, and a chat request naming it is refused with the\ndoor's name. `speech` means `POST /v1/audio/speech` (P3a).\n\nOpenAI's own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Measured, not assumed, and the two are not always\ndisjoint**: an Ollama runner started for chat refuses to\nembed, `nomic-embed-text` refuses to chat -- but\n`llama-server` given `--embedding` still serves chat\nperfectly well. Hence a list.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n",
+        description="Which surfaces this model can be sent to. `decisions` means\n`POST /v1/systemone`; a decision-only model lists nothing\nelse, and a chat request naming it is refused with the\ndoor's name. `speech` means `POST /v1/audio/speech` (P3a),\n`transcription` `POST /v1/audio/transcriptions` (P3b).\n\nOpenAI's own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Measured, not assumed, and the two are not always\ndisjoint**: an Ollama runner started for chat refuses to\nembed, `nomic-embed-text` refuses to chat -- but\n`llama-server` given `--embedding` still serves chat\nperfectly well. Hence a list.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n",
     )
     image_input: bool | None = Field(
         None,
@@ -1346,6 +1347,55 @@ class SpeechStreamFormat(StrEnum):
 
     audio = 'audio'
     sse = 'sse'
+
+
+class TimestampGranularity(StrEnum):
+    """
+    Named, as every enum in this document should be: an inline one is
+    numbered by the generator, and the next one renumbers the rest
+    (S6's `Source1`, and P3b's first draft, which renamed nine `Type`
+    enums).
+
+    """
+
+    word = 'word'
+    segment = 'segment'
+
+
+class TranscriptionUsageType(StrEnum):
+    """
+    Which unit the backend counted in.
+    """
+
+    duration = 'duration'
+    tokens = 'tokens'
+
+
+class TranscriptionResponseFormat(StrEnum):
+    """
+    `srt` and `vtt` are refused; `text` is rendered here from `json`.
+    """
+
+    json = 'json'
+    text = 'text'
+    verbose_json = 'verbose_json'
+    srt = 'srt'
+    vtt = 'vtt'
+
+
+class TranscriptionUsageOut(BaseModel):
+    """
+    OpenAI's two shapes: `{"type": "duration", "seconds"}` for a
+    backend that counts audio, `{"type": "tokens", ...}` for one that
+    counts tokens.
+
+    """
+
+    type: TranscriptionUsageType
+    seconds: float | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
 
 
 class ChatModality(StrEnum):
@@ -2936,6 +2986,41 @@ class SpeechRequest(BaseModel):
     stream_format: SpeechStreamFormat | None = None
 
 
+class TranscriptionForm(BaseModel):
+    """
+    OpenAI's multipart form (P3b). Fields this door does not carry are
+    refused naming them.
+
+    """
+
+    file: bytes = Field(..., description='At most 25 MiB.')
+    model: str
+    language: str | None = None
+    prompt: str | None = None
+    response_format: TranscriptionResponseFormat | None = None
+    temperature: float | None = Field(None, ge=0.0, le=1.0)
+    timestamp_granularities: list[TimestampGranularity] | None = Field(
+        None,
+        description='Sent as `timestamp_granularities[]`, once per value, as the SDK does.',
+    )
+    stream: bool | None = Field(None, description='Refused when true.')
+
+
+class Transcription(BaseModel):
+    text: str
+    usage: TranscriptionUsageOut | None = None
+
+
+class TranscriptionVerbose(BaseModel):
+    task: Literal['transcribe']
+    language: str | None = None
+    duration: float | None = None
+    text: str
+    segments: list[dict[str, Any]] | None = None
+    words: list[dict[str, Any]] | None = None
+    usage: TranscriptionUsageOut | None = None
+
+
 class Delta(BaseModel):
     """
     Incremental payload. The first chunk carries `role`;
@@ -3356,6 +3441,18 @@ class MetricRequest(BaseModel):
     )
     promptTokens: int | None = None
     completionTokens: int | None = None
+    door: str | None = Field(
+        None,
+        description='Which door the request came in by (P3b): `speech` or\n`transcription`. Null on rows from before schema v7 and on every\nother door, whose rows carry tokens.\n',
+    )
+    characters: int | None = Field(
+        None,
+        description='For speech, the characters spoken, the unit providers bill it in.',
+    )
+    audioSeconds: float | None = Field(
+        None,
+        description='For transcription, the seconds of audio heard, where the backend says.',
+    )
     outcome: Outcome
     tries: list[MetricAttempt] = Field(..., min_length=0)
 

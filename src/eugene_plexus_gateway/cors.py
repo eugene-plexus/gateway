@@ -85,6 +85,9 @@ FRONT_DOOR_PATHS: frozenset[str] = frozenset(
         "/v1/responses",
         # P3a: a page that reads text aloud is the plainest browser client.
         "/v1/audio/speech",
+        # P3b, and the one that refuses, so a browser reads why.
+        "/v1/audio/transcriptions",
+        "/v1/audio/translations",
     }
 )
 

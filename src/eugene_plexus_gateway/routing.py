@@ -315,6 +315,11 @@ class _Backend:
         return "speech" in self.surfaces
 
     @property
+    def transcribes(self) -> bool:
+        """Whether this model serves the transcription surface (P3b)."""
+        return "transcription" in self.surfaces
+
+    @property
     def chats(self) -> bool:
         """Whether this model serves chat completions.
 
@@ -466,6 +471,7 @@ class Resolution:
             + (["embeddings"] if any(b.embeds for b in backends) else [])
             + (["decisions"] if any(b.decides for b in backends) else [])
             + (["speech"] if any(b.speaks for b in backends) else [])
+            + (["transcription"] if any(b.transcribes for b in backends) else [])
         )
 
     def reported_surfaces(self) -> list[str]:
@@ -1702,6 +1708,21 @@ class RoutingTable:
         ordered = [b.client for b in self._order(resolution.model, eligible)]
         return TieredClient(name=resolution.model, tiers=[ordered], hooks=self)
 
+    def pick_transcription(self, resolution: Resolution) -> TieredClient | None:
+        """`pick`'s tiers, holding only backends that transcribe (P3b).
+
+        Tiers, as chat (§5, call #4): a fallback model's transcript is
+        still a transcript. Every tier is filtered, so a fallback cannot
+        hand the audio to a model that only chats.
+        """
+        tiers: list[list[DriverClient]] = []
+        for tier in resolution.tiers:
+            eligible = [b for b in tier.eligible() if b.transcribes]
+            tiers.append([b.client for b in self._order(tier.target, eligible)] if eligible else [])
+        if not any(tiers):
+            return None
+        return TieredClient(name=resolution.model, tiers=tiers, hooks=self)
+
     @staticmethod
     def speech_formats_for(resolution: Resolution) -> list[SpeechFormat]:
         """The formats every backend speaking this model -- the slot's first,
@@ -1765,28 +1786,6 @@ class RoutingTable:
             return None
         ordered = [b.client for b in self._order(resolution.model, free)]
         return TieredClient(name=resolution.model, tiers=[ordered], hooks=self)
-
-    def surfaces_for(self, model: str) -> list[Surface]:
-        """Which OpenAI surfaces this model can be sent to.
-
-        A list because the two are not always disjoint: an Ollama runner
-        is one or the other, but `llama-server` in `--embedding` mode
-        still chats. Derived from every backend serving the name, so a
-        surface appears when at least one of them offers it -- the
-        opposite of `tool_calling`, which is the weakest-backend answer.
-        That difference is deliberate: `tool_calling` promises a request
-        will be carried whichever replica takes it, while `surfaces`
-        answers "is there any point sending this here at all".
-        """
-        backends = self.resolve(model).backends()
-        out: list[Surface] = []
-        if any(b.chats for b in backends):
-            out.append(Surface.chat)
-        if any(b.embeds for b in backends):
-            out.append(Surface.embeddings)
-        if any(b.decides for b in backends):
-            out.append(Surface.decisions)
-        return out
 
     def candidates_considered(self, resolution: Resolution) -> list[CandidateRow]:
         """What the balancer saw for each candidate, in tier order.

@@ -31,6 +31,8 @@ dependencies = [
     "pyyaml>=6.0,<7",
     "httpx>=0.27,<1",
     "pyjwt[crypto]>=2.9,<3",
+    # P3b: the transcription door is multipart, as the OpenAI SDK sends it.
+    "python-multipart>=0.0.20,<0.1",
 ]
 
 [project.optional-dependencies]

@@ -11,28 +11,41 @@ MAX_BODY_BYTES = 16 * 1024 * 1024
 
 
 class InferenceBodyLimit:
-    def __init__(self, app: ASGIApp, *, paths: set[str], driver: bool = False) -> None:
+    """`paths` are bounded at `MAX_BODY_BYTES`; `limits` names a path with a
+    limit of its own (P3b: an audio upload is bigger than any JSON body)."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        *,
+        paths: set[str],
+        driver: bool = False,
+        limits: dict[str, int] | None = None,
+    ) -> None:
         self.app, self.paths, self.driver = app, paths, driver
+        self.limits = limits or {}
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or scope["path"] not in self.paths:
+        path = scope.get("path")
+        if scope["type"] != "http" or (path not in self.paths and path not in self.limits):
             await self.app(scope, receive, send)
             return
+        limit = self.limits.get(path, MAX_BODY_BYTES)
         body = bytearray()
         for key, value in scope.get("headers", []):
             if key == b"content-length" and value.isdigit():
                 significant = value.lstrip(b"0")
-                if len(significant) <= 8 and int(significant or b"0") <= MAX_BODY_BYTES:
+                if len(significant) <= 10 and int(significant or b"0") <= limit:
                     continue
-                await self._refuse(scope, receive, send)
+                await self._refuse(scope, receive, send, limit)
                 return
         while True:
             event = await receive()
             if event["type"] == "http.disconnect":
                 return
             chunk = event.get("body", b"")
-            if len(body) + len(chunk) > MAX_BODY_BYTES:
-                await self._refuse(scope, receive, send)
+            if len(body) + len(chunk) > limit:
+                await self._refuse(scope, receive, send, limit)
                 return
             body.extend(chunk)
             if not event.get("more_body", False):
@@ -48,8 +61,11 @@ class InferenceBodyLimit:
 
         await self.app(scope, replay, send)
 
-    async def _refuse(self, scope: Scope, receive: Receive, send: Send) -> None:
-        message = "body: exceeds the 16 MiB request limit; resize or remove attachments."
+    async def _refuse(self, scope: Scope, receive: Receive, send: Send, limit: int) -> None:
+        # The documented number for the shared limit, whatever a test patches
+        # the byte count to; a path's own limit is named from its bytes.
+        size = f"{limit // (1024 * 1024)} MiB" if scope.get("path") in self.limits else "16 MiB"
+        message = f"body: exceeds the {size} request limit; resize or remove attachments."
         payload: dict[str, Any]
         if self.driver:
             payload = {"detail": {"title": "Request too large", "status": 413, "detail": message}}

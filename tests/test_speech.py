@@ -227,6 +227,12 @@ def test_a_served_clip_is_retained_as_served(settings: Settings) -> None:
         [row] = _rows(client)
     assert (row["outcome"], row["servedModel"], row["streamed"]) == ("served", "narrator", True)
     assert [t["served"] for t in row["tries"]] == [True]
+    # P3b: speech is billed in characters, and the row says so.
+    assert (row["door"], row["characters"], row["audioSeconds"]) == (
+        "speech",
+        len("Hello there."),
+        None,
+    )
 
 
 def test_a_failed_clip_is_retained_as_an_error_with_its_attempt(settings: Settings) -> None:

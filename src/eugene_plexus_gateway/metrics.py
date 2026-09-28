@@ -50,7 +50,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Bounded because the alternative to dropping rows is stalling
 # completions, and that trade is never worth making. Sized so a burst
@@ -150,6 +150,11 @@ class RequestRow:
     client_key_name: str | None = None
     request_id: str | None = None
     elapsed_ms: int | None = None
+    # v7 (P3b): the door, and the unit a door that is not token-shaped is
+    # billed in -- characters spoken, seconds of audio heard.
+    door: str | None = None
+    characters: int | None = None
+    audio_seconds: float | None = None
 
 
 _DDL = """
@@ -178,7 +183,10 @@ CREATE TABLE IF NOT EXISTS request (
     client_key_id     TEXT,
     client_key_name   TEXT,
     correlation_id    TEXT,
-    elapsed_ms        INTEGER
+    elapsed_ms        INTEGER,
+    door              TEXT,
+    characters        INTEGER,
+    audio_seconds     REAL
 );
 
 CREATE INDEX IF NOT EXISTS request_started_at ON request (started_at);
@@ -329,13 +337,20 @@ class MetricsStore:
         conn.commit()
 
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        if row is not None and int(row[0]) in (2, 3, 4, 5):
+        if row is not None and int(row[0]) in (2, 3, 4, 5, 6):
             columns = {r[1] for r in conn.execute("PRAGMA table_info(request)")}
             for column in ("client_key_id", "client_key_name"):
                 if column not in columns:
                     conn.execute(f"ALTER TABLE request ADD COLUMN {column} TEXT")
             for table, additions in {
-                "request": {"correlation_id": "TEXT", "elapsed_ms": "INTEGER"},
+                "request": {
+                    "correlation_id": "TEXT",
+                    "elapsed_ms": "INTEGER",
+                    # v7: the door and its unit (P3b).
+                    "door": "TEXT",
+                    "characters": "INTEGER",
+                    "audio_seconds": "REAL",
+                },
                 "attempt": {
                     "retry_disposition": "TEXT",
                     "usage_known": "INTEGER NOT NULL DEFAULT 0",
@@ -495,8 +510,9 @@ class MetricsStore:
                     "INSERT INTO request (started_at, requested_model, served_model, attempts,"
                     " tier, total_ms, waited_ms, swapped_in, streamed, prompt_tokens,"
                     " completion_tokens, outcome, routing_ms, refreshed, strategy,"
-                    " client_key_id, client_key_name, correlation_id, elapsed_ms)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " client_key_id, client_key_name, correlation_id, elapsed_ms,"
+                    " door, characters, audio_seconds)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         _iso(row.started_at),
                         row.requested_model,
@@ -517,6 +533,9 @@ class MetricsStore:
                         row.client_key_name,
                         row.request_id,
                         row.elapsed_ms,
+                        row.door,
+                        row.characters,
+                        row.audio_seconds,
                     ),
                 )
                 request_id = cursor.lastrowid
@@ -967,7 +986,8 @@ class MetricsStore:
                 SELECT id, started_at, requested_model, served_model, attempts, tier,
                        total_ms, waited_ms, swapped_in, streamed, prompt_tokens,
                        completion_tokens, outcome, routing_ms, refreshed, strategy,
-                       client_key_id, client_key_name, correlation_id, elapsed_ms
+                       client_key_id, client_key_name, correlation_id, elapsed_ms,
+                       door, characters, audio_seconds
                 FROM request r {clause}
                 ORDER BY id DESC LIMIT ?
                 """,
@@ -1078,6 +1098,9 @@ class MetricsStore:
                 "clientKeyName": r[17],
                 "requestId": r[18],
                 "elapsedMs": r[19],
+                "door": r[20],
+                "characters": r[21],
+                "audioSeconds": r[22],
                 "tries": tries[r[0]],
                 "candidates": considered[r[0]],
             }

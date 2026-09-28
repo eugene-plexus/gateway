@@ -1239,6 +1239,55 @@ class FinishReason(StrEnum):
     error = 'error'
 
 
+class TimestampGranularity(StrEnum):
+    """
+    Named, so a later inline enum cannot renumber it.
+    """
+
+    word = 'word'
+    segment = 'segment'
+
+
+class TranscribeAudio(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    data: str = Field(
+        ...,
+        description="The file's bytes, base64, no `data:` prefix. At most 25 MiB decoded.",
+        max_length=35000000,
+        min_length=1,
+    )
+    filename: str = Field(
+        ...,
+        description='The name the caller uploaded it under. Backends read the format\nfrom its extension as often as from its bytes, so it is sent on.\n',
+        max_length=255,
+        min_length=1,
+    )
+    mediaType: str | None = Field(
+        None,
+        description="The upload's `Content-Type`, when the caller sent one.",
+        max_length=128,
+    )
+
+
+class TranscriptionUsage(BaseModel):
+    """
+    What the backend counted, in its own unit (measured 2026-09-28):
+    seconds of audio for Whisper, tokens for `gpt-4o-mini-transcribe`
+    and `llama-server`.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    seconds: float | None = None
+    inputTokens: int | None = None
+    outputTokens: int | None = None
+    totalTokens: int | None = None
+
+
 class AudioOutputRequest(BaseModel):
     """
     Answer with audio as well as text (P2b, 2026-09-28): the chat
@@ -1942,6 +1991,67 @@ class SpeakRequest(BaseModel):
     requestId: UUID | None = None
 
 
+class TranscribeRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    model: str | None = Field(
+        None,
+        description="Which of this driver's models the request is for: an `id` from\n`DriverInfo.models`, **unprefixed** — the gateway strips the\n`<driver name>/` it added. Optional so a caller from before P1\nstill works against a single-model driver, which serves its one\nmodel when this is absent. An account driver refuses a request\nwithout it (400, `#model-required`), and every driver refuses a\nmodel it does not list (404, `#model-not-served`) before calling\nits backend.\n",
+        min_length=1,
+    )
+    localOnly: bool | None = Field(
+        False,
+        description='As `GenerateRequest.localOnly`: refuse before forwarding any\naudio unless the active engine is classified local.\n',
+    )
+    audio: TranscribeAudio
+    language: str | None = Field(
+        None,
+        description='The spoken language, ISO-639-1 (`en`), when the caller knows it.',
+        max_length=16,
+        min_length=2,
+    )
+    prompt: str | None = Field(
+        None,
+        description="Text to guide the transcript's style or spelling, as OpenAI's.",
+        max_length=8192,
+    )
+    temperature: float | None = Field(None, ge=0.0, le=1.0)
+    verbose: bool | None = Field(
+        False,
+        description="Ask for `language`, `duration` and segments as well as the text:\nOpenAI's `verbose_json`. A backend that cannot make it refuses,\nand the refusal is relayed.\n",
+    )
+    timestampGranularities: list[TimestampGranularity] | None = Field(
+        None, description='With `verbose` only, as OpenAI requires.', max_length=2
+    )
+    requestId: UUID | None = None
+
+
+class TranscribeResponse(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    text: str
+    language: str | None = Field(
+        None, description='The spoken language, as the backend names it.'
+    )
+    duration: float | None = Field(
+        None, description="The audio's length in seconds, when the backend says."
+    )
+    segments: list[dict[str, Any]] | None = Field(
+        None, description="`verbose` only: the backend's segments, as it sent them."
+    )
+    words: list[dict[str, Any]] | None = Field(
+        None,
+        description="`verbose` with word timestamps: the backend's words, as it sent them.",
+    )
+    usage: TranscriptionUsage | None = None
+    modelId: str | None = Field(
+        None, description='The model the backend says answered.'
+    )
+    latencyMs: int | None = None
+
+
 class Tool(BaseModel):
     type: Literal['function']
     function: FunctionDefinition
@@ -2038,7 +2148,7 @@ class DriverModel(BaseModel):
     )
     surfaces: list[str] = Field(
         ...,
-        description='Which requests this model answers. The values so far:\n\n* `chat` (`/v1/generate`), `embeddings` (`/v1/embed`) and\n  `decisions` (`/v1/decide`), which have doors today;\n* `completion`, `speech`, `transcription`, `image`, `video`,\n  `moderation` and `rerank`, which name OpenAI\'s and\n  OpenRouter\'s doors Eugene has not built yet.\n\nA driver reports those anyway, so a model\'s id does not\nchange on the day its door arrives, and the gateway lists a\nmodel on `GET /v1/models` only once a door serves one of its\nsurfaces (P1-4).\n\n**Strings, not an enum, on purpose.** A newer driver\nreporting a surface an older gateway has never heard of must\nnot fail that gateway\'s validation of the whole `/v1/info`,\nwhich would make every model on the driver unreachable over\none unknown word. A reader ignores a surface it does not\nknow. Empty only for a model whose kind neither the backend\nnor the driver could decide, which serves nothing.\n\n**Replaces `capabilities.embeddings` and\n`capabilities.chatCapable`**, which said the same thing once\nfor the whole driver. Where they came from still holds for a\nsingle-model driver: `embeddings` is **a property of the\nrunning backend, not of the model**, and not readable from\nanything (`llama-server`\'s `/props` carries no pooling\nfield, and an Ollama runner started for chat refuses with\n*"This server does not support embeddings"*), so it is\ndetermined by trying once and cached for the driver\'s\nlifetime. A System One backend serves `decisions` alone. An\naccount takes each model\'s surfaces from its catalogue.\n',
+        description='Which requests this model answers. The values so far:\n\n* `chat` (`/v1/generate`), `embeddings` (`/v1/embed`),\n  `decisions` (`/v1/decide`), `speech` (`/v1/speak`, P3a) and\n  `transcription` (`/v1/transcribe`, P3b), which have doors;\n* `completion`, `image`, `video`, `moderation` and `rerank`,\n  which name OpenAI\'s and OpenRouter\'s doors Eugene has not\n  built yet.\n\nA single-model `llama-server` whose projector hears\n(`/props` `modalities.audio`) serves `transcription` beside\n`chat`: its `/v1/audio/transcriptions` answers only then\n(measured).\n\nA driver reports those anyway, so a model\'s id does not\nchange on the day its door arrives, and the gateway lists a\nmodel on `GET /v1/models` only once a door serves one of its\nsurfaces (P1-4).\n\n**Strings, not an enum, on purpose.** A newer driver\nreporting a surface an older gateway has never heard of must\nnot fail that gateway\'s validation of the whole `/v1/info`,\nwhich would make every model on the driver unreachable over\none unknown word. A reader ignores a surface it does not\nknow. Empty only for a model whose kind neither the backend\nnor the driver could decide, which serves nothing.\n\n**Replaces `capabilities.embeddings` and\n`capabilities.chatCapable`**, which said the same thing once\nfor the whole driver. Where they came from still holds for a\nsingle-model driver: `embeddings` is **a property of the\nrunning backend, not of the model**, and not readable from\nanything (`llama-server`\'s `/props` carries no pooling\nfield, and an Ollama runner started for chat refuses with\n*"This server does not support embeddings"*), so it is\ndetermined by trying once and cached for the driver\'s\nlifetime. A System One backend serves `decisions` alone. An\naccount takes each model\'s surfaces from its catalogue.\n',
     )
     inputModalities: list[str] | None = Field(
         None,

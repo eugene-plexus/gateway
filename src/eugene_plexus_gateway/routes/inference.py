@@ -35,7 +35,7 @@ from typing import Any
 
 import httpx
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from .. import admission, anthropic, chat_contract, decisions, responses
@@ -48,6 +48,9 @@ from .._generated.driver_models import (
     Message,
     Role,
     SpeakRequest,
+    TranscribeAudio,
+    TranscribeRequest,
+    TranscribeResponse,
 )
 from .._generated.driver_models import (
     DecisionQuestion as DriverDecisionQuestion,
@@ -62,6 +65,7 @@ from .._generated.driver_models import ReasoningEffort as DriverReasoningEffort
 from .._generated.driver_models import ResponseFormat as DriverResponseFormat
 from .._generated.driver_models import ServiceTier as DriverServiceTier
 from .._generated.driver_models import SpeechFormat as DriverSpeechFormat
+from .._generated.driver_models import TimestampGranularity as DriverTimestampGranularity
 from .._generated.driver_models import Tool as DriverTool
 from .._generated.driver_models import ToolChoice as DriverToolChoice
 from .._generated.driver_models import Verbosity as DriverVerbosity
@@ -176,13 +180,16 @@ class _Recording:
 
 def _record(
     rec: _Recording,
-    body: ChatCompletionRequest | SpeechRequest,
+    body: ChatCompletionRequest | SpeechRequest | chat_contract.TranscriptionAsk,
     tries: list[AttemptRow],
     *,
     served_model: str | None = None,
     tier: int | None = None,
     usage: Any = None,
     backend_ms: int | None = None,
+    door: str | None = None,
+    characters: int | None = None,
+    audio_seconds: float | None = None,
 ) -> None:
     """Join the per-attempt rows to the facts only this route holds.
 
@@ -240,6 +247,9 @@ def _record(
                 client_key_name=context.key_name if context else None,
                 request_id=context.id if context else None,
                 elapsed_ms=int((time.perf_counter() - context.started) * 1000) if context else None,
+                door=door,
+                characters=characters,
+                audio_seconds=audio_seconds,
             )
         )
         if (context := admission.current.get()) is not None:
@@ -1687,17 +1697,17 @@ async def create_speech(request: Request) -> Any:
             media = await serve_while_connected(request, anext(events), what="speech")
         except ClientGone:
             await events.aclose()
-            _record(rec, body, tries)
+            _record(rec, body, tries, door="speech", characters=len(body.input))
             return _error(
                 code=499,
                 message="The client disconnected; the backend call was cancelled.",
                 error_type="client_disconnected",
             )
         except DriverError as e:
-            _record(rec, body, tries)
+            _record(rec, body, tries, door="speech", characters=len(body.input))
             return _driver_failure(e).as_openai()
         except httpx.TimeoutException as e:
-            _record(rec, body, tries)
+            _record(rec, body, tries, door="speech", characters=len(body.input))
             return _error(
                 code=504,
                 message=(
@@ -1708,7 +1718,7 @@ async def create_speech(request: Request) -> Any:
                 error_type="timeout",
             )
         except httpx.HTTPError as e:
-            _record(rec, body, tries)
+            _record(rec, body, tries, door="speech", characters=len(body.input))
             return _error(
                 code=502,
                 message=f"A backend serving {body.model!r} failed ({type(e).__name__}).",
@@ -1731,9 +1741,207 @@ async def create_speech(request: Request) -> Any:
                     tries,
                     served_model=getattr(client, "served_model", None),
                     tier=getattr(client, "tier", 1),
+                    door="speech",
+                    characters=len(body.input),
                 )
 
         return StreamingResponse(audio(), media_type=str(media))
+
+
+# --------------------------------------------------------------------------- #
+# /v1/audio/transcriptions, /v1/audio/translations
+# --------------------------------------------------------------------------- #
+
+
+def _transcription_usage(result: TranscribeResponse) -> dict[str, Any] | None:
+    """OpenAI's two usage shapes: seconds for a backend that counts audio,
+    tokens for one that counts tokens."""
+    usage = result.usage
+    if usage is None:
+        return None
+    if usage.seconds is not None:
+        return {"type": "duration", "seconds": usage.seconds}
+    if usage.inputTokens is None and usage.outputTokens is None:
+        return None
+    return {
+        "type": "tokens",
+        "input_tokens": usage.inputTokens,
+        "output_tokens": usage.outputTokens,
+        "total_tokens": usage.totalTokens,
+    }
+
+
+def _transcription_body(result: TranscribeResponse, fmt: str) -> Any:
+    """The answer in the shape `response_format` asked for (P3b): `text` is
+    rendered here, because llama-server refuses it (measured)."""
+    if fmt == "text":
+        return PlainTextResponse(result.text)
+    body: dict[str, Any] = {"text": result.text}
+    if fmt == "verbose_json":
+        body = {
+            "task": "transcribe",
+            "language": result.language,
+            "duration": result.duration,
+            "text": result.text,
+            "segments": result.segments,
+            "words": result.words,
+        }
+        body = {k: v for k, v in body.items() if v is not None}
+    usage = _transcription_usage(result)
+    if usage is not None:
+        body["usage"] = usage
+    return JSONResponse(content=body)
+
+
+@router.post("/v1/audio/transcriptions", dependencies=_auth)
+async def create_transcription(request: Request) -> Any:
+    """Audio in, text out (P3b, 2026-09-28), OpenAI's multipart form.
+
+    **Tiers, as chat** (§5, call #4): `pick_transcription` hands back every
+    tier of the slot, each holding only backends that transcribe, so a
+    fallback cannot give the audio to a model that only chats.
+    """
+    try:
+        # Cached first, because `form()` consumes the stream without caching
+        # it, and `serve_while_connected`'s watcher reads the body again.
+        # The body limit has already buffered it, 26 MiB at most.
+        await request.body()
+        form = await request.form(max_files=1, max_fields=32)
+    except Exception:
+        return _error(
+            code=400,
+            message="body: must be multipart/form-data with the audio as `file`, as the "
+            "OpenAI SDK sends it.",
+            error_type="invalid_request_error",
+            param="body",
+        )
+    try:
+        ask = await chat_contract.read_transcription(form)
+    except chat_contract.Refusal as exc:
+        return _error(
+            code=413 if isinstance(exc, chat_contract.TooLarge) else 400,
+            message=exc.message,
+            error_type="invalid_request_error",
+            param=exc.field,
+        )
+    finally:
+        await form.close()
+    await admission.authorize(request, ask.model)
+    table = _routing(request)
+    if table is None:
+        return _error(
+            code=503,
+            message="The gateway is starting up or in safe mode; no routing table exists yet.",
+            error_type="service_unavailable",
+        )
+    resolution = await admission.permitted(table.resolve(ask.model))
+    if not resolution.has_backends():
+        return _no_such_model(ask.model, table).as_openai()
+    surfaces = resolution.surfaces()
+    if surfaces and "transcription" not in surfaces:
+        return _wrong_surface(
+            ask.model, surfaces, wanted="transcription", instead="/v1/chat/completions"
+        ).as_openai()
+    if not surfaces and (reported := resolution.reported_surfaces()):
+        return _no_door_yet(ask.model, reported, wanted="transcription").as_openai()
+    client = table.pick_transcription(resolution)
+    if client is None and await table.refresh_if_stale():
+        resolution = await admission.permitted(table.resolve(ask.model))
+        client = table.pick_transcription(resolution)
+    if client is None:
+        # No wake, as for embeddings and speech.
+        return _not_ready(resolution, None).as_openai()
+    if isinstance(client, TieredClient):
+        client.authorize_attempt = admission.before_attempt
+
+    rec = _Recording(metrics=_metrics(request), started=time.perf_counter())
+    with collect_attempts() as tries:
+
+        def record(result: TranscribeResponse | None = None) -> None:
+            seconds = None
+            if result is not None:
+                seconds = result.usage.seconds if result.usage is not None else None
+                seconds = seconds if seconds is not None else result.duration
+            _record(
+                rec,
+                ask,
+                tries,
+                served_model=getattr(client, "served_model", None) if result else None,
+                tier=getattr(client, "tier", 1) if result else None,
+                door="transcription",
+                audio_seconds=seconds,
+            )
+
+        try:
+            result = await serve_while_connected(
+                request,
+                client.transcribe(
+                    TranscribeRequest(
+                        audio=TranscribeAudio(
+                            data=base64.b64encode(ask.audio).decode("ascii"),
+                            filename=ask.filename,
+                            mediaType=ask.media_type,
+                        ),
+                        language=ask.language,
+                        prompt=ask.prompt,
+                        temperature=ask.temperature,
+                        verbose=ask.response_format == "verbose_json",
+                        timestampGranularities=[
+                            DriverTimestampGranularity(g) for g in ask.granularities
+                        ]
+                        or None,
+                        localOnly=admission.local_only(),
+                        requestId=admission.request_id(),
+                    )
+                ),
+                what="a transcription",
+            )
+        except ClientGone:
+            record()
+            return _error(
+                code=499,
+                message="The client disconnected; the backend call was cancelled.",
+                error_type="client_disconnected",
+            )
+        except DriverError as e:
+            record()
+            return _driver_failure(e).as_openai()
+        except httpx.TimeoutException as e:
+            record()
+            return _error(
+                code=504,
+                message=(
+                    f"No backend serving {ask.model!r} transcribed within the gateway's "
+                    f"requestTimeoutSeconds ({_timeout_seconds(_store(request)):g}s). "
+                    f"({type(e).__name__})"
+                ),
+                error_type="timeout",
+            )
+        except httpx.HTTPError as e:
+            record()
+            return _error(
+                code=502,
+                message=f"A backend serving {ask.model!r} failed ({type(e).__name__}).",
+                error_type="upstream_error",
+            )
+        record(result)
+    return _transcription_body(result, ask.response_format)
+
+
+@router.post("/v1/audio/translations", dependencies=_auth)
+async def create_translation(request: Request) -> Any:
+    """Refused (P3-4): only OpenAI's own API translates, and there is no
+    OpenAI key here to verify it against. A 400 that says so, rather than a
+    404 that reads as a typo."""
+    return _error(
+        code=400,
+        message=(
+            "No backend here translates speech: only OpenAI's own API serves "
+            "/v1/audio/translations, and this door is not built (P3-4). Transcribe with "
+            "/v1/audio/transcriptions and translate the text with a chat model."
+        ),
+        error_type="invalid_request_error",
+    )
 
 
 # --------------------------------------------------------------------------- #

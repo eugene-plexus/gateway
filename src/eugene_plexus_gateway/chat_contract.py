@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, RootModel, ValidationError
@@ -160,6 +161,117 @@ def parse_speech(raw: Any) -> SpeechRequest:
             "stream_format", 'only "audio" is served: the audio itself is streamed as raw bytes'
         )
     return parsed
+
+
+#: OpenAI's upload limit (P3b). The body limit is a little larger, for the
+#: form's other fields; this is the file itself.
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
+
+#: Every field of OpenAI's transcription form, and what this door does with
+#: it. A field not here is refused naming it, as an unknown JSON field is.
+_CARRIED = {
+    "file",
+    "model",
+    "language",
+    "prompt",
+    "response_format",
+    "temperature",
+    "timestamp_granularities[]",
+    "stream",
+}
+_NOT_CARRIED = {
+    "chunking_strategy": "is not carried: the backend decides how to split the audio",
+    "include[]": "is not carried: no backend here returns transcription logprobs",
+    "known_speaker_names[]": "is not carried: no backend here labels speakers",
+    "known_speaker_references[]": "is not carried: no backend here labels speakers",
+}
+
+
+class TooLarge(Refusal):
+    """A refusal that is a 413, not a 400."""
+
+
+@dataclass(frozen=True)
+class TranscriptionAsk:
+    """The transcription form, read (P3b)."""
+
+    model: str
+    audio: bytes
+    filename: str
+    media_type: str | None
+    response_format: str
+    language: str | None
+    prompt: str | None
+    temperature: float | None
+    granularities: list[str]
+
+
+async def read_transcription(form: Any) -> TranscriptionAsk:
+    """OpenAI's multipart form, refused naming the field, as chat is."""
+    for key in form:
+        if key in _NOT_CARRIED:
+            raise Refusal(key.rstrip("[]"), _NOT_CARRIED[key])
+        if key not in _CARRIED:
+            raise Refusal(_field_name(key), "is not a field of this form")
+
+    def text(key: str, *, limit: int) -> str | None:
+        value = form.get(key)
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise Refusal(key, "must be a text field")
+        if len(value) > limit:
+            raise Refusal(key, f"is longer than {limit} characters")
+        return value
+
+    upload = form.get("file")
+    if upload is None or isinstance(upload, str):
+        raise Refusal("file", "is required: the audio, as a multipart file")
+    model = text("model", limit=512)
+    if not model:
+        raise Refusal("model", "is required")
+    fmt = text("response_format", limit=32) or "json"
+    if fmt in ("srt", "vtt"):
+        raise Refusal(
+            "response_format", "srt and vtt are not made here; ask for json, text or verbose_json"
+        )
+    if fmt not in ("json", "text", "verbose_json"):
+        raise Refusal("response_format", "must be json, text or verbose_json")
+    stream = text("stream", limit=8)
+    if stream is not None and stream.lower() not in ("false", "0"):
+        raise Refusal("stream", "is not served: the answer is one JSON document")
+    temperature: float | None = None
+    raw = text("temperature", limit=32)
+    if raw is not None:
+        try:
+            temperature = float(raw)
+        except ValueError:
+            raise Refusal("temperature", "must be a number") from None
+        if not 0 <= temperature <= 1:
+            raise Refusal("temperature", "must be between 0 and 1")
+    granularities = [str(g) for g in form.getlist("timestamp_granularities[]")]
+    if any(g not in ("word", "segment") for g in granularities):
+        raise Refusal("timestamp_granularities", "must be word or segment")
+    if granularities and fmt != "verbose_json":
+        raise Refusal(
+            "timestamp_granularities", "needs response_format verbose_json, as OpenAI's does"
+        )
+    audio = await upload.read()
+    if len(audio) > MAX_UPLOAD_BYTES:
+        raise TooLarge("file", f"is {len(audio)} bytes; the limit is 25 MiB, as OpenAI's is")
+    if not audio:
+        raise Refusal("file", "is empty")
+    return TranscriptionAsk(
+        model=model,
+        audio=audio,
+        filename=(upload.filename or "audio")[:255],
+        media_type=upload.content_type or None,
+        response_format=fmt,
+        language=text("language", limit=16) or None,
+        prompt=text("prompt", limit=8192) or None,
+        temperature=temperature,
+        granularities=granularities,
+    )
 
 
 def uses_functions(parsed: ChatCompletionRequest) -> bool:
