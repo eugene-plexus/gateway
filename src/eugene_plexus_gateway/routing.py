@@ -314,12 +314,6 @@ class _Backend:
         """Whether this model serves the speech surface (P3a)."""
         return "speech" in self.surfaces
 
-    def takes_speech_format(self, fmt: str) -> bool:
-        """Whether this backend can give its model's speech in `fmt`. An
-        unlisted set is left to the driver, which refuses naming its own."""
-        formats = self.caps.speechFormats if self.caps is not None else None
-        return not formats or any(f.value == fmt for f in formats)
-
     @property
     def chats(self) -> bool:
         """Whether this model serves chat completions.
@@ -1685,23 +1679,24 @@ class RoutingTable:
         ordered = [b.client for b in self._order(resolution.model, eligible)]
         return TieredClient(name=resolution.model, tiers=[ordered], hooks=self)
 
-    def pick_speech(self, resolution: Resolution, fmt: str) -> TieredClient | None:
+    def pick_speech(self, resolution: Resolution) -> TieredClient | None:
         """`pick_embedding`'s single-model tier, for speech (P3a).
 
         **One model: the slot's first.** For a model requested by its own
         name that is the model; for a slot alias (`narrator -> [a, b]`) it
-        is `a`. Its replicas that can give `fmt` balance and fail over, and
-        the next tier is never reached, because it is a different voice
-        (section 5, #4). A first model that is down is down, not replaced.
+        is `a`. Its replicas balance and fail over, and the next tier is
+        never reached, because it is a different voice (section 5, #4). A
+        first model that is down is down, not replaced.
+
+        **No format filter here.** The route has already refused a format
+        that any of these backends cannot give (`speech_formats_for` is
+        their intersection), and a second copy of that rule answered a
+        503 "not ready" the one time it was the only copy (P3a sabotage).
         """
         first = resolution.tiers[0] if resolution.tiers else None
         if first is None:
             return None
-        eligible = [
-            b
-            for b in first.eligible()
-            if b.speaks and b.public_id == first.target and b.takes_speech_format(fmt)
-        ]
+        eligible = [b for b in first.eligible() if b.speaks and b.public_id == first.target]
         if not eligible:
             return None
         ordered = [b.client for b in self._order(resolution.model, eligible)]

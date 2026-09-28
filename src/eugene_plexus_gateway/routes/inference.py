@@ -1653,10 +1653,10 @@ async def create_speech(request: Request) -> Any:
             error_type="invalid_request_error",
             param="response_format",
         )
-    client = table.pick_speech(resolution, fmt.value)
+    client = table.pick_speech(resolution)
     if client is None and await table.refresh_if_stale():
         resolution = await admission.permitted(table.resolve(body.model))
-        client = table.pick_speech(resolution, fmt.value)
+        client = table.pick_speech(resolution)
     if client is None:
         # No wake, as for embeddings: start-on-demand is chat-path lifecycle.
         return _not_ready(resolution, None).as_openai()
