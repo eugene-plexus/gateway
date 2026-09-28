@@ -1351,6 +1351,38 @@ class ImageUsage(BaseModel):
     )
 
 
+class VideoJobStatus(StrEnum):
+    """
+    OpenAI's words. OpenRouter's `pending` is `queued`.
+    """
+
+    queued = 'queued'
+    in_progress = 'in_progress'
+    completed = 'completed'
+    failed = 'failed'
+
+
+class VideoJob(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    jobId: str = Field(..., description="The backend's own job id.")
+    status: VideoJobStatus
+    progress: int | None = Field(
+        None,
+        description='Where the backend says; OpenRouter does not (measured).',
+        ge=0,
+        le=100,
+    )
+    error: str | None = Field(
+        None, description="A failed job's reason, in the backend's words."
+    )
+    cost: float | None = Field(
+        None, description="The provider's charge in US dollars, once it says."
+    )
+    modelId: str | None = None
+
+
 class AudioOutputRequest(BaseModel):
     """
     Answer with audio as well as text (P2b, 2026-09-28): the chat
@@ -1743,6 +1775,27 @@ class DriverCatalogue(BaseModel):
     error: str | None = Field(
         None,
         description='Why the most recent read failed, in the backend\'s own words\nwhere it gave any (*"missing the permission models_read"* is\nnot *"invalid key"*). Null after a read that worked. A\nfailed read never empties the list: the previous one stays\nin force (R2.1\'s rule).\n',
+    )
+
+
+class VideoCapabilities(BaseModel):
+    """
+    For a `video` model (P5): what OpenRouter's `GET /videos/models`
+    lists, which the gateway routes on. Null lists mean the listing did
+    not say.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    durations: list[int] | None = Field(None, description='The whole seconds it makes.')
+    sizes: list[str] | None = Field(
+        None,
+        description='The `WIDTHxHEIGHT` sizes it makes; another is its 400 (measured).',
+    )
+    firstFrame: bool | None = Field(
+        None, description='Whether it takes a first frame (image-to-video).'
     )
 
 
@@ -2196,6 +2249,33 @@ class ImageResponse(BaseModel):
     latencyMs: int | None = None
 
 
+class VideoRequest(BaseModel):
+    """
+    One video job (P5). `seconds` and `size` are the gateway's, already
+    routed to a model whose listing takes them (A2).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    model: str | None = Field(
+        None,
+        description="Which of this driver's models the request is for: an `id` from\n`DriverInfo.models`, **unprefixed** — the gateway strips the\n`<driver name>/` it added. Optional so a caller from before P1\nstill works against a single-model driver, which serves its one\nmodel when this is absent. An account driver refuses a request\nwithout it (400, `#model-required`), and every driver refuses a\nmodel it does not list (404, `#model-not-served`) before calling\nits backend.\n",
+        min_length=1,
+    )
+    localOnly: bool | None = Field(False, description='As `GenerateRequest.localOnly`.')
+    prompt: str = Field(..., max_length=32000, min_length=1)
+    seconds: int | None = Field(
+        None, description="Sent as OpenRouter's `duration`.", ge=1, le=120
+    )
+    size: str | None = Field(
+        None, description='`WIDTHxHEIGHT`, one the model lists.', max_length=32
+    )
+    firstFrame: ImageData | None = None
+    requestId: UUID | None = None
+
+
 class Tool(BaseModel):
     type: Literal['function']
     function: FunctionDefinition
@@ -2317,6 +2397,7 @@ class Capabilities(BaseModel):
     )
     decision: DecisionCapability | None = None
     image: ImageCapabilities | None = None
+    video: VideoCapabilities | None = None
 
 
 class InputAudioContentPart(BaseModel):
@@ -2473,7 +2554,7 @@ class DriverModel(BaseModel):
     )
     surfaces: list[str] = Field(
         ...,
-        description='Which requests this model answers. The values so far:\n\n* `chat` (`/v1/generate`), `embeddings` (`/v1/embed`),\n  `decisions` (`/v1/decide`), `speech` (`/v1/speak`, P3a),\n  `transcription` (`/v1/transcribe`, P3b) and `image`\n  (`/v1/image`, P4), which have doors;\n* `completion`, `video`, `moderation` and `rerank`, which name\n  OpenAI\'s and OpenRouter\'s doors Eugene has not built yet.\n\nAn OpenRouter model whose output is image and text (Gemini\'s\nimage models) serves `image` beside `chat`: its images route\nanswers them too (measured).\n\nA single-model `llama-server` whose projector hears\n(`/props` `modalities.audio`) serves `transcription` beside\n`chat`: its `/v1/audio/transcriptions` answers only then\n(measured).\n\nA driver reports those anyway, so a model\'s id does not\nchange on the day its door arrives, and the gateway lists a\nmodel on `GET /v1/models` only once a door serves one of its\nsurfaces (P1-4).\n\n**Strings, not an enum, on purpose.** A newer driver\nreporting a surface an older gateway has never heard of must\nnot fail that gateway\'s validation of the whole `/v1/info`,\nwhich would make every model on the driver unreachable over\none unknown word. A reader ignores a surface it does not\nknow. Empty only for a model whose kind neither the backend\nnor the driver could decide, which serves nothing.\n\n**Replaces `capabilities.embeddings` and\n`capabilities.chatCapable`**, which said the same thing once\nfor the whole driver. Where they came from still holds for a\nsingle-model driver: `embeddings` is **a property of the\nrunning backend, not of the model**, and not readable from\nanything (`llama-server`\'s `/props` carries no pooling\nfield, and an Ollama runner started for chat refuses with\n*"This server does not support embeddings"*), so it is\ndetermined by trying once and cached for the driver\'s\nlifetime. A System One backend serves `decisions` alone. An\naccount takes each model\'s surfaces from its catalogue.\n',
+        description='Which requests this model answers. The values so far:\n\n* `chat` (`/v1/generate`), `embeddings` (`/v1/embed`),\n  `decisions` (`/v1/decide`), `speech` (`/v1/speak`, P3a),\n  `transcription` (`/v1/transcribe`, P3b), `image`\n  (`/v1/image`, P4) and `video` (`/v1/video`, P5), which have\n  doors;\n* `completion`, `moderation` and `rerank`, which name OpenAI\'s\n  and OpenRouter\'s doors Eugene has not built yet.\n\nAn OpenRouter model whose output is image and text (Gemini\'s\nimage models) serves `image` beside `chat`: its images route\nanswers them too (measured).\n\nA single-model `llama-server` whose projector hears\n(`/props` `modalities.audio`) serves `transcription` beside\n`chat`: its `/v1/audio/transcriptions` answers only then\n(measured).\n\nA driver reports those anyway, so a model\'s id does not\nchange on the day its door arrives, and the gateway lists a\nmodel on `GET /v1/models` only once a door serves one of its\nsurfaces (P1-4).\n\n**Strings, not an enum, on purpose.** A newer driver\nreporting a surface an older gateway has never heard of must\nnot fail that gateway\'s validation of the whole `/v1/info`,\nwhich would make every model on the driver unreachable over\none unknown word. A reader ignores a surface it does not\nknow. Empty only for a model whose kind neither the backend\nnor the driver could decide, which serves nothing.\n\n**Replaces `capabilities.embeddings` and\n`capabilities.chatCapable`**, which said the same thing once\nfor the whole driver. Where they came from still holds for a\nsingle-model driver: `embeddings` is **a property of the\nrunning backend, not of the model**, and not readable from\nanything (`llama-server`\'s `/props` carries no pooling\nfield, and an Ollama runner started for chat refuses with\n*"This server does not support embeddings"*), so it is\ndetermined by trying once and cached for the driver\'s\nlifetime. A System One backend serves `decisions` alone. An\naccount takes each model\'s surfaces from its catalogue.\n',
     )
     inputModalities: list[str] | None = Field(
         None,

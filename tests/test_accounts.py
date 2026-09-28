@@ -118,30 +118,28 @@ def test_the_same_account_name_on_two_machines_is_one_account(settings: Any) -> 
 
 
 def test_a_model_with_no_door_yet_is_not_listed(settings: Any) -> None:
-    """P1-4: an account's video model is on the driver's list and not on
-    `/v1/models` until the videos door exists (P5). This used a speech model
-    until P3a gave speech its door, and an image model until P4 (2026-09-28)
-    gave images theirs."""
+    """P1-4: an account's rerank model is on the driver's list and not on
+    `/v1/models` until a rerank door exists. This used a speech model until
+    P3a gave speech its door, an image model until P4 and a video model until
+    P5 (2026-09-28)."""
     app = create_app(settings=settings)
 
-    class _WithVideo(FakeDriverClient):
+    class _WithRerank(FakeDriverClient):
         def describe(self):  # type: ignore[no-untyped-def]
             info = super().describe()
             assert info.models is not None
-            info.models[1].surfaces = ["video"]
+            info.models[1].surfaces = ["rerank"]
             return info
 
-    account = _WithVideo(
+    account = _WithRerank(
         name="openrouter",
-        models=["mistralai/mistral-nemo", "x-ai/grok-imagine-video"],
+        models=["mistralai/mistral-nemo", "cohere/rerank-v3.5"],
         account=True,
     )
     app.state.routing = make_routing_table(account)
     with TestClient(app) as client:
         ids = [m["id"] for m in client.get("/v1/models").json()["data"]]
-        refused = client.post(
-            "/v1/chat/completions", json=_chat("openrouter/x-ai/grok-imagine-video")
-        )
+        refused = client.post("/v1/chat/completions", json=_chat("openrouter/cohere/rerank-v3.5"))
     assert ids == ["openrouter/mistralai/mistral-nemo"]
     assert refused.status_code >= 400
     assert not account.calls
@@ -281,9 +279,9 @@ async def test_a_refresh_prefixes_an_accounts_models(route_http: Any) -> None:  
         "version": "0.2.0",
         "models": [
             {"id": "mistralai/mistral-nemo", "surfaces": ["chat"]},
-            # A video model: no door until P5 (a speech model until P3a, an
-            # image model until P4).
-            {"id": "x-ai/grok-imagine-video", "surfaces": ["video"]},
+            # A rerank model: no door yet (a speech model until P3a, an image
+            # model until P4, a video model until P5).
+            {"id": "cohere/rerank-v3.5", "surfaces": ["rerank"]},
         ],
         "catalogue": {"source": "openrouter", "total": 2, "exposed": 2},
     }
@@ -297,8 +295,8 @@ async def test_a_refresh_prefixes_an_accounts_models(route_http: Any) -> None:  
     table = RoutingTable(agent_url="http://agent")
     await table.refresh()
     assert table.known_models() == [
+        "openrouter/cohere/rerank-v3.5",
         "openrouter/mistralai/mistral-nemo",
-        "openrouter/x-ai/grok-imagine-video",
     ]
     assert [m.id for m in table.as_model_list()] == ["openrouter/mistralai/mistral-nemo"]
     await table.aclose()

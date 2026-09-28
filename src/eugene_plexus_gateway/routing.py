@@ -57,11 +57,18 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import httpx
 
-from ._generated.driver_models import Capabilities, DriverInfo, DriverModel, ImageCapabilities
+from . import video_doors
+from ._generated.driver_models import (
+    Capabilities,
+    DriverInfo,
+    DriverModel,
+    ImageCapabilities,
+    VideoCapabilities,
+)
 from ._generated.models import (
     BackendKind,
     ControlRootView,
@@ -78,7 +85,7 @@ from ._generated.models import (
 )
 from ._http import internal_client
 from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS
-from .driver_client import BoundClient, DriverClient, HttpDriverClient, TieredClient
+from .driver_client import BoundClient, DriverClient, HttpDriverClient, TieredClient, VideoJobs
 from .driver_client import Key as DriverKey
 from .image_doors import ImageAsk, rules_out
 from .metrics import AttemptRow, CandidateRow
@@ -222,6 +229,24 @@ _IMAGE, _AUDIO, _FILE = frozenset({"image"}), frozenset({"audio"}), frozenset({"
 _SPEAKS = frozenset({"audio_output"})
 
 
+def _video_listing(backends: list[_Backend]) -> dict[str, Any]:
+    """A video model's listing on `GET /v1/models` (P5): the durations and
+    sizes its backends list, and whether any takes a first frame. Nothing
+    for a model that makes no videos."""
+    makers = [b for b in backends if b.makes_videos]
+    if not makers:
+        return {}
+    durations = sorted({d for b in makers if b.video_caps for d in (b.video_caps.durations or [])})
+    sizes = sorted({s for b in makers if b.video_caps for s in (b.video_caps.sizes or [])})
+    return {
+        "video_durations": durations or None,
+        "video_sizes": sizes or None,
+        "video_first_frame": any(
+            b.video_caps is not None and bool(b.video_caps.firstFrame) for b in makers
+        ),
+    }
+
+
 def takes(caps: Capabilities | None, needs: frozenset[str]) -> bool:
     """Whether a model's capabilities confirm every attachment kind in `needs`.
     Unknown is no: an unconfirmed backend is never sent an attachment."""
@@ -329,6 +354,16 @@ class _Backend:
     def image_caps(self) -> ImageCapabilities | None:
         """What its listing says it takes on the images doors (P4)."""
         return self.caps.image if self.caps is not None else None
+
+    @property
+    def makes_videos(self) -> bool:
+        """Whether this model serves the video surface (P5)."""
+        return "video" in self.surfaces
+
+    @property
+    def video_caps(self) -> VideoCapabilities | None:
+        """What its listing says it takes on the videos door (P5)."""
+        return self.caps.video if self.caps is not None else None
 
     @property
     def chats(self) -> bool:
@@ -484,6 +519,7 @@ class Resolution:
             + (["speech"] if any(b.speaks for b in backends) else [])
             + (["transcription"] if any(b.transcribes for b in backends) else [])
             + (["image"] if any(b.makes_images for b in backends) else [])
+            + (["video"] if any(b.makes_videos for b in backends) else [])
         )
 
     def reported_surfaces(self) -> list[str]:
@@ -1808,6 +1844,52 @@ class RoutingTable:
             f"No model serving {resolution.model!r} takes this request ({said}). Nothing was sent."
         )
 
+    def pick_video(self, resolution: Resolution, ask: video_doors.VideoAsk) -> TieredClient | None:
+        """`pick`'s tiers for a video submit, holding only models that make
+        videos and whose listing takes this request (P5). **Failover is at
+        submit only** (section 5, #4): an accepted job is bound to its backend."""
+        tiers: list[list[DriverClient]] = []
+        for tier in resolution.tiers:
+            eligible = [
+                b
+                for b in tier.eligible()
+                if b.makes_videos and video_doors.rules_out(b.video_caps, ask) is None
+            ]
+            tiers.append([b.client for b in self._order(tier.target, eligible)] if eligible else [])
+        if not any(tiers):
+            return None
+        return TieredClient(name=resolution.model, tiers=tiers, hooks=self)
+
+    @staticmethod
+    def video_refusal(resolution: Resolution, ask: video_doors.VideoAsk) -> tuple[str, str] | None:
+        """`image_refusal`'s rule for videos: `(field, message)` when no model
+        in the slot that makes videos takes this request, whatever is ready."""
+        reasons: dict[str, tuple[str, str]] = {}
+        for backend in resolution.backends():
+            if not backend.makes_videos:
+                continue
+            ruled = video_doors.rules_out(backend.video_caps, ask)
+            if ruled is None:
+                return None
+            reasons.setdefault(backend.public_id, ruled)
+        if not reasons:
+            return None
+        said = "; ".join(f"{model} {why}" for model, (_, why) in sorted(reasons.items()))
+        first = next(iter(reasons.values()))[0]
+        return first, (
+            f"{first}: no model serving {resolution.model!r} takes this request ({said}). "
+            "Change or remove it, or choose a model whose listing takes it. Nothing was sent."
+        )
+
+    def driver_client(self, name: str, node: str | None) -> VideoJobs | None:
+        """The one driver a video job belongs to, by `(node, name)`, or None
+        when it is not reachable right now. A poll reaches that driver and no
+        other: the job exists on its backend alone."""
+        for backend in self._snapshot.reachable:
+            if backend.name == name and backend.node == node:
+                return cast(VideoJobs, backend.client)
+        return None
+
     @staticmethod
     def speech_formats_for(resolution: Resolution) -> list[SpeechFormat]:
         """The formats every backend speaking this model -- the slot's first,
@@ -2034,6 +2116,7 @@ class RoutingTable:
                         audio_input=any(takes(b.caps, _AUDIO) for b in backends),
                         file_input=any(takes(b.caps, _FILE) for b in backends),
                         audio_output=any(takes(b.caps, _SPEAKS) for b in backends),
+                        **_video_listing(backends),
                         # Said for an image model only: `false` on every chat
                         # model would be noise in every picker.
                         image_streaming=any(

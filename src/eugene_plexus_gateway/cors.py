@@ -59,6 +59,7 @@ from typing import Any
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse, Response
 
+from . import door_paths
 from ._generated.models import Problem
 
 Scope = MutableMapping[str, Any]
@@ -92,6 +93,10 @@ FRONT_DOOR_PATHS: frozenset[str] = frozenset(
         "/v1/images/generations",
         "/v1/images/edits",
         "/v1/images/variations",
+        # P5, matched as templates by `door_paths.matches`.
+        "/v1/videos",
+        "/v1/videos/{video_id}",
+        "/v1/videos/{video_id}/content",
     }
 )
 
@@ -194,7 +199,9 @@ class FrontDoorCors:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or scope.get("path") not in FRONT_DOOR_PATHS:
+        if scope["type"] != "http" or not door_paths.matches(
+            scope.get("path") or "", FRONT_DOOR_PATHS
+        ):
             await self.app(scope, receive, send)
             return
 

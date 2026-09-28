@@ -1212,6 +1212,7 @@ class Surface(StrEnum):
     speech = 'speech'
     transcription = 'transcription'
     image = 'image'
+    video = 'video'
 
 
 class ModelRoutingInfo(BaseModel):
@@ -1235,7 +1236,7 @@ class ModelRoutingInfo(BaseModel):
     )
     surfaces: list[Surface] | None = Field(
         None,
-        description="Which surfaces this model can be sent to. `decisions` means\n`POST /v1/systemone`; a decision-only model lists nothing\nelse, and a chat request naming it is refused with the\ndoor's name. `speech` means `POST /v1/audio/speech` (P3a),\n`transcription` `POST /v1/audio/transcriptions` (P3b), `image`\n`POST /v1/images/generations` and `/edits` (P4).\n\nOpenAI's own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Measured, not assumed, and the two are not always\ndisjoint**: an Ollama runner started for chat refuses to\nembed, `nomic-embed-text` refuses to chat -- but\n`llama-server` given `--embedding` still serves chat\nperfectly well. Hence a list.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n",
+        description="Which surfaces this model can be sent to. `decisions` means\n`POST /v1/systemone`; a decision-only model lists nothing\nelse, and a chat request naming it is refused with the\ndoor's name. `speech` means `POST /v1/audio/speech` (P3a),\n`transcription` `POST /v1/audio/transcriptions` (P3b), `image`\n`POST /v1/images/generations` and `/edits` (P4), `video`\n`POST /v1/videos` (P5).\n\nOpenAI's own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Measured, not assumed, and the two are not always\ndisjoint**: an Ollama runner started for chat refuses to\nembed, `nomic-embed-text` refuses to chat -- but\n`llama-server` given `--embedding` still serves chat\nperfectly well. Hence a list.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n",
     )
     image_input: bool | None = Field(
         None,
@@ -1268,6 +1269,17 @@ class ModelRoutingInfo(BaseModel):
     image_mask: bool | None = Field(
         None,
         description="For an `image` model: at least one backend honours `mask`\n(OpenAI's API only, measured).\n",
+    )
+    video_durations: list[int] | None = Field(
+        None,
+        description='For a `video` model, the whole seconds its backends list (P5).',
+    )
+    video_sizes: list[str] | None = Field(
+        None, description='For a `video` model, the sizes its backends list.'
+    )
+    video_first_frame: bool | None = Field(
+        None,
+        description='For a `video` model, at least one backend takes an `input_reference`.',
     )
     audio_output: bool | None = Field(
         None,
@@ -1518,6 +1530,59 @@ class ImageStreamEvent(BaseModel):
     output_format: str
     partial_image_index: int | None = None
     usage: ImagesUsage | None = None
+
+
+class VideoCreateRequest(BaseModel):
+    """
+    OpenAI's JSON video request (P5). Unknown fields are refused naming them.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    model: str
+    prompt: str = Field(..., max_length=32000, min_length=1)
+    seconds: str | None = Field(
+        None,
+        description="Whole seconds, as a string as OpenAI's is; any the model lists (P5-1).",
+        pattern='^[0-9]{1,3}$',
+    )
+    size: str | None = Field(None, max_length=32)
+    input_reference: ImageRef | None = None
+
+
+class VideoCreateForm(BaseModel):
+    """
+    OpenAI's multipart video request, with `input_reference` a file.
+    """
+
+    model: str
+    prompt: str
+    seconds: str | None = None
+    size: str | None = None
+    input_reference: bytes | None = None
+
+
+class VideoStatus(StrEnum):
+    queued = 'queued'
+    in_progress = 'in_progress'
+    completed = 'completed'
+    failed = 'failed'
+
+
+class VideoVariant(StrEnum):
+    """
+    Only `video` is served.
+    """
+
+    video = 'video'
+    thumbnail = 'thumbnail'
+    spritesheet = 'spritesheet'
+
+
+class VideoError(BaseModel):
+    code: str
+    message: str
 
 
 class ChatModality(StrEnum):
@@ -3653,7 +3718,7 @@ class MetricRequest(BaseModel):
     completionTokens: int | None = None
     door: str | None = Field(
         None,
-        description='Which door the request came in by (P3b): `speech`,\n`transcription`, or `images` (P4, schema v8). Null on rows from\nbefore schema v7 and on every other door, whose rows carry\ntokens.\n',
+        description="Which door the request came in by (P3b): `speech`,\n`transcription`, `images` (P4, schema v8) or `videos` (P5,\nschema v9, the submit's row). Null on rows from before schema v7\nand on every other door, whose rows carry tokens.\n",
     )
     characters: int | None = Field(
         None,
@@ -3666,6 +3731,9 @@ class MetricRequest(BaseModel):
     images: int | None = Field(
         None,
         description='For images, how many were returned (P4, schema v8). Tokens ride beside it.',
+    )
+    videoSeconds: int | None = Field(
+        None, description='For a video job, the seconds asked for (P5, schema v9).'
     )
     outcome: Outcome
     tries: list[MetricAttempt] = Field(..., min_length=0)
@@ -3764,6 +3832,29 @@ class ImagesResponse(BaseModel):
     quality: str | None = None
     background: str | None = None
     usage: ImagesUsage | None = None
+    x_eugene_plexus: CompletionRoutingInfo | None = None
+
+
+class VideoResource(BaseModel):
+    """
+    OpenAI's `VideoResource`, every field its schema requires. `id` is
+    the signed handle.
+
+    """
+
+    id: str
+    object: Literal['video']
+    model: str
+    status: VideoStatus
+    progress: int
+    created_at: int
+    completed_at: int | None
+    expires_at: int | None
+    prompt: str | None
+    size: str
+    seconds: str
+    remixed_from_video_id: str | None
+    error: VideoError | None
     x_eugene_plexus: CompletionRoutingInfo | None = None
 
 

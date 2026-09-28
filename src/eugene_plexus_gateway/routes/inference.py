@@ -31,6 +31,7 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, replace
 from dataclasses import field as dc_field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -38,7 +39,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
-from .. import admission, anthropic, chat_contract, decisions, image_doors, responses
+from .. import admission, anthropic, chat_contract, decisions, image_doors, responses, video_doors
 from .._generated.driver_models import AudioOutputFormat as DriverAudioOutputFormat
 from .._generated.driver_models import (
     AudioOutputRequest,
@@ -54,6 +55,7 @@ from .._generated.driver_models import (
     TranscribeAudio,
     TranscribeRequest,
     TranscribeResponse,
+    VideoJob,
 )
 from .._generated.driver_models import (
     DecisionQuestion as DriverDecisionQuestion,
@@ -118,7 +120,7 @@ from .._generated.models import (
 from ..config import ConfigStore
 from ..dependencies import require_authorized
 from ..disconnect import ClientGone, serve_while_connected
-from ..driver_client import DriverClient, DriverError, TieredClient
+from ..driver_client import DriverClient, DriverError, TieredClient, VideoJobs
 from ..images import attachment_kinds, max_images
 from ..lifecycle import LifecycleManager, WakeResult
 from ..metrics import AttemptRow, CandidateRow, MetricsStore, RequestRow
@@ -186,7 +188,8 @@ def _record(
     body: ChatCompletionRequest
     | SpeechRequest
     | chat_contract.TranscriptionAsk
-    | image_doors.ImageAsk,
+    | image_doors.ImageAsk
+    | video_doors.VideoAsk,
     tries: list[AttemptRow],
     *,
     served_model: str | None = None,
@@ -197,6 +200,7 @@ def _record(
     characters: int | None = None,
     audio_seconds: float | None = None,
     images: int | None = None,
+    video_seconds: int | None = None,
 ) -> None:
     """Join the per-attempt rows to the facts only this route holds.
 
@@ -261,6 +265,7 @@ def _record(
                 characters=characters,
                 audio_seconds=audio_seconds,
                 images=images,
+                video_seconds=video_seconds,
             )
         )
         if (context := admission.current.get()) is not None:
@@ -466,6 +471,7 @@ _DOORS = {
     "speech": "/v1/audio/speech",
     "transcription": "/v1/audio/transcriptions",
     "image": "/v1/images/generations",
+    "video": "/v1/videos",
 }
 
 
@@ -2272,6 +2278,301 @@ async def _stream_images(
                 record(result)
 
         return StreamingResponse(sse(), media_type="text/event-stream")
+
+
+# --------------------------------------------------------------------------- #
+# /v1/videos
+# --------------------------------------------------------------------------- #
+
+
+def _handles(request: Request) -> video_doors.Handles:
+    """The gateway's own handle signer (P5-4), made on first use: its secret
+    lives beside the gateway's config, so a restart keeps every handle."""
+    handles = getattr(request.app.state, "video_handles", None)
+    if handles is None:
+        settings = getattr(request.app.state, "settings", None)
+        folder = settings.config_file.resolve().parent if settings is not None else Path(".")
+        handles = video_doors.Handles(folder / "video-handles.key")
+        request.app.state.video_handles = handles
+    return handles
+
+
+def _owner() -> str:
+    context = admission.current.get()
+    return video_doors.owner_of(context.key_id if context is not None else None)
+
+
+def _no_such_video(video_id: str) -> JSONResponse:
+    """One answer for a forged handle, another install's, and another key's:
+    telling them apart would tell a caller which jobs exist."""
+    shown = video_id if len(video_id) <= 64 else video_id[:61] + "..."
+    return _error(
+        code=404,
+        message=f"No video job {shown!r} for this key.",
+        error_type="invalid_request_error",
+        param="video_id",
+    )
+
+
+@router.post("/v1/videos", dependencies=_auth)
+async def create_video(request: Request) -> Any:
+    """A video job (P5, 2026-09-28), OpenAI's shape; the answer's `id` is a
+    signed handle. **Failover at submit only**; settings route by the
+    model's listing."""
+    if request.headers.get("content-type", "").startswith("multipart/form-data"):
+        try:
+            # Cached first, as for transcription and image edits.
+            await request.body()
+            form = await request.form(max_files=1, max_fields=16)
+        except Exception:
+            return _error(
+                code=400,
+                message="body: must be JSON, or multipart/form-data as the OpenAI SDK sends "
+                "an input_reference.",
+                error_type="invalid_request_error",
+                param="body",
+            )
+        try:
+            ask = await video_doors.read_create_form(form)
+        except chat_contract.Refusal as exc:
+            return _image_refused(exc)
+        finally:
+            await form.close()
+    else:
+        try:
+            raw = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            return _error(
+                code=400,
+                message="body: must be valid JSON.",
+                error_type="invalid_request_error",
+                param="body",
+            )
+        try:
+            ask = video_doors.parse_create(raw)
+        except chat_contract.Refusal as exc:
+            return _image_refused(exc)
+
+    await admission.authorize(request, ask.model)
+    table = _routing(request)
+    if table is None:
+        return _error(
+            code=503,
+            message="The gateway is starting up or in safe mode; no routing table exists yet.",
+            error_type="service_unavailable",
+        )
+    resolution = await admission.permitted(table.resolve(ask.model))
+    if not resolution.has_backends():
+        return _no_such_model(ask.model, table).as_openai()
+    surfaces = resolution.surfaces()
+    if surfaces and "video" not in surfaces:
+        return _wrong_surface(
+            ask.model, surfaces, wanted="video", instead="/v1/chat/completions"
+        ).as_openai()
+    if not surfaces and (reported := resolution.reported_surfaces()):
+        return _no_door_yet(ask.model, reported, wanted="video").as_openai()
+    refused = table.video_refusal(resolution, ask)
+    if refused is not None:
+        field, message = refused
+        return _error(code=400, message=message, error_type="invalid_request_error", param=field)
+    client = table.pick_video(resolution, ask)
+    if client is None and await table.refresh_if_stale():
+        resolution = await admission.permitted(table.resolve(ask.model))
+        client = table.pick_video(resolution, ask)
+    if client is None:
+        return _not_ready(resolution, None).as_openai()
+    if isinstance(client, TieredClient):
+        client.authorize_attempt = admission.before_attempt
+
+    rec = _Recording(metrics=_metrics(request), started=time.perf_counter())
+    with collect_attempts() as tries:
+
+        def record(job: VideoJob | None = None) -> None:
+            _record(
+                rec,
+                ask,
+                tries,
+                served_model=getattr(client, "served_model", None) if job else None,
+                tier=getattr(client, "tier", 1) if job else None,
+                door="videos",
+                video_seconds=ask.seconds,
+            )
+
+        try:
+            job = await serve_while_connected(
+                request,
+                client.video(
+                    video_doors.to_driver(
+                        ask, local_only=admission.local_only(), request_id=admission.request_id()
+                    )
+                ),
+                what="a video submit",
+            )
+        except ClientGone:
+            record()
+            return _error(
+                code=499,
+                message="The client disconnected; the backend call was cancelled.",
+                error_type="client_disconnected",
+            )
+        except DriverError as e:
+            record()
+            return _driver_failure(e).as_openai()
+        except httpx.TimeoutException as e:
+            record()
+            return _error(
+                code=504,
+                message=(
+                    f"No backend serving {ask.model!r} accepted the job within the gateway's "
+                    f"requestTimeoutSeconds ({_timeout_seconds(_store(request)):g}s). "
+                    f"({type(e).__name__})"
+                ),
+                error_type="timeout",
+            )
+        except httpx.HTTPError as e:
+            record()
+            return _error(
+                code=502,
+                message=f"A backend serving {ask.model!r} failed ({type(e).__name__}).",
+                error_type="upstream_error",
+            )
+        record(job)
+    payload = {
+        "v": 1,
+        "d": getattr(client, "served_by", None),
+        "n": getattr(client, "served_by_node", None),
+        "m": getattr(client, "served_model", None) or ask.model,
+        "j": job.jobId,
+        "o": _owner(),
+        "c": int(time.time()),
+        "s": ask.seconds,
+        "z": ask.size,
+    }
+    handle = _handles(request).issue(payload)
+    body = video_doors.resource(handle, payload, job)
+    body["x_eugene_plexus"] = _routing_info(client, table, ask.model, rec.started).model_dump(
+        mode="json", exclude_none=True
+    )
+    return JSONResponse(body)
+
+
+@router.get("/v1/videos", dependencies=_auth)
+async def list_videos(request: Request) -> Any:
+    """Refused (call #5): with no store, one key's jobs cannot be told from
+    another's, and the provider's list is every key's together."""
+    return _error(
+        code=400,
+        message=(
+            "Videos are not listed here: this install keeps no store of jobs, and the "
+            "provider's list would show every key's. Keep the id POST /v1/videos returned "
+            "and poll GET /v1/videos/{video_id}."
+        ),
+        error_type="invalid_request_error",
+    )
+
+
+async def _video_backend(
+    request: Request, video_id: str
+) -> tuple[dict[str, Any], VideoJobs] | JSONResponse:
+    """The handle's payload and the one driver that holds its job, or the
+    answer to give instead."""
+    await admission.authorize(request)
+    payload = _handles(request).read(video_id)
+    if payload is None or payload.get("o") != _owner():
+        return _no_such_video(video_id)
+    table = _routing(request)
+    client = table.driver_client(payload["d"], payload.get("n")) if table is not None else None
+    if client is None:
+        where = f"{payload['d']!r}" + (f" on {payload['n']!r}" if payload.get("n") else "")
+        return _error(
+            code=503,
+            message=f"The backend that holds this job ({where}) is not reachable right now. "
+            "Poll again once it is; the job is not lost.",
+            error_type="service_unavailable",
+        )
+    return payload, client
+
+
+@router.get("/v1/videos/{video_id}", dependencies=_auth)
+async def retrieve_video(request: Request, video_id: str) -> Any:
+    """The job as its backend reports it now, in OpenAI's shape."""
+    found = await _video_backend(request, video_id)
+    if isinstance(found, JSONResponse):
+        return found
+    payload, client = found
+    try:
+        job = await client.video_job(payload["j"])
+    except DriverError as e:
+        if e.status_code == 404:
+            return _no_such_video(video_id)
+        return _driver_failure(e).as_openai()
+    except httpx.HTTPError as e:
+        return _error(
+            code=502,
+            message=f"The backend holding this job failed ({type(e).__name__}).",
+            error_type="upstream_error",
+        )
+    return JSONResponse(video_doors.resource(video_id, payload, job))
+
+
+@router.get("/v1/videos/{video_id}/content", dependencies=_auth)
+async def download_video(request: Request, video_id: str, variant: str | None = None) -> Any:
+    """The finished job's MP4, streamed. `variant` other than `video` is
+    refused: OpenRouter ignores it and answers the MP4 (measured)."""
+    if variant not in (None, "video"):
+        return _error(
+            code=400,
+            message=f"variant: only video is served; no backend here makes a {variant}, and "
+            "the provider would answer the video itself.",
+            error_type="invalid_request_error",
+            param="variant",
+        )
+    found = await _video_backend(request, video_id)
+    if isinstance(found, JSONResponse):
+        return found
+    payload, client = found
+    try:
+        job = await client.video_job(payload["j"])
+    except DriverError as e:
+        if e.status_code == 404:
+            return _no_such_video(video_id)
+        return _driver_failure(e).as_openai()
+    if job.status.value != "completed":
+        return _error(
+            code=400,
+            message=f"This job has no video yet: it is {job.status.value}. Poll "
+            "GET /v1/videos/{video_id} until it is completed.",
+            error_type="invalid_request_error",
+            param="video_id",
+        )
+    chunks = client.video_content(payload["j"])
+    try:
+        first = await serve_while_connected(request, anext(chunks), what="a video download")
+    except StopAsyncIteration:
+        first = b""
+    except ClientGone:
+        await chunks.aclose()
+        return _error(
+            code=499,
+            message="The client disconnected; the download was cancelled.",
+            error_type="client_disconnected",
+        )
+    except DriverError as e:
+        await chunks.aclose()
+        return _driver_failure(e).as_openai()
+
+    async def body() -> AsyncIterator[bytes]:
+        try:
+            if first:
+                yield first
+            async for chunk in chunks:
+                yield chunk
+        except (DriverError, httpx.HTTPError) as e:
+            log.warning("video download for a job on %r failed mid-stream: %s", payload["d"], e)
+        finally:
+            await chunks.aclose()
+
+    return StreamingResponse(body(), media_type="video/mp4")
 
 
 # --------------------------------------------------------------------------- #

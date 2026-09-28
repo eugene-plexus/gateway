@@ -23,6 +23,7 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
+from urllib.parse import quote
 
 import httpx
 from pydantic import ValidationError
@@ -44,6 +45,8 @@ from ._generated.driver_models import (
     TokenCount,
     TranscribeRequest,
     TranscribeResponse,
+    VideoJob,
+    VideoRequest,
 )
 from ._http import internal_client
 from .circuit import Circuit
@@ -215,7 +218,16 @@ class DriverClient(Protocol):
     def image_stream(
         self, request: ImageRequest
     ) -> AsyncGenerator[ImagePartial | ImageResponse, None]: ...
+    async def video(self, request: VideoRequest) -> VideoJob: ...
     async def aclose(self) -> None: ...
+
+
+class VideoJobs(Protocol):
+    """What a poll needs of the one driver that holds a job (P5). Not on
+    `DriverClient`: a poll goes to that driver and never over tiers."""
+
+    async def video_job(self, job_id: str) -> VideoJob: ...
+    def video_content(self, job_id: str) -> AsyncGenerator[bytes, None]: ...
 
 
 class RoutingHooks(Protocol):
@@ -497,6 +509,53 @@ class HttpDriverClient:
                     raise self._invalid_reply() from exc
             raise self._invalid_reply()
 
+    async def video(self, request: VideoRequest) -> VideoJob:
+        """The driver's `POST /v1/video` (P5): the job, accepted."""
+        payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
+        response = await self._client.post(
+            "/v1/video",
+            json=payload,
+            headers={"X-Request-ID": str(request.requestId)} if request.requestId else None,
+        )
+        return self._video_job_from(response)
+
+    async def video_job(self, job_id: str) -> VideoJob:
+        """The driver's `GET /v1/video/{jobId}`: the job now."""
+        response = await self._client.get(f"/v1/video/{quote(job_id, safe='')}")
+        return self._video_job_from(response)
+
+    def _video_job_from(self, response: httpx.Response) -> VideoJob:
+        if response.status_code >= 400:
+            raise DriverError(
+                driver_name=self.name,
+                driver_url=self.base_url,
+                status_code=response.status_code,
+                problem=_problem_from_response(response),
+                raw_body=response.text,
+            )
+        try:
+            return VideoJob.model_validate(response.json())
+        except ValueError as exc:
+            raise self._invalid_reply() from exc
+
+    async def video_content(self, job_id: str) -> AsyncGenerator[bytes, None]:
+        """The driver's `/v1/video/{jobId}/content`, streamed. A non-200
+        raises before anything is yielded."""
+        path = f"/v1/video/{quote(job_id, safe='')}/content"
+        async with self._client.stream("GET", path) as response:
+            if response.status_code >= 400:
+                body = await response.aread()
+                raise DriverError(
+                    driver_name=self.name,
+                    driver_url=self.base_url,
+                    status_code=response.status_code,
+                    problem=_problem_from_bytes(body),
+                    raw_body=body.decode("utf-8", "replace"),
+                )
+            async for chunk in response.aiter_raw():
+                if chunk:
+                    yield chunk
+
     async def count_tokens(self, request: GenerateRequest) -> int:
         """The driver's `/v1/generate/count`: the backend's own tokenizer, no generation."""
         payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
@@ -711,6 +770,7 @@ class BoundClient:
             SpeakRequest,
             TranscribeRequest,
             ImageRequest,
+            VideoRequest,
         )
     ](self, request: R) -> R:
         return request.model_copy(update={"model": self.model})
@@ -754,6 +814,11 @@ class BoundClient:
 
     async def image(self, request: ImageRequest) -> ImageResponse:
         result = await self._inner.image(self._bind(request))
+        result.modelId = self._publish(result.modelId)
+        return result
+
+    async def video(self, request: VideoRequest) -> VideoJob:
+        result = await self._inner.video(self._bind(request))
         result.modelId = self._publish(result.modelId)
         return result
 
@@ -1136,6 +1201,12 @@ class TieredClient:
         model's image is still an image. `pick_image` built every tier from
         models whose listing takes this request."""
         return await self._over_tiers("image", lambda c: c.image(request))
+
+    async def video(self, request: VideoRequest) -> VideoJob:
+        """A video submit over the slot's tiers (P5): **failover at submit
+        only** (section 5, #4). Once one backend accepts the job it is that
+        backend's, and the handle names it."""
+        return await self._over_tiers("video", lambda c: c.video(request))
 
     async def image_stream(
         self, request: ImageRequest

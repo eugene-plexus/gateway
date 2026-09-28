@@ -17,6 +17,7 @@ from fastapi import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from . import door_paths
 from ._generated.client_key_models import ClientAdmissionResult
 from .metrics import AttemptRow, RequestRow
 
@@ -327,6 +328,11 @@ CLIENT_ADMISSION_PATHS = frozenset(
         "/v1/images/generations",
         "/v1/images/edits",
         "/v1/images/variations",
+        # P5: the first doors whose path carries a value, matched by
+        # `door_paths.matches` against the route's template.
+        "/v1/videos",
+        "/v1/videos/{video_id}",
+        "/v1/videos/{video_id}/content",
     }
 )
 
@@ -338,7 +344,7 @@ class ClientAdmissionMiddleware:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or scope["path"] not in CLIENT_ADMISSION_PATHS:
+        if scope["type"] != "http" or not door_paths.matches(scope["path"], CLIENT_ADMISSION_PATHS):
             await self.app(scope, receive, send)
             return
         context = ClientRequest(scope)

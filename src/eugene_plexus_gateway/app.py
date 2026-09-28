@@ -270,6 +270,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # P4: 25 MiB of images, as multipart or as base64 data: URLs in
             # JSON (33.4 MiB); the route checks the images themselves.
             "/v1/images/edits": 36 * 1024 * 1024,
+            # P5: a first frame of up to 25 MiB, as a file or a data: URL.
+            "/v1/videos": 36 * 1024 * 1024,
         },
     )
     return app
