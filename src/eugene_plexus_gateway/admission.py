@@ -318,6 +318,10 @@ CLIENT_ADMISSION_PATHS = frozenset(
         "/v1/systemone",
         # Slice 4, 2026-09-23: Codex CLI's only door.
         "/v1/responses",
+        # P3a, 2026-09-28. Shipped without this row for one commit, and a
+        # scoped key could speak through any model it was not allowed:
+        # the rule above, broken exactly as it describes.
+        "/v1/audio/speech",
     }
 )
 

@@ -256,6 +256,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "/v1/embeddings",
             "/v1/systemone",
             "/v1/responses",
+            "/v1/audio/speech",
         },
         driver=False,
     )
