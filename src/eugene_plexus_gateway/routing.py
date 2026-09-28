@@ -1688,13 +1688,19 @@ class RoutingTable:
     def pick_speech(self, resolution: Resolution, fmt: str) -> TieredClient | None:
         """`pick_embedding`'s single-model tier, for speech (P3a).
 
-        Replicas of the requested model that can give it in `fmt`, and
-        nothing else: a slot's other targets are a different voice.
+        **One model: the slot's first.** For a model requested by its own
+        name that is the model; for a slot alias (`narrator -> [a, b]`) it
+        is `a`. Its replicas that can give `fmt` balance and fail over, and
+        the next tier is never reached, because it is a different voice
+        (section 5, #4). A first model that is down is down, not replaced.
         """
+        first = resolution.tiers[0] if resolution.tiers else None
+        if first is None:
+            return None
         eligible = [
             b
-            for b in resolution.eligible_backends()
-            if b.speaks and b.public_id == resolution.model and b.takes_speech_format(fmt)
+            for b in first.eligible()
+            if b.speaks and b.public_id == first.target and b.takes_speech_format(fmt)
         ]
         if not eligible:
             return None
@@ -1703,9 +1709,11 @@ class RoutingTable:
 
     @staticmethod
     def speech_formats_for(resolution: Resolution) -> list[SpeechFormat]:
-        """The formats every backend speaking this model can give, in the
-        enum's order; empty when none says."""
-        speakers = [b for b in resolution.backends() if b.speaks]
+        """The formats every backend speaking this model -- the slot's first,
+        as `pick_speech` chooses it -- can give, in the enum's order; empty
+        when none says."""
+        first = resolution.tiers[0].backends if resolution.tiers else []
+        speakers = [b for b in first if b.speaks]
         sets = [
             {f.value for f in b.caps.speechFormats}
             for b in speakers
@@ -1722,7 +1730,7 @@ class RoutingTable:
         none lists any -- which is not "no voices" (P3-3)."""
         seen: dict[str, None] = {}
         listed = False
-        for backend in resolution.backends():
+        for backend in resolution.tiers[0].backends if resolution.tiers else []:
             voices = backend.model.voices if backend.speaks and backend.model is not None else None
             if voices is not None:
                 listed = True

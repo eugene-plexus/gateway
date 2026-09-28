@@ -167,6 +167,32 @@ def test_with_every_replica_down_the_slot_target_is_still_not_used(settings: Set
     assert not other.spoken
 
 
+def test_a_slot_alias_speaks_with_its_first_model(settings: Settings) -> None:
+    first = Speaker(name="a", model_id="narrator", voices=["af_heart"], formats=["mp3"])
+    second = Speaker(name="c", model_id="other-voice", voices=["rachel"])
+    slots = [{"model": "voice", "targets": ["narrator", "other-voice"]}]
+    with serve(settings, first, second, slots=slots) as client:
+        response = client.post("/v1/audio/speech", json=speech(model="voice"))
+        listed = {m["id"]: m["x_eugene_plexus"] for m in client.get("/v1/models").json()["data"]}
+    assert response.status_code == 200, response.text
+    assert first.spoken and not second.spoken
+    # What the alias is listed with is what it will be answered with.
+    assert listed["voice"]["voices"] == ["af_heart"]
+    assert listed["voice"]["speech_formats"] == ["mp3"]
+
+
+def test_a_slot_aliass_first_model_down_is_not_replaced_by_its_second(
+    settings: Settings,
+) -> None:
+    first = Speaker(name="a", model_id="narrator", fail=httpx.ConnectError("refused"))
+    second = Speaker(name="c", model_id="other-voice")
+    slots = [{"model": "voice", "targets": ["narrator", "other-voice"]}]
+    with serve(settings, first, second, slots=slots) as client:
+        response = client.post("/v1/audio/speech", json=speech(model="voice"))
+    assert response.status_code >= 500, response.text
+    assert first.spoken and not second.spoken
+
+
 def test_after_the_first_byte_a_failure_ends_the_audio_and_does_not_cascade(
     settings: Settings,
 ) -> None:
