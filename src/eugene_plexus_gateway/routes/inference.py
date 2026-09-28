@@ -2063,6 +2063,27 @@ async def create_image_variation(request: Request) -> Any:
     )
 
 
+def _record_images(
+    rec: _Recording,
+    ask: image_doors.ImageAsk,
+    tries: list[AttemptRow],
+    client: DriverClient,
+    result: ImageResponse | None,
+) -> None:
+    """The images doors' row (P4): the image count beside the tokens, and
+    the served model and tier only when something was served."""
+    _record(
+        rec,
+        ask,
+        tries,
+        served_model=getattr(client, "served_model", None) if result else None,
+        tier=getattr(client, "tier", 1) if result else None,
+        usage=result.usage if result else None,
+        door="images",
+        images=len(result.images) if result else None,
+    )
+
+
 async def _serve_images(request: Request, ask: image_doors.ImageAsk) -> Any:
     """Route and answer one images request, from either door (P4).
 
@@ -2113,16 +2134,7 @@ async def _serve_images(request: Request, ask: image_doors.ImageAsk) -> Any:
     with collect_attempts() as tries:
 
         def record(result: ImageResponse | None = None) -> None:
-            _record(
-                rec,
-                ask,
-                tries,
-                served_model=getattr(client, "served_model", None) if result else None,
-                tier=getattr(client, "tier", 1) if result else None,
-                usage=result.usage if result else None,
-                door="images",
-                images=len(result.images) if result else None,
-            )
+            _record_images(rec, ask, tries, client, result)
 
         try:
             result = await serve_while_connected(
@@ -2178,16 +2190,7 @@ async def _stream_images(
     with collect_attempts() as tries:
 
         def record(result: ImageResponse | None = None) -> None:
-            _record(
-                rec,
-                ask,
-                tries,
-                served_model=getattr(client, "served_model", None) if result else None,
-                tier=getattr(client, "tier", 1) if result else None,
-                usage=result.usage if result else None,
-                door="images",
-                images=len(result.images) if result else None,
-            )
+            _record_images(rec, ask, tries, client, result)
 
         events = client.image_stream(driver_request)
         try:
