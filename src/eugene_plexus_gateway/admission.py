@@ -192,6 +192,24 @@ def local_only() -> bool:
     return context.local_only if context else False
 
 
+#: A driver setting's name as the chat door spells it, for a refusal. The
+#: rest are spelt the same on both sides.
+_WIRE_NAMES = {
+    "maxTokens": "max_tokens",
+    "topP": "top_p",
+    "toolChoice": "tool_choice",
+    "responseFormat": "response_format",
+    "topK": "top_k",
+    "minP": "min_p",
+    "frequencyPenalty": "frequency_penalty",
+    "presencePenalty": "presence_penalty",
+    "parallelToolCalls": "parallel_tool_calls",
+    "logitBias": "logit_bias",
+    "reasoningEffort": "reasoning_effort",
+    "webSearchOptions": "web_search_options",
+}
+
+
 async def permitted(resolution: Any, requirements: Any = None) -> Any:
     context = current.get()
     allowed = context.allowed_models if context else None
@@ -204,6 +222,9 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
     # No prompt accompanies this probe. Reconfirm before wake/selection, then
     # carry localOnly to the driver to close the probe-to-execution race.
     semaphore = asyncio.Semaphore(8)
+    # Every setting some reachable backend confirms, so a refusal can name
+    # the one nobody does rather than "the required settings".
+    confirmed_anywhere: set[str] = set()
 
     async def confirm(backend: Any) -> Any:
         try:
@@ -219,6 +240,8 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
             if entry is None:
                 return None  # the model left the driver since the last refresh
             caps = entry.capabilities
+            if caps is not None:
+                confirmed_anywhere.update(caps.supportedSettings or [])
             if settings and (
                 caps is None or not settings.issubset(set(caps.supportedSettings or []))
             ):
@@ -236,10 +259,22 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
     result = replace(resolution, tiers=tiers).restricted(allowed, local_only=local_only())
     if not result.has_backends():
         if not local_only():
+            missing = sorted(settings - confirmed_anywhere)
+            if missing:
+                # Named in the caller's words (2026-09-28): "the required
+                # settings" sent a caller to guess which of theirs it was.
+                wire = [_WIRE_NAMES.get(m, m) for m in missing]
+                raise AdmissionFailure(
+                    400,
+                    f"No permitted backend serving this model takes {', '.join(wire)}. Remove "
+                    f"{'it' if len(wire) == 1 else 'them'} or choose a model whose backend does. "
+                    "Nothing was forwarded or woken.",
+                    param=wire[0],
+                )
             raise AdmissionFailure(
                 400,
                 "No permitted backend confirms the required tools or explicit settings "
-                "(tool_calling / supportedSettings). Nothing was forwarded or woken.",
+                "together (tool_calling / supportedSettings). Nothing was forwarded or woken.",
                 param="tools" if tools else None,
             )
         raise AdmissionFailure(

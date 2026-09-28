@@ -113,6 +113,11 @@ class StreamEvent:
     delta, and validating a *fragment* against the whole-call shape
     would reject the normal case -- `id` and `name` arrive once, and
     `arguments` arrives split at arbitrary points."""
+    logprobs: dict[str, Any] | None = None
+    """The log probabilities of this event's tokens (P2c), riding with its
+    `text`, which may be empty. Parsed JSON in OpenAI's shape."""
+    annotations: list[dict[str, Any]] | None = None
+    """Citations from a provider's web search (P2c), OpenAI's shape."""
     audio: dict[str, Any] | None = None
     """A fragment of a spoken answer (P2b), as the driver's `AudioDelta`
     (camelCase, parsed JSON). Output like text, so a commit point."""
@@ -510,9 +515,17 @@ class HttpDriverClient:
                 if isinstance(audio, dict) and audio:
                     yield StreamEvent(audio=audio)
                     continue
+                annotations = parsed.get("annotations")
+                if isinstance(annotations, list) and annotations:
+                    yield StreamEvent(annotations=[a for a in annotations if isinstance(a, dict)])
+                    continue
                 text = parsed.get("text")
-                if isinstance(text, str) and text:
-                    yield StreamEvent(text=text)
+                logprobs = parsed.get("logprobs")
+                if (isinstance(text, str) and text) or isinstance(logprobs, dict):
+                    yield StreamEvent(
+                        text=text if isinstance(text, str) else "",
+                        logprobs=logprobs if isinstance(logprobs, dict) else None,
+                    )
 
     async def aclose(self) -> None:
         await self._client.aclose()

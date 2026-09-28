@@ -175,6 +175,110 @@ class AudioOutputFormat(StrEnum):
     pcm16 = 'pcm16'
 
 
+class ReasoningEffort(StrEnum):
+    """
+    How much a reasoning model thinks before it answers: OpenAI's
+    `reasoning_effort` (P2c, 2026-09-28). Measured on
+    `openai/gpt-oss-20b` through OpenRouter: 17 reasoning tokens at
+    `low`, 275 at `high`. A setting, so it routes only to a model
+    that lists it (A2).
+
+    """
+
+    none = 'none'
+    minimal = 'minimal'
+    low = 'low'
+    medium = 'medium'
+    high = 'high'
+    xhigh = 'xhigh'
+
+
+class Verbosity(StrEnum):
+    """
+    OpenAI's `verbosity`, how long the answer is. A setting, routed as A2 says.
+    """
+
+    low = 'low'
+    medium = 'medium'
+    high = 'high'
+
+
+class Prediction(BaseModel):
+    """
+    OpenAI's predicted output: text the answer is expected to repeat
+    most of, which a backend can use to answer faster. A setting,
+    routed as A2 says.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    type: Literal['content']
+    content: str | list[TextContentPart]
+
+
+class WebSearchContextSize(StrEnum):
+    low = 'low'
+    medium = 'medium'
+    high = 'high'
+
+
+class Approximate(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    city: str | None = None
+    country: str | None = None
+    region: str | None = None
+    timezone: str | None = None
+
+
+class WebSearchUserLocation(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    type: Literal['approximate']
+    approximate: Approximate
+
+
+class PromptCacheRetention(StrEnum):
+    """
+    OpenAI's `prompt_cache_retention`, a hint (see `prompt_cache_key`).
+    """
+
+    in_memory = 'in_memory'
+    field_24h = '24h'
+
+
+class ServiceTier(StrEnum):
+    """
+    OpenAI's `service_tier`, a hint carried to OpenAI's own API only.
+    """
+
+    auto = 'auto'
+    default = 'default'
+    flex = 'flex'
+    scale = 'scale'
+    priority = 'priority'
+
+
+class ChatTopLogprob(BaseModel):
+    token: str
+    logprob: float
+    bytes: list[int] | None = None
+
+
+class UrlCitation(BaseModel):
+    url: str
+    title: str | None = None
+    start_index: int | None = Field(
+        None,
+        description="Where in `content` the citation applies. Perplexity's Sonar sends 0 for all.",
+    )
+    end_index: int | None = None
+
+
 class ComponentKind(StrEnum):
     """
     Which Eugene Plexus component class a topology entry
@@ -1180,6 +1284,27 @@ class ToolChoice(StrEnum):
     required = 'required'
 
 
+class FunctionCallMode(StrEnum):
+    none = 'none'
+    auto = 'auto'
+
+
+class FunctionCallName(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str
+
+
+class FunctionCallDelta(BaseModel):
+    """
+    A fragment of a deprecated `function_call`, accumulated like a tool call's.
+    """
+
+    name: str | None = None
+    arguments: str | None = None
+
+
 class ChatModality(StrEnum):
     """
     One part of what the answer is made of. Named rather than inline
@@ -1257,6 +1382,10 @@ class ChatCompletionAudioDelta(BaseModel):
 
 class Role1(StrEnum):
     """
+    `function` is the deprecated role for a function's result,
+    answering the assistant's `function_call` before it; it is
+    carried as a `tool` message answering that call (P2c).
+
     `developer` is OpenAI's newer name for the instruction role,
     sent by current SDKs and frameworks when they target a
     reasoning model. It reaches the backend as `system`, in
@@ -1271,10 +1400,14 @@ class Role1(StrEnum):
     user = 'user'
     assistant = 'assistant'
     tool = 'tool'
+    function = 'function'
 
 
 class FinishReason(StrEnum):
     """
+    `function_call` only when the request used the deprecated
+    `functions`, in place of `tool_calls` (P2c).
+
     `stop` for a natural end or a matched stop sequence,
     `length` for hitting the token cap, `tool_calls` when the
     model stopped because it wants one or more tools run,
@@ -1303,6 +1436,7 @@ class FinishReason(StrEnum):
     length = 'length'
     tool_calls = 'tool_calls'
     content_filter = 'content_filter'
+    function_call = 'function_call'
 
 
 class Role2(StrEnum):
@@ -1318,6 +1452,7 @@ class FinishReason1(Enum):
     length = 'length'
     tool_calls = 'tool_calls'
     content_filter = 'content_filter'
+    function_call = 'function_call'
     NoneType_None = None
 
 
@@ -1983,6 +2118,11 @@ class AnthropicErrorResponse(BaseModel):
     error: Error
 
 
+class ResponsesInputTokens(BaseModel):
+    object: Literal['response.input_tokens']
+    input_tokens: int = Field(..., ge=0)
+
+
 class ToolChoice1(StrEnum):
     """
     `auto`, `none`, `required`, or `{"type": "function", "name": …}`.
@@ -2530,6 +2670,45 @@ class FileContentPart(BaseModel):
     file: InputFile
 
 
+class WebSearchOptions(BaseModel):
+    """
+    Ask the model to search the web before it answers: OpenAI's
+    `web_search_options`. The search is the model provider's, not this
+    install's. A setting, routed as A2 says; **listed is not promised**
+    (OpenRouter lists it for `gpt-4o-mini`, and OpenAI refuses it for
+    that model, measured), so a provider's refusal is still the
+    caller's 400. The citations come back as `annotations`.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    search_context_size: WebSearchContextSize | None = None
+    user_location: WebSearchUserLocation | None = None
+
+
+class ChatTokenLogprob(BaseModel):
+    token: str
+    logprob: float
+    bytes: list[int] | None = None
+    top_logprobs: list[ChatTopLogprob] | None = None
+
+
+class ChatAnnotation(BaseModel):
+    """
+    A web source the answer cites, OpenAI's shape (P2c). Carried back
+    from a search the provider ran for `web_search_options`. Only
+    `url_citation` is carried: OpenRouter's own `file` annotations are
+    a cache of how it parsed a PDF, not a citation, and no OpenAI
+    client reads them.
+
+    """
+
+    type: Literal['url_citation']
+    url_citation: UrlCitation
+
+
 class ComputeDevice(BaseModel):
     """
     One compute device on one host, as that host's agent detected it.
@@ -2712,17 +2891,11 @@ class Delta(BaseModel):
         description='Tool-call fragments. Each carries an `index` and the\ncaller accumulates by it: `id` and `function.name`\narrive once, `function.arguments` arrives as a string\nsplit across any number of frames. A single frame is\n**not** parseable JSON and was never meant to be.\n',
     )
     audio: ChatCompletionAudioDelta | None = None
-
-
-class ChatCompletionChunkChoice(BaseModel):
-    index: int
-    delta: Delta = Field(
-        ...,
-        description='Incremental payload. The first chunk carries `role`;\nsubsequent chunks carry `content` fragments, `tool_calls`\nfragments, `audio` fragments, or neither on the terminal\nchunk.\n',
+    annotations: list[ChatAnnotation] | None = Field(
+        None,
+        description='Citations, as the provider streams them (P2c); accumulate them.',
     )
-    finish_reason: FinishReason1 | None = Field(
-        None, description='Null until the terminal chunk.'
-    )
+    function_call: FunctionCallDelta | None = None
 
 
 class Tool(BaseModel):
@@ -3150,6 +3323,18 @@ class InputAudioContentPart(BaseModel):
     input_audio: InputAudio
 
 
+class ChatLogprobs(BaseModel):
+    """
+    The chosen tokens' log probabilities, OpenAI's shape (P2c). Asked
+    for with `logprobs` (and `top_logprobs` for alternatives). Streamed,
+    each frame carries the entries for its own tokens.
+
+    """
+
+    content: list[ChatTokenLogprob] | None = None
+    refusal: list[ChatTokenLogprob] | None = None
+
+
 class DirectoryListing(BaseModel):
     """
     One directory on the component's own host, listed for a picker.
@@ -3192,20 +3377,18 @@ class ModelList(BaseModel):
     data: list[Model]
 
 
-class ChatCompletionChunk(BaseModel):
-    """
-    One SSE frame of a streaming completion.
-    """
-
-    id: str
-    object: Literal['chat.completion.chunk']
-    created: int
-    model: str
-    choices: list[ChatCompletionChunkChoice]
-    usage: CompletionUsage | None = None
-    x_eugene_plexus: CompletionRoutingInfo | None = Field(
+class ChatCompletionChunkChoice(BaseModel):
+    index: int
+    delta: Delta = Field(
+        ...,
+        description='Incremental payload. The first chunk carries `role`;\nsubsequent chunks carry `content` fragments, `tool_calls`\nfragments, `audio` fragments, or neither on the terminal\nchunk.\n',
+    )
+    logprobs: ChatLogprobs | None = Field(
         None,
-        description='Set on the **final frame only**, alongside `usage` — the\nsame place OpenAI puts its own end-of-stream extras.\nAbsent on every earlier frame, because the values are not\nknown until the completion is done. **One exception, asked\nfor:** with `stream_options.include_progress`, a progress\nchunk before the first token carries an `x_eugene_plexus`\nholding only `progress`, with `choices: []`.\n\nAdded at M8. Until then a streaming client could see no\nrouting information at all: the non-streaming response\ncarried this and the stream did not, so exactly the clients\nthat stream — the UI playground among them — were the ones\nthat could not tell which backend answered. Retained\nmetrics do not depend on this (they are recorded at the\nrouting hooks, which fire on both paths); this closes the\nmatching gap in what a caller can see.\n',
+        description="The log probabilities of this frame's tokens, with `logprobs` true.",
+    )
+    finish_reason: FinishReason1 | None = Field(
+        None, description='Null until the terminal chunk.'
     )
 
 
@@ -3319,6 +3502,23 @@ class AnthropicCountTokensRequest(BaseModel):
     tool_choice: AnthropicToolChoice | None = None
 
 
+class ChatCompletionChunk(BaseModel):
+    """
+    One SSE frame of a streaming completion.
+    """
+
+    id: str
+    object: Literal['chat.completion.chunk']
+    created: int
+    model: str
+    choices: list[ChatCompletionChunkChoice]
+    usage: CompletionUsage | None = None
+    x_eugene_plexus: CompletionRoutingInfo | None = Field(
+        None,
+        description='Set on the **final frame only**, alongside `usage` — the\nsame place OpenAI puts its own end-of-stream extras.\nAbsent on every earlier frame, because the values are not\nknown until the completion is done. **One exception, asked\nfor:** with `stream_options.include_progress`, a progress\nchunk before the first token carries an `x_eugene_plexus`\nholding only `progress`, with `choices: []`.\n\nAdded at M8. Until then a streaming client could see no\nrouting information at all: the non-streaming response\ncarried this and the stream did not, so exactly the clients\nthat stream — the UI playground among them — were the ones\nthat could not tell which backend answered. Retained\nmetrics do not depend on this (they are recorded at the\nrouting hooks, which fire on both paths); this closes the\nmatching gap in what a caller can see.\n',
+    )
+
+
 class RoutingTableView(BaseModel):
     """
     The gateway's resolved routing table, as of the last refresh.
@@ -3370,7 +3570,7 @@ class ChatCompletionMessage(BaseModel):
 
     role: Role1 = Field(
         ...,
-        description="`developer` is OpenAI's newer name for the instruction role,\nsent by current SDKs and frameworks when they target a\nreasoning model. It reaches the backend as `system`, in\nplace -- local chat templates know only `system`, and the\ntwo mean the same thing to a model that is not OpenAI's.\nRefused with a 400 until 2026-09-23.\n",
+        description="`function` is the deprecated role for a function's result,\nanswering the assistant's `function_call` before it; it is\ncarried as a `tool` message answering that call (P2c).\n\n`developer` is OpenAI's newer name for the instruction role,\nsent by current SDKs and frameworks when they target a\nreasoning model. It reaches the backend as `system`, in\nplace -- local chat templates know only `system`, and the\ntwo mean the same thing to a model that is not OpenAI's.\nRefused with a 400 until 2026-09-23.\n",
     )
     content: str | MessageContent1 | None = Field(
         None,
@@ -3393,14 +3593,25 @@ class ChatCompletionMessage(BaseModel):
         None,
         description='On a response: the spoken answer (P2b). On a request:\nrefused with a 400, since it would name stored audio.\n',
     )
+    function_call: FunctionCall | None = Field(
+        None,
+        description="The deprecated single function call (P2c). On a response, only\nwhen the request used `functions`. On a request's assistant\nmessage, it is carried as that turn's one tool call.\n",
+    )
+    annotations: list[ChatAnnotation] | None = Field(
+        None,
+        description="On a response: the web sources the answer cites (P2c). On a\nrequest's assistant message, accepted and not forwarded: it\ndescribes the text beside it and instructs nothing.\n",
+    )
 
 
 class ChatCompletionChoice(BaseModel):
     index: int
     message: ChatCompletionMessage
+    logprobs: ChatLogprobs | None = Field(
+        None, description="With `logprobs` true, the answer's; otherwise null."
+    )
     finish_reason: FinishReason = Field(
         ...,
-        description='`stop` for a natural end or a matched stop sequence,\n`length` for hitting the token cap, `tool_calls` when the\nmodel stopped because it wants one or more tools run,\n`content_filter` when a safety classifier stopped it.\n\n**`content_filter` is OpenAI\'s own value and is carried\nsince 2026-09-19.** Before that the chain was\n`content_filter` → the driver\'s `error` → `stop`, so a\nfiltered answer arrived as a natural end and a caller had\nno way to tell a refusal from a reply. The same mistake as\n`tool_calls` → `stop` before 2026-09-11, one value along:\na state with no row of its own reported as its nearest\nneighbour.\n\nUntil 2026-09-11 this enum was `stop` and `length` only, and\nits description said so in as many words — "OpenAI\'s two\nvalues for a completion **without** tool calls". That\nsentence was the single occurrence of the string "tool"\nanywhere in this contract or the driver\'s, and it was an\naccurate description of a control plane no agent harness\ncould use.\n',
+        description='`function_call` only when the request used the deprecated\n`functions`, in place of `tool_calls` (P2c).\n\n`stop` for a natural end or a matched stop sequence,\n`length` for hitting the token cap, `tool_calls` when the\nmodel stopped because it wants one or more tools run,\n`content_filter` when a safety classifier stopped it.\n\n**`content_filter` is OpenAI\'s own value and is carried\nsince 2026-09-19.** Before that the chain was\n`content_filter` → the driver\'s `error` → `stop`, so a\nfiltered answer arrived as a natural end and a caller had\nno way to tell a refusal from a reply. The same mistake as\n`tool_calls` → `stop` before 2026-09-11, one value along:\na state with no row of its own reported as its nearest\nneighbour.\n\nUntil 2026-09-11 this enum was `stop` and `length` only, and\nits description said so in as many words — "OpenAI\'s two\nvalues for a completion **without** tool calls". That\nsentence was the single occurrence of the string "tool"\nanywhere in this contract or the driver\'s, and it was an\naccurate description of a control plane no agent harness\ncould use.\n',
     )
 
 
@@ -3512,15 +3723,47 @@ class ChatCompletionRequest(BaseModel):
         description='Ignored annotations; not provider storage or queryable metadata.',
     )
     safety_identifier: str | None = Field(
-        None, description='Ignored annotation; not an authenticated user identity.'
+        None,
+        description="A hint (P2c): carried to OpenAI's own API, which uses it for abuse\ndetection, and dropped for every other backend, none of which\nlists it. Not an authenticated identity here.\n",
+        max_length=64,
     )
+    prompt_cache_key: str | None = Field(
+        None,
+        description="A hint (P2c): OpenAI's cache routing key, carried to OpenAI's own\nAPI and dropped elsewhere. A hint changes where or how cheaply an\nanswer is made, never what it says, so dropping it is honest\nwhere refusing a setting is not. No OpenRouter model lists it\n(measured).\n",
+        max_length=1024,
+    )
+    prompt_cache_retention: PromptCacheRetention | None = None
+    service_tier: ServiceTier | None = None
     n: Literal[1] = Field(
         1,
         description='Only one completion is supported; any other non-null value returns 400.',
     )
-    logprobs: Literal[False] = Field(
-        False,
-        description='Only false is supported; log probabilities are not implemented.',
+    logprobs: bool | None = Field(
+        None,
+        description="Return each chosen token's log probability (P2c). Routes only to\na model that lists `logprobs` (149 on OpenRouter, measured),\nwhere it was refused with a 400 before 2026-09-28.\n",
+    )
+    top_logprobs: int | None = Field(
+        None,
+        description='How many alternatives per token, with `logprobs` true; refused without it.',
+        ge=0,
+        le=20,
+    )
+    logit_bias: dict[str, int] | None = Field(
+        None,
+        description="Token id (as a string) to a bias from -100 to 100, OpenAI's\nshape. A setting, routed as A2 says (141 models list it). Token\nids are the model's own, so the same bias means something else\non another model -- which is why it is never sent to one that\ndid not list it.\n",
+    )
+    reasoning_effort: ReasoningEffort | None = None
+    verbosity: Verbosity | None = None
+    prediction: Prediction | None = None
+    web_search_options: WebSearchOptions | None = None
+    functions: list[FunctionDefinition] | None = Field(
+        None,
+        description='**Deprecated by OpenAI; translated, not refused (P2c).** The same\nthing as `tools` with every tool a function, carried as tools.\nThe answer is given back in the deprecated shape too,\n`message.function_call` and `finish_reason: function_call`,\nbecause a client that sends this shape reads that one. One call\nper turn, as the old API had: `parallel_tool_calls` is sent as\nfalse. Refused together with `tools` or `tool_choice`.\n',
+        max_length=128,
+    )
+    function_call: FunctionCallMode | FunctionCallName | None = Field(
+        None,
+        description='The deprecated `function_call`: `none`, `auto`, or `{"name"}` to\nforce one function. Translated to `tool_choice`.\n',
     )
     store: Literal[False] = Field(
         False,

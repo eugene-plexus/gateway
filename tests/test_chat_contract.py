@@ -132,10 +132,13 @@ def test_conflicting_limits(client: TestClient, fake_driver: FakeDriverClient) -
 @pytest.mark.parametrize(
     "extra,param",
     [
-        ({"reasoning_effort": "high"}, "reasoning_effort"),
         # `frequency_penalty` and `parallel_tool_calls` stood here until
-        # 2026-09-23, when the driver's request grew fields to carry them;
-        # these two are still consequential and still have nowhere to go.
+        # 2026-09-23, when the driver's request grew fields to carry them.
+        # `reasoning_effort`, `logit_bias` and `logprobs: true` are carried
+        # since P2c (2026-09-28) and route only to a backend that lists
+        # them; this fixture's lists none, so each is still refused and
+        # nothing is sent -- now by routing, naming the field.
+        ({"reasoning_effort": "high"}, "reasoning_effort"),
         ({"top_logprobs": 2}, "top_logprobs"),
         ({"logit_bias": {"1": -100}}, "logit_bias"),
         # Refused as `modalities` until P2b (2026-09-28); audio output is

@@ -137,6 +137,110 @@ class AudioOutputFormat(StrEnum):
     pcm16 = 'pcm16'
 
 
+class ReasoningEffort(StrEnum):
+    """
+    How much a reasoning model thinks before it answers: OpenAI's
+    `reasoning_effort` (P2c, 2026-09-28). Measured on
+    `openai/gpt-oss-20b` through OpenRouter: 17 reasoning tokens at
+    `low`, 275 at `high`. A setting, so it routes only to a model
+    that lists it (A2).
+
+    """
+
+    none = 'none'
+    minimal = 'minimal'
+    low = 'low'
+    medium = 'medium'
+    high = 'high'
+    xhigh = 'xhigh'
+
+
+class Verbosity(StrEnum):
+    """
+    OpenAI's `verbosity`, how long the answer is. A setting, routed as A2 says.
+    """
+
+    low = 'low'
+    medium = 'medium'
+    high = 'high'
+
+
+class Prediction(BaseModel):
+    """
+    OpenAI's predicted output: text the answer is expected to repeat
+    most of, which a backend can use to answer faster. A setting,
+    routed as A2 says.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    type: Literal['content']
+    content: str | list[TextContentPart]
+
+
+class WebSearchContextSize(StrEnum):
+    low = 'low'
+    medium = 'medium'
+    high = 'high'
+
+
+class Approximate(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    city: str | None = None
+    country: str | None = None
+    region: str | None = None
+    timezone: str | None = None
+
+
+class WebSearchUserLocation(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    type: Literal['approximate']
+    approximate: Approximate
+
+
+class PromptCacheRetention(StrEnum):
+    """
+    OpenAI's `prompt_cache_retention`, a hint (see `prompt_cache_key`).
+    """
+
+    in_memory = 'in_memory'
+    field_24h = '24h'
+
+
+class ServiceTier(StrEnum):
+    """
+    OpenAI's `service_tier`, a hint carried to OpenAI's own API only.
+    """
+
+    auto = 'auto'
+    default = 'default'
+    flex = 'flex'
+    scale = 'scale'
+    priority = 'priority'
+
+
+class ChatTopLogprob(BaseModel):
+    token: str
+    logprob: float
+    bytes: list[int] | None = None
+
+
+class UrlCitation(BaseModel):
+    url: str
+    title: str | None = None
+    start_index: int | None = Field(
+        None,
+        description="Where in `content` the citation applies. Perplexity's Sonar sends 0 for all.",
+    )
+    end_index: int | None = None
+
+
 class BackendKind(StrEnum):
     """
     Which wire protocol an inference-driver instance speaks to its
@@ -1592,6 +1696,45 @@ class FileContentPart(BaseModel):
     file: InputFile
 
 
+class WebSearchOptions(BaseModel):
+    """
+    Ask the model to search the web before it answers: OpenAI's
+    `web_search_options`. The search is the model provider's, not this
+    install's. A setting, routed as A2 says; **listed is not promised**
+    (OpenRouter lists it for `gpt-4o-mini`, and OpenAI refuses it for
+    that model, measured), so a provider's refusal is still the
+    caller's 400. The citations come back as `annotations`.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    search_context_size: WebSearchContextSize | None = None
+    user_location: WebSearchUserLocation | None = None
+
+
+class ChatTokenLogprob(BaseModel):
+    token: str
+    logprob: float
+    bytes: list[int] | None = None
+    top_logprobs: list[ChatTopLogprob] | None = None
+
+
+class ChatAnnotation(BaseModel):
+    """
+    A web source the answer cites, OpenAI's shape (P2c). Carried back
+    from a search the provider ran for `web_search_options`. Only
+    `url_citation` is carried: OpenRouter's own `file` annotations are
+    a cache of how it parsed a PDF, not a citation, and no OpenAI
+    client reads them.
+
+    """
+
+    type: Literal['url_citation']
+    url_citation: UrlCitation
+
+
 class ComputeDevice(BaseModel):
     """
     One compute device on one host, as that host's agent detected it.
@@ -1728,30 +1871,6 @@ class DirectoryEntry(BaseModel):
         False,
         description='A dot-prefixed name, or the hidden attribute on Windows.\nOnly present in a listing that asked for `showHidden`.\n',
     )
-
-
-class StreamToken(BaseModel):
-    """
-    One `event: token` payload. Exactly one of `text`, `reasoning`,
-    `toolCalls` or `audio` is set.
-
-    A reasoning frame is output like any other: it is the first
-    thing a reasoning model produces, so it is also the commit point
-    one layer up -- once a caller has been shown the model thinking,
-    a failure cannot cascade onto another model's answer.
-
-    """
-
-    text: str | None = Field(None, description="A fragment of the assistant's text.")
-    reasoning: str | None = Field(
-        None,
-        description="A fragment of the model's reasoning, from a backend that\nstreams it separately (`delta.reasoning_content` on\nllama.cpp, `delta.reasoning` on vLLM). Never sent when this\ndriver's `thinkingMode` is `off`.\n",
-    )
-    toolCalls: list[ToolCallDelta] | None = Field(
-        None,
-        description='Fragments of one or more tool calls, accumulated by `index`.\n',
-    )
-    audio: AudioDelta | None = None
 
 
 class Tool(BaseModel):
@@ -1917,6 +2036,18 @@ class InputAudioContentPart(BaseModel):
     input_audio: InputAudio
 
 
+class ChatLogprobs(BaseModel):
+    """
+    The chosen tokens' log probabilities, OpenAI's shape (P2c). Asked
+    for with `logprobs` (and `top_logprobs` for alternatives). Streamed,
+    each frame carries the entries for its own tokens.
+
+    """
+
+    content: list[ChatTokenLogprob] | None = None
+    refusal: list[ChatTokenLogprob] | None = None
+
+
 class DirectoryListing(BaseModel):
     """
     One directory on the component's own host, listed for a picker.
@@ -1976,6 +2107,11 @@ class GenerateResponse(BaseModel):
         description="**`content_filter` is separate from `error` since\n2026-09-19**, and the two were one value for the same\nreason `tool_calls` was folded into `stop` before step 6:\nthe map had a row for a state nobody had a use for yet, so\nthe state was reported as its nearest neighbour.\n\nA filtered answer is not a backend error — nothing broke,\nthe backend did exactly what it was configured to do — and\nit is not a natural end either, which is what the caller\nsaw. `error` means the generation was truncated because\nsomething failed mid-stream; `content_filter` means a\nclassifier stopped it on purpose. OpenAI and Anthropic each\nhave their own name for this state and the gateway renders\nit in the caller's vocabulary, so a client that switches on\nthe field gets the vendor value it already understands.\n",
     )
     audio: GeneratedAudio | None = None
+    logprobs: ChatLogprobs | None = None
+    annotations: list[ChatAnnotation] | None = Field(
+        None,
+        description="The web sources the answer cites, from a provider's search (P2c).",
+    )
     usage: Usage | None = None
     requestId: UUID | None = None
     backend: BackendKind | None = None
@@ -1986,6 +2122,33 @@ class GenerateResponse(BaseModel):
     latencyMs: int | None = Field(
         None, description='End-to-end driver-side latency in milliseconds.'
     )
+
+
+class StreamToken(BaseModel):
+    """
+    One `event: token` payload. Exactly one of `text`, `reasoning`,
+    `toolCalls`, `audio` or `annotations` is set; `logprobs` rides with
+    the `text` whose tokens it describes.
+
+    A reasoning frame is output like any other: it is the first
+    thing a reasoning model produces, so it is also the commit point
+    one layer up -- once a caller has been shown the model thinking,
+    a failure cannot cascade onto another model's answer.
+
+    """
+
+    text: str | None = Field(None, description="A fragment of the assistant's text.")
+    reasoning: str | None = Field(
+        None,
+        description="A fragment of the model's reasoning, from a backend that\nstreams it separately (`delta.reasoning_content` on\nllama.cpp, `delta.reasoning` on vLLM). Never sent when this\ndriver's `thinkingMode` is `off`.\n",
+    )
+    toolCalls: list[ToolCallDelta] | None = Field(
+        None,
+        description='Fragments of one or more tool calls, accumulated by `index`.\n',
+    )
+    audio: AudioDelta | None = None
+    logprobs: ChatLogprobs | None = None
+    annotations: list[ChatAnnotation] | None = None
 
 
 class MessageContent1(
@@ -2053,7 +2216,7 @@ class GenerateRequest(BaseModel):
     )
     callerSettings: list[str] | None = Field(
         None,
-        description="A2 provenance: names of settings explicitly requested by the caller,\nusing this request's field names (maxTokens, temperature, topP, seed,\nstop, tools, toolChoice, responseFormat, topK, minP, frequencyPenalty,\npresencePenalty, parallelToolCalls). The gateway preserves this\nlist on each fallback attempt. An adapter must refuse a known unsupported\nexplicit setting with 400, rather than silently dropping it. Settings\nsupplied only by profiles/defaults retain the adapter's default behavior.\nThis field is internal and is not forwarded to upstream providers.\n",
+        description="A2 provenance: names of settings explicitly requested by the caller,\nusing this request's field names (maxTokens, temperature, topP, seed,\nstop, tools, toolChoice, responseFormat, topK, minP, frequencyPenalty,\npresencePenalty, parallelToolCalls; since P2c logprobs, logitBias,\nreasoningEffort, verbosity, prediction, webSearchOptions). `topLogprobs`\nrides with `logprobs`. The hints (`promptCacheKey`,\n`promptCacheRetention`, `serviceTier`, `safetyIdentifier`) are never\nlisted: a backend that cannot carry a hint drops it. The gateway preserves this\nlist on each fallback attempt. An adapter must refuse a known unsupported\nexplicit setting with 400, rather than silently dropping it. Settings\nsupplied only by profiles/defaults retain the adapter's default behavior.\nThis field is internal and is not forwarded to upstream providers.\n",
     )
     messages: list[Message] = Field(
         ...,
@@ -2122,6 +2285,27 @@ class GenerateRequest(BaseModel):
     )
     responseFormat: ResponseFormat | None = None
     audioOutput: AudioOutputRequest | None = None
+    logprobs: bool | None = Field(
+        None,
+        description="Return the chosen tokens' log probabilities (P2c). A setting.",
+    )
+    topLogprobs: int | None = Field(None, ge=0, le=20)
+    logitBias: dict[str, int] | None = Field(
+        None, description="Token id to bias, OpenAI's `logit_bias`. A setting."
+    )
+    reasoningEffort: ReasoningEffort | None = None
+    verbosity: Verbosity | None = None
+    prediction: Prediction | None = None
+    webSearchOptions: WebSearchOptions | None = None
+    promptCacheKey: str | None = Field(
+        None,
+        description="A hint, carried to OpenAI's own API and dropped elsewhere (P2c).",
+    )
+    promptCacheRetention: PromptCacheRetention | None = None
+    serviceTier: ServiceTier | None = None
+    safetyIdentifier: str | None = Field(
+        None, description='A hint, as `promptCacheKey`.'
+    )
     reportProgress: bool | None = Field(
         False,
         description="On `POST /v1/generate/stream` only: emit `event: progress`\nframes saying what the backend is doing when it is not yet,\nor not at the moment, producing output -- see\n`StreamProgress` for what each backend reports. Ignored by\n`POST /v1/generate`. Not an output setting: it changes what\nthe stream says about the work, never what the model says.\n\nllama.cpp's own `return_progress` flag is sent only once the\nbackend has answered as `llama-server` (its `/props`), since\na hosted API refuses a field it does not know.\n\n**The 200 commits at the first progress frame**, where it\notherwise commits at the first token, so a backend that\nfails partway through reading the prompt fails as an\n`event: error` frame instead of a status code. That is why\nit is asked for rather than sent by default.\n",

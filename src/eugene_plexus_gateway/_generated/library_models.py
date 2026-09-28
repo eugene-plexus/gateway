@@ -160,6 +160,110 @@ class AudioOutputFormat(StrEnum):
     pcm16 = 'pcm16'
 
 
+class ReasoningEffort(StrEnum):
+    """
+    How much a reasoning model thinks before it answers: OpenAI's
+    `reasoning_effort` (P2c, 2026-09-28). Measured on
+    `openai/gpt-oss-20b` through OpenRouter: 17 reasoning tokens at
+    `low`, 275 at `high`. A setting, so it routes only to a model
+    that lists it (A2).
+
+    """
+
+    none = 'none'
+    minimal = 'minimal'
+    low = 'low'
+    medium = 'medium'
+    high = 'high'
+    xhigh = 'xhigh'
+
+
+class Verbosity(StrEnum):
+    """
+    OpenAI's `verbosity`, how long the answer is. A setting, routed as A2 says.
+    """
+
+    low = 'low'
+    medium = 'medium'
+    high = 'high'
+
+
+class Prediction(BaseModel):
+    """
+    OpenAI's predicted output: text the answer is expected to repeat
+    most of, which a backend can use to answer faster. A setting,
+    routed as A2 says.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    type: Literal['content']
+    content: str | list[TextContentPart]
+
+
+class WebSearchContextSize(StrEnum):
+    low = 'low'
+    medium = 'medium'
+    high = 'high'
+
+
+class Approximate(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    city: str | None = None
+    country: str | None = None
+    region: str | None = None
+    timezone: str | None = None
+
+
+class WebSearchUserLocation(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    type: Literal['approximate']
+    approximate: Approximate
+
+
+class PromptCacheRetention(StrEnum):
+    """
+    OpenAI's `prompt_cache_retention`, a hint (see `prompt_cache_key`).
+    """
+
+    in_memory = 'in_memory'
+    field_24h = '24h'
+
+
+class ServiceTier(StrEnum):
+    """
+    OpenAI's `service_tier`, a hint carried to OpenAI's own API only.
+    """
+
+    auto = 'auto'
+    default = 'default'
+    flex = 'flex'
+    scale = 'scale'
+    priority = 'priority'
+
+
+class ChatTopLogprob(BaseModel):
+    token: str
+    logprob: float
+    bytes: list[int] | None = None
+
+
+class UrlCitation(BaseModel):
+    url: str
+    title: str | None = None
+    start_index: int | None = Field(
+        None,
+        description="Where in `content` the citation applies. Perplexity's Sonar sends 0 for all.",
+    )
+    end_index: int | None = None
+
+
 class BackendKind(StrEnum):
     """
     Which wire protocol an inference-driver instance speaks to its
@@ -1912,6 +2016,45 @@ class FileContentPart(BaseModel):
     file: InputFile
 
 
+class WebSearchOptions(BaseModel):
+    """
+    Ask the model to search the web before it answers: OpenAI's
+    `web_search_options`. The search is the model provider's, not this
+    install's. A setting, routed as A2 says; **listed is not promised**
+    (OpenRouter lists it for `gpt-4o-mini`, and OpenAI refuses it for
+    that model, measured), so a provider's refusal is still the
+    caller's 400. The citations come back as `annotations`.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    search_context_size: WebSearchContextSize | None = None
+    user_location: WebSearchUserLocation | None = None
+
+
+class ChatTokenLogprob(BaseModel):
+    token: str
+    logprob: float
+    bytes: list[int] | None = None
+    top_logprobs: list[ChatTopLogprob] | None = None
+
+
+class ChatAnnotation(BaseModel):
+    """
+    A web source the answer cites, OpenAI's shape (P2c). Carried back
+    from a search the provider ran for `web_search_options`. Only
+    `url_citation` is carried: OpenRouter's own `file` annotations are
+    a cache of how it parsed a PDF, not a citation, and no OpenAI
+    client reads them.
+
+    """
+
+    type: Literal['url_citation']
+    url_citation: UrlCitation
+
+
 class ComputeDevice(BaseModel):
     """
     One compute device on one host, as that host's agent detected it.
@@ -2353,6 +2496,18 @@ class InputAudioContentPart(BaseModel):
     )
     type: Literal['input_audio']
     input_audio: InputAudio
+
+
+class ChatLogprobs(BaseModel):
+    """
+    The chosen tokens' log probabilities, OpenAI's shape (P2c). Asked
+    for with `logprobs` (and `top_logprobs` for alternatives). Streamed,
+    each frame carries the entries for its own tokens.
+
+    """
+
+    content: list[ChatTokenLogprob] | None = None
+    refusal: list[ChatTokenLogprob] | None = None
 
 
 class DirectoryListing(BaseModel):

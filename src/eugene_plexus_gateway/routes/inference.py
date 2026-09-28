@@ -55,12 +55,19 @@ from .._generated.driver_models import (
     DecisionRequest as DriverDecisionRequest,
 )
 from .._generated.driver_models import NamedToolChoice as DriverNamedToolChoice
+from .._generated.driver_models import Prediction as DriverPrediction
+from .._generated.driver_models import PromptCacheRetention as DriverPromptCacheRetention
+from .._generated.driver_models import ReasoningEffort as DriverReasoningEffort
 from .._generated.driver_models import ResponseFormat as DriverResponseFormat
+from .._generated.driver_models import ServiceTier as DriverServiceTier
 from .._generated.driver_models import Tool as DriverTool
 from .._generated.driver_models import ToolChoice as DriverToolChoice
+from .._generated.driver_models import Verbosity as DriverVerbosity
+from .._generated.driver_models import WebSearchOptions as DriverWebSearchOptions
 from .._generated.models import (
     AudioOutputFormat,
     BackendKind,
+    ChatAnnotation,
     ChatCompletionAudio,
     ChatCompletionAudioDelta,
     ChatCompletionChoice,
@@ -69,6 +76,7 @@ from .._generated.models import (
     ChatCompletionMessage,
     ChatCompletionRequest,
     ChatCompletionResponse,
+    ChatLogprobs,
     CompletionRoutingInfo,
     CompletionTokensDetails,
     CompletionUsage,
@@ -79,6 +87,7 @@ from .._generated.models import (
     EmbeddingUsage,
     FinishReason,
     FunctionCall,
+    FunctionCallDelta,
     ModelList,
     Object,
     Object1,
@@ -1102,35 +1111,61 @@ async def count_anthropic_message_tokens(request: Request) -> Any:
     except anthropic.Refusal as refusal:
         return refusal.response()
 
+    counted = await _counted(request, body)
+    if counted.failure is not None:
+        return counted.failure.as_anthropic()
+    if counted.rejected is not None:
+        return anthropic.error_response(
+            400, f"The backend rejected this request: {counted.rejected}"
+        )
+    if counted.reason is not None:
+        return _cannot_count(body.model, counted.reason)
+    return JSONResponse(content={"input_tokens": counted.tokens})
+
+
+@dataclass(frozen=True)
+class _Count:
+    """A count, or why there is none: a door's own refusal (`failure`),
+    the backend's 400 (`rejected`), or a count it cannot give (`reason`)."""
+
+    tokens: int | None = None
+    failure: _Failure | None = None
+    rejected: str | None = None
+    reason: str | None = None
+
+
+async def _counted(request: Request, body: ChatCompletionRequest) -> _Count:
+    """A prompt counted by a ready backend of the tier that would serve it.
+
+    Shared by `/v1/messages/count_tokens` and `/v1/responses/input_tokens`
+    (P2c), which differ only in how they say the answer. **A key check,
+    not an admission**: nothing is generated, woken or recorded.
+    """
     await admission.authorize(request, None)
     table = _routing(request)
     if table is None:
-        return _cannot_count(body.model, "the gateway is starting or in safe mode")
+        return _Count(reason="the gateway is starting or in safe mode")
     store = _store(request)
     generate = _to_generate_request(body, store)
     resolution = await admission.permitted(table.resolve(body.model), requirements=generate)
     if not resolution.has_backends():
-        return _no_such_model(body.model, table).as_anthropic()
+        return _Count(failure=_no_such_model(body.model, table))
     surfaces = resolution.surfaces()
     if surfaces and "chat" not in surfaces:
-        return _wrong_surface(
-            body.model, surfaces, wanted="chat", instead="/v1/embeddings"
-        ).as_anthropic()
+        return _Count(
+            failure=_wrong_surface(body.model, surfaces, wanted="chat", instead="/v1/embeddings")
+        )
     if not surfaces and (reported := resolution.reported_surfaces()):
-        return _no_door_yet(body.model, reported, wanted="chat").as_anthropic()
+        return _Count(failure=_no_door_yet(body.model, reported, wanted="chat"))
     if body.tools and not _any_backend_carries_tools(resolution):
-        return _tools_unsupported(body.model).as_anthropic()
+        return _Count(failure=_tools_unsupported(body.model))
     kinds = attachment_kinds(body.messages)
     if "image" in kinds:
-        return _cannot_count(
-            body.model,
-            "an image's token cost is decided by the projector when it encodes the picture",
+        return _Count(
+            reason="an image's token cost is decided by the projector when it encodes the picture"
         )
     if kinds:
-        return _cannot_count(
-            body.model,
-            "an attachment's token cost is decided by the encoder that reads it",
-        )
+        return _Count(reason="an attachment's token cost is decided by the encoder that reads it")
 
     client = table.pick(resolution)
     if client is None and await table.refresh_if_stale():
@@ -1140,23 +1175,23 @@ async def count_anthropic_message_tokens(request: Request) -> Any:
         # Deliberately no wake. A caller who wants a sleeping model loaded
         # to count with can send the request itself -- which is exactly
         # the fallback Claude Code takes on this 400, knowingly.
-        return _cannot_count(body.model, "nothing that serves it is running")
+        return _Count(reason="nothing that serves it is running")
 
     generate.localOnly = admission.local_only()
     try:
-        counted = await serve_while_connected(
+        tokens = await serve_while_connected(
             request, client.count_tokens(generate), what="a token count"
         )
     except ClientGone as e:
-        return _serve_failure(e, body, store).as_anthropic()
+        return _Count(failure=_serve_failure(e, body, store))
     except DriverError as e:
         detail = (e.problem.detail if e.problem is not None else None) or str(e)
         if e.status_code == 400:
-            return anthropic.error_response(400, f"The backend rejected this request: {detail}")
-        return _cannot_count(body.model, detail)
+            return _Count(rejected=detail)
+        return _Count(reason=detail)
     except httpx.HTTPError as e:
-        return _cannot_count(body.model, f"its backend could not be reached ({type(e).__name__})")
-    return JSONResponse(content={"input_tokens": counted})
+        return _Count(reason=f"its backend could not be reached ({type(e).__name__})")
+    return _Count(tokens=tokens)
 
 
 # --------------------------------------------------------------------------- #
@@ -1255,6 +1290,47 @@ async def _stream_responses(
             model=served_model, finish=response.finishReason, usage=response.usage
         ):
             yield chunk
+
+
+@router.post("/v1/responses/input_tokens")
+async def count_response_input_tokens(request: Request) -> Any:
+    """OpenAI's `/v1/responses/input_tokens` (P2c): the body translated as
+    `/v1/responses` translates it and counted by the backend, the way
+    `/v1/messages/count_tokens` counts. A count it cannot give is a 400
+    saying why; OpenRouter has no such endpoint (measured)."""
+    try:
+        await responses.authorize(request)
+    except responses.Refusal as refusal:
+        return refusal.response()
+    try:
+        raw = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        return responses.error_response(400, "body: must be valid JSON.", param="body")
+    if not isinstance(raw, dict):
+        return responses.error_response(400, "body: must be a JSON object.", param="body")
+    raw = {k: v for k, v in raw.items() if k != "stream"}
+    try:
+        translated = await run_in_threadpool(
+            lambda: responses.translate_request(raw, max_images=max_images(_store(request)))
+        )
+    except responses.Refusal as refusal:
+        return refusal.response()
+    body = translated.request
+    counted = await _counted(request, body)
+    if counted.failure is not None:
+        return counted.failure.as_responses()
+    if counted.rejected is not None:
+        return responses.error_response(
+            400, f"The backend rejected this request: {counted.rejected}", param="input"
+        )
+    if counted.reason is not None:
+        return responses.error_response(
+            400,
+            f"Cannot count tokens for {body.model!r} without generating: {counted.reason}. "
+            "Nothing was sent to the model.",
+            param="model",
+        )
+    return JSONResponse(content={"object": "response.input_tokens", "input_tokens": counted.tokens})
 
 
 @router.post("/v1/responses")
@@ -1766,8 +1842,18 @@ def _to_generate_request(
                 ("frequency_penalty", "frequencyPenalty"),
                 ("presence_penalty", "presencePenalty"),
                 ("parallel_tool_calls", "parallelToolCalls"),
+                # P2c. `logprobs: false` asks for nothing, so it is not a
+                # setting a backend must honour; only true is.
+                ("logprobs", "logprobs"),
+                ("logit_bias", "logitBias"),
+                ("reasoning_effort", "reasoningEffort"),
+                ("verbosity", "verbosity"),
+                ("prediction", "prediction"),
+                ("web_search_options", "webSearchOptions"),
             )
-            if getattr(body, source) is not None
+            if (
+                body.logprobs is True if source == "logprobs" else getattr(body, source) is not None
+            )
         ]
         or None,
         messages=[_to_driver_message(m) for m in body.messages],
@@ -1802,6 +1888,31 @@ def _to_generate_request(
         frequencyPenalty=body.frequency_penalty,
         presencePenalty=body.presence_penalty,
         parallelToolCalls=body.parallel_tool_calls,
+        # P2c: the settings a backend must honour or not be asked, and
+        # the hints it may drop. Caller-only, like the seed.
+        logprobs=True if body.logprobs is True else None,
+        topLogprobs=body.top_logprobs if body.logprobs is True else None,
+        logitBias=body.logit_bias,
+        reasoningEffort=DriverReasoningEffort(body.reasoning_effort.value)
+        if body.reasoning_effort is not None
+        else None,
+        verbosity=DriverVerbosity(body.verbosity.value) if body.verbosity is not None else None,
+        prediction=DriverPrediction.model_validate(body.prediction.model_dump(mode="json"))
+        if body.prediction is not None
+        else None,
+        webSearchOptions=DriverWebSearchOptions.model_validate(
+            body.web_search_options.model_dump(mode="json", exclude_none=True)
+        )
+        if body.web_search_options is not None
+        else None,
+        promptCacheKey=body.prompt_cache_key,
+        promptCacheRetention=DriverPromptCacheRetention(body.prompt_cache_retention.value)
+        if body.prompt_cache_retention is not None
+        else None,
+        serviceTier=DriverServiceTier(body.service_tier.value)
+        if body.service_tier is not None
+        else None,
+        safetyIdentifier=body.safety_identifier,
         # A spoken answer (P2b). The driver asks the backend for a pcm16
         # stream whatever the format; this format says what to make of it.
         audioOutput=AudioOutputRequest(
@@ -2146,6 +2257,46 @@ def _routing_info(
     )
 
 
+def _to_openai_logprobs(raw: Any) -> ChatLogprobs | None:
+    """The driver's logprobs (OpenAI's shape already) as the door's type."""
+    if raw is None:
+        return None
+    data = raw if isinstance(raw, dict) else raw.model_dump(mode="json", exclude_none=True)
+    try:
+        return ChatLogprobs.model_validate(data)
+    except ValueError:
+        log.debug("unreadable logprobs from a driver (omitted)")
+        return None
+
+
+def _to_openai_annotations(raw: Any) -> list[ChatAnnotation] | None:
+    """The driver's citations as the door's type, or None for none."""
+    out: list[ChatAnnotation] = []
+    for item in raw or []:
+        data = item if isinstance(item, dict) else item.model_dump(mode="json", exclude_none=True)
+        try:
+            out.append(ChatAnnotation.model_validate(data))
+        except ValueError:
+            log.debug("unreadable citation from a driver (omitted)")
+    return out or None
+
+
+def _to_legacy_function_call(response: GenerateResponse) -> FunctionCall | None:
+    """The answer's one call in the deprecated `function_call` shape (P2c).
+    The old API had one call per turn and `parallel_tool_calls` was sent
+    false, so a second call is not expected; if one came, the first is it."""
+    calls = response.toolCalls or []
+    if not calls:
+        return None
+    return FunctionCall(name=calls[0].function.name, arguments=calls[0].function.arguments)
+
+
+def _legacy_finish(finish: FinishReason, legacy: bool) -> FinishReason:
+    """`tool_calls` as the deprecated `function_call`, for a caller that
+    sent `functions`."""
+    return FinishReason.function_call if legacy and finish is FinishReason.tool_calls else finish
+
+
 def _to_openai_audio(response: GenerateResponse) -> ChatCompletionAudio | None:
     """The driver's assembled clip as OpenAI's `message.audio`, with the
     format the bytes are rather than the one asked (P2-2)."""
@@ -2191,6 +2342,7 @@ def _to_chat_completion(
     usage = _openai_usage(response.usage)
     truncated = _prompt_truncated(body, response.usage)
     _warn_if_truncated(truncated, body, response.usage, getattr(client, "served_by", None))
+    legacy = chat_contract.uses_functions(body)
     return ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex}",
         object="chat.completion",
@@ -2210,10 +2362,13 @@ def _to_chat_completion(
                     # `max_tokens` answered with an empty `content` and
                     # nothing to say why.
                     reasoning_content=response.reasoning,
-                    tool_calls=_to_openai_tool_calls(response.toolCalls),
+                    tool_calls=None if legacy else _to_openai_tool_calls(response.toolCalls),
+                    function_call=_to_legacy_function_call(response) if legacy else None,
                     audio=_to_openai_audio(response),
+                    annotations=_to_openai_annotations(response.annotations),
                 ),
-                finish_reason=_finish_reason(response),
+                logprobs=_to_openai_logprobs(response.logprobs),
+                finish_reason=_legacy_finish(_finish_reason(response), legacy),
             )
         ],
         usage=usage,
@@ -2276,6 +2431,7 @@ async def _stream_completion(
         model: str,
         usage: Any = None,
         routing: CompletionRoutingInfo | None = None,
+        logprobs: ChatLogprobs | None = None,
     ) -> ChatCompletionChunk:
         return ChatCompletionChunk(
             id=completion_id,
@@ -2286,6 +2442,7 @@ async def _stream_completion(
                 ChatCompletionChunkChoice(
                     index=0,
                     delta=delta,
+                    logprobs=logprobs,
                     finish_reason=finish,  # type: ignore[arg-type]
                 )
             ],
@@ -2293,6 +2450,7 @@ async def _stream_completion(
             x_eugene_plexus=routing,
         )
 
+    legacy = chat_contract.uses_functions(body)
     with collect_attempts() as tries:
         emitted_role = False
         response: GenerateResponse | None = None
@@ -2349,6 +2507,24 @@ async def _stream_completion(
                     # the first event of any kind, so a backend that
                     # dies here truncates rather than splicing half a
                     # call onto another model's.
+                    if legacy:
+                        # The deprecated shape: one call, as `function_call`
+                        # fragments with no index or id (P2c).
+                        for fragment in event.tool_calls:
+                            function = fragment.get("function") or {}
+                            yield frame(
+                                envelope(
+                                    delta=Delta(
+                                        function_call=FunctionCallDelta(
+                                            name=function.get("name"),
+                                            arguments=function.get("arguments"),
+                                        )
+                                    ),
+                                    finish=None,
+                                    model=body.model,
+                                )
+                            )
+                        continue
                     yield frame(
                         envelope(
                             delta=Delta(tool_calls=_to_openai_tool_call_deltas(event.tool_calls)),
@@ -2369,6 +2545,16 @@ async def _stream_completion(
                         )
                     )
                     continue
+                if event.annotations:
+                    # Citations, as the provider streams them (P2c).
+                    yield frame(
+                        envelope(
+                            delta=Delta(annotations=_to_openai_annotations(event.annotations)),
+                            finish=None,
+                            model=body.model,
+                        )
+                    )
+                    continue
                 if event.audio:
                     # A fragment of the spoken answer (P2b), forwarded as
                     # it lands. Past the commit point like any output.
@@ -2381,7 +2567,12 @@ async def _stream_completion(
                     )
                     continue
                 yield frame(
-                    envelope(delta=Delta(content=event.text), finish=None, model=body.model)
+                    envelope(
+                        delta=Delta(content=event.text),
+                        finish=None,
+                        model=body.model,
+                        logprobs=_to_openai_logprobs(event.logprobs),
+                    )
                 )
         except (DriverError, httpx.HTTPError) as e:
             # An error after the stream has been opened cannot become an
@@ -2473,7 +2664,7 @@ async def _stream_completion(
         yield frame(
             envelope(
                 delta=Delta(),
-                finish=_finish_reason(response),
+                finish=_legacy_finish(_finish_reason(response), legacy),
                 model=served_model,
                 usage=usage if body.stream_options is None else None,
                 routing=_routing_info(

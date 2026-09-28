@@ -77,20 +77,19 @@ def parse_request(raw: Any, *, max_images: int = DEFAULT_MAX_IMAGES) -> ChatComp
         body["max_tokens"] = new
 
     # Opaque client annotations do not control inference or establish identity.
-    # They are deliberately neither stored nor forwarded as provider metadata.
-    for field in ("metadata", "safety_identifier"):
-        value = body.pop(field, None)
-        if value is not None:
-            if field == "metadata":
-                if not isinstance(value, dict) or not all(
-                    isinstance(k, str) and isinstance(v, str) for k, v in value.items()
-                ):
-                    raise Refusal(field, "must be an object of strings or null")
-            elif not isinstance(value, str):
-                raise Refusal(field, "must be a string or null")
+    # `metadata` is deliberately neither stored nor forwarded as provider
+    # metadata. `safety_identifier` was popped here too until P2c
+    # (2026-09-28); it is a hint carried to OpenAI's own API now, validated
+    # by the schema like any other field.
+    value = body.pop("metadata", None)
+    if value is not None and (
+        not isinstance(value, dict)
+        or not all(isinstance(k, str) and isinstance(v, str) for k, v in value.items())
+    ):
+        raise Refusal("metadata", "must be an object of strings or null")
 
     # Common SDK defaults with exactly the behavior this endpoint provides.
-    for field, neutral in {"n": 1, "logprobs": False, "store": False}.items():
+    for field, neutral in {"n": 1, "store": False}.items():
         value = body.pop(field, None)
         if value is not None and (type(value) is not type(neutral) or value != neutral):
             raise Refusal(field, f"only {str(neutral).lower()} is supported")
@@ -104,6 +103,7 @@ def parse_request(raw: Any, *, max_images: int = DEFAULT_MAX_IMAGES) -> ChatComp
                 raise Refusal(f"stream_options.{flag}", "must be a boolean")
         if body.get("stream") is not True:
             raise Refusal("stream_options", "requires stream true")
+    _translate_functions(body)
     # Before the schema, so `{"id": ...}` -- the shape OpenAI takes here --
     # is told why rather than which of the response's fields it lacks.
     for index, message in enumerate(body.get("messages") or []):
@@ -140,7 +140,78 @@ def parse_request(raw: Any, *, max_images: int = DEFAULT_MAX_IMAGES) -> ChatComp
     except ImageRefusal as exc:
         raise Refusal(exc.field, exc.reason) from None
     _check_audio_output(parsed)
+    if parsed.top_logprobs is not None and parsed.logprobs is not True:
+        raise Refusal("top_logprobs", "requires logprobs true")
     return parsed
+
+
+def uses_functions(parsed: ChatCompletionRequest) -> bool:
+    """Whether the caller used the deprecated `functions`, and so reads the
+    answer in the deprecated shape (P2c)."""
+    return parsed.functions is not None
+
+
+def _translate_functions(body: dict[str, Any]) -> None:
+    """The deprecated `functions`, `function_call` and `function` role, as
+    tools, in the raw body before the schema reads it (P2c).
+
+    OpenAI deprecated them for tools, which are the same thing with every
+    tool a function; clients built on the old shape still send it. So they
+    are carried rather than refused, and `functions` stays on the request
+    as the mark that the answer goes back in the old shape. One call per
+    turn, as the old API gave: `parallel_tool_calls` defaults to false.
+    """
+    functions = body.get("functions")
+    if body.get("function_call") is not None and functions is None:
+        raise Refusal("function_call", "requires functions")
+    if functions is not None:
+        if body.get("tools") is not None:
+            raise Refusal("functions", "cannot be sent with tools; send one or the other")
+        if body.get("tool_choice") is not None:
+            raise Refusal("tool_choice", "cannot be sent with functions; use function_call")
+        if isinstance(functions, list):
+            body["tools"] = [{"type": "function", "function": f} for f in functions]
+        choice = body.get("function_call")
+        if isinstance(choice, str):
+            body["tool_choice"] = choice
+        elif isinstance(choice, dict):
+            body["tool_choice"] = {"type": "function", "function": {"name": choice.get("name")}}
+        body.setdefault("parallel_tool_calls", False)
+    # The history, which may be in the old shape whichever the request is:
+    # each `function` result answers the assistant `function_call` before
+    # it, so they are paired in order and given one id.
+    pending: list[str] = []
+    for index, message in enumerate(body.get("messages") or []):
+        if not isinstance(message, dict):
+            continue
+        call = message.get("function_call")
+        if call is not None:
+            if message.get("role") != "assistant":
+                raise Refusal(
+                    f"messages[{index}].function_call", "is accepted only on assistant messages"
+                )
+            if message.get("tool_calls"):
+                raise Refusal(f"messages[{index}].function_call", "cannot be sent with tool_calls")
+            if isinstance(call, dict):
+                call_id = f"call_function_{index}"
+                message["tool_calls"] = [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": call.get("name"), "arguments": call.get("arguments")},
+                    }
+                ]
+                del message["function_call"]
+                pending.append(call_id)
+        if message.get("role") == "function":
+            if not pending:
+                raise Refusal(
+                    f"messages[{index}]",
+                    "a function result must follow the assistant function_call it answers",
+                )
+            message["role"] = "tool"
+            message["tool_call_id"] = pending.pop(0)
+            message.pop("name", None)
 
 
 def wants_audio(parsed: ChatCompletionRequest) -> bool:
