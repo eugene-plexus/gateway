@@ -508,6 +508,29 @@ def test_a_second_account_is_tried_only_when_the_first_could_not_do_the_job(sett
     assert other.asked == [], "a refused query would be refused again in the same words"
 
 
+def test_when_every_account_fails_the_model_is_told_each_reason_first_first(settings) -> None:
+    """An unreachable second account must not hide the first one's reason,
+    which is the one an operator has to fix (found on a slow CI runner,
+    2026-09-29: the model was told only "could not be reached")."""
+    json_off = FakeSearch(
+        error=ToolDriverError(
+            driver="searx",
+            status=502,
+            detail="SearXNG refused JSON output; add json to search.formats",
+        )
+    )
+    gone = FakeSearch(
+        error=ToolDriverError(driver="brave", status=0, detail="could not be reached")
+    )
+    model = ScriptedDriver(turns=[Turn(calls=[search_call()]), Turn("answered without it")])
+    accounts = [account(json_off, "searx"), account(gone, "brave")]
+    with TestClient(app_with(settings, model, searches=accounts)) as c:
+        assert chat(c).status_code == 200
+    told = model.calls[1].messages[-1].content
+    assert "searx: SearXNG refused JSON output" in told and "brave: could not be reached" in told
+    assert told.index("search.formats") < told.index("could not be reached")
+
+
 # --------------------------------------------------------------------------- #
 # A backend that searches itself
 # --------------------------------------------------------------------------- #

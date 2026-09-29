@@ -497,12 +497,20 @@ class SearchRunner:
             }
         )
         last: ToolDriverError | None = None
+        #: Every account's reason, in the order tried: the first is the one an
+        #: operator most likely has to fix (free accounts are tried first),
+        #: and a later, unreachable one must not hide it (found by the P8
+        #: acceptance on a slow CI runner, 2026-09-29).
+        reasons: list[str] = []
+        first: ToolDriverError | None = None
         for account in self.table.search_accounts(WEB_SEARCH):
             execution.driver, execution.node = account.name, account.node
             try:
                 answer: SearchAnswer = await account.client.web_search(request)
             except ToolDriverError as exc:
                 last = exc
+                first = first or exc
+                reasons.append(f"{account.name}: {exc.detail}")
                 log.info("search account %r failed: %s", account.name, exc.detail)
                 if not exc.worth_another_account:
                     break
@@ -519,12 +527,13 @@ class SearchRunner:
             execution.error = "no search account could be reached"
             execution.error_code = "unavailable"
         else:
-            execution.error = last.detail
+            execution.error = last.detail if len(reasons) < 2 else "; ".join(reasons)
+            code_from = first or last
             execution.error_code = (
                 "too_many_requests"
-                if last.status == 429
+                if code_from.status == 429
                 else "invalid_input"
-                if last.status == 400
+                if code_from.status == 400
                 else "unavailable"
             )
         return execution
