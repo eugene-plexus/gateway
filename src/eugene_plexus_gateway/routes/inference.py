@@ -1711,6 +1711,19 @@ def _text_completion(
     }
 
 
+def _completion_routing(prepared: _Serving, model: str) -> dict[str, Any]:
+    """What served a completion, for the answer and a stream's finishing
+    frame. Missing until the playground's browser run looked for it (U7)."""
+    return _routing_info(
+        prepared.client,
+        prepared.table,
+        model,
+        prepared.started,
+        waited_ms=prepared.waited_ms,
+        swapped_in=prepared.swapped_in,
+    ).model_dump(mode="json", exclude_none=True)
+
+
 def _completion_usage(usage: Any) -> dict[str, Any] | None:
     if usage is None or (usage.promptTokens is None and usage.completionTokens is None):
         return None
@@ -1834,6 +1847,7 @@ async def create_completion(request: Request) -> Any:
     usage = _completion_usage(response.usage)
     if usage is not None:
         content["usage"] = usage
+    content["x_eugene_plexus"] = _completion_routing(prepared, body.model)
     return JSONResponse(content=content)
 
 
@@ -1936,6 +1950,7 @@ async def _stream_text_completion(
                         "finish_reason": _completion_finish(response.finishReason),
                     }
                 ],
+                x_eugene_plexus=_completion_routing(prepared, model),
             )
         )
         usage = _completion_usage(response.usage)

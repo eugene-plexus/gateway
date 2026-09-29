@@ -91,6 +91,9 @@ def test_the_prompt_goes_to_the_driver_as_written_and_comes_back_as_text(
     assert sent.completion.suffix is None and sent.messages == []
     assert (sent.maxTokens, sent.temperature) == (8, 0.01)
     assert (rows[0]["door"], rows[0]["servedModel"]) == ("completion", "coder")
+    # What served it, as chat's answer says (found missing by the U7 browser run).
+    assert body["x_eugene_plexus"]["driver"] == "a"
+    assert body["x_eugene_plexus"]["attempts"] == 1 and body["x_eugene_plexus"]["tier"] == 1
 
 
 def test_a_suffix_routes_only_to_a_model_that_fills_in_the_middle(settings: Settings) -> None:
@@ -177,6 +180,10 @@ def test_a_stream_is_text_completion_chunks_then_usage_then_done(settings: Setti
     assert finishes == ["length"]
     assert frames[-1]["choices"] == [] and frames[-1]["usage"]["completion_tokens"] == 3
     assert coder.calls[0].completion is not None
+    # The finishing frame says what served it, as chat's final frame does.
+    [finishing] = [f for f in frames if any(c["finish_reason"] for c in f["choices"])]
+    assert finishing["x_eugene_plexus"]["driver"] == "a"
+    assert all("x_eugene_plexus" not in f for f in frames if f is not finishing)
 
 
 def test_a_stream_without_include_usage_carries_no_usage_frame(settings: Settings) -> None:

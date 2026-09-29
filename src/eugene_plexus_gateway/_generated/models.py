@@ -3339,19 +3339,6 @@ class CompletionRequest(BaseModel):
     )
 
 
-class CompletionChunk(BaseModel):
-    """
-    One SSE `data:` frame. With `include_usage`, a last frame has `choices` empty and `usage`.
-    """
-
-    id: str
-    object: Literal['text_completion']
-    created: int
-    model: str
-    choices: list[CompletionChoice]
-    usage: CompletionUsage | None = None
-
-
 class ModerationInputPart(BaseModel):
     type: ModerationInputPartType
     text: str | None = None
@@ -3978,6 +3965,23 @@ class ModelList(BaseModel):
 
 
 class CompletionResponse(BaseModel):
+    id: str
+    object: Literal['text_completion']
+    created: int
+    model: str
+    choices: list[CompletionChoice]
+    usage: CompletionUsage | None = None
+    x_eugene_plexus: CompletionRoutingInfo | None = None
+
+
+class CompletionChunk(BaseModel):
+    """
+    One SSE `data:` frame. The frame with `finish_reason` carries
+    `x_eugene_plexus`, as chat's final frame does. With
+    `include_usage`, a last frame has `choices` empty and `usage`.
+
+    """
+
     id: str
     object: Literal['text_completion']
     created: int
