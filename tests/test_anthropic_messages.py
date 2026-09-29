@@ -320,13 +320,24 @@ def test_an_image_inside_a_tool_result_is_checked_too(settings: Settings) -> Non
 
 
 def test_a_server_side_tool_is_refused(settings: Settings) -> None:
-    """We have no web search to run and no sandbox to run code in."""
+    """No sandbox to run code in: any server tool but web search is refused.
+
+    **Amended at P8, not added to.** Web search runs here now; with no
+    search account the refusal says so (the loop's own tests are in
+    `test_server_tools.py`), and every other server tool is refused as
+    before.
+    """
     fake = FakeDriverClient(name="d1", model_id=MODEL, supports_tools=True)
     request = body(tools=[{"type": "web_search_20250305", "name": "web_search"}])
     with _client(_app_with(settings, fake)) as client:
         r = client.post("/v1/messages", json=request)
+        assert r.status_code == 400
+        assert "no search account is set up" in r.json()["error"]["message"]
+        assert fake.calls == [], "nothing is forwarded when the search cannot run"
+        code = body(tools=[{"type": "code_execution_20250522", "name": "code_execution"}])
+        r = client.post("/v1/messages", json=code)
     assert r.status_code == 400
-    assert "web_search" in r.json()["error"]["message"]
+    assert "code_execution" in r.json()["error"]["message"]
 
 
 def test_mcp_servers_is_refused(settings: Settings) -> None:

@@ -326,7 +326,11 @@ class ComponentKind(StrEnum):
     `gateway` is the one OpenAI-compatible front door and there is
     exactly one. `inference-driver` instances are the per-backend
     wrappers and there are N — one per backend, wherever that
-    backend lives. `library` scans the operator's model
+    backend lives. `tool-driver` instances (P8, 2026-09-29) run the
+    tools the hub runs itself — `web_search` — one per tool provider
+    account (a SearXNG, a Brave subscription), and there are zero or
+    more; the gateway runs the loop that offers a tool to a model and
+    calls a tool-driver when the model uses it. `library` scans the operator's model
     directories and holds per-model launch profiles; there is
     exactly one, and it is deliberately not in the request path.
 
@@ -344,6 +348,7 @@ class ComponentKind(StrEnum):
     gateway = 'gateway'
     inference_driver = 'inference-driver'
     library = 'library'
+    tool_driver = 'tool-driver'
 
 
 class ComputeDeviceKind(StrEnum):
@@ -2238,7 +2243,12 @@ class AnthropicContentBlock(BaseModel):
     `signature`) -- returned ahead of the answer when the request
     enabled thinking, and read back on an assistant turn as that
     turn's reasoning. `redacted_thinking` is accepted on the way in
-    and dropped.
+    and dropped. `server_tool_use` and `web_search_tool_result` (P8)
+    are returned for a search this install ran and, handed back on
+    an assistant turn, become that turn's history: the query, and
+    each result's title, address and the excerpt the model read,
+    which `encrypted_content` carries (readable only here, as a
+    thinking block's `signature` is).
 
     `document` was refused with a 400 until 2026-09-28, and `image`
     until 2026-09-23, on one reasoning: a model that never received
@@ -2309,10 +2319,11 @@ class AnthropicToolDefinition(BaseModel):
 
     A definition carrying a `type` naming a server-side tool —
     anything this gateway would have to execute itself, rather than
-    hand back to the caller — is refused with a 400. This control
-    plane routes to local engines; it has no web search to run and
-    no sandbox to run code in, and pretending otherwise would fail
-    at the moment the model chose to use one.
+    hand back to the caller — is refused with a 400, **except web
+    search** (`web_search_<date>`), which this install's search
+    account runs since P8. There is no sandbox to run code in, and
+    pretending otherwise would fail at the moment the model chose to
+    use one.
 
     """
 
@@ -2391,6 +2402,16 @@ class StopReason(Enum):
     NoneType_None = None
 
 
+class ServerToolUse(BaseModel):
+    """
+    Present when this install ran searches for the request (P8):
+    `{"web_search_requests": N}`, as Anthropic reports its own.
+
+    """
+
+    web_search_requests: int | None = Field(None, ge=0)
+
+
 class AnthropicUsage(BaseModel):
     """
     Token counts, renamed from the backend's OpenAI-shaped `usage`.
@@ -2411,6 +2432,10 @@ class AnthropicUsage(BaseModel):
     output_tokens: int
     cache_creation_input_tokens: int | None = 0
     cache_read_input_tokens: int | None = 0
+    server_tool_use: ServerToolUse | None = Field(
+        None,
+        description='Present when this install ran searches for the request (P8):\n`{"web_search_requests": N}`, as Anthropic reports its own.\n',
+    )
 
 
 class Type4(StrEnum):
@@ -2531,7 +2556,9 @@ class ResponsesInputItem(BaseModel):
     (`call_id`, `name`, `arguments` as a JSON string),
     `function_call_output` (`call_id`, `output` as a string or a list
     of `input_text` / `input_image` parts), and `reasoning`
-    (`content` of `reasoning_text` parts, `encrypted_content`).
+    (`content` of `reasoning_text` parts, `encrypted_content`), and a
+    `web_search_call` handed back (P8), which becomes a line of the
+    assistant's history naming the search and its sources.
     Codex drops `id` and `status` when it sends items back
     (measured), so neither is required. Refused: `item_reference` and
     any other type.
@@ -2557,8 +2584,9 @@ class ResponsesInputItem(BaseModel):
 class ResponsesTool(BaseModel):
     """
     A `function` tool (`name`, `description`, `parameters`, `strict`)
-    maps onto an OpenAI chat function. `web_search` is accepted and
-    removed (see the endpoint); any other `type` is refused.
+    maps onto an OpenAI chat function. `web_search` runs on this
+    install's search account, or is removed and named when it cannot
+    (see the endpoint); any other `type` is refused.
 
     """
 
@@ -2594,6 +2622,7 @@ class Type6(StrEnum):
     reasoning = 'reasoning'
     message = 'message'
     function_call = 'function_call'
+    web_search_call = 'web_search_call'
 
 
 class ResponsesOutputItem(BaseModel):
@@ -2602,8 +2631,10 @@ class ResponsesOutputItem(BaseModel):
     [{"type": "reasoning_text", "text"}], "encrypted_content"?}`,
     `{"type": "message", "id", "role": "assistant", "status",
     "content": [{"type": "output_text", "text", "annotations": []}]}`,
-    or `{"type": "function_call", "id", "status", "call_id", "name",
-    "arguments"}`.
+    `{"type": "function_call", "id", "status", "call_id", "name",
+    "arguments"}`, or, for a search this install ran (P8),
+    `{"type": "web_search_call", "id", "status", "action": {"type":
+    "search", "query", "sources": [{"type": "url", "url"}]}}`.
 
     """
 
@@ -2909,6 +2940,41 @@ class MetricAttempt(BaseModel):
 class Outcome(StrEnum):
     served = 'served'
     error = 'error'
+
+
+class MetricToolOutcome(StrEnum):
+    """
+    `over_limit` is a call past the request's limit, answered without
+    running. Named rather than inline: an inline `outcome` enum here
+    generated as `Outcome1` beside the request's own `Outcome` (the S6
+    trap).
+
+    """
+
+    ok = 'ok'
+    error = 'error'
+    over_limit = 'over_limit'
+
+
+class MetricToolExecution(BaseModel):
+    tool: str = Field(..., description='The tool that ran -- `web_search`.')
+    driver: str | None = Field(
+        None,
+        description='The tool-driver (search account) that ran it; null when none was asked.',
+    )
+    node: str | None = None
+    provider: str | None = Field(
+        None, description="The account's provider, `searxng` or `brave`."
+    )
+    version: str | None = Field(
+        None,
+        description="How the caller named the tool: `web_search_options`,\n`web_search`, or Anthropic's dated `web_search_20250305` -- kept\nso a new date is noticed rather than discovered.\n",
+    )
+    outcome: MetricToolOutcome
+    results: int | None = Field(
+        None, description='How many results the model was given.'
+    )
+    elapsedMs: int = Field(..., ge=0)
 
 
 class MetricCandidate(BaseModel):
@@ -3534,6 +3600,11 @@ class CompletionRoutingInfo(BaseModel):
         description='How many backends were tried. Greater than 1 means the\npriority-list cascade fired and an earlier backend failed.\n',
         ge=1,
     )
+    web_searches: int | None = Field(
+        None,
+        description='How many web searches this install ran for the request (P8).\nAbsent when none ran, and when the backend searched itself.\n',
+        ge=0,
+    )
     tier: int | None = Field(
         None,
         description="Which tier of the slot answered, 1-based. Greater than 1\nmeans every backend in an earlier tier was ineligible or\nfailed — a cloud target answering for a local model, say.\n\n**Positional, counted over the slot's tiers rather than over\nthe ones that had anything in them**, which is the only\nreading that answers the question this field exists for:\n*did the primary serve this?* A primary whose companion\ndriver is down is a tier with no backends, and it still\noccupies its number. See `ModelRoutingInfo.tiers` for which\ntier can be absent and why.\n",
@@ -3880,6 +3951,10 @@ class MetricRequest(BaseModel):
     )
     outcome: Outcome
     tries: list[MetricAttempt] = Field(..., min_length=0)
+    webSearches: list[MetricToolExecution] | None = Field(
+        None,
+        description="Each search this install ran for the request (P8, schema v10),\nin order. **No query text is kept**, by A5's rule that no prompt\nis kept: a query is made from the prompt.\n",
+    )
 
 
 class MetricRequestPage(BaseModel):

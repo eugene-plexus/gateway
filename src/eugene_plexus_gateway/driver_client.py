@@ -140,6 +140,12 @@ class StreamEvent:
     Only a request with `reportProgress` gets any."""
     done: bool = False
     result: GenerateResponse | None = None
+    search: Any = None
+    """A search the gateway itself is running for this answer (P8), as a
+    `server_tools.SearchUpdate`. Never from a driver: the search loop
+    yields it between a model's turns, and each door renders it in its own
+    vocabulary (a `web_search_call` item, a `server_tool_use` block) or
+    not at all (chat)."""
 
 
 def _problem_from_bytes(raw: bytes) -> Problem | None:
@@ -980,11 +986,28 @@ class TieredClient:
         #: The published id of the model that answered -- a slot's target,
         #: prefixed for an account. Set with `served_by`.
         self.served_model: str | None = None
+        #: The candidate that answered the last call, for `pin`.
+        self.served_candidate: DriverClient | None = None
         self.tier = 0
 
     @property
     def candidates(self) -> list[DriverClient]:
         return [c for tier in self._tiers for c in tier]
+
+    def pin(self) -> None:
+        """Send every later call to the backend that answered, and only to it.
+
+        P8's rule: **failover ends at the first search**. A model call
+        after a search is a turn of one answer whose conversation now holds
+        that search's results; another backend continuing it would be the
+        seam M10 forbids for tokens. The empty tiers in front keep `tier`
+        counting the slot's tiers, so a pinned tier-2 backend still reports
+        2 on every turn.
+        """
+        served = self.served_candidate
+        if served is None:
+            return
+        self._tiers = [[] for _ in range(max(0, self.tier - 1))] + [[served]]
 
     async def info(self, *, models: bool = True, model: str | None = None) -> DriverInfo:
         """Report the first reachable backend's `/v1/info`.
@@ -1072,6 +1095,7 @@ class TieredClient:
                     self.served_by = driver
                     self.served_model = getattr(candidate, "public_model", None)
                     self.served_by_node = node
+                    self.served_candidate = candidate
                     self.tier = tier_index + 1
                     return result
         # Every backend failed in a cascade-eligible way. Re-raise the
@@ -1634,6 +1658,7 @@ class TieredClient:
                     self.served_by = driver
                     self.served_model = getattr(candidate, "public_model", None)
                     self.served_by_node = node
+                    self.served_candidate = candidate
                     self.tier = tier_index + 1
                     return
                 finally:

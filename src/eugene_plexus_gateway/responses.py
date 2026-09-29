@@ -31,7 +31,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import ValidationError
 
-from . import chat_contract, images
+from . import chat_contract, images, server_tools
 from ._generated.models import (
     ChatCompletionMessage,
     ChatCompletionRequest,
@@ -292,11 +292,32 @@ class Translated:
     include_reasoning: bool = False
     #: The request's settings, echoed on the response object as OpenAI does.
     echo: dict[str, Any] = field(default_factory=dict)
+    #: A `web_search` tool that may run here (P8), or None.
+    search: server_tools.SearchPlan | None = None
+    #: Why a `web_search` tool was removed rather than run, when it was.
+    search_reason: str | None = None
 
     def headers(self) -> dict[str, str]:
-        if not self.ignored:
-            return {}
-        return {"x-eugene-plexus-ignored-settings": ", ".join(dict.fromkeys(self.ignored))}
+        out: dict[str, str] = {}
+        if self.ignored:
+            out["x-eugene-plexus-ignored-settings"] = ", ".join(dict.fromkeys(self.ignored))
+        if self.search_reason:
+            # A header value is latin-1: the reason is ours and plain ASCII,
+            # but a dash from a person's words would not be, so it is kept safe.
+            out["x-eugene-plexus-web-search"] = f"not run: {self.search_reason}".encode(
+                "ascii", "replace"
+            ).decode()
+        return out
+
+    def run_search(self) -> server_tools.SearchPlan | None:
+        """The search is going to run: it is no longer an ignored setting."""
+        self.ignored = [i for i in self.ignored if i != "tools.web_search"]
+        return self.search
+
+    def skip_search(self, reason: str) -> None:
+        """The search cannot run here: removed, as before P8, and why said."""
+        self.search = None
+        self.search_reason = reason
 
 
 def _name(value: Any) -> str:
@@ -347,15 +368,19 @@ def _response_format(text: Mapping[str, Any]) -> ResponseFormat | None:
     raise Refusal(f"text.format.type: {_name(kind)!s} is not supported.", param="text")
 
 
-def _tools(definitions: Any, ignored: list[str]) -> list[Tool] | None:
-    """Function tools as the chat shape; `web_search` removed and named.
+def _tools(
+    definitions: Any, ignored: list[str], searches: list[Mapping[str, Any]] | None = None
+) -> list[Tool] | None:
+    """Function tools as the chat shape; `web_search` set aside and named.
 
     `web_search` rides on **every** Codex request (record §1). Refusing it
     would refuse the first request of every session -- `/v1/messages` did
-    exactly that with `output_config` -- so it is taken off and named on
-    the ignored-settings header: there is no search here to run, and the
-    model is never told there is. Every other server-side tool is refused,
-    because the model would be offered something that cannot happen.
+    exactly that with `output_config` -- so it is taken off the function
+    list and named on the ignored-settings header. Since P8 its definition
+    is kept in `searches`, so the route can run it when a search can run
+    here and leave it removed when not. Every other server-side tool is
+    refused, because the model would be offered something that cannot
+    happen.
     """
     if definitions is None:
         return None
@@ -368,6 +393,8 @@ def _tools(definitions: Any, ignored: list[str]) -> list[Tool] | None:
         kind = definition.get("type")
         if isinstance(kind, str) and kind.startswith("web_search"):
             ignored.append("tools.web_search")
+            if searches is not None:
+                searches.append(definition)
             continue
         if kind != "function":
             raise Refusal(
@@ -756,6 +783,29 @@ class _Conversation:
             )
         )
 
+    def web_search_call(self, item: Mapping[str, Any]) -> None:
+        """A search this gateway ran, handed back by the client (P8).
+
+        Codex sends its previous output items back as input. The item
+        carries the query and the sources, not the excerpts the model read,
+        so it becomes a line of the assistant's turn naming both -- enough
+        for the model to know it searched and where it looked.
+        """
+        self._flush_hoisted()
+        self._assistant = True
+        given = item.get("action")
+        action: Mapping[str, Any] = given if isinstance(given, Mapping) else {}
+        query = action.get("query") if isinstance(action.get("query"), str) else ""
+        sources: list[str] = [
+            str(s["url"])
+            for s in action.get("sources") or []
+            if isinstance(s, Mapping) and isinstance(s.get("url"), str)
+        ]
+        note = f'[Searched the web for "{query}".' if query else "[Searched the web."
+        if sources:
+            note += " Sources: " + ", ".join(sources[:10])
+        self._parts.append(TextContentPart(type="text", text=note + "]"))
+
     def function_call_output(self, item: Mapping[str, Any], where: str) -> None:
         """A tool's result, as the `tool` message answering its call.
 
@@ -838,6 +888,8 @@ def _messages(
             conversation.function_call_output(item, where)
         elif kind == "reasoning":
             conversation.reasoning(item)
+        elif kind == "web_search_call":
+            conversation.web_search_call(item)
         elif kind == "item_reference":
             raise Refusal(
                 f"{where}: an item_reference names a stored item, and this gateway keeps no "
@@ -941,6 +993,25 @@ def translate_request(
 
     budget = images.ImageBudget(max_images)
     messages = _messages(raw, budget, ignored)
+    searches: list[Mapping[str, Any]] = []
+    tools = _tools(raw.get("tools"), ignored, searches)
+    search: server_tools.SearchPlan | None = None
+    search_reason: str | None = None
+    max_tool_calls = raw.get("max_tool_calls")
+    if max_tool_calls is not None and (type(max_tool_calls) is not int or max_tool_calls < 1):
+        raise Refusal("max_tool_calls: must be a positive JSON integer.", param="max_tool_calls")
+    if searches:
+        if searches[0].get("external_web_access") is False:
+            # Design call #2: Codex's default and its `cached` mode. The user
+            # did not ask for their prompt to leave the machine.
+            search_reason = (
+                "external_web_access is false (Codex's default); set web_search = "
+                '"live" in Codex to search'
+            )
+        else:
+            search = server_tools.plan_from_responses(
+                searches[0], max_tool_calls=max_tool_calls, has_functions=bool(tools)
+            )
     try:
         request = ChatCompletionRequest(
             model=model,
@@ -949,7 +1020,7 @@ def translate_request(
             temperature=_number(raw, "temperature", 0, 2),
             top_p=_number(raw, "top_p", 0, 1),
             stream=bool(raw.get("stream")),
-            tools=_tools(raw.get("tools"), ignored),
+            tools=tools,
             tool_choice=_tool_choice(raw.get("tool_choice")),
             parallel_tool_calls=raw.get("parallel_tool_calls"),
             response_format=_response_format(text),
@@ -963,6 +1034,8 @@ def translate_request(
         request=request,
         ignored=ignored,
         include_reasoning=include_reasoning,
+        search=search,
+        search_reason=search_reason,
         echo={
             "instructions": raw.get("instructions"),
             "tools": raw.get("tools") or [],
@@ -1055,14 +1128,96 @@ def reasoning_item(text: str, *, include_encrypted: bool, item_id: str | None = 
     return item
 
 
-def message_item(text: str, *, status: str = "completed", item_id: str | None = None) -> dict:
+def message_item(
+    text: str,
+    *,
+    status: str = "completed",
+    item_id: str | None = None,
+    annotations: list[dict[str, Any]] | None = None,
+) -> dict:
     return {
         "id": item_id or _item_id("msg"),
         "type": "message",
         "role": "assistant",
         "status": status,
-        "content": [{"type": "output_text", "text": text, "annotations": [], "logprobs": []}],
+        "content": [
+            {
+                "type": "output_text",
+                "text": text,
+                "annotations": annotations or [],
+                "logprobs": [],
+            }
+        ],
     }
+
+
+def url_citations(text: str, executions: list[Any]) -> list[dict[str, Any]]:
+    """The addresses `text` cites, in the Responses API's flat shape."""
+    return [
+        {
+            "type": "url_citation",
+            "start_index": a["url_citation"]["start_index"],
+            "end_index": a["url_citation"]["end_index"],
+            "url": a["url_citation"]["url"],
+            "title": a["url_citation"]["title"],
+        }
+        for a in server_tools.citations(text, executions)
+    ]
+
+
+def web_search_item(execution: Any, *, status: str = "completed") -> dict[str, Any]:
+    """One search this install ran, as OpenAI's `web_search_call` item.
+
+    `action.sources` is always there: the include that asks for it is the
+    only way OpenAI's own API returns it, and a caller reading a search
+    that says nothing about where it looked cannot check it.
+    """
+    return {
+        "id": f"ws_{execution.item_id}",
+        "type": "web_search_call",
+        "status": status
+        if status != "completed"
+        else ("completed" if execution.outcome == "ok" else "failed"),
+        "action": {
+            "type": "search",
+            "query": execution.query,
+            "sources": [
+                {"type": "url", "url": r.get("url")}
+                for r in execution.results
+                if isinstance(r.get("url"), str)
+            ],
+        },
+    }
+
+
+def transcript_items(
+    transcript: list[tuple[str, Any]],
+    *,
+    tool_calls: Any,
+    include_reasoning: bool,
+    status: str = "completed",
+) -> list[dict[str, Any]]:
+    """Output items in the order they happened: reasoning, text and each
+    search, then the caller's function calls (P8)."""
+    item_status = "incomplete" if status == "incomplete" else "completed"
+    searches = [value for kind, value in transcript if kind == "search"]
+    items: list[dict[str, Any]] = []
+    for kind, value in transcript:
+        if kind == "reasoning" and value:
+            items.append(reasoning_item(value, include_encrypted=include_reasoning))
+        elif kind == "text" and value:
+            items.append(
+                message_item(value, status=item_status, annotations=url_citations(value, searches))
+            )
+        elif kind == "search":
+            items.append(web_search_item(value))
+    for call in tool_calls or []:
+        items.append(
+            call_item(
+                call.id, call.function.name, call.function.arguments or "{}", status=item_status
+            )
+        )
+    return items
 
 
 def call_item(
@@ -1214,6 +1369,9 @@ class StreamTranslator:
         self._open: dict[str, Any] | None = None
         #: Open function calls by the driver's call index.
         self._calls: dict[int, dict[str, Any]] = {}
+        #: Searches this install has run for the response so far (P8), for
+        #: the citations on each message item as it closes.
+        self._searches: list[Any] = []
 
     # -- framing ----------------------------------------------------------
 
@@ -1286,8 +1444,22 @@ class StreamTranslator:
                 ),
             ]
         else:
-            done = message_item(text, status=status, item_id=item["id"])
+            cited = url_citations(text, self._searches) if self._searches else []
+            done = message_item(text, status=status, item_id=item["id"], annotations=cited)
             events = [
+                self.frame(
+                    "response.output_text.annotation.added",
+                    {
+                        "item_id": item["id"],
+                        "output_index": index,
+                        "content_index": 0,
+                        "annotation_index": position,
+                        "annotation": annotation,
+                    },
+                )
+                for position, annotation in enumerate(cited)
+            ]
+            events += [
                 self.frame(
                     "response.output_text.done",
                     {
@@ -1457,6 +1629,43 @@ class StreamTranslator:
                     )
                 )
         return events
+
+    def search(self, update: Any) -> list[str]:
+        """A search this install is running (P8), as OpenAI streams its own:
+        the item added, `in_progress` then `searching`; then `completed`
+        and the item done, carrying the query and the sources."""
+        execution = update.execution
+        item_id = f"ws_{execution.item_id}"
+        if update.phase == "started":
+            events = self._close_open() + self._close_calls()
+            index = self._next_index()
+            item = {"id": item_id, "type": "web_search_call", "status": "in_progress"}
+            events.append(
+                self.frame("response.output_item.added", {"output_index": index, "item": item})
+            )
+            for name in (
+                "response.web_search_call.in_progress",
+                "response.web_search_call.searching",
+            ):
+                events.append(self.frame(name, {"item_id": item_id, "output_index": index}))
+            # Counted as an item from here, so the next one is numbered after it.
+            self.output.append(item)
+            return events
+        index = next(
+            (i for i, it in enumerate(self.output) if it.get("id") == item_id), len(self.output)
+        )
+        done = web_search_item(execution)
+        if index < len(self.output):
+            self.output[index] = done
+        else:
+            self.output.append(done)
+        self._searches.append(execution)
+        return [
+            self.frame(
+                "response.web_search_call.completed", {"item_id": item_id, "output_index": index}
+            ),
+            self.frame("response.output_item.done", {"output_index": index, "item": done}),
+        ]
 
     # -- the end --------------------------------------------------------------
 

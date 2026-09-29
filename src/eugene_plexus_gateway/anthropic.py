@@ -33,7 +33,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
-from . import chat_contract, images, tokens
+from . import chat_contract, images, server_tools, tokens
 from ._generated.models import (
     AnthropicMessagesRequest,
     ChatCompletionMessage,
@@ -616,20 +616,24 @@ def _tools(definitions: Any) -> list[Tool] | None:
 
     A definition carrying a `type` is a **server-side** tool -- web
     search, code execution, a computer -- which this gateway would have
-    to run itself. It has nothing to run them with, so it refuses at the
-    door rather than at the moment the model chooses to use one, which
-    would be a failure with no good place to report it.
+    to run itself. **Web search it runs** (P8): a `web_search_<date>`
+    tool is set aside here and read by `search_plan`. Anything else it has
+    nothing to run with, so it refuses at the door rather than at the
+    moment the model chooses to use one, which would be a failure with no
+    good place to report it.
     """
     if not definitions:
         return None
     out: list[Tool] = []
     for definition in definitions:
         server_side = getattr(definition, "type", None)
+        if server_side and server_tools.ANTHROPIC_TOOL.match(str(server_side)):
+            continue
         if server_side:
             raise Refusal(
                 f"tools: {definition.name!r} is a server-side tool ({server_side}), which this "
-                "gateway cannot execute. It routes to local engines and hands tool calls back "
-                "to you; only client-side tools work here."
+                "gateway cannot execute. It runs web search itself and hands every other tool "
+                "call back to you; only client-side tools and web search work here."
             )
         out.append(
             Tool(
@@ -641,7 +645,65 @@ def _tools(definitions: Any) -> list[Tool] | None:
                 ),
             )
         )
-    return out
+    return out or None
+
+
+def search_plan(raw: Mapping[str, Any]) -> server_tools.SearchPlan | None:
+    """The request's `web_search_<date>` server tool, as a search plan (P8).
+
+    Claude Code's WebSearch is its own request offering exactly this tool
+    (`web_search_20250305`, `max_uses: 8`, measured), so on that request
+    search is the only tool and the model's first turn makes one.
+    """
+    tools = raw.get("tools")
+    if not isinstance(tools, list):
+        return None
+    search = next(
+        (
+            t
+            for t in tools
+            if isinstance(t, Mapping)
+            and isinstance(t.get("type"), str)
+            and server_tools.ANTHROPIC_TOOL.match(t["type"])
+        ),
+        None,
+    )
+    if search is None:
+        return None
+    functions = [t for t in tools if isinstance(t, Mapping) and not t.get("type")]
+    return server_tools.plan_from_anthropic(search, has_functions=bool(functions))
+
+
+def _search_history(block: Any) -> str | None:
+    """A search block handed back on an assistant turn, as text the model reads.
+
+    `server_tool_use` says what was searched; `web_search_tool_result`
+    what was found, each result's excerpt recovered from the
+    `encrypted_content` this door wrote (anyone else's is not readable
+    here, and only the title and address are kept).
+    """
+    kind = _field(block, "type")
+    if kind == "server_tool_use":
+        query = (
+            (_field(block, "input") or {}).get("query")
+            if isinstance(_field(block, "input"), Mapping)
+            else None
+        )
+        return f'[Searched the web for "{query}".]' if query else "[Searched the web.]"
+    content = _field(block, "content")
+    if content is not None and not isinstance(content, list):
+        return f"[The web search failed: {_field(content, 'error_code') or 'unavailable'}.]"
+    lines = ["[Web search results:"]
+    for index, result in enumerate(content or [], start=1):
+        # A model or a dict, as everywhere in this translator.
+        url = _field(result, "url")
+        if not isinstance(url, str):
+            continue
+        lines.append(f"{index}. {_field(result, 'title') or url} {url}")
+        excerpt = decode_signature(_field(result, "encrypted_content"))
+        if excerpt:
+            lines.append(f"   {excerpt}")
+    return "\n".join(lines) + "]"
 
 
 def translate_request(
@@ -743,6 +805,13 @@ def translate_request(
                 thought = _field(block, "thinking") or decode_signature(_field(block, "signature"))
                 if thought:
                     reasoning_parts.append(str(thought))
+            elif kind in ("server_tool_use", "web_search_tool_result"):
+                # A search this door ran, handed back (P8). Folded into the
+                # turn's text: the model reads what it searched and found,
+                # and no tool call is left without its result.
+                note = _search_history(block)
+                if note:
+                    parts.append(TextContentPart(type="text", text=note))
             elif kind == "tool_use":
                 # The inbound half. Without it a tool loop cannot
                 # continue past its first turn, because the assistant
@@ -873,7 +942,7 @@ def stop_reason(finish: Any) -> str:
     return _STOP_REASON_BY_FINISH.get(getattr(finish, "value", str(finish)), "end_turn")
 
 
-def usage_block(usage: Any) -> dict[str, int]:
+def usage_block(usage: Any, *, web_searches: int = 0) -> dict[str, Any]:
     """Token counts, renamed -- and split the way Anthropic splits them.
 
     **Anthropic's `input_tokens` excludes cached input**: a client that
@@ -891,12 +960,68 @@ def usage_block(usage: Any) -> dict[str, int]:
     prompt = getattr(usage, "promptTokens", 0) or 0
     cached = getattr(usage, "cachedPromptTokens", None) or 0
     cached = min(cached, prompt)
-    return {
+    block: dict[str, Any] = {
         "input_tokens": prompt - cached,
         "output_tokens": getattr(usage, "completionTokens", 0) or 0,
         "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": cached,
     }
+    if web_searches:
+        # As Anthropic reports its own searches (P8).
+        block["server_tool_use"] = {"web_search_requests": web_searches}
+    return block
+
+
+def search_blocks(execution: Any) -> list[dict[str, Any]]:
+    """One search as Anthropic's two blocks: what was searched, what was found.
+
+    `encrypted_content` is this door's carrier, as a thinking block's
+    signature is: the excerpt the model read, readable only here, so a
+    client that hands the blocks back gives the model its results again.
+    A failure is Anthropic's error block with its own error codes.
+    """
+    tool_use_id = f"srvtoolu_{execution.item_id}"
+    use = {
+        "type": "server_tool_use",
+        "id": tool_use_id,
+        "name": "web_search",
+        "input": {"query": execution.query},
+    }
+    if execution.outcome != "ok":
+        content: Any = {
+            "type": "web_search_tool_result_error",
+            "error_code": execution.error_code or "unavailable",
+        }
+    else:
+        content = [
+            {
+                "type": "web_search_result",
+                "url": r.get("url"),
+                "title": r.get("title") or r.get("url"),
+                "encrypted_content": encode_signature(r.get("snippet") or r.get("title") or ""),
+                "page_age": r.get("publishedAt"),
+            }
+            for r in execution.results
+            if isinstance(r.get("url"), str)
+        ]
+    return [use, {"type": "web_search_tool_result", "tool_use_id": tool_use_id, "content": content}]
+
+
+def transcript_blocks(
+    transcript: list[tuple[str, Any]], tool_calls: Any, *, display: str | None = None
+) -> list[dict[str, Any]]:
+    """Content blocks in the order they happened (P8): thinking when asked
+    for, text, each search's two blocks, then the caller's tool calls."""
+    blocks: list[dict[str, Any]] = []
+    for kind, value in transcript:
+        if kind == "reasoning" and value and display is not None:
+            blocks.append(thinking_block(value, display))
+        elif kind == "text" and value:
+            blocks.append({"type": "text", "text": value})
+        elif kind == "search":
+            blocks.extend(search_blocks(value))
+    blocks.extend(content_blocks(None, tool_calls))
+    return blocks
 
 
 def content_blocks(
@@ -939,18 +1064,22 @@ def message_response(
     reasoning: str | None = None,
     display: str | None = None,
     stop_sequence: str | None = None,
+    transcript: list[tuple[str, Any]] | None = None,
+    web_searches: int = 0,
 ) -> dict[str, Any]:
     return {
         "id": f"msg_{uuid.uuid4().hex}",
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": content_blocks(content, tool_calls, reasoning=reasoning, display=display),
+        "content": transcript_blocks(transcript, tool_calls, display=display)
+        if transcript and any(kind == "search" for kind, _ in transcript)
+        else content_blocks(content, tool_calls, reasoning=reasoning, display=display),
         "stop_reason": stop_reason(finish),
         # Named when the backend named it (vLLM does, llama.cpp does not)
         # and only beside the stop reason that says a sequence matched.
         "stop_sequence": stop_sequence if stop_reason(finish) == "stop_sequence" else None,
-        "usage": usage_block(usage),
+        "usage": usage_block(usage, web_searches=web_searches),
     }
 
 
@@ -1015,6 +1144,8 @@ class StreamTranslator:
         #: Under `"omitted"` the text is not streamed; it is held here and
         #: sent as the block's closing `signature_delta`.
         self._withheld: list[str] = []
+        #: Searches this install ran for the message (P8), for `usage`.
+        self.web_searches = 0
 
     def start(self, model: str | None = None) -> str:
         """`message_start`, emitted on the FIRST DRIVER EVENT.
@@ -1219,6 +1350,56 @@ class StreamTranslator:
             del self._tool_index[call_index]
         return out
 
+    def search(self, update: Any) -> list[str]:
+        """A search this install is running (P8), as Anthropic streams its own.
+
+        On start, the `server_tool_use` block -- opened, its query as one
+        `input_json_delta`, closed -- so a client shows the search as it
+        happens. On completion, the `web_search_tool_result` block, whole.
+        """
+        execution = update.execution
+        use, result = search_blocks(execution)
+        out = self._close_thinking() + self._close_text() + self._close_tool_except(None)
+        if update.phase == "started":
+            index = self._next_index
+            self._next_index += 1
+            out.append(
+                frame(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {**use, "input": {}},
+                    },
+                )
+            )
+            out.append(
+                frame(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": json.dumps(use["input"]),
+                        },
+                    },
+                )
+            )
+            out.append(frame("content_block_stop", {"type": "content_block_stop", "index": index}))
+            return out
+        self.web_searches += 1
+        index = self._next_index
+        self._next_index += 1
+        out.append(
+            frame(
+                "content_block_start",
+                {"type": "content_block_start", "index": index, "content_block": result},
+            )
+        )
+        out.append(frame("content_block_stop", {"type": "content_block_stop", "index": index}))
+        return out
+
     def close_blocks(self) -> list[str]:
         """Every block that opened also closes, in the order it opened."""
         out = self._close_thinking()
@@ -1240,7 +1421,7 @@ class StreamTranslator:
             },
         }
         if usage is not None:
-            delta["usage"] = usage_block(usage)
+            delta["usage"] = usage_block(usage, web_searches=self.web_searches)
         out.append(frame("message_delta", delta))
         out.append(frame("message_stop", {"type": "message_stop"}))
         return out

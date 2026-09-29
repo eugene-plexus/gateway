@@ -97,6 +97,22 @@ FIELDS: list[ConfigField] = [
         minimum=1,
     ),
     ConfigField(
+        key="maxToolCalls",
+        label="Web searches per request",
+        description=(
+            "How many web searches this install runs for one request when the caller "
+            "does not say (P8). Past it the model is told no more searches are "
+            "available and answers with what it found. A caller's own max_tool_calls "
+            "(Codex) or max_uses (Claude Code) wins over this. Each search sends the "
+            "model's query to your search account, and a paid one counts every search."
+        ),
+        category="generation",
+        valueType=ConfigValueType.integer,
+        default=5,
+        minimum=1,
+        maximum=50,
+    ),
+    ConfigField(
         key="profileCacheSeconds",
         label="Profile refresh interval",
         description=(

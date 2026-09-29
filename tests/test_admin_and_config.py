@@ -152,6 +152,7 @@ def test_config_schema_lists_the_gateway_fields(client: TestClient) -> None:
     assert keys == {
         "defaultTemperature",
         "defaultMaxTokens",
+        "maxToolCalls",
         "profileCacheSeconds",
         "profileMaxStaleSeconds",
         "requestTimeoutSeconds",

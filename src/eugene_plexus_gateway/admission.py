@@ -65,6 +65,13 @@ class ClientRequest:
     def local_only(self) -> bool:
         return ((self.access or {}).get("limits") or {}).get("localOnly") is True
 
+    @property
+    def allowed_tools(self) -> list[str] | None:
+        """The key's `allowedTools` (P8): None permits every tool the
+        install runs, as on every key minted before P8."""
+        tools = ((self.access or {}).get("limits") or {}).get("allowedTools")
+        return list(tools) if isinstance(tools, list) else None
+
     async def contact(self, action: str) -> dict[str, Any]:
         began = time.perf_counter()
         try:

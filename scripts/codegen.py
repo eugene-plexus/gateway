@@ -54,6 +54,8 @@ SPECS_TO_GENERATE: list[tuple[str, str, list[str] | None]] = [
     ("openapi/inference-driver.yaml", "driver_models.py", None),
     ("openapi/library.yaml", "library_models.py", None),
     ("openapi/components/client-keys.yaml", "client_key_models.py", None),
+    # P8: the gateway calls a search account's tool-driver as a client.
+    ("openapi/tool-driver.yaml", "tool_driver_models.py", None),
 ]
 
 

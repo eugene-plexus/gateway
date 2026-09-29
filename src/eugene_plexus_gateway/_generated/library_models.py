@@ -344,7 +344,11 @@ class ComponentKind(StrEnum):
     `gateway` is the one OpenAI-compatible front door and there is
     exactly one. `inference-driver` instances are the per-backend
     wrappers and there are N — one per backend, wherever that
-    backend lives. `library` scans the operator's model
+    backend lives. `tool-driver` instances (P8, 2026-09-29) run the
+    tools the hub runs itself — `web_search` — one per tool provider
+    account (a SearXNG, a Brave subscription), and there are zero or
+    more; the gateway runs the loop that offers a tool to a model and
+    calls a tool-driver when the model uses it. `library` scans the operator's model
     directories and holds per-model launch profiles; there is
     exactly one, and it is deliberately not in the request path.
 
@@ -362,6 +366,7 @@ class ComponentKind(StrEnum):
     gateway = 'gateway'
     inference_driver = 'inference-driver'
     library = 'library'
+    tool_driver = 'tool-driver'
 
 
 class ComputeDeviceKind(StrEnum):

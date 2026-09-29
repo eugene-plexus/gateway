@@ -17,6 +17,10 @@ class AllowedModel(RootModel[str]):
     root: str = Field(..., max_length=256, min_length=1)
 
 
+class AllowedTool(RootModel[str]):
+    root: str = Field(..., max_length=64, min_length=1)
+
+
 class ClientKeyLimits(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -28,6 +32,11 @@ class ClientKeyLimits(BaseModel):
     allowedModels: list[AllowedModel] | None = Field(
         None,
         description="Null permits all. Empty permits none. Both the id the caller\nasked for and every model actually tried (a slot's fallback\ntargets) must be allowed.\n\nAn entry is an exact id, or a pattern with `*` (P1,\n2026-09-27): `*` matches any run of characters, `/` included,\nand is the only wildcard, so `openrouter/*` allows every\nmodel of the account named `openrouter`\n(`openrouter/anthropic/claude-opus-5.5`) and nothing else.\nWithout it, scoping a key to one account means typing out\nhundreds of names. The same matcher runs in the gateway, the\nagent and the control root.\n",
+        max_length=100,
+    )
+    allowedTools: list[AllowedTool] | None = Field(
+        None,
+        description='The tools the hub runs itself (P8) that this key may have run\non its behalf -- `web_search` today. **Null permits every tool\nthe install runs** (design call #5: a key is allowed search once\na search account exists, and can be denied it here). Empty\npermits none. An entry is a tool name or a pattern with `*`,\nmatched by the same matcher as `allowedModels`.\n\nA key denied a tool is not refused for asking: the door says\nwhy the search did not run, as it does for an install with no\nsearch account (`gateway.yaml`, "Server-run tools"). A\n`localOnly` key never has a tool run whatever this says,\nbecause a search sends a query derived from the prompt to the\npublic internet.\n',
         max_length=100,
     )
     maxConcurrentRequests: int | None = Field(2, ge=1, le=64)

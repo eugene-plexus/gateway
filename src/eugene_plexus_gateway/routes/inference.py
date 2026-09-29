@@ -48,6 +48,7 @@ from .. import (
     image_doors,
     moderation_door,
     responses,
+    server_tools,
     video_doors,
 )
 from .._generated.driver_models import AudioOutputFormat as DriverAudioOutputFormat
@@ -130,13 +131,14 @@ from .._generated.models import (
     ToolCall,
     ToolCallDelta,
 )
+from .._generated.models import Stage as StreamStage
 from ..config import ConfigStore
 from ..dependencies import require_authorized
 from ..disconnect import ClientGone, serve_while_connected
 from ..driver_client import DriverClient, DriverError, TieredClient, VideoJobs
 from ..images import attachment_kinds, max_images
 from ..lifecycle import LifecycleManager, WakeResult
-from ..metrics import AttemptRow, CandidateRow, MetricsStore, RequestRow
+from ..metrics import AttemptRow, CandidateRow, MetricsStore, RequestRow, ToolExecutionRow
 from ..routing import Resolution, RoutingTable, collect_attempts, takes
 
 log = logging.getLogger(__name__)
@@ -215,6 +217,7 @@ def _record(
     audio_seconds: float | None = None,
     images: int | None = None,
     video_seconds: int | None = None,
+    client: Any = None,
 ) -> None:
     """Join the per-attempt rows to the facts only this route holds.
 
@@ -249,13 +252,18 @@ def _record(
         if len(considered) < 2 and all(c.eligible for c in considered):
             considered = []
         context = admission.current.get()
+        # P8: every model call after the first went to one pinned backend,
+        # so it is a turn of one answer and not a backend tried -- counted
+        # as an attempt it would read as a cascade in every rollup.
+        searched = client if isinstance(client, server_tools.SearchingClient) else None
+        extra_turns = max(0, searched.turns - 1) if searched is not None else 0
         rec.metrics.record(
             RequestRow(
                 started_at=datetime.now(UTC),
                 # A moderation's model is settled before it is recorded (P6-1).
                 requested_model=body.model or "",
                 served_model=served_model,
-                attempts=max(1, len(tries)),
+                attempts=max(1, len(tries) - extra_turns),
                 tier=tier if served is not None else None,
                 total_ms=int((time.perf_counter() - rec.started) * 1000),
                 waited_ms=rec.waited_ms,
@@ -281,6 +289,19 @@ def _record(
                 audio_seconds=audio_seconds,
                 images=images,
                 video_seconds=video_seconds,
+                web_searches=[
+                    ToolExecutionRow(
+                        tool=server_tools.WEB_SEARCH,
+                        driver=e.driver,
+                        node=e.node,
+                        provider=e.provider,
+                        version=e.version,
+                        outcome=e.outcome,
+                        results=len(e.results) if e.outcome == "ok" else None,
+                        elapsed_ms=e.elapsed_ms,
+                    )
+                    for e in (searched.executions if searched is not None else [])
+                ],
             )
         )
         if (context := admission.current.get()) is not None:
@@ -630,6 +651,9 @@ class _Serving:
     started: float
     waited_ms: int
     swapped_in: bool
+    #: Why a search that would be removed rather than refused could not run
+    #: (P8, the Responses door), for the door to say so.
+    search_blocked: str | None = None
 
 
 async def _prepare(
@@ -640,6 +664,7 @@ async def _prepare(
     instead: str,
     install_max_tokens: bool = True,
     completion: CompletionPrompt | None = None,
+    search: server_tools.SearchPlan | None = None,
 ) -> _Serving | _Failure:
     """Resolve, refuse, refresh, wake, and start the clock.
 
@@ -667,8 +692,74 @@ async def _prepare(
             error_type="service_unavailable",
         )
 
-    resolution = await admission.permitted(table.resolve(body.model), requirements=constraints)
+    # P8: a search this install can run is a search any tool-calling model
+    # can make, so admission stops asking for a backend that searches
+    # itself; `server_tools.searchable` keeps both kinds below. A search it
+    # cannot run keeps P2c's rule (only a model that searches itself), and
+    # the refusal says why nothing else could.
+    blocked: str | None = None
+    searching = False
+    search_blocked: str | None = None
+    if search is not None:
+        # Decided here, after `admission.authorize` has read the key's
+        # limits: before it, a local-only key and a key denied web search
+        # would both read as unrestricted.
+        blocked = server_tools.why_not(table, admission.current.get())
+        searching = blocked is None
+        if blocked is not None and search.when_blocked == "refuse":
+            return _Failure(
+                code=400,
+                message=(
+                    f"tools: web search could not run for this request: {blocked}. "
+                    "Nothing was forwarded."
+                ),
+                error_type="invalid_request_error",
+                param="tools",
+            )
+        if blocked is not None and search.when_blocked == "skip":
+            search_blocked, blocked = blocked, None
+        if searching:
+            kept = [s for s in (constraints.callerSettings or []) if s != "webSearchOptions"]
+            constraints = constraints.model_copy(
+                update={"callerSettings": kept or None, "webSearchOptions": None}
+            )
+
+    async def permit(resolved: Any) -> Any:
+        try:
+            return await admission.permitted(resolved, requirements=constraints)
+        except admission.AdmissionFailure as failure:
+            if blocked is not None and failure.param == "web_search_options":
+                raise admission.AdmissionFailure(
+                    failure.status,
+                    f"{failure.message} Nor can this install search for it: {blocked}.",
+                    retry=failure.retry,
+                    param=failure.param,
+                ) from None
+            raise
+
+    native: set[tuple[str | None, str, str | None]] = set()
+
+    async def resolve() -> Any:
+        nonlocal native
+        resolved = await permit(table.resolve(body.model))
+        if searching:
+            resolved, native = server_tools.searchable(resolved)
+        return resolved
+
+    resolution = await resolve()
     if not resolution.has_backends():
+        if searching and (await permit(table.resolve(body.model))).has_backends():
+            return _Failure(
+                code=400,
+                message=(
+                    f"No backend serving {body.model!r} can search the web: it neither runs "
+                    "web search itself nor calls tools, and a search this install runs is "
+                    "offered to the model as a tool. Choose a model whose backend supports "
+                    "tool calling. Nothing was forwarded or woken."
+                ),
+                error_type="invalid_request_error",
+                param="tools",
+            )
         return _no_such_model(body.model, table)
 
     # An embeddings-only model, named on the chat surface. Refused by
@@ -713,7 +804,7 @@ async def _prepare(
     client = table.pick(resolution, needs=needs, surface=only)
     if client is None and await table.refresh_if_stale():
         refreshed = True
-        resolution = await admission.permitted(table.resolve(body.model), requirements=constraints)
+        resolution = await resolve()
         if not resolution.has_backends():
             return _no_such_model(body.model, table)
         client = table.pick(resolution, needs=needs, surface=only)
@@ -726,9 +817,7 @@ async def _prepare(
         if lifecycle is not None:
             wake = await lifecycle.wake(resolution)
             if wake.ok:
-                resolution = await admission.permitted(
-                    table.resolve(body.model), requirements=constraints
-                )
+                resolution = await resolve()
                 client = table.pick(resolution, needs=needs, surface=only)
                 considered = table.candidates_considered(resolution)
         if client is None:
@@ -767,17 +856,36 @@ async def _prepare(
             ):
                 return original
             defaults = await profiles.get(paths.get((candidate.node, candidate.name)))
-            prepared = _to_generate_request(
+            # The profile's three defaults, copied onto the request this
+            # candidate is being handed -- never a request rebuilt from the
+            # caller's body. A rebuild threw away whatever was added since:
+            # the search loop's own turns (P8) arrived here with the model's
+            # tool calls and the search results appended, and left without
+            # them whenever the caller had not set all three values, which
+            # is nearly every request.
+            filled = _to_generate_request(
                 body, store, defaults, install_max_tokens=install_max_tokens
             )
-            prepared.localOnly = original.localOnly
-            prepared.requestId = original.requestId
-            if completion is not None:
-                prepared.completion = completion
-                prepared.messages = []
-            return prepared
+            return original.model_copy(
+                update={
+                    "maxTokens": filled.maxTokens,
+                    "temperature": filled.temperature,
+                    "topP": filled.topP,
+                }
+            )
 
         client.prepare_request = prepare_candidate
+    served: Any = client
+    if searching and search is not None:
+        # The loop wraps the routed client last, so it chains the profile
+        # defaults hook set above rather than replacing it.
+        served = server_tools.SearchingClient(
+            client,
+            plan=search,
+            runner=server_tools.SearchRunner(table, search),
+            limit=search.limit(store.get("maxToolCalls") if store is not None else None),
+            native=native,
+        )
     waited_ms = wake.waited_ms if wake is not None and wake.ok else 0
     # Excludes the wake, which is `waited_ms` and already reported. The
     # two must not overlap or a swap would be counted twice.
@@ -786,7 +894,8 @@ async def _prepare(
 
     started = time.perf_counter()
     return _Serving(
-        client=client,
+        search_blocked=search_blocked,
+        client=served,
         table=table,
         generate=generate,
         started=started,
@@ -827,7 +936,12 @@ async def create_chat_completion(request: Request) -> Any:
         return _error(
             code=400, message=exc.message, error_type="invalid_request_error", param=exc.field
         )
-    prepared = await _prepare(request, body, surface="chat", instead="/v1/embeddings")
+    plan = (
+        server_tools.plan_from_chat(body.web_search_options, has_tools=bool(body.tools))
+        if body.web_search_options is not None
+        else None
+    )
+    prepared = await _prepare(request, body, surface="chat", instead="/v1/embeddings", search=plan)
     if isinstance(prepared, _Failure):
         return prepared.as_openai()
     client = prepared.client
@@ -912,6 +1026,7 @@ async def create_chat_completion(request: Request) -> Any:
             tier=getattr(client, "tier", 1),
             usage=response.usage,
             backend_ms=response.latencyMs,
+            client=client,
         )
         return JSONResponse(content=_completion_body(result))
 
@@ -1001,6 +1116,10 @@ async def _stream_anthropic(
                     # first token the cascade can still change which
                     # backend answers.
                     yield translator.start()
+                if event.search is not None:
+                    for chunk in translator.search(event.search):
+                        yield chunk
+                    continue
                 if event.tool_calls:
                     for chunk in translator.tool_fragments(event.tool_calls):
                         yield chunk
@@ -1053,6 +1172,7 @@ async def _stream_anthropic(
             tier=getattr(prepared.client, "tier", 1),
             usage=response.usage,
             backend_ms=response.latencyMs,
+            client=prepared.client,
         )
         truncated = _prompt_truncated(body, response.usage)
         _warn_if_truncated(
@@ -1104,7 +1224,20 @@ async def create_anthropic_message(request: Request) -> Any:
     except anthropic.Refusal as refusal:
         return refusal.response()
 
-    prepared = await _prepare(request, body, surface="chat", instead="/v1/embeddings")
+    # P8: a `web_search_<date>` server tool runs here or is refused with the
+    # reason. Refused rather than dropped: Claude Code's WebSearch request
+    # exists only to search, and answering it without one invents results.
+    plan = anthropic.search_plan(raw)
+    if plan is not None:
+        plan.when_blocked = "refuse"
+    headers = anthropic.compatibility_headers(raw)
+    if plan is not None and plan.ignored:
+        named = headers.get("x-eugene-plexus-ignored-settings")
+        headers["x-eugene-plexus-ignored-settings"] = ", ".join(
+            [*([named] if named else []), *plan.ignored]
+        )
+
+    prepared = await _prepare(request, body, surface="chat", instead="/v1/embeddings", search=plan)
     if isinstance(prepared, _Failure):
         return prepared.as_anthropic()
 
@@ -1116,7 +1249,7 @@ async def create_anthropic_message(request: Request) -> Any:
                 body, prepared, model=body.model, display=anthropic.thinking_display(raw)
             ),
             media_type="text/event-stream",
-            headers=anthropic.compatibility_headers(raw),
+            headers=headers,
         )
 
     store = _store(request)
@@ -1142,6 +1275,10 @@ async def create_anthropic_message(request: Request) -> Any:
             tier=getattr(prepared.client, "tier", 1),
             usage=response.usage,
             backend_ms=response.latencyMs,
+            client=prepared.client,
+        )
+        searched = (
+            prepared.client if isinstance(prepared.client, server_tools.SearchingClient) else None
         )
         return JSONResponse(
             content=anthropic.message_response(
@@ -1153,9 +1290,11 @@ async def create_anthropic_message(request: Request) -> Any:
                 reasoning=response.reasoning,
                 display=anthropic.thinking_display(raw),
                 stop_sequence=response.stopSequence,
+                transcript=searched.transcript if searched is not None else None,
+                web_searches=_searches_run(prepared.client) or 0,
             ),
             headers={
-                **anthropic.compatibility_headers(raw),
+                **headers,
                 **anthropic.envelope_headers(
                     _routing_info(
                         prepared.client,
@@ -1343,6 +1482,10 @@ async def _stream_responses(
                     # Captured, NOT broken out of -- see `_stream_completion`.
                     response = event.result
                     continue
+                if event.search is not None:
+                    for chunk in translator.search(event.search):
+                        yield chunk
+                    continue
                 if event.tool_calls:
                     for chunk in translator.tool_fragments(event.tool_calls):
                         yield chunk
@@ -1387,6 +1530,7 @@ async def _stream_responses(
             tier=getattr(prepared.client, "tier", 1),
             usage=response.usage,
             backend_ms=response.latencyMs,
+            client=prepared.client,
         )
         truncated = _prompt_truncated(body, response.usage)
         _warn_if_truncated(
@@ -1469,11 +1613,24 @@ async def create_response(request: Request) -> Any:
         return refusal.response()
     body = translated.request
 
+    # P8: `web_search` runs when a search can run here, and is removed and
+    # named, with the reason, when it cannot -- as it always was before.
+    if translated.search is not None:
+        translated.search.when_blocked = "skip"
     prepared = await _prepare(
-        request, body, surface="chat", instead="/v1/embeddings", install_max_tokens=False
+        request,
+        body,
+        surface="chat",
+        instead="/v1/embeddings",
+        install_max_tokens=False,
+        search=translated.search,
     )
     if isinstance(prepared, _Failure):
         return prepared.as_responses()
+    if prepared.search_blocked is not None:
+        translated.skip_search(prepared.search_blocked)
+    elif translated.search is not None:
+        translated.run_search()
     response_id = responses.new_id(admission.request_id())
 
     if body.stream:
@@ -1506,21 +1663,38 @@ async def create_response(request: Request) -> Any:
             tier=getattr(prepared.client, "tier", 1),
             usage=response.usage,
             backend_ms=response.latencyMs,
+            client=prepared.client,
         )
         status, details = responses.status_of(response.finishReason)
+        searched = (
+            prepared.client
+            if isinstance(prepared.client, server_tools.SearchingClient)
+            and prepared.client.executions
+            else None
+        )
+        output = (
+            responses.transcript_items(
+                searched.transcript,
+                tool_calls=response.toolCalls,
+                include_reasoning=translated.include_reasoning,
+                status=status,
+            )
+            if searched is not None
+            else responses.output_items(
+                content=response.content,
+                tool_calls=response.toolCalls,
+                reasoning=response.reasoning,
+                include_reasoning=translated.include_reasoning,
+                status=status,
+            )
+        )
         return JSONResponse(
             content=responses.response_object(
                 response_id=response_id,
                 created_at=created_at,
                 model=served_model,
                 status=status,
-                output=responses.output_items(
-                    content=response.content,
-                    tool_calls=response.toolCalls,
-                    reasoning=response.reasoning,
-                    include_reasoning=translated.include_reasoning,
-                    status=status,
-                ),
+                output=output,
                 echo=translated.echo,
                 usage=response.usage,
                 incomplete_details=details,
@@ -3758,7 +3932,16 @@ def _routing_info(
         # the wrong one here.
         context_length=table.context_length_for(model, served_by, served_node),
         prompt_truncated=prompt_truncated,
+        web_searches=_searches_run(client),
     )
+
+
+def _searches_run(client: Any) -> int | None:
+    """How many searches this install ran for the request (P8), or None."""
+    if not isinstance(client, server_tools.SearchingClient):
+        return None
+    ran = sum(1 for e in client.executions if e.outcome != "over_limit")
+    return ran or None
 
 
 def _to_openai_logprobs(raw: Any) -> ChatLogprobs | None:
@@ -3958,8 +4141,32 @@ async def _stream_completion(
     with collect_attempts() as tries:
         emitted_role = False
         response: GenerateResponse | None = None
+        # P8: text written before a search and text written after it are one
+        # message on this wire, so a paragraph break goes between them.
+        spoke = False
+        paragraph = False
         try:
             async for event in client.stream(generate):
+                if event.search is not None:
+                    # Chat has no item for a search; a caller that asked for
+                    # progress is told one is running, and nobody else sees it.
+                    paragraph = paragraph or spoke
+                    if event.search.phase == "started" and generate.reportProgress:
+                        yield frame(
+                            ChatCompletionChunk(
+                                id=completion_id,
+                                object="chat.completion.chunk",
+                                created=created,
+                                model=body.model,
+                                choices=[],
+                                x_eugene_plexus=CompletionRoutingInfo(
+                                    progress=StreamProgress(
+                                        stage=StreamStage.tool, tool="web_search"
+                                    )
+                                ),
+                            )
+                        )
+                    continue
                 if event.progress is not None:
                     # What the backend is doing, before or between its
                     # output. No role chunk first: it is not the answer
@@ -4070,9 +4277,13 @@ async def _stream_completion(
                         )
                     )
                     continue
+                text = event.text
+                if text and paragraph:
+                    text, paragraph = "\n\n" + text, False
+                spoke = spoke or bool(text)
                 yield frame(
                     envelope(
-                        delta=Delta(content=event.text),
+                        delta=Delta(content=text),
                         finish=None,
                         model=body.model,
                         logprobs=_to_openai_logprobs(event.logprobs),
@@ -4153,6 +4364,7 @@ async def _stream_completion(
             tier=getattr(client, "tier", 1),
             usage=response.usage,
             backend_ms=response.latencyMs,
+            client=client,
         )
         # A truncated prompt is reported on the streamed path too, and it
         # can only be a flag here: the answer has already been delivered

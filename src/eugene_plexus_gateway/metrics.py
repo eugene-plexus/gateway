@@ -50,7 +50,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # Bounded because the alternative to dropping rows is stalling
 # completions, and that trade is never worth making. Sized so a burst
@@ -122,6 +122,26 @@ class AttemptRow:
 
 
 @dataclass(slots=True)
+class ToolExecutionRow:
+    """One search the install ran for a request (v10, P8).
+
+    **No query text.** A query is made from the prompt, and A5's rule is
+    that no prompt is kept; what ran, where, how long and with what
+    outcome is enough to see a failing account or a new Anthropic tool
+    date without it.
+    """
+
+    tool: str
+    outcome: str
+    elapsed_ms: int
+    driver: str | None = None
+    node: str | None = None
+    provider: str | None = None
+    version: str | None = None
+    results: int | None = None
+
+
+@dataclass(slots=True)
 class RequestRow:
     """One completion the gateway accepted."""
 
@@ -159,6 +179,8 @@ class RequestRow:
     images: int | None = None
     # v9 (P5): the seconds of video a job asked for, on the submit's row.
     video_seconds: int | None = None
+    # v10 (P8): each search the install ran for this request, in order.
+    web_searches: list[ToolExecutionRow] = field(default_factory=list)
 
 
 _DDL = """
@@ -235,6 +257,22 @@ CREATE TABLE IF NOT EXISTS candidate (
 );
 
 CREATE INDEX IF NOT EXISTS candidate_request ON candidate (request_id);
+
+-- v10 (P8): the searches a request ran. No query text, ever.
+CREATE TABLE IF NOT EXISTS tool_execution (
+    request_id INTEGER NOT NULL REFERENCES request (id) ON DELETE CASCADE,
+    seq        INTEGER NOT NULL,
+    tool       TEXT    NOT NULL,
+    driver     TEXT,
+    node       TEXT,
+    provider   TEXT,
+    version    TEXT,
+    outcome    TEXT    NOT NULL,
+    results    INTEGER,
+    elapsed_ms INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS tool_execution_request ON tool_execution (request_id);
 
 -- Hourly aggregates, kept indefinitely: a few hundred rows a day, and
 -- the only thing that can answer "what did last night look like" once
@@ -343,7 +381,9 @@ class MetricsStore:
         conn.commit()
 
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        if row is not None and int(row[0]) in (2, 3, 4, 5, 6, 7, 8):
+        # v10 added a table and no column: the DDL above created it, so a
+        # v9 file needs only its version moved on.
+        if row is not None and int(row[0]) in (2, 3, 4, 5, 6, 7, 8, 9):
             columns = {r[1] for r in conn.execute("PRAGMA table_info(request)")}
             for column in ("client_key_id", "client_key_name"):
                 if column not in columns:
@@ -577,6 +617,25 @@ class MetricsStore:
                             a.first_ms,
                         )
                         for seq, a in enumerate(row.tries)
+                    ],
+                )
+                conn.executemany(
+                    "INSERT INTO tool_execution (request_id, seq, tool, driver, node, provider,"
+                    " version, outcome, results, elapsed_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            request_id,
+                            seq,
+                            t.tool,
+                            t.driver,
+                            t.node,
+                            t.provider,
+                            t.version,
+                            t.outcome,
+                            t.results,
+                            t.elapsed_ms,
+                        )
+                        for seq, t in enumerate(row.web_searches)
                     ],
                 )
                 conn.executemany(
@@ -1090,6 +1149,39 @@ class MetricsStore:
                     }
                 )
 
+            searched: dict[int, list[dict[str, Any]]] = {i: [] for i in ids}
+            for (
+                request_id,
+                tool,
+                driver,
+                node,
+                provider,
+                version,
+                outcome,
+                results,
+                elapsed_ms,
+            ) in conn.execute(
+                f"""
+                SELECT request_id, tool, driver, node, provider, version, outcome, results,
+                       elapsed_ms
+                FROM tool_execution WHERE request_id IN ({placeholders})
+                ORDER BY request_id, seq
+                """,
+                ids,
+            ).fetchall():
+                searched[request_id].append(
+                    {
+                        "tool": tool,
+                        "driver": driver,
+                        "node": node,
+                        "provider": provider,
+                        "version": version,
+                        "outcome": outcome,
+                        "results": results,
+                        "elapsedMs": elapsed_ms,
+                    }
+                )
+
         out = [
             {
                 "startedAt": _parse(r[1]),
@@ -1118,6 +1210,7 @@ class MetricsStore:
                 "videoSeconds": r[24],
                 "tries": tries[r[0]],
                 "candidates": considered[r[0]],
+                **({"webSearches": searched[r[0]]} if searched[r[0]] else {}),
             }
             for r in rows
         ]

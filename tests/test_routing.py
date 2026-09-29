@@ -449,3 +449,50 @@ async def test_unreadable_runtimes_endpoint_does_not_stop_routing(route_http: An
     assert table.known_models() == ["qwen"]
     assert table.runtime_for("qwen") is None
     await table.aclose()
+
+
+async def test_a_search_account_is_discovered_apart_from_the_drivers(route_http: Any) -> None:
+    """P8: a `tool-driver` in the agent's topology is a search account --
+    probed at its own `/v1/info`, never routed a model -- and one that is
+    not set up yet is known but not offered."""
+    probed: list[int | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/node":
+            return httpx.Response(200, json={"enrolled": False})
+        if request.url.path == "/v1/components":
+            return httpx.Response(
+                200,
+                json=_components(
+                    _driver_entry("a", 8081),
+                    {"name": "searx", "kind": "tool-driver", "url": "http://127.0.0.1:8190"},
+                    {"name": "brave", "kind": "tool-driver", "url": "http://127.0.0.1:8191"},
+                ),
+            )
+        probed.append(request.url.port)
+        if request.url.port == 8190:
+            return httpx.Response(
+                200,
+                json={
+                    "provider": "searxng",
+                    "label": "SearXNG",
+                    "tools": ["web_search", "a_tool_from_the_future"],
+                    "egress": "internet",
+                    "configured": True,
+                },
+            )
+        if request.url.port == 8191:
+            return httpx.Response(
+                200,
+                json={"provider": "brave", "tools": [], "egress": "internet", "configured": False},
+            )
+        return httpx.Response(200, json=_info("qwen"))
+
+    route_http(handler)
+    table = RoutingTable(agent_url="http://agent")
+    await table.refresh()
+    assert [b.name for b in table.backends_for("qwen")] == ["a"]
+    assert sorted(a.name for a in table.tool_accounts()) == ["brave", "searx"]
+    assert [a.name for a in table.search_accounts()] == ["searx"]
+    assert sorted(p for p in probed if p) == [8081, 8190, 8191]
+    await table.aclose()

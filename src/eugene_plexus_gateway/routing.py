@@ -91,6 +91,7 @@ from .image_doors import ImageAsk, rules_out
 from .metrics import AttemptRow, CandidateRow
 from .model_patterns import permits
 from .outbound import RECIPIENT_CONTROL, Outbound
+from .tool_client import ToolDriverClient, ToolDriverInfo
 
 # Deadline for one topology read (an agent's `/v1/components`, a control
 # root's `/v1/nodes`). Short because a refresh can run inside a request
@@ -483,7 +484,24 @@ class _Snapshot:
     # which is the only agent when no control root is configured.
     agents: dict[str | None, str] = field(default_factory=dict)
     control_root: ControlRootFacts = field(default_factory=ControlRootFacts)
+    #: The search accounts (P8) that answered their `/v1/info`, set up or
+    #: not, in the order a search tries them.
+    tools: list[ToolAccount] = field(default_factory=list)
     refreshed_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+
+@dataclass(frozen=True)
+class ToolAccount:
+    """One search account (a tool-driver, P8) the gateway can reach."""
+
+    node: str | None
+    name: str
+    url: str
+    client: ToolDriverClient
+    info: ToolDriverInfo
+
+    def runs(self, tool: str) -> bool:
+        return self.info.configured and tool in self.info.tools
 
 
 @dataclass
@@ -647,6 +665,8 @@ class RoutingTable:
         # throw away the connection pool and leak sockets. The node is in
         # the key because the name is not unique across machines.
         self._clients: dict[tuple[str | None, str, str], HttpDriverClient] = {}
+        #: One client per search account, kept across refreshes (R1.1).
+        self._tool_clients: dict[tuple[str | None, str, str], ToolDriverClient] = {}
         # One `BoundClient` per model a driver serves, by
         # (node, name, url, driver's model id), kept across refreshes so
         # each model's circuit -- its cooldown -- survives them.
@@ -697,6 +717,13 @@ class RoutingTable:
         # entry here is what the refresh uses instead of an empty list,
         # which is the whole of review §6.1 #9 and §6.2 #18.
         self._last_entries: dict[str | None, list[tuple[str, str]]] = {}
+        #: The search accounts each node last declared -- kept for a node
+        #: that did not answer, as its drivers are.
+        self._last_tool_entries: dict[str | None, list[tuple[str, str]]] = {}
+        #: What the in-flight read of each node found, handed from
+        #: `_fetch_driver_entries` to `_fetch_agent`, which decides whether
+        #: the read counts (the same answered-or-not rule as the drivers).
+        self._fetched_tools: dict[str | None, list[tuple[str, str]]] = {}
         self._last_facts: dict[str | None, dict[Key, _RuntimeFacts]] = {}
         # `(url, source)` last written to the log, so the control root is
         # announced when it is first found and when it changes -- not on
@@ -752,6 +779,10 @@ class RoutingTable:
             with contextlib.suppress(BaseException):
                 await client.aclose()
         self._clients.clear()
+        for tool_client in self._tool_clients.values():
+            with contextlib.suppress(BaseException):
+                await tool_client.aclose()
+        self._tool_clients.clear()
         with contextlib.suppress(BaseException):
             await self._json_client.aclose()
         self._snapshot = _Snapshot(agents={None: self._agent_url})
@@ -1025,6 +1056,9 @@ class RoutingTable:
         for known in list(self._last_facts):
             if known not in agents:
                 self._last_facts.pop(known, None)
+        for known in list(self._last_tool_entries):
+            if known not in agents:
+                self._last_tool_entries.pop(known, None)
 
         # Every agent, concurrently: its drivers and its runtimes.
         fetched = await asyncio.gather(
@@ -1035,6 +1069,7 @@ class RoutingTable:
         # model produce two entries rather than one that overwrites the
         # other.
         entries: list[tuple[str | None, str, str]] = []
+        tool_entries: list[tuple[str | None, str, str]] = []
         runtimes: dict[Key, _RuntimeFacts] = {}
         for node, result in zip(agents, fetched, strict=True):
             if isinstance(result, BaseException):
@@ -1043,6 +1078,9 @@ class RoutingTable:
             agent_entries, agent_runtimes = result
             entries.extend((node, name, url) for name, url in agent_entries)
             runtimes.update(agent_runtimes)
+            tool_entries.extend(
+                (node, name, url) for name, url in self._last_tool_entries.get(node, [])
+            )
 
         # Drop clients for drivers that left the topology.
         live_keys = set(entries)
@@ -1056,12 +1094,25 @@ class RoutingTable:
             if bound_key[:3] not in live_keys:
                 self._bound.pop(bound_key, None)
 
-        results = await asyncio.gather(
-            *(self._probe(node, name, url) for node, name, url in entries),
-            return_exceptions=True,
+        live_tools = set(tool_entries)
+        for tool_key in list(self._tool_clients):
+            if tool_key not in live_tools:
+                tool_client = self._tool_clients.pop(tool_key)
+                log.info("search account %r left the topology; closing its client", tool_key[1])
+                with contextlib.suppress(BaseException):
+                    await tool_client.aclose()
+
+        results, tools = await asyncio.gather(
+            asyncio.gather(
+                *(self._probe(node, name, url) for node, name, url in entries),
+                return_exceptions=True,
+            ),
+            self._probe_tools(tool_entries),
         )
 
-        snapshot = _Snapshot(runtimes=runtimes, agents=agents, control_root=control_root)
+        snapshot = _Snapshot(
+            runtimes=runtimes, agents=agents, control_root=control_root, tools=tools
+        )
         for probe in results:
             if isinstance(probe, BaseException):
                 log.warning("driver probe raised unexpectedly: %s", probe)
@@ -1246,8 +1297,10 @@ class RoutingTable:
         )
         if entries_ok:
             self._last_entries[node] = entries
+            self._last_tool_entries[node] = self._fetched_tools.pop(node, [])
         else:
             entries = list(self._last_entries.get(node, []))
+            self._fetched_tools.pop(node, None)
         if runtimes_ok:
             self._last_facts[node] = runtimes
         else:
@@ -1317,8 +1370,12 @@ class RoutingTable:
         if not isinstance(components, list):
             return [], False
         out: list[tuple[str, str]] = []
+        tools: list[tuple[str, str]] = []
         for entry in components:
-            if not isinstance(entry, dict) or entry.get("kind") != "inference-driver":
+            if not isinstance(entry, dict) or entry.get("kind") not in (
+                "inference-driver",
+                "tool-driver",
+            ):
                 continue
             # `advertiseUrl` is where a peer on another host reaches the
             # component — the agent's advertise host with that component's
@@ -1333,7 +1390,12 @@ class RoutingTable:
                 else entry.get("advertiseUrl") or entry.get("url")
             )
             if isinstance(name, str) and name and isinstance(url, str) and url:
-                out.append((name, url.rstrip("/")))
+                # A search account (P8) is found the same way and kept apart:
+                # it serves no model, so it must never reach `_probe`.
+                (tools if entry.get("kind") == "tool-driver" else out).append(
+                    (name, url.rstrip("/"))
+                )
+        self._fetched_tools[node] = tools
         return out, True
 
     async def _fetch_runtime_facts(
@@ -1393,6 +1455,43 @@ class RoutingTable:
                 spec={k: entry[k] for k in _SPEC_FIELDS if entry.get(k) is not None},
             )
         return facts, True
+
+    async def _probe_tools(self, entries: list[tuple[str | None, str, str]]) -> list[ToolAccount]:
+        """Every search account that answers its `/v1/info`, in search order.
+
+        This gateway's own node first -- a search on the same machine is a
+        loopback hop -- then by node and name, so the order is stable and
+        a second account is a real fallback rather than a coin flip.
+        """
+
+        async def one(node: str | None, name: str, url: str) -> ToolAccount | None:
+            client = self._tool_clients.get((node, name, url))
+            if client is None:
+                client = ToolDriverClient(
+                    name=name, base_url=url, node=node, auth=self._driver_auth(node)
+                )
+                self._tool_clients[(node, name, url)] = client
+            try:
+                info = await client.info()
+            except (httpx.HTTPError, ValueError) as e:
+                log.info("search account %r at %s did not answer: %s", name, url, e)
+                return None
+            return ToolAccount(node=node, name=name, url=url, client=client, info=info)
+
+        found = await asyncio.gather(
+            *(one(node, name, url) for node, name, url in entries), return_exceptions=True
+        )
+        accounts = [a for a in found if isinstance(a, ToolAccount)]
+        accounts.sort(key=lambda a: (not self._is_own_node(a.node), a.node or "", a.name))
+        return accounts
+
+    def search_accounts(self, tool: str = "web_search") -> list[ToolAccount]:
+        """The accounts that run `tool` right now, in the order to try them."""
+        return [a for a in self._snapshot.tools if a.runs(tool)]
+
+    def tool_accounts(self) -> list[ToolAccount]:
+        """Every search account that answered, set up or not."""
+        return list(self._snapshot.tools)
 
     async def _probe(self, node: str | None, name: str, url: str) -> _Backend | _Unreachable:
         client = self._clients.get((node, name, url))
