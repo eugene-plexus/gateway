@@ -43,10 +43,15 @@ def test_total_deadline_cancels_owned_work_releases_admission_and_never_replays(
     driver.stream = hanging_stream
     driver.supports_embeddings = True
     install_snapshot(app.state.routing, driver, fallback)
+    # A stream's deadline must fire after its headers are sent, or the answer
+    # is the 504 a stream that never started gets. 0.08 s raced the route's
+    # own preparation on a slow CI runner; 0.5 s does not, and the backend
+    # still hangs for 30.
+    budget = 0.5 if extra.get("stream") else 0.08
     with TestClient(app) as client:
         original = app.state.config_store.get
         app.state.config_store.get = lambda key: (
-            0.08 if key == "requestTimeoutSeconds" else original(key)
+            budget if key == "requestTimeoutSeconds" else original(key)
         )
         before = time.perf_counter()
         response = client.post(
