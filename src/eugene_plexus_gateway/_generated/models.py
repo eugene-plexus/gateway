@@ -2558,7 +2558,10 @@ class ResponsesInputItem(BaseModel):
     of `input_text` / `input_image` parts), and `reasoning`
     (`content` of `reasoning_text` parts, `encrypted_content`), and a
     `web_search_call` handed back (P8), which becomes a line of the
-    assistant's history naming the search and its sources.
+    assistant's history naming the search and its sources, and an
+    `image_generation_call` handed back (P8e), which becomes a line
+    naming the prompt the image was made for -- its base64 is not
+    sent to the model.
     Codex drops `id` and `status` when it sends items back
     (measured), so neither is required. Refused: `item_reference` and
     any other type.
@@ -2586,7 +2589,9 @@ class ResponsesTool(BaseModel):
     A `function` tool (`name`, `description`, `parameters`, `strict`)
     maps onto an OpenAI chat function. `web_search` runs on this
     install's search account, or is removed and named when it cannot
-    (see the endpoint); any other `type` is refused.
+    (see the endpoint); `image_generation` runs on this install's
+    image models, or is refused naming why (P8e); any other `type` is
+    refused.
 
     """
 
@@ -2623,6 +2628,7 @@ class Type6(StrEnum):
     message = 'message'
     function_call = 'function_call'
     web_search_call = 'web_search_call'
+    image_generation_call = 'image_generation_call'
 
 
 class ResponsesOutputItem(BaseModel):
@@ -2632,9 +2638,13 @@ class ResponsesOutputItem(BaseModel):
     `{"type": "message", "id", "role": "assistant", "status",
     "content": [{"type": "output_text", "text", "annotations": []}]}`,
     `{"type": "function_call", "id", "status", "call_id", "name",
-    "arguments"}`, or, for a search this install ran (P8),
+    "arguments"}`, for a search this install ran (P8),
     `{"type": "web_search_call", "id", "status", "action": {"type":
-    "search", "query", "sources": [{"type": "url", "url"}]}}`.
+    "search", "query", "sources": [{"type": "url", "url"}]}}`, or for
+    an image it made (P8e), `{"type": "image_generation_call", "id",
+    "status", "result", "revised_prompt", "size", "quality",
+    "background", "output_format", "action": "generate"}` -- `result`
+    the base64 image, null and `status: failed` when none was made.
 
     """
 
@@ -2957,14 +2967,17 @@ class MetricToolOutcome(StrEnum):
 
 
 class MetricToolExecution(BaseModel):
-    tool: str = Field(..., description='The tool that ran -- `web_search`.')
+    tool: str = Field(
+        ..., description='The tool that ran -- `web_search` or `image_generation`.'
+    )
     driver: str | None = Field(
         None,
-        description='The tool-driver (search account) that ran it; null when none was asked.',
+        description='The tool-driver (search account) that ran a search, or the\ninference-driver that made an image; null when none was asked.\n',
     )
     node: str | None = None
     provider: str | None = Field(
-        None, description="The account's provider, `searxng` or `brave`."
+        None,
+        description="The search account's provider, `searxng` or `brave`; for an\nimage, the image model that made it.\n",
     )
     version: str | None = Field(
         None,
@@ -2972,7 +2985,7 @@ class MetricToolExecution(BaseModel):
     )
     outcome: MetricToolOutcome
     results: int | None = Field(
-        None, description='How many results the model was given.'
+        None, description='How many results the model was given, or images made.'
     )
     elapsedMs: int = Field(..., ge=0)
 
@@ -3954,6 +3967,10 @@ class MetricRequest(BaseModel):
     webSearches: list[MetricToolExecution] | None = Field(
         None,
         description="Each search this install ran for the request (P8, schema v10),\nin order. **No query text is kept**, by A5's rule that no prompt\nis kept: a query is made from the prompt.\n",
+    )
+    imageGenerations: list[MetricToolExecution] | None = Field(
+        None,
+        description='Each image the `image_generation` tool made or failed to make\nfor the request (P8e, schema v10), in order. No prompt text is\nkept, for the same reason. Absent on rows written before P8e.\n',
     )
 
 

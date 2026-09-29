@@ -129,6 +129,13 @@ def collect_attempts() -> Iterator[list[AttemptRow]]:
         _attempts.reset(token)
 
 
+def current_attempts() -> list[AttemptRow] | None:
+    """The attempt rows being collected for this request, if any: the image
+    tool (P8e) takes its own off them, since this request's rows are the
+    model's."""
+    return _attempts.get()
+
+
 READY = "ready"
 STOPPED = "stopped"
 LEAST_BUSY = "least_busy"

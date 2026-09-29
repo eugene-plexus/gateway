@@ -296,6 +296,8 @@ class Translated:
     search: server_tools.SearchPlan | None = None
     #: Why a `web_search` tool was removed rather than run, when it was.
     search_reason: str | None = None
+    #: An `image_generation` tool (P8e), or None. It runs or is refused.
+    image: server_tools.ImagePlan | None = None
 
     def headers(self) -> dict[str, str]:
         out: dict[str, str] = {}
@@ -369,7 +371,10 @@ def _response_format(text: Mapping[str, Any]) -> ResponseFormat | None:
 
 
 def _tools(
-    definitions: Any, ignored: list[str], searches: list[Mapping[str, Any]] | None = None
+    definitions: Any,
+    ignored: list[str],
+    searches: list[Mapping[str, Any]] | None = None,
+    images: list[Mapping[str, Any]] | None = None,
 ) -> list[Tool] | None:
     """Function tools as the chat shape; `web_search` set aside and named.
 
@@ -378,9 +383,10 @@ def _tools(
     exactly that with `output_config` -- so it is taken off the function
     list and named on the ignored-settings header. Since P8 its definition
     is kept in `searches`, so the route can run it when a search can run
-    here and leave it removed when not. Every other server-side tool is
-    refused, because the model would be offered something that cannot
-    happen.
+    here and leave it removed when not. `image_generation` (P8e) is kept
+    in `images` for the route, which runs it or refuses it naming why.
+    Every other server-side tool is refused, because the model would be
+    offered something that cannot happen.
     """
     if definitions is None:
         return None
@@ -396,11 +402,14 @@ def _tools(
             if searches is not None:
                 searches.append(definition)
             continue
+        if kind == "image_generation" and images is not None:
+            images.append(definition)
+            continue
         if kind != "function":
             raise Refusal(
                 f"tools[{index}]: {_name(kind)} is a tool this gateway cannot run. It routes to "
-                "local engines and hands function calls back to you; only `function` tools "
-                "(and `web_search`, which is removed) are accepted.",
+                "local engines and hands function calls back to you; only `function` tools, "
+                "`web_search` and `image_generation` are accepted.",
                 param="tools",
             )
         name = definition.get("name")
@@ -437,8 +446,8 @@ def _tool_choice(choice: Any) -> Any:
         return NamedToolChoice(type="function", function=Function(name=name))
     kind = choice.get("type") if isinstance(choice, Mapping) else choice
     raise Refusal(
-        f"tool_choice: forcing {_name(kind)} is not supported; this gateway runs no server-side "
-        "tools and carries `auto`, `none`, `required` or one named function.",
+        f"tool_choice: forcing {_name(kind)} is not supported; this gateway carries `auto`, "
+        "`none`, `required` or one named function.",
         param="tool_choice",
     )
 
@@ -806,6 +815,27 @@ class _Conversation:
             note += " Sources: " + ", ".join(sources[:10])
         self._parts.append(TextContentPart(type="text", text=note + "]"))
 
+    def image_generation_call(self, item: Mapping[str, Any]) -> None:
+        """An image this gateway made, handed back by the client (P8e-4).
+
+        It becomes a line of the assistant's turn naming the prompt. The
+        base64 is not re-sent: the model never saw the image the first time,
+        and a long conversation of images is not carried to it as images.
+        """
+        self._flush_hoisted()
+        self._assistant = True
+        prompt = item.get("revised_prompt")
+        made = item.get("status") != "failed" and bool(item.get("result"))
+        if isinstance(prompt, str) and prompt:
+            note = (
+                f'[Made an image for the prompt "{prompt}".]'
+                if made
+                else f'[Tried to make an image for the prompt "{prompt}"; it failed.]'
+            )
+        else:
+            note = "[Made an image.]" if made else "[Tried to make an image; it failed.]"
+        self._parts.append(TextContentPart(type="text", text=note))
+
     def function_call_output(self, item: Mapping[str, Any], where: str) -> None:
         """A tool's result, as the `tool` message answering its call.
 
@@ -890,6 +920,8 @@ def _messages(
             conversation.reasoning(item)
         elif kind == "web_search_call":
             conversation.web_search_call(item)
+        elif kind == "image_generation_call":
+            conversation.image_generation_call(item)
         elif kind == "item_reference":
             raise Refusal(
                 f"{where}: an item_reference names a stored item, and this gateway keeps no "
@@ -994,7 +1026,8 @@ def translate_request(
     budget = images.ImageBudget(max_images)
     messages = _messages(raw, budget, ignored)
     searches: list[Mapping[str, Any]] = []
-    tools = _tools(raw.get("tools"), ignored, searches)
+    image_tools: list[Mapping[str, Any]] = []
+    tools = _tools(raw.get("tools"), ignored, searches, image_tools)
     search: server_tools.SearchPlan | None = None
     search_reason: str | None = None
     max_tool_calls = raw.get("max_tool_calls")
@@ -1012,6 +1045,12 @@ def translate_request(
             search = server_tools.plan_from_responses(
                 searches[0], max_tool_calls=max_tool_calls, has_functions=bool(tools)
             )
+    image: server_tools.ImagePlan | None = None
+    if image_tools:
+        image = server_tools.plan_from_image_tool(image_tools[0], max_tool_calls=max_tool_calls)
+        ignored.extend(image.ignored)
+        if len(image_tools) > 1:
+            ignored.append("tools.image_generation (all but the first)")
     try:
         request = ChatCompletionRequest(
             model=model,
@@ -1036,6 +1075,7 @@ def translate_request(
         include_reasoning=include_reasoning,
         search=search,
         search_reason=search_reason,
+        image=image,
         echo={
             "instructions": raw.get("instructions"),
             "tools": raw.get("tools") or [],
@@ -1190,6 +1230,24 @@ def web_search_item(execution: Any, *, status: str = "completed") -> dict[str, A
     }
 
 
+def image_generation_item(execution: Any, *, status: str = "completed") -> dict[str, Any]:
+    """One image this install made (P8e), as OpenAI's `image_generation_call`
+    item: `result` the base64 image, null when none was made."""
+    made = execution.outcome == "ok"
+    item: dict[str, Any] = {
+        "id": f"ig_{execution.item_id}",
+        "type": "image_generation_call",
+        "status": status if status != "completed" else ("completed" if made else "failed"),
+        "result": execution.image if made else None,
+        "action": "generate",
+    }
+    for key in ("revised_prompt", "size", "quality", "background", "output_format"):
+        value = getattr(execution, key, None)
+        if value:
+            item[key] = value
+    return item
+
+
 def transcript_items(
     transcript: list[tuple[str, Any]],
     *,
@@ -1198,7 +1256,7 @@ def transcript_items(
     status: str = "completed",
 ) -> list[dict[str, Any]]:
     """Output items in the order they happened: reasoning, text and each
-    search, then the caller's function calls (P8)."""
+    search and image, then the caller's function calls (P8)."""
     item_status = "incomplete" if status == "incomplete" else "completed"
     searches = [value for kind, value in transcript if kind == "search"]
     items: list[dict[str, Any]] = []
@@ -1211,6 +1269,8 @@ def transcript_items(
             )
         elif kind == "search":
             items.append(web_search_item(value))
+        elif kind == "image":
+            items.append(image_generation_item(value))
     for call in tool_calls or []:
         items.append(
             call_item(
@@ -1672,6 +1732,48 @@ class StreamTranslator:
         return [
             self.frame(
                 "response.web_search_call.completed", {"item_id": item_id, "output_index": index}
+            ),
+            self.frame("response.output_item.done", {"output_index": index, "item": done}),
+        ]
+
+    def image(self, update: Any) -> list[str]:
+        """An image this install is making (P8e), as OpenAI streams its own:
+        the item added, `in_progress` then `generating`; then `completed`
+        and the item done, carrying the image."""
+        execution = update.execution
+        item_id = f"ig_{execution.item_id}"
+        if update.phase == "started":
+            events = self._close_open() + self._close_calls()
+            index = self._next_index()
+            item = {
+                "id": item_id,
+                "type": "image_generation_call",
+                "status": "in_progress",
+                "result": None,
+                "action": "generate",
+            }
+            events.append(
+                self.frame("response.output_item.added", {"output_index": index, "item": item})
+            )
+            for name in (
+                "response.image_generation_call.in_progress",
+                "response.image_generation_call.generating",
+            ):
+                events.append(self.frame(name, {"item_id": item_id, "output_index": index}))
+            self.output.append(item)
+            return events
+        index = next(
+            (i for i, it in enumerate(self.output) if it.get("id") == item_id), len(self.output)
+        )
+        done = image_generation_item(execution)
+        if index < len(self.output):
+            self.output[index] = done
+        else:
+            self.output.append(done)
+        return [
+            self.frame(
+                "response.image_generation_call.completed",
+                {"item_id": item_id, "output_index": index},
             ),
             self.frame("response.output_item.done", {"output_index": index, "item": done}),
         ]

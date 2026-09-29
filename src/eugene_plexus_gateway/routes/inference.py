@@ -139,7 +139,7 @@ from ..driver_client import DriverClient, DriverError, TieredClient, VideoJobs
 from ..images import attachment_kinds, max_images
 from ..lifecycle import LifecycleManager, WakeResult
 from ..metrics import AttemptRow, CandidateRow, MetricsStore, RequestRow, ToolExecutionRow
-from ..routing import Resolution, RoutingTable, collect_attempts, takes
+from ..routing import Resolution, RoutingTable, collect_attempts, current_attempts, takes
 
 log = logging.getLogger(__name__)
 
@@ -289,25 +289,49 @@ def _record(
                 audio_seconds=audio_seconds,
                 images=images,
                 video_seconds=video_seconds,
-                web_searches=[
-                    ToolExecutionRow(
-                        tool=server_tools.WEB_SEARCH,
-                        driver=e.driver,
-                        node=e.node,
-                        provider=e.provider,
-                        version=e.version,
-                        outcome=e.outcome,
-                        results=len(e.results) if e.outcome == "ok" else None,
-                        elapsed_ms=e.elapsed_ms,
-                    )
-                    for e in (searched.executions if searched is not None else [])
-                ],
+                tool_executions=_tool_rows(searched),
             )
         )
         if (context := admission.current.get()) is not None:
             context.recorded = True
     except Exception:
         log.debug("could not record request metrics", exc_info=True)
+
+
+def _tool_rows(searched: server_tools.SearchingClient | None) -> list[ToolExecutionRow]:
+    """One metrics row per server-run tool call (P8, P8e), in the order they
+    ran. No query and no prompt text, by A5's rule."""
+    if searched is None:
+        return []
+    rows: list[ToolExecutionRow] = []
+    for kind, value in searched.transcript:
+        if kind == "search":
+            rows.append(
+                ToolExecutionRow(
+                    tool=server_tools.WEB_SEARCH,
+                    driver=value.driver,
+                    node=value.node,
+                    provider=value.provider,
+                    version=value.version,
+                    outcome=value.outcome,
+                    results=len(value.results) if value.outcome == "ok" else None,
+                    elapsed_ms=value.elapsed_ms,
+                )
+            )
+        elif kind == "image":
+            rows.append(
+                ToolExecutionRow(
+                    tool=server_tools.IMAGE_GENERATION,
+                    driver=value.driver,
+                    node=value.node,
+                    provider=value.model,
+                    version=value.version,
+                    outcome=value.outcome,
+                    results=1 if value.outcome == "ok" else None,
+                    elapsed_ms=value.elapsed_ms,
+                )
+            )
+    return rows
 
 
 def _error(
@@ -665,6 +689,7 @@ async def _prepare(
     install_max_tokens: bool = True,
     completion: CompletionPrompt | None = None,
     search: server_tools.SearchPlan | None = None,
+    image: server_tools.ImagePlan | None = None,
 ) -> _Serving | _Failure:
     """Resolve, refuse, refresh, wake, and start the clock.
 
@@ -724,6 +749,30 @@ async def _prepare(
                 update={"callerSettings": kept or None, "webSearchOptions": None}
             )
 
+    # P8e: an `image_generation` tool runs through an image model chosen
+    # here, after `admission.authorize` has read the key, or the request is
+    # a 400 saying why (P8e-3) -- never a silent removal.
+    if image is not None:
+        settings = _store(request)
+        chosen, reason = server_tools.image_model(
+            table,
+            image,
+            admission.current.get(),
+            settings.get("imageToolModel") if settings is not None else None,
+        )
+        if chosen is None:
+            return _Failure(
+                code=400,
+                message=(
+                    f"tools: image generation could not run for this request: {reason}. "
+                    "Nothing was forwarded."
+                ),
+                error_type="invalid_request_error",
+                param="tools",
+            )
+        image.chosen = chosen
+    looping = searching or image is not None
+
     async def permit(resolved: Any) -> Any:
         try:
             return await admission.permitted(resolved, requirements=constraints)
@@ -742,23 +791,32 @@ async def _prepare(
     async def resolve() -> Any:
         nonlocal native
         resolved = await permit(table.resolve(body.model))
-        if searching:
-            resolved, native = server_tools.searchable(resolved)
+        if looping:
+            # An image is made only here, so with one asked for every
+            # candidate must call tools, a backend that searches itself too.
+            resolved, native = server_tools.searchable(resolved, native_ok=image is None)
         return resolved
 
     resolution = await resolve()
     if not resolution.has_backends():
-        if searching and (await permit(table.resolve(body.model))).has_backends():
-            return _Failure(
-                code=400,
-                message=(
+        if looping and (await permit(table.resolve(body.model))).has_backends():
+            message = (
+                (
+                    f"No backend serving {body.model!r} can make images: image generation "
+                    "here is offered to the model as a tool, and none of its backends calls "
+                    "tools. Choose a model whose backend supports tool calling. Nothing was "
+                    "forwarded or woken."
+                )
+                if image is not None
+                else (
                     f"No backend serving {body.model!r} can search the web: it neither runs "
                     "web search itself nor calls tools, and a search this install runs is "
                     "offered to the model as a tool. Choose a model whose backend supports "
                     "tool calling. Nothing was forwarded or woken."
-                ),
-                error_type="invalid_request_error",
-                param="tools",
+                )
+            )
+            return _Failure(
+                code=400, message=message, error_type="invalid_request_error", param="tools"
             )
         return _no_such_model(body.model, table)
 
@@ -876,15 +934,30 @@ async def _prepare(
 
         client.prepare_request = prepare_candidate
     served: Any = client
-    if searching and search is not None:
+    if looping:
         # The loop wraps the routed client last, so it chains the profile
         # defaults hook set above rather than replacing it.
+        run_search = search if searching else None
         served = server_tools.SearchingClient(
             client,
-            plan=search,
-            runner=server_tools.SearchRunner(table, search),
-            limit=search.limit(store.get("maxToolCalls") if store is not None else None),
+            plan=run_search,
+            runner=server_tools.SearchRunner(table, run_search) if run_search else None,
+            limit=server_tools.request_limit(
+                run_search, image, store.get("maxToolCalls") if store is not None else None
+            ),
             native=native,
+            image=image,
+            image_runner=server_tools.ImageRunner(
+                table,
+                image,
+                permit=admission.permitted,
+                local_only=admission.local_only(),
+                request_id=admission.request_id(),
+                before_attempt=admission.before_attempt,
+                attempts=current_attempts,
+            )
+            if image is not None
+            else None,
         )
     waited_ms = wake.waited_ms if wake is not None and wake.ok else 0
     # Excludes the wake, which is `waited_ms` and already reported. The
@@ -1486,6 +1559,10 @@ async def _stream_responses(
                     for chunk in translator.search(event.search):
                         yield chunk
                     continue
+                if event.image is not None:
+                    for chunk in translator.image(event.image):
+                        yield chunk
+                    continue
                 if event.tool_calls:
                     for chunk in translator.tool_fragments(event.tool_calls):
                         yield chunk
@@ -1624,6 +1701,7 @@ async def create_response(request: Request) -> Any:
         instead="/v1/embeddings",
         install_max_tokens=False,
         search=translated.search,
+        image=translated.image,
     )
     if isinstance(prepared, _Failure):
         return prepared.as_responses()
@@ -1669,7 +1747,7 @@ async def create_response(request: Request) -> Any:
         searched = (
             prepared.client
             if isinstance(prepared.client, server_tools.SearchingClient)
-            and prepared.client.executions
+            and (prepared.client.executions or prepared.client.images)
             else None
         )
         output = (

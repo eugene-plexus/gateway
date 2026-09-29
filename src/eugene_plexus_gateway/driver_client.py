@@ -146,6 +146,10 @@ class StreamEvent:
     yields it between a model's turns, and each door renders it in its own
     vocabulary (a `web_search_call` item, a `server_tool_use` block) or
     not at all (chat)."""
+    image: Any = None
+    """An image the gateway itself is making for this answer (P8e), as a
+    `server_tools.SearchUpdate` over an `ImageExecution`. Only on the
+    Responses door, the one door whose API defines `image_generation`."""
 
 
 def _problem_from_bytes(raw: bytes) -> Problem | None:

@@ -98,19 +98,34 @@ FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="maxToolCalls",
-        label="Web searches per request",
+        label="Web searches and images per request",
         description=(
-            "How many web searches this install runs for one request when the caller "
-            "does not say (P8). Past it the model is told no more searches are "
-            "available and answers with what it found. A caller's own max_tool_calls "
+            "How many web searches and images this install runs for one request when "
+            "the caller does not say (P8). Past it the model is told no more are "
+            "available and answers with what it has. A caller's own max_tool_calls "
             "(Codex) or max_uses (Claude Code) wins over this. Each search sends the "
-            "model's query to your search account, and a paid one counts every search."
+            "model's query to your search account, and a paid one counts every search; "
+            "each image is billed by the provider that makes it."
         ),
         category="generation",
         valueType=ConfigValueType.integer,
         default=5,
         minimum=1,
         maximum=50,
+    ),
+    ConfigField(
+        key="imageToolModel",
+        label="Image model for tools",
+        description=(
+            "The image model that answers an app's image_generation tool on "
+            "/v1/responses when the app does not name one this install serves (P8e). "
+            "Blank, the default, uses the one image model a key may use, and asks "
+            "for this setting only when there are several. An id as /v1/models lists "
+            "it, such as openrouter/openai/gpt-image-1."
+        ),
+        category="generation",
+        valueType=ConfigValueType.string,
+        default=None,
     ),
     ConfigField(
         key="profileCacheSeconds",

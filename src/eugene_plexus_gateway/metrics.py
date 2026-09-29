@@ -121,9 +121,24 @@ class AttemptRow:
     first_ms: int | None = None
 
 
+def _tool_lists(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """A request's tool rows, split by tool as the contract names them:
+    `webSearches` (P8) and `imageGenerations` (P8e). Each is left out when
+    empty, so a row that ran neither reads exactly as it did before P8."""
+    out: dict[str, Any] = {}
+    searches = [r for r in rows if r["tool"] != "image_generation"]
+    images = [r for r in rows if r["tool"] == "image_generation"]
+    if searches:
+        out["webSearches"] = searches
+    if images:
+        out["imageGenerations"] = images
+    return out
+
+
 @dataclass(slots=True)
 class ToolExecutionRow:
-    """One search the install ran for a request (v10, P8).
+    """One search the install ran for a request (v10, P8), or one image the
+    `image_generation` tool made (P8e).
 
     **No query text.** A query is made from the prompt, and A5's rule is
     that no prompt is kept; what ran, where, how long and with what
@@ -180,7 +195,7 @@ class RequestRow:
     # v9 (P5): the seconds of video a job asked for, on the submit's row.
     video_seconds: int | None = None
     # v10 (P8): each search the install ran for this request, in order.
-    web_searches: list[ToolExecutionRow] = field(default_factory=list)
+    tool_executions: list[ToolExecutionRow] = field(default_factory=list)
 
 
 _DDL = """
@@ -635,7 +650,7 @@ class MetricsStore:
                             t.results,
                             t.elapsed_ms,
                         )
-                        for seq, t in enumerate(row.web_searches)
+                        for seq, t in enumerate(row.tool_executions)
                     ],
                 )
                 conn.executemany(
@@ -1210,7 +1225,7 @@ class MetricsStore:
                 "videoSeconds": r[24],
                 "tries": tries[r[0]],
                 "candidates": considered[r[0]],
-                **({"webSearches": searched[r[0]]} if searched[r[0]] else {}),
+                **_tool_lists(searched[r[0]]),
             }
             for r in rows
         ]
