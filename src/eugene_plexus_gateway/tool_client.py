@@ -80,6 +80,9 @@ class ToolDriverInfo:
     tools: list[str]
     configured: bool
     version: str | None = None
+    #: `free` or `per_search`. An account that does not say is read as
+    #: billing: nothing is assumed to cost nothing.
+    billing: str = "per_search"
 
 
 @dataclass
@@ -122,6 +125,7 @@ class ToolDriverClient:
             tools=[t for t in tools if isinstance(t, str)] if isinstance(tools, list) else [],
             configured=bool(body.get("configured", True)),
             version=body.get("version") if isinstance(body.get("version"), str) else None,
+            billing="free" if body.get("billing") == "free" else "per_search",
         )
 
     async def web_search(self, request: WebSearchRequest) -> SearchAnswer:

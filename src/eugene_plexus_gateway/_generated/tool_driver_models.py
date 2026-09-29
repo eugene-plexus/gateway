@@ -30,21 +30,18 @@ class Egress(StrEnum):
     internet = 'internet'
 
 
-class ToolDriverInfo(BaseModel):
-    provider: str = Field(..., description='The provider key, `searxng` or `brave`.')
-    label: str | None = Field(None, description="The provider's display name.")
-    tools: list[ToolName] = Field(
-        ..., description='The tools this process runs. Empty until it is configured.'
-    )
-    egress: Egress = Field(
-        ...,
-        description='Where a query goes. Always `internet`: even a SearXNG on the\nLAN forwards the query to public engines.\n',
-    )
-    configured: bool | None = Field(
-        None,
-        description="False until the provider's address (and key, where it has one) is set.",
-    )
-    version: str | None = None
+class ToolBilling(StrEnum):
+    """
+    Whether the provider bills each search (`per_search`: Brave) or not
+    (`free`: SearXNG). The gateway tries a free account before one that
+    bills, so an install with both pays only when the free one could not
+    answer. Absent is read as `per_search`: an account that does not say
+    is not assumed to cost nothing.
+
+    """
+
+    free = 'free'
+    per_search = 'per_search'
 
 
 class AllowedDomain(RootModel[str]):
@@ -1251,6 +1248,24 @@ class WebSearchResult(BaseModel):
         None,
         description='When the page was published, as the provider reported it (ISO 8601 where it gave one).',
     )
+
+
+class ToolDriverInfo(BaseModel):
+    provider: str = Field(..., description='The provider key, `searxng` or `brave`.')
+    label: str | None = Field(None, description="The provider's display name.")
+    tools: list[ToolName] = Field(
+        ..., description='The tools this process runs. Empty until it is configured.'
+    )
+    egress: Egress = Field(
+        ...,
+        description='Where a query goes. Always `internet`: even a SearXNG on the\nLAN forwards the query to public engines.\n',
+    )
+    configured: bool | None = Field(
+        None,
+        description="False until the provider's address (and key, where it has one) is set.",
+    )
+    billing: ToolBilling | None = None
+    version: str | None = None
 
 
 class WebSearchRequest(BaseModel):

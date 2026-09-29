@@ -496,3 +496,31 @@ async def test_a_search_account_is_discovered_apart_from_the_drivers(route_http:
     assert [a.name for a in table.search_accounts()] == ["searx"]
     assert sorted(p for p in probed if p) == [8081, 8190, 8191]
     await table.aclose()
+
+
+async def test_a_free_search_account_is_tried_before_one_that_bills(route_http: Any) -> None:
+    """`brave` sorts first by name, and bills; `searx` is free and must come first."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/node":
+            return httpx.Response(200, json={"enrolled": False})
+        if request.url.path == "/v1/components":
+            return httpx.Response(
+                200,
+                json=_components(
+                    {"name": "brave", "kind": "tool-driver", "url": "http://127.0.0.1:8190"},
+                    {"name": "searx", "kind": "tool-driver", "url": "http://127.0.0.1:8191"},
+                    {"name": "unsaid", "kind": "tool-driver", "url": "http://127.0.0.1:8192"},
+                ),
+            )
+        billing = {8190: "per_search", 8191: "free", 8192: None}[request.url.port]
+        body = {"provider": "x", "tools": ["web_search"], "egress": "internet", "configured": True}
+        if billing:
+            body["billing"] = billing
+        return httpx.Response(200, json=body)
+
+    route_http(handler)
+    table = RoutingTable(agent_url="http://agent")
+    await table.refresh()
+    assert [a.name for a in table.search_accounts()] == ["searx", "brave", "unsaid"]
+    await table.aclose()

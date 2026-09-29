@@ -1639,7 +1639,16 @@ class StreamTranslator:
         if update.phase == "started":
             events = self._close_open() + self._close_calls()
             index = self._next_index()
-            item = {"id": item_id, "type": "web_search_call", "status": "in_progress"}
+            # The query rides on the item from the moment it is added: Codex
+            # prints `web search: <query>` for the added item and again for
+            # the done one, and an item added without it printed an empty
+            # line (measured, Codex 0.130.0).
+            item = {
+                "id": item_id,
+                "type": "web_search_call",
+                "status": "in_progress",
+                "action": {"type": "search", "query": execution.query},
+            }
             events.append(
                 self.frame("response.output_item.added", {"output_index": index, "item": item})
             )

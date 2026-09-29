@@ -368,15 +368,46 @@ def test_the_limit_ends_the_loop_and_the_model_is_told(settings, search) -> None
     assert statuses == ["completed", "completed", "failed"]
 
 
+def test_a_search_asked_for_on_the_last_turn_never_reaches_the_caller(settings, search) -> None:
+    """The last turn offers no search tool, and a model may call it anyway.
+    That turn's calls are re-framed for the caller -- all but the search,
+    which the caller never offered and cannot run."""
+    looping = [Turn(calls=[search_call(f"q{i}", f"call_{i}")]) for i in range(10)]
+    model = ScriptedDriver(turns=looping)
+    with TestClient(app_with(settings, model, searches=[account(search)])) as client:
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": MODEL,
+                "input": "search forever",
+                "tools": [{"type": "web_search"}],
+                "max_tool_calls": 1,
+                "stream": True,
+            },
+        )
+    assert response.status_code == 200, response.text
+    assert len(model.calls) == 3, "one search, one refused, and the last turn"
+    assert model.calls[-1].tools is None
+    added = [d["item"] for name, d in events(response) if name == "response.output_item.added"]
+    assert not [i for i in added if i["type"] == "function_call"], added
+    assert not [n for n, _ in events(response) if n.startswith("response.function_call")]
+
+
 # --------------------------------------------------------------------------- #
 # Failover ends at the first search
 # --------------------------------------------------------------------------- #
 
 
 def test_after_a_search_a_failure_is_reported_and_never_cascaded(settings, search) -> None:
+    """The second turn fails the way a dead backend does -- a failure the
+    first call WOULD cascade on. A `RuntimeError` here cascades nowhere
+    whether or not the loop pins, so the check could not fail (the P8
+    sabotage pass, 2026-09-29)."""
+    import httpx
+
     primary = ScriptedDriver(
         name="a",
-        turns=[Turn(calls=[search_call()]), Turn(error=RuntimeError("engine died"))],
+        turns=[Turn(calls=[search_call()]), Turn(error=httpx.ConnectError("engine died"))],
     )
     backup = ScriptedDriver(name="b", turns=[Turn("<backup would have answered>")])
     slots = [{"model": "slot", "targets": [MODEL, "b-model"]}]
@@ -867,3 +898,34 @@ def test_a_profile_default_does_not_throw_away_the_loops_turns(settings, search)
 @pytest.fixture(autouse=True)
 def _no_ambient(monkeypatch) -> Iterator[None]:
     yield
+
+
+def test_a_newer_anthropic_tool_date_is_accepted_and_its_unknown_settings_named(
+    settings, search
+) -> None:
+    """Refusing an unknown date would break WebSearch the day Claude Code
+    sends one (Troy, 2026-09-29): any `web_search_<8 digits>` runs, the
+    settings this gateway knows are honoured, and any other is named."""
+    model = ScriptedDriver(turns=[Turn(calls=[search_call()]), Turn(ANSWER)])
+    newer = {
+        **CLAUDE_CODE_SEARCH,
+        "tools": [
+            {
+                "type": "web_search_20991231",
+                "name": "web_search",
+                "max_uses": 3,
+                "allowed_domains": ["github.com"],
+                "a_future_knob": True,
+            }
+        ],
+    }
+    with TestClient(app_with(settings, model, searches=[account(search)])) as client:
+        response = client.post("/v1/messages", json=newer)
+    assert response.status_code == 200, response.text
+    assert "tools.web_search.a_future_knob" in response.headers["x-eugene-plexus-ignored-settings"]
+    (asked,) = search.asked
+    assert [d.root for d in asked.allowedDomains] == ["github.com"]
+    malformed = {**CLAUDE_CODE_SEARCH, "tools": [{"type": "web_search_2099", "name": "web_search"}]}
+    with TestClient(app_with(settings, model, searches=[account(search)])) as client:
+        refused = client.post("/v1/messages", json=malformed)
+    assert refused.status_code == 400 and "web_search_2099" in refused.json()["error"]["message"]

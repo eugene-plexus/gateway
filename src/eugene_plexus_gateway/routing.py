@@ -1459,9 +1459,12 @@ class RoutingTable:
     async def _probe_tools(self, entries: list[tuple[str | None, str, str]]) -> list[ToolAccount]:
         """Every search account that answers its `/v1/info`, in search order.
 
-        This gateway's own node first -- a search on the same machine is a
-        loopback hop -- then by node and name, so the order is stable and
-        a second account is a real fallback rather than a coin flip.
+        **A free account before one that bills**, so an install with a
+        SearXNG and a Brave key pays only when SearXNG could not answer --
+        found by the first acceptance run, where name order sent every
+        search to Brave. Then this gateway's own node first (a loopback
+        hop), then by node and name, so the order is stable and a second
+        account is a real fallback rather than a coin flip.
         """
 
         async def one(node: str | None, name: str, url: str) -> ToolAccount | None:
@@ -1482,7 +1485,14 @@ class RoutingTable:
             *(one(node, name, url) for node, name, url in entries), return_exceptions=True
         )
         accounts = [a for a in found if isinstance(a, ToolAccount)]
-        accounts.sort(key=lambda a: (not self._is_own_node(a.node), a.node or "", a.name))
+        accounts.sort(
+            key=lambda a: (
+                a.info.billing != "free",
+                not self._is_own_node(a.node),
+                a.node or "",
+                a.name,
+            )
+        )
         return accounts
 
     def search_accounts(self, tool: str = "web_search") -> list[ToolAccount]:
