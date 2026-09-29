@@ -1241,6 +1241,34 @@ class FinishReason(StrEnum):
     error = 'error'
 
 
+class Text(RootModel[str]):
+    root: str = Field(..., max_length=1000000)
+
+
+class ModerationPartType(StrEnum):
+    """
+    Named, so a later inline enum cannot renumber it.
+    """
+
+    text = 'text'
+    image = 'image'
+
+
+class ModerateResponse(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str | None = Field(None, description="The backend's id for this moderation.")
+    results: list[dict[str, Any]] = Field(
+        ...,
+        description='One per input, as the backend sent them: `flagged`,\n`categories`, `category_scores` and\n`category_applied_input_types`.\n',
+    )
+    modelId: str | None = Field(
+        None, description='The model the backend says answered.'
+    )
+    latencyMs: int | None = None
+
+
 class TimestampGranularity(StrEnum):
     """
     Named, so a later inline enum cannot renumber it.
@@ -2070,6 +2098,19 @@ class DirectoryEntry(BaseModel):
     )
 
 
+class ModerationPart(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    type: ModerationPartType
+    text: str | None = Field(None, max_length=1000000)
+    image: str | None = Field(
+        None,
+        description='For `image`: a `data:` URL, as `image_url.url` carries it.',
+        max_length=16000000,
+    )
+
+
 class SpeakRequest(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -2537,6 +2578,38 @@ class StreamToken(BaseModel):
     annotations: list[ChatAnnotation] | None = None
 
 
+class ModerateRequest(BaseModel):
+    """
+    Exactly one of `texts` and `parts`.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    model: str | None = Field(
+        None,
+        description="Which of this driver's models the request is for: an `id` from\n`DriverInfo.models`, **unprefixed** — the gateway strips the\n`<driver name>/` it added. Optional so a caller from before P1\nstill works against a single-model driver, which serves its one\nmodel when this is absent. An account driver refuses a request\nwithout it (400, `#model-required`), and every driver refuses a\nmodel it does not list (404, `#model-not-served`) before calling\nits backend.\n",
+        min_length=1,
+    )
+    localOnly: bool | None = Field(
+        False,
+        description='As `GenerateRequest.localOnly`: refuse before sending anything\nunless the active engine is classified local.\n',
+    )
+    texts: list[Text] | None = Field(
+        None,
+        description='Texts moderated one by one, with one result each.',
+        max_length=2048,
+        min_length=1,
+    )
+    parts: list[ModerationPart] | None = Field(
+        None,
+        description='One input of text and an image, with one result.',
+        max_length=32,
+        min_length=1,
+    )
+    requestId: UUID | None = None
+
+
 class DriverModel(BaseModel):
     """
     One model a driver serves, with what that model can do.
@@ -2560,7 +2633,7 @@ class DriverModel(BaseModel):
     )
     surfaces: list[str] = Field(
         ...,
-        description='Which requests this model answers. The values so far:\n\n* `chat` (`/v1/generate`), `embeddings` (`/v1/embed`),\n  `decisions` (`/v1/decide`), `speech` (`/v1/speak`, P3a),\n  `transcription` (`/v1/transcribe`, P3b), `translation`\n  (`/v1/transcribe` with `translate`, P3-4), `image`\n  (`/v1/image`, P4) and `video` (`/v1/video`, P5), which have\n  doors;\n* `completion`, `moderation` and `rerank`, which name OpenAI\'s\n  and OpenRouter\'s doors Eugene has not built yet.\n\nAn OpenRouter model whose output is image and text (Gemini\'s\nimage models) serves `image` beside `chat`: its images route\nanswers them too (measured).\n\nA single-model `llama-server` whose projector hears\n(`/props` `modalities.audio`) serves `transcription` beside\n`chat`: its `/v1/audio/transcriptions` answers only then\n(measured).\n\nOpenAI\'s `whisper-*` models serve `translation` beside\n`transcription`; nothing else here translates (measured).\nElevenLabs\' `scribe_*` models serve `transcription`, listed\nonly while the key may use speech-to-text (P3-1, as P3-2\nrequires `models_read` for its speech models).\n\nA driver reports those anyway, so a model\'s id does not\nchange on the day its door arrives, and the gateway lists a\nmodel on `GET /v1/models` only once a door serves one of its\nsurfaces (P1-4).\n\n**Strings, not an enum, on purpose.** A newer driver\nreporting a surface an older gateway has never heard of must\nnot fail that gateway\'s validation of the whole `/v1/info`,\nwhich would make every model on the driver unreachable over\none unknown word. A reader ignores a surface it does not\nknow. Empty only for a model whose kind neither the backend\nnor the driver could decide, which serves nothing.\n\n**Replaces `capabilities.embeddings` and\n`capabilities.chatCapable`**, which said the same thing once\nfor the whole driver. Where they came from still holds for a\nsingle-model driver: `embeddings` is **a property of the\nrunning backend, not of the model**, and not readable from\nanything (`llama-server`\'s `/props` carries no pooling\nfield, and an Ollama runner started for chat refuses with\n*"This server does not support embeddings"*), so it is\ndetermined by trying once and cached for the driver\'s\nlifetime. A System One backend serves `decisions` alone. An\naccount takes each model\'s surfaces from its catalogue.\n',
+        description='Which requests this model answers. The values so far:\n\n* `chat` (`/v1/generate`), `embeddings` (`/v1/embed`),\n  `decisions` (`/v1/decide`), `speech` (`/v1/speak`, P3a),\n  `transcription` (`/v1/transcribe`, P3b), `translation`\n  (`/v1/transcribe` with `translate`, P3-4), `image`\n  (`/v1/image`, P4), `video` (`/v1/video`, P5) and\n  `moderation` (`/v1/moderate`, P6), which have doors;\n* `completion` and `rerank`, which name OpenAI\'s and\n  OpenRouter\'s doors Eugene has not built yet.\n\nAn OpenRouter model whose output is image and text (Gemini\'s\nimage models) serves `image` beside `chat`: its images route\nanswers them too (measured).\n\nA single-model `llama-server` whose projector hears\n(`/props` `modalities.audio`) serves `transcription` beside\n`chat`: its `/v1/audio/transcriptions` answers only then\n(measured).\n\nOpenAI\'s `whisper-*` models serve `translation` beside\n`transcription`; nothing else here translates (measured).\nElevenLabs\' `scribe_*` models serve `transcription`, listed\nonly while the key may use speech-to-text (P3-1, as P3-2\nrequires `models_read` for its speech models).\n\nA driver reports those anyway, so a model\'s id does not\nchange on the day its door arrives, and the gateway lists a\nmodel on `GET /v1/models` only once a door serves one of its\nsurfaces (P1-4).\n\n**Strings, not an enum, on purpose.** A newer driver\nreporting a surface an older gateway has never heard of must\nnot fail that gateway\'s validation of the whole `/v1/info`,\nwhich would make every model on the driver unreachable over\none unknown word. A reader ignores a surface it does not\nknow. Empty only for a model whose kind neither the backend\nnor the driver could decide, which serves nothing.\n\n**Replaces `capabilities.embeddings` and\n`capabilities.chatCapable`**, which said the same thing once\nfor the whole driver. Where they came from still holds for a\nsingle-model driver: `embeddings` is **a property of the\nrunning backend, not of the model**, and not readable from\nanything (`llama-server`\'s `/props` carries no pooling\nfield, and an Ollama runner started for chat refuses with\n*"This server does not support embeddings"*), so it is\ndetermined by trying once and cached for the driver\'s\nlifetime. A System One backend serves `decisions` alone. An\naccount takes each model\'s surfaces from its catalogue.\n',
     )
     inputModalities: list[str] | None = Field(
         None,

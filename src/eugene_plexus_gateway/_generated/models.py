@@ -1216,6 +1216,7 @@ class Surface(StrEnum):
     translation = 'translation'
     image = 'image'
     video = 'video'
+    moderation = 'moderation'
 
 
 class ModelRoutingInfo(BaseModel):
@@ -1239,7 +1240,7 @@ class ModelRoutingInfo(BaseModel):
     )
     surfaces: list[Surface] | None = Field(
         None,
-        description="Which surfaces this model can be sent to. `decisions` means\n`POST /v1/systemone`; a decision-only model lists nothing\nelse, and a chat request naming it is refused with the\ndoor's name. `speech` means `POST /v1/audio/speech` (P3a),\n`transcription` `POST /v1/audio/transcriptions` (P3b),\n`translation` `POST /v1/audio/translations` (P3-4), `image`\n`POST /v1/images/generations` and `/edits` (P4), `video`\n`POST /v1/videos` (P5).\n\nOpenAI's own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Measured, not assumed, and the two are not always\ndisjoint**: an Ollama runner started for chat refuses to\nembed, `nomic-embed-text` refuses to chat -- but\n`llama-server` given `--embedding` still serves chat\nperfectly well. Hence a list.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n",
+        description="Which surfaces this model can be sent to. `decisions` means\n`POST /v1/systemone`; a decision-only model lists nothing\nelse, and a chat request naming it is refused with the\ndoor's name. `speech` means `POST /v1/audio/speech` (P3a),\n`transcription` `POST /v1/audio/transcriptions` (P3b),\n`translation` `POST /v1/audio/translations` (P3-4), `image`\n`POST /v1/images/generations` and `/edits` (P4), `video`\n`POST /v1/videos` (P5), `moderation` `POST /v1/moderations`\n(P6).\n\nOpenAI's own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Measured, not assumed, and the two are not always\ndisjoint**: an Ollama runner started for chat refuses to\nembed, `nomic-embed-text` refuses to chat -- but\n`llama-server` given `--embedding` still serves chat\nperfectly well. Hence a list.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n",
     )
     image_input: bool | None = Field(
         None,
@@ -1409,6 +1410,35 @@ class TranscriptionResponseFormat(StrEnum):
     verbose_json = 'verbose_json'
     srt = 'srt'
     vtt = 'vtt'
+
+
+class ModerationTexts(RootModel[list[str]]):
+    """
+    Moderated one by one, with one result each.
+    """
+
+    root: list[str] = Field(
+        ..., description='Moderated one by one, with one result each.', min_length=1
+    )
+
+
+class ModerationImageUrl(BaseModel):
+    url: str = Field(..., description='A `data:` URL (A4).')
+
+
+class ModerationInputPartType(StrEnum):
+    text = 'text'
+    image_url = 'image_url'
+
+
+class ModerationResult(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    flagged: bool
+    categories: dict[str, bool] | None = None
+    category_scores: dict[str, float] | None = None
+    category_applied_input_types: dict[str, list[str]] | None = None
 
 
 class TranslationForm(BaseModel):
@@ -3241,6 +3271,18 @@ class TranscriptionVerbose(BaseModel):
     usage: TranscriptionUsageOut | None = None
 
 
+class ModerationInputPart(BaseModel):
+    type: ModerationInputPartType
+    text: str | None = None
+    image_url: ModerationImageUrl | None = None
+
+
+class ModerationResponse(BaseModel):
+    id: str
+    model: str = Field(..., description='The public id of the model that answered.')
+    results: list[ModerationResult]
+
+
 class ImageGenerationRequest(BaseModel):
     """
     OpenAI's image generation request (P4). Unknown fields are refused naming them.
@@ -3751,7 +3793,7 @@ class MetricRequest(BaseModel):
     completionTokens: int | None = None
     door: str | None = Field(
         None,
-        description="Which door the request came in by (P3b): `speech`,\n`transcription`, `translation` (P3-4), `images` (P4, schema v8)\nor `videos` (P5, schema v9, the submit's row). Null on rows from\nbefore schema v7 and on every other door, whose rows carry\ntokens.\n",
+        description="Which door the request came in by (P3b): `speech`,\n`transcription`, `translation` (P3-4), `images` (P4, schema v8),\n`videos` (P5, schema v9, the submit's row) or `moderation` (P6).\nNull on rows from before schema v7 and on every other door,\nwhose rows carry tokens.\n",
     )
     characters: int | None = Field(
         None,
@@ -3852,6 +3894,18 @@ class DirectoryListing(BaseModel):
 class ModelList(BaseModel):
     object: Literal['list']
     data: list[Model]
+
+
+class ModerationParts(RootModel[list[ModerationInputPart]]):
+    """
+    One input of text and an image, with one result.
+    """
+
+    root: list[ModerationInputPart] = Field(
+        ...,
+        description='One input of text and an image, with one result.',
+        min_length=1,
+    )
 
 
 class ImagesResponse(BaseModel):
@@ -4014,6 +4068,19 @@ class AnthropicCountTokensRequest(BaseModel):
     system: str | list[AnthropicSystemBlock] | None = None
     tools: list[AnthropicToolDefinition] | None = None
     tool_choice: AnthropicToolChoice | None = None
+
+
+class ModerationRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    model: str | None = Field(
+        None, description='Left out, the one moderation model this key may use (P6-1).'
+    )
+    input: str | ModerationTexts | ModerationParts = Field(
+        ...,
+        description="A string, an array of strings, or an array of parts. Every piece\nis a named schema: an inline array here was generated as `Input`\nand renamed the embeddings request's `Input` to `Input2`.\n",
+    )
 
 
 class ChatCompletionChunk(BaseModel):

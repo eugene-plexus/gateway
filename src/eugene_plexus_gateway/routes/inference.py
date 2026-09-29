@@ -39,7 +39,16 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
-from .. import admission, anthropic, chat_contract, decisions, image_doors, responses, video_doors
+from .. import (
+    admission,
+    anthropic,
+    chat_contract,
+    decisions,
+    image_doors,
+    moderation_door,
+    responses,
+    video_doors,
+)
 from .._generated.driver_models import AudioOutputFormat as DriverAudioOutputFormat
 from .._generated.driver_models import (
     AudioOutputRequest,
@@ -50,6 +59,7 @@ from .._generated.driver_models import (
     ImageRequest,
     ImageResponse,
     Message,
+    ModerateRequest,
     Role,
     SpeakRequest,
     TranscribeAudio,
@@ -70,6 +80,7 @@ from .._generated.driver_models import ReasoningEffort as DriverReasoningEffort
 from .._generated.driver_models import ResponseFormat as DriverResponseFormat
 from .._generated.driver_models import ServiceTier as DriverServiceTier
 from .._generated.driver_models import SpeechFormat as DriverSpeechFormat
+from .._generated.driver_models import Text as DriverModerationText
 from .._generated.driver_models import TimestampGranularity as DriverTimestampGranularity
 from .._generated.driver_models import Tool as DriverTool
 from .._generated.driver_models import ToolChoice as DriverToolChoice
@@ -189,7 +200,8 @@ def _record(
     | SpeechRequest
     | chat_contract.TranscriptionAsk
     | image_doors.ImageAsk
-    | video_doors.VideoAsk,
+    | video_doors.VideoAsk
+    | moderation_door.ModerationAsk,
     tries: list[AttemptRow],
     *,
     served_model: str | None = None,
@@ -238,7 +250,8 @@ def _record(
         rec.metrics.record(
             RequestRow(
                 started_at=datetime.now(UTC),
-                requested_model=body.model,
+                # A moderation's model is settled before it is recorded (P6-1).
+                requested_model=body.model or "",
                 served_model=served_model,
                 attempts=max(1, len(tries)),
                 tier=tier if served is not None else None,
@@ -473,6 +486,7 @@ _DOORS = {
     "translation": "/v1/audio/translations",
     "image": "/v1/images/generations",
     "video": "/v1/videos",
+    "moderation": "/v1/moderations",
 }
 
 
@@ -558,6 +572,32 @@ async def list_models(request: Request) -> ModelList:
             context.allowed_models if context else None, local_only=admission.local_only()
         ),
     )
+
+
+@router.get("/v1/models/{model:path}", dependencies=_auth)
+async def retrieve_model(request: Request, model: str) -> Any:
+    """One model, exactly as `GET /v1/models` lists it for this caller (P6).
+
+    The id takes the rest of the path, because an account's ids carry
+    slashes (`openrouter/anthropic/claude-opus-5.5`). A model this key may
+    not use is the same 404 as one that does not exist, so a scoped key
+    learns nothing of what it cannot reach.
+    """
+    await admission.authorize(request)
+    context = admission.current.get()
+    table = _routing(request)
+    listed = (
+        table.as_model_list(
+            context.allowed_models if context else None, local_only=admission.local_only()
+        )
+        if table is not None
+        else []
+    )
+    found = next((m for m in listed if m.id == model), None)
+    if found is None:
+        return _no_such_model(model, table).as_openai()
+    # Serialised as the list serialises it, so the two are the same object.
+    return JSONResponse(content=found.model_dump(mode="json"))
 
 
 # --------------------------------------------------------------------------- #
@@ -1633,6 +1673,167 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
         model=result.modelId or body.model,
         usage=usage,
         x_eugene_plexus=_routing_info(client, table, body.model, started),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# /v1/moderations
+# --------------------------------------------------------------------------- #
+
+
+async def _moderation_model(request: Request, table: RoutingTable) -> str | _Failure:
+    """The model a request that left `model` out is for (P6-1): the one
+    model with the moderation surface this key may use, or a 400 naming
+    the choices. The OpenAI SDK leaves it out, and OpenAI then uses
+    `omni-moderation-latest`; here that is whichever one the install has."""
+    await admission.authorize(request)
+    context = admission.current.get()
+    choices = [
+        m.id
+        for m in table.as_model_list(
+            context.allowed_models if context else None, local_only=admission.local_only()
+        )
+        # A slot alias is not another model: `verdicts -> [omni]` would
+        # otherwise make every install with a moderation slot "several".
+        if table.serves(m.id)
+        and m.x_eugene_plexus is not None
+        and "moderation" in [getattr(s, "value", s) for s in m.x_eugene_plexus.surfaces or []]
+    ]
+    if len(choices) == 1:
+        return choices[0]
+    return _Failure(
+        code=400,
+        message=(
+            "model: required here, since this install has no moderation model you may use."
+            if not choices
+            else "model: required here, since this install has several moderation models: "
+            + ", ".join(choices)
+            + "."
+        ),
+        error_type="invalid_request_error",
+        param="model",
+    )
+
+
+@router.post("/v1/moderations", dependencies=_auth)
+async def create_moderation(request: Request) -> Any:
+    """Text or an image in, a verdict out (P6, 2026-09-28), OpenAI's shape.
+
+    **Same model only** (P6-2): `pick_moderation` hands back replicas of the
+    slot's first model and nothing else, as embeddings do: a verdict is its
+    model's own categories and thresholds, so a different model's is a
+    different policy.
+    """
+    try:
+        raw = await request.json()
+    except ValueError:
+        return _error(
+            code=400,
+            message="body: must be JSON.",
+            error_type="invalid_request_error",
+            param="body",
+        )
+    try:
+        ask = moderation_door.parse(raw, max_images=max_images(_store(request)))
+    except moderation_door.Refusal as exc:
+        return _error(
+            code=400, message=exc.message, error_type="invalid_request_error", param=exc.field
+        )
+    table = _routing(request)
+    if table is None:
+        return _error(
+            code=503,
+            message="The gateway is starting up or in safe mode; no routing table exists yet.",
+            error_type="service_unavailable",
+        )
+    if ask.model is None:
+        chosen = await _moderation_model(request, table)
+        if isinstance(chosen, _Failure):
+            return chosen.as_openai()
+        ask = replace(ask, model=chosen)
+    model = ask.model or ""
+    await admission.authorize(request, model)
+    resolution = await admission.permitted(table.resolve(model))
+    if not resolution.has_backends():
+        return _no_such_model(model, table).as_openai()
+    surfaces = resolution.surfaces()
+    if surfaces and "moderation" not in surfaces:
+        return _wrong_surface(
+            model, surfaces, wanted="moderation", instead="/v1/chat/completions"
+        ).as_openai()
+    if not surfaces and (reported := resolution.reported_surfaces()):
+        return _no_door_yet(model, reported, wanted="moderation").as_openai()
+    client = table.pick_moderation(resolution)
+    if client is None and await table.refresh_if_stale():
+        resolution = await admission.permitted(table.resolve(model))
+        client = table.pick_moderation(resolution)
+    if client is None:
+        # No wake, as for embeddings and speech.
+        return _not_ready(resolution, None).as_openai()
+    if isinstance(client, TieredClient):
+        client.authorize_attempt = admission.before_attempt
+
+    rec = _Recording(metrics=_metrics(request), started=time.perf_counter())
+    with collect_attempts() as tries:
+
+        def record(served: bool = False) -> None:
+            _record(
+                rec,
+                ask,
+                tries,
+                served_model=getattr(client, "served_model", None) if served else None,
+                tier=getattr(client, "tier", 1) if served else None,
+                door="moderation",
+            )
+
+        try:
+            result = await serve_while_connected(
+                request,
+                client.moderate(
+                    ModerateRequest(
+                        texts=[DriverModerationText(t) for t in ask.texts] if ask.texts else None,
+                        parts=ask.parts,
+                        localOnly=admission.local_only(),
+                        requestId=admission.request_id(),
+                    )
+                ),
+                what="a moderation",
+            )
+        except ClientGone:
+            record()
+            return _error(
+                code=499,
+                message="The client disconnected; the backend call was cancelled.",
+                error_type="client_disconnected",
+            )
+        except DriverError as e:
+            record()
+            return _driver_failure(e).as_openai()
+        except httpx.TimeoutException as e:
+            record()
+            return _error(
+                code=504,
+                message=(
+                    f"No backend serving {model!r} moderated within the gateway's "
+                    f"requestTimeoutSeconds ({_timeout_seconds(_store(request)):g}s). "
+                    f"({type(e).__name__})"
+                ),
+                error_type="timeout",
+            )
+        except httpx.HTTPError as e:
+            record()
+            return _error(
+                code=502,
+                message=f"A backend serving {model!r} failed ({type(e).__name__}).",
+                error_type="upstream_error",
+            )
+        record(served=True)
+    return JSONResponse(
+        content={
+            "id": result.id or f"modr-{uuid.uuid4().hex[:24]}",
+            "model": getattr(client, "served_model", None) or model,
+            "results": result.results,
+        }
     )
 
 

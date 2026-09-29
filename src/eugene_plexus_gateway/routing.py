@@ -351,6 +351,11 @@ class _Backend:
         return "translation" in self.surfaces
 
     @property
+    def moderates(self) -> bool:
+        """Whether this model serves the moderation surface (P6)."""
+        return "moderation" in self.surfaces
+
+    @property
     def makes_images(self) -> bool:
         """Whether this model serves the image surface (P4)."""
         return "image" in self.surfaces
@@ -526,6 +531,7 @@ class Resolution:
             + (["translation"] if any(b.translates for b in backends) else [])
             + (["image"] if any(b.makes_images for b in backends) else [])
             + (["video"] if any(b.makes_videos for b in backends) else [])
+            + (["moderation"] if any(b.moderates for b in backends) else [])
         )
 
     def reported_surfaces(self) -> list[str]:
@@ -1733,6 +1739,16 @@ class RoutingTable:
             return None
         return TieredClient(name=resolution.model, tiers=tiers, hooks=self)
 
+    def pick_moderation(self, resolution: Resolution) -> TieredClient | None:
+        """`pick_embedding`'s single-model tier, for moderation (P6-2): a
+        verdict is its model's categories and thresholds, so a slot's other
+        targets are never reached; its replicas balance and fail over."""
+        eligible = [b for b in resolution.first_model() if b.moderates]
+        if not eligible:
+            return None
+        ordered = [b.client for b in self._order(resolution.model, eligible)]
+        return TieredClient(name=resolution.model, tiers=[ordered], hooks=self)
+
     def pick_embedding(self, resolution: Resolution) -> TieredClient | None:
         """A client that can only ever reach ONE model.
 
@@ -2078,6 +2094,11 @@ class RoutingTable:
 
     def is_empty(self) -> bool:
         return not self._snapshot.by_model
+
+    def serves(self, model_id: str) -> bool:
+        """Whether some driver serves `model_id` itself, rather than it being
+        only a configured slot's alias for other models."""
+        return model_id in self._snapshot.by_model
 
     # --- read models ------------------------------------------------------
 

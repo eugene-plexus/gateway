@@ -39,6 +39,8 @@ from ._generated.driver_models import (
     ImagePartial,
     ImageRequest,
     ImageResponse,
+    ModerateRequest,
+    ModerateResponse,
     Problem,
     RetryDisposition,
     SpeakRequest,
@@ -211,6 +213,7 @@ class DriverClient(Protocol):
 
     async def decide(self, request: DecisionRequest) -> DecisionResponse: ...
     async def transcribe(self, request: TranscribeRequest) -> TranscribeResponse: ...
+    async def moderate(self, request: ModerateRequest) -> ModerateResponse: ...
     async def count_tokens(self, request: GenerateRequest) -> int: ...
     def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]: ...
     def speak(self, request: SpeakRequest) -> AsyncGenerator[str | bytes, None]: ...
@@ -408,6 +411,27 @@ class HttpDriverClient:
             )
         try:
             return DecisionResponse.model_validate(response.json())
+        except ValueError as exc:
+            raise self._invalid_reply() from exc
+
+    async def moderate(self, request: ModerateRequest) -> ModerateResponse:
+        """The driver's `/v1/moderate` (P6)."""
+        payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
+        response = await self._client.post(
+            "/v1/moderate",
+            json=payload,
+            headers={"X-Request-ID": str(request.requestId)} if request.requestId else None,
+        )
+        if response.status_code >= 400:
+            raise DriverError(
+                driver_name=self.name,
+                driver_url=self.base_url,
+                status_code=response.status_code,
+                problem=_problem_from_response(response),
+                raw_body=response.text,
+            )
+        try:
+            return ModerateResponse.model_validate(response.json())
         except ValueError as exc:
             raise self._invalid_reply() from exc
 
@@ -771,6 +795,7 @@ class BoundClient:
             TranscribeRequest,
             ImageRequest,
             VideoRequest,
+            ModerateRequest,
         )
     ](self, request: R) -> R:
         return request.model_copy(update={"model": self.model})
@@ -806,6 +831,11 @@ class BoundClient:
 
     async def transcribe(self, request: TranscribeRequest) -> TranscribeResponse:
         result = await self._inner.transcribe(self._bind(request))
+        result.modelId = self._publish(result.modelId)
+        return result
+
+    async def moderate(self, request: ModerateRequest) -> ModerateResponse:
+        result = await self._inner.moderate(self._bind(request))
         result.modelId = self._publish(result.modelId)
         return result
 
@@ -1195,6 +1225,12 @@ class TieredClient:
         built, each holding only backends that transcribe.
         """
         return await self._over_tiers("transcribe", lambda c: c.transcribe(request))
+
+    async def moderate(self, request: ModerateRequest) -> ModerateResponse:
+        """A moderation over replicas of ONE model (P6-2): `pick_moderation`
+        builds a single tier of the slot's first model, as `pick_embedding`
+        does, since categories and thresholds are that model's own."""
+        return await self._over_tiers("moderate", lambda c: c.moderate(request))
 
     async def image(self, request: ImageRequest) -> ImageResponse:
         """Images over the slot's tiers, as chat (P4, call #4): a fallback

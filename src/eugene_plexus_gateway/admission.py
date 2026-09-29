@@ -333,6 +333,9 @@ CLIENT_ADMISSION_PATHS = frozenset(
         "/v1/videos",
         "/v1/videos/{video_id}",
         "/v1/videos/{video_id}/content",
+        # P6. The model id takes the rest of the path (`door_paths`).
+        "/v1/models/{model:path}",
+        "/v1/moderations",
     }
 )
 

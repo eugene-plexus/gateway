@@ -97,6 +97,9 @@ FRONT_DOOR_PATHS: frozenset[str] = frozenset(
         "/v1/videos",
         "/v1/videos/{video_id}",
         "/v1/videos/{video_id}/content",
+        # P6: a moderation check in a page, and one model looked up.
+        "/v1/models/{model:path}",
+        "/v1/moderations",
     }
 )
 
