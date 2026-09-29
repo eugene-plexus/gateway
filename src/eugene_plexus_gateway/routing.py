@@ -224,9 +224,13 @@ _INPUT_FLAGS = {
     "audio": "audioInput",
     "file": "fileInput",
     "audio_output": "audioOutput",
+    # P6: a `/v1/completions` request with `suffix` routes like an
+    # attachment, only to a model that fills in the middle.
+    "fill_in_middle": "fillInMiddle",
 }
 _IMAGE, _AUDIO, _FILE = frozenset({"image"}), frozenset({"audio"}), frozenset({"file"})
 _SPEAKS = frozenset({"audio_output"})
+_FILLS = frozenset({"fill_in_middle"})
 
 
 def _video_listing(backends: list[_Backend]) -> dict[str, Any]:
@@ -354,6 +358,11 @@ class _Backend:
     def moderates(self) -> bool:
         """Whether this model serves the moderation surface (P6)."""
         return "moderation" in self.surfaces
+
+    @property
+    def completes(self) -> bool:
+        """Whether this model continues raw text: `/v1/completions` (P6)."""
+        return "completion" in self.surfaces
 
     @property
     def makes_images(self) -> bool:
@@ -532,6 +541,7 @@ class Resolution:
             + (["image"] if any(b.makes_images for b in backends) else [])
             + (["video"] if any(b.makes_videos for b in backends) else [])
             + (["moderation"] if any(b.moderates for b in backends) else [])
+            + (["completion"] if any(b.completes for b in backends) else [])
         )
 
     def reported_surfaces(self) -> list[str]:
@@ -1715,7 +1725,11 @@ class RoutingTable:
         return sorted(rotated, key=lambda b: self.inflight(b.key) / b.parallel_slots)
 
     def pick(
-        self, resolution: Resolution, *, needs: frozenset[str] = frozenset()
+        self,
+        resolution: Resolution,
+        *,
+        needs: frozenset[str] = frozenset(),
+        surface: str | None = None,
     ) -> TieredClient | None:
         """The client to send a request through, or None when nothing in
         the slot is eligible right now.
@@ -1728,10 +1742,18 @@ class RoutingTable:
         `audio`, `file`), and only a backend confirming every one of them
         is eligible -- in every tier, so a fallback cannot hand the audio
         to a model that cannot hear it.
+
+        `surface`, when given, keeps each tier to backends serving it: a
+        raw completion (P6) must never reach a model that only chats, since
+        it would answer the prompt as a chat turn.
         """
         tiers: list[list[DriverClient]] = []
         for tier in resolution.tiers:
-            eligible = [b for b in tier.eligible() if takes(b.caps, needs)]
+            eligible = [
+                b
+                for b in tier.eligible()
+                if takes(b.caps, needs) and (surface is None or surface in b.surfaces)
+            ]
             # An empty tier stays in the list, so the response's `tier`
             # counts the slot's tiers rather than the eligible ones.
             tiers.append([b.client for b in self._order(tier.target, eligible)] if eligible else [])
@@ -2148,6 +2170,7 @@ class RoutingTable:
                         tool_calling=_all_carry_tools(backends),
                         image_input=any(takes(b.caps, _IMAGE) for b in backends),
                         audio_input=any(takes(b.caps, _AUDIO) for b in backends),
+                        fill_in_middle=any(takes(b.caps, _FILLS) for b in backends),
                         file_input=any(takes(b.caps, _FILE) for b in backends),
                         audio_output=any(takes(b.caps, _SPEAKS) for b in backends),
                         **_video_listing(backends),

@@ -262,6 +262,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "/v1/images/variations",
             # P6: text and at most a few images, as chat carries them.
             "/v1/moderations",
+            # P6: a prompt and a suffix, as chat carries text.
+            "/v1/completions",
         },
         driver=False,
         # P3b: OpenAI's 25 MiB upload plus the form's other fields. The

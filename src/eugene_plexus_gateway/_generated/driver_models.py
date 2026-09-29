@@ -1808,6 +1808,38 @@ class DriverCatalogue(BaseModel):
     )
 
 
+class CompletionPrompt(BaseModel):
+    """
+    P6: a raw text continuation instead of a conversation, OpenAI's
+    legacy `/v1/completions`. With it `messages` is empty and **no chat
+    template is applied**: the backend continues `prompt` as written,
+    special tokens parsed, so a client-rendered fill-in-the-middle
+    prompt works (measured on `llama-server` b11235). Only a model with
+    the `completion` surface is asked, and each engine is asked the way
+    it continues raw text: `llama-server` and vLLM at `/v1/completions`,
+    Ollama at `/api/generate` with `raw` (its `/v1/completions` wraps a
+    prompt in the chat template, read in its source).
+
+    **`suffix` asks for fill-in-the-middle** and only a model whose
+    `Capabilities.fillInMiddle` is true is asked. `llama-server`'s
+    `/v1/completions` ignores a suffix (measured), so it is sent to
+    `/infill` instead; Ollama takes it on `/api/generate` for a model
+    with its `insert` capability; vLLM refuses one for every model but
+    DeepSeek V4, so it is never sent there.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    prompt: str = Field(..., max_length=4000000)
+    suffix: str | None = Field(
+        None,
+        description='The text after the cursor, for fill-in-the-middle.',
+        max_length=4000000,
+    )
+
+
 class VideoCapabilities(BaseModel):
     """
     For a `video` model (P5): what OpenRouter's `GET /videos/models`
@@ -2413,6 +2445,10 @@ class Capabilities(BaseModel):
     streaming: bool | None = Field(
         None, description='Whether `/v1/generate/stream` emits true incremental tokens.'
     )
+    fillInMiddle: bool | None = Field(
+        None,
+        description='P6: whether a `completion` with a `suffix` is filled in the\nmiddle by this model: `llama-server` answering `/infill` (the\nmodel carries fill-in-the-middle tokens), or an Ollama model\nwith the `insert` capability. Unknown is false.\n',
+    )
     imageInput: bool | None = Field(
         None,
         description='Whether the loaded model is confirmed to accept inline PNG/JPEG\nimages. Unknown or unverified backends report false. Rechecked\nbefore image generation; never inferred from the provider name.\n',
@@ -2633,7 +2669,7 @@ class DriverModel(BaseModel):
     )
     surfaces: list[str] = Field(
         ...,
-        description='Which requests this model answers. The values so far:\n\n* `chat` (`/v1/generate`), `embeddings` (`/v1/embed`),\n  `decisions` (`/v1/decide`), `speech` (`/v1/speak`, P3a),\n  `transcription` (`/v1/transcribe`, P3b), `translation`\n  (`/v1/transcribe` with `translate`, P3-4), `image`\n  (`/v1/image`, P4), `video` (`/v1/video`, P5) and\n  `moderation` (`/v1/moderate`, P6), which have doors;\n* `completion` and `rerank`, which name OpenAI\'s and\n  OpenRouter\'s doors Eugene has not built yet.\n\nAn OpenRouter model whose output is image and text (Gemini\'s\nimage models) serves `image` beside `chat`: its images route\nanswers them too (measured).\n\nA single-model `llama-server` whose projector hears\n(`/props` `modalities.audio`) serves `transcription` beside\n`chat`: its `/v1/audio/transcriptions` answers only then\n(measured).\n\nOpenAI\'s `whisper-*` models serve `translation` beside\n`transcription`; nothing else here translates (measured).\nElevenLabs\' `scribe_*` models serve `transcription`, listed\nonly while the key may use speech-to-text (P3-1, as P3-2\nrequires `models_read` for its speech models).\n\nA driver reports those anyway, so a model\'s id does not\nchange on the day its door arrives, and the gateway lists a\nmodel on `GET /v1/models` only once a door serves one of its\nsurfaces (P1-4).\n\n**Strings, not an enum, on purpose.** A newer driver\nreporting a surface an older gateway has never heard of must\nnot fail that gateway\'s validation of the whole `/v1/info`,\nwhich would make every model on the driver unreachable over\none unknown word. A reader ignores a surface it does not\nknow. Empty only for a model whose kind neither the backend\nnor the driver could decide, which serves nothing.\n\n**Replaces `capabilities.embeddings` and\n`capabilities.chatCapable`**, which said the same thing once\nfor the whole driver. Where they came from still holds for a\nsingle-model driver: `embeddings` is **a property of the\nrunning backend, not of the model**, and not readable from\nanything (`llama-server`\'s `/props` carries no pooling\nfield, and an Ollama runner started for chat refuses with\n*"This server does not support embeddings"*), so it is\ndetermined by trying once and cached for the driver\'s\nlifetime. A System One backend serves `decisions` alone. An\naccount takes each model\'s surfaces from its catalogue.\n',
+        description='Which requests this model answers. The values so far:\n\n* `chat` (`/v1/generate`), `embeddings` (`/v1/embed`),\n  `decisions` (`/v1/decide`), `speech` (`/v1/speak`, P3a),\n  `transcription` (`/v1/transcribe`, P3b), `translation`\n  (`/v1/transcribe` with `translate`, P3-4), `image`\n  (`/v1/image`, P4), `video` (`/v1/video`, P5),\n  `moderation` (`/v1/moderate`, P6) and `completion`\n  (`/v1/generate` with `completion`, P6), which have doors;\n* `rerank`, which names a door Eugene has not built yet.\n\n`completion` is reported for a local `llama-server`, a vLLM,\nand an Ollama account\'s models with its `completion`\ncapability: engines that continue raw text (P6-4). An account\nover a hosted API does not report it: OpenRouter\'s completions\nanswer the prompt as a chat turn (measured).\n\nAn OpenRouter model whose output is image and text (Gemini\'s\nimage models) serves `image` beside `chat`: its images route\nanswers them too (measured).\n\nA single-model `llama-server` whose projector hears\n(`/props` `modalities.audio`) serves `transcription` beside\n`chat`: its `/v1/audio/transcriptions` answers only then\n(measured).\n\nOpenAI\'s `whisper-*` models serve `translation` beside\n`transcription`; nothing else here translates (measured).\nElevenLabs\' `scribe_*` models serve `transcription`, listed\nonly while the key may use speech-to-text (P3-1, as P3-2\nrequires `models_read` for its speech models).\n\nA driver reports those anyway, so a model\'s id does not\nchange on the day its door arrives, and the gateway lists a\nmodel on `GET /v1/models` only once a door serves one of its\nsurfaces (P1-4).\n\n**Strings, not an enum, on purpose.** A newer driver\nreporting a surface an older gateway has never heard of must\nnot fail that gateway\'s validation of the whole `/v1/info`,\nwhich would make every model on the driver unreachable over\none unknown word. A reader ignores a surface it does not\nknow. Empty only for a model whose kind neither the backend\nnor the driver could decide, which serves nothing.\n\n**Replaces `capabilities.embeddings` and\n`capabilities.chatCapable`**, which said the same thing once\nfor the whole driver. Where they came from still holds for a\nsingle-model driver: `embeddings` is **a property of the\nrunning backend, not of the model**, and not readable from\nanything (`llama-server`\'s `/props` carries no pooling\nfield, and an Ollama runner started for chat refuses with\n*"This server does not support embeddings"*), so it is\ndetermined by trying once and cached for the driver\'s\nlifetime. A System One backend serves `decisions` alone. An\naccount takes each model\'s surfaces from its catalogue.\n',
     )
     inputModalities: list[str] | None = Field(
         None,
@@ -2751,9 +2787,10 @@ class GenerateRequest(BaseModel):
         None,
         description="A2 provenance: names of settings explicitly requested by the caller,\nusing this request's field names (maxTokens, temperature, topP, seed,\nstop, tools, toolChoice, responseFormat, topK, minP, frequencyPenalty,\npresencePenalty, parallelToolCalls; since P2c logprobs, logitBias,\nreasoningEffort, verbosity, prediction, webSearchOptions). `topLogprobs`\nrides with `logprobs`. The hints (`promptCacheKey`,\n`promptCacheRetention`, `serviceTier`, `safetyIdentifier`) are never\nlisted: a backend that cannot carry a hint drops it. The gateway preserves this\nlist on each fallback attempt. An adapter must refuse a known unsupported\nexplicit setting with 400, rather than silently dropping it. Settings\nsupplied only by profiles/defaults retain the adapter's default behavior.\nThis field is internal and is not forwarded to upstream providers.\n",
     )
+    completion: CompletionPrompt | None = None
     messages: list[Message] = Field(
         ...,
-        description='Full prompt as an ordered conversation. Whatever system\nmessage the caller wants is already in here; the driver does\nnot modify, prepend to, or reorder it.\n',
+        description='Full prompt as an ordered conversation. Whatever system\nmessage the caller wants is already in here; the driver does\nnot modify, prepend to, or reorder it. Empty with `completion`.\n',
     )
     maxTokens: int | None = Field(
         None,

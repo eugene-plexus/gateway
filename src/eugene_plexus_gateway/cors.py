@@ -100,6 +100,8 @@ FRONT_DOOR_PATHS: frozenset[str] = frozenset(
         # P6: a moderation check in a page, and one model looked up.
         "/v1/models/{model:path}",
         "/v1/moderations",
+        # P6: an editor extension in a browser (a web IDE) completes code.
+        "/v1/completions",
     }
 )
 

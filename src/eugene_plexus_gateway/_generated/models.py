@@ -1217,6 +1217,7 @@ class Surface(StrEnum):
     image = 'image'
     video = 'video'
     moderation = 'moderation'
+    completion = 'completion'
 
 
 class ModelRoutingInfo(BaseModel):
@@ -1240,7 +1241,7 @@ class ModelRoutingInfo(BaseModel):
     )
     surfaces: list[Surface] | None = Field(
         None,
-        description="Which surfaces this model can be sent to. `decisions` means\n`POST /v1/systemone`; a decision-only model lists nothing\nelse, and a chat request naming it is refused with the\ndoor's name. `speech` means `POST /v1/audio/speech` (P3a),\n`transcription` `POST /v1/audio/transcriptions` (P3b),\n`translation` `POST /v1/audio/translations` (P3-4), `image`\n`POST /v1/images/generations` and `/edits` (P4), `video`\n`POST /v1/videos` (P5), `moderation` `POST /v1/moderations`\n(P6).\n\nOpenAI's own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Measured, not assumed, and the two are not always\ndisjoint**: an Ollama runner started for chat refuses to\nembed, `nomic-embed-text` refuses to chat -- but\n`llama-server` given `--embedding` still serves chat\nperfectly well. Hence a list.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n",
+        description="Which surfaces this model can be sent to. `decisions` means\n`POST /v1/systemone`; a decision-only model lists nothing\nelse, and a chat request naming it is refused with the\ndoor's name. `speech` means `POST /v1/audio/speech` (P3a),\n`transcription` `POST /v1/audio/transcriptions` (P3b),\n`translation` `POST /v1/audio/translations` (P3-4), `image`\n`POST /v1/images/generations` and `/edits` (P4), `video`\n`POST /v1/videos` (P5), `moderation` `POST /v1/moderations`\n(P6), `completion` `POST /v1/completions` (P6).\n\nOpenAI's own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Measured, not assumed, and the two are not always\ndisjoint**: an Ollama runner started for chat refuses to\nembed, `nomic-embed-text` refuses to chat -- but\n`llama-server` given `--embedding` still serves chat\nperfectly well. Hence a list.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n",
     )
     image_input: bool | None = Field(
         None,
@@ -1249,6 +1250,10 @@ class ModelRoutingInfo(BaseModel):
     audio_input: bool | None = Field(
         None,
         description='At least one backend confirms audio input for this model. A\nrequest carrying `input_audio` routes only to those backends,\nincluding fallback. Added 2026-09-28 (P2).\n',
+    )
+    fill_in_middle: bool | None = Field(
+        None,
+        description='At least one backend fills in the middle for this model (P6): a\n`/v1/completions` request with `suffix` routes only to those\nbackends, including fallback.\n',
     )
     file_input: bool | None = Field(
         None,
@@ -1410,6 +1415,36 @@ class TranscriptionResponseFormat(StrEnum):
     verbose_json = 'verbose_json'
     srt = 'srt'
     vtt = 'vtt'
+
+
+class CompletionPrompts(RootModel[list[str]]):
+    """
+    One prompt only in P6.
+    """
+
+    root: list[str] = Field(
+        ..., description='One prompt only in P6.', max_length=1, min_length=1
+    )
+
+
+class CompletionStop1(RootModel[list[str]]):
+    root: list[str] = Field(..., max_length=4)
+
+
+class CompletionStreamOptions(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    include_usage: bool | None = None
+
+
+class CompletionChoice(BaseModel):
+    text: str
+    index: int
+    logprobs: None = None
+    finish_reason: str | None = Field(
+        ..., description='`stop` or `length`; null on a chunk before the last.'
+    )
 
 
 class ModerationTexts(RootModel[list[str]]):
@@ -3271,6 +3306,52 @@ class TranscriptionVerbose(BaseModel):
     usage: TranscriptionUsageOut | None = None
 
 
+class CompletionRequest(BaseModel):
+    """
+    OpenAI's legacy completion request (P6). Every piece is a named
+    schema: an inline `oneOf` in a document this size is renamed by
+    the next one.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    model: str
+    prompt: str | CompletionPrompts
+    suffix: str | None = None
+    max_tokens: int | None = Field(None, ge=1)
+    temperature: float | None = Field(None, ge=0.0, le=2.0)
+    top_p: float | None = Field(None, ge=0.0, le=1.0)
+    n: int | None = Field(None, description='1 only in P6.')
+    stream: bool | None = None
+    stream_options: CompletionStreamOptions | None = None
+    logprobs: int | None = Field(None, description='Refused in P6.')
+    echo: bool | None = Field(None, description='Refused when true in P6.')
+    stop: str | CompletionStop1 | None = None
+    presence_penalty: float | None = Field(None, ge=-2.0, le=2.0)
+    frequency_penalty: float | None = Field(None, ge=-2.0, le=2.0)
+    best_of: int | None = Field(None, description='1 only in P6.')
+    logit_bias: dict[str, int] | None = None
+    seed: int | None = None
+    user: str | None = Field(
+        None, description='Accepted and not forwarded, as on chat.'
+    )
+
+
+class CompletionChunk(BaseModel):
+    """
+    One SSE `data:` frame. With `include_usage`, a last frame has `choices` empty and `usage`.
+    """
+
+    id: str
+    object: Literal['text_completion']
+    created: int
+    model: str
+    choices: list[CompletionChoice]
+    usage: CompletionUsage | None = None
+
+
 class ModerationInputPart(BaseModel):
     type: ModerationInputPartType
     text: str | None = None
@@ -3793,7 +3874,7 @@ class MetricRequest(BaseModel):
     completionTokens: int | None = None
     door: str | None = Field(
         None,
-        description="Which door the request came in by (P3b): `speech`,\n`transcription`, `translation` (P3-4), `images` (P4, schema v8),\n`videos` (P5, schema v9, the submit's row) or `moderation` (P6).\nNull on rows from before schema v7 and on every other door,\nwhose rows carry tokens.\n",
+        description="Which door the request came in by (P3b): `speech`,\n`transcription`, `translation` (P3-4), `images` (P4, schema v8),\n`videos` (P5, schema v9, the submit's row), `moderation` (P6)\nor `completion` (P6, a row that carries tokens as chat's does).\nNull on rows from before schema v7 and on every other door,\nwhose rows carry tokens.\n",
     )
     characters: int | None = Field(
         None,
@@ -3894,6 +3975,16 @@ class DirectoryListing(BaseModel):
 class ModelList(BaseModel):
     object: Literal['list']
     data: list[Model]
+
+
+class CompletionResponse(BaseModel):
+    id: str
+    object: Literal['text_completion']
+    created: int
+    model: str
+    choices: list[CompletionChoice]
+    usage: CompletionUsage | None = None
+    x_eugene_plexus: CompletionRoutingInfo | None = None
 
 
 class ModerationParts(RootModel[list[ModerationInputPart]]):

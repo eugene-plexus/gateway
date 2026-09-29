@@ -336,6 +336,7 @@ CLIENT_ADMISSION_PATHS = frozenset(
         # P6. The model id takes the rest of the path (`door_paths`).
         "/v1/models/{model:path}",
         "/v1/moderations",
+        "/v1/completions",
     }
 )
 

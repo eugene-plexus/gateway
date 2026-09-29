@@ -43,6 +43,7 @@ from .. import (
     admission,
     anthropic,
     chat_contract,
+    completion_door,
     decisions,
     image_doors,
     moderation_door,
@@ -52,6 +53,7 @@ from .. import (
 from .._generated.driver_models import AudioOutputFormat as DriverAudioOutputFormat
 from .._generated.driver_models import (
     AudioOutputRequest,
+    CompletionPrompt,
     EmbedRequest,
     GenerateRequest,
     GenerateResponse,
@@ -487,6 +489,7 @@ _DOORS = {
     "image": "/v1/images/generations",
     "video": "/v1/videos",
     "moderation": "/v1/moderations",
+    "completion": "/v1/completions",
 }
 
 
@@ -636,6 +639,7 @@ async def _prepare(
     surface: str,
     instead: str,
     install_max_tokens: bool = True,
+    completion: CompletionPrompt | None = None,
 ) -> _Serving | _Failure:
     """Resolve, refuse, refresh, wake, and start the clock.
 
@@ -700,14 +704,19 @@ async def _prepare(
     if chat_contract.wants_audio(body):
         # Routed like an attachment: only to a model that confirms it.
         needs = needs | {"audio_output"}
+    # P6: a raw completion goes only to a model that continues raw text,
+    # and its suffix only to one that fills in the middle, in every tier.
+    only = "completion" if completion is not None else None
+    if completion is not None:
+        needs = frozenset({"fill_in_middle"}) if completion.suffix is not None else frozenset()
     wake: WakeResult | None = None
-    client = table.pick(resolution, needs=needs)
+    client = table.pick(resolution, needs=needs, surface=only)
     if client is None and await table.refresh_if_stale():
         refreshed = True
         resolution = await admission.permitted(table.resolve(body.model), requirements=constraints)
         if not resolution.has_backends():
             return _no_such_model(body.model, table)
-        client = table.pick(resolution, needs=needs)
+        client = table.pick(resolution, needs=needs, surface=only)
     # What the balancer saw, read before the wake so the numbers are the
     # ones the decision was made on. Read even when only one backend is
     # eligible; `_record` decides whether it is worth keeping.
@@ -720,7 +729,7 @@ async def _prepare(
                 resolution = await admission.permitted(
                     table.resolve(body.model), requirements=constraints
                 )
-                client = table.pick(resolution, needs=needs)
+                client = table.pick(resolution, needs=needs, surface=only)
                 considered = table.candidates_considered(resolution)
         if client is None:
             if needs and resolution.eligible_backends():
@@ -732,6 +741,11 @@ async def _prepare(
         client.authorize_attempt = admission.before_attempt
     generate = _to_generate_request(body, store, install_max_tokens=install_max_tokens)
     generate.localOnly = admission.local_only()
+    if completion is not None:
+        # The chat body's one message was a stand-in; the driver is sent
+        # the prompt itself, continued as written.
+        generate.completion = completion
+        generate.messages = []
     profiles = getattr(request.app.state, "profile_defaults", None)
     if profiles is not None and isinstance(client, TieredClient):
         # Capture the routing snapshot that selected these candidates. A later
@@ -758,6 +772,9 @@ async def _prepare(
             )
             prepared.localOnly = original.localOnly
             prepared.requestId = original.requestId
+            if completion is not None:
+                prepared.completion = completion
+                prepared.messages = []
             return prepared
 
         client.prepare_request = prepare_candidate
@@ -1674,6 +1691,257 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
         usage=usage,
         x_eugene_plexus=_routing_info(client, table, body.model, started),
     )
+
+
+# --------------------------------------------------------------------------- #
+# /v1/completions
+# --------------------------------------------------------------------------- #
+
+
+def _text_completion(
+    response_id: str, created: int, model: str, choices: list[dict[str, Any]], **extra: Any
+) -> dict[str, Any]:
+    return {
+        "id": response_id,
+        "object": "text_completion",
+        "created": created,
+        "model": model,
+        "choices": choices,
+        **extra,
+    }
+
+
+def _completion_usage(usage: Any) -> dict[str, Any] | None:
+    if usage is None or (usage.promptTokens is None and usage.completionTokens is None):
+        return None
+    prompt, completion = usage.promptTokens or 0, usage.completionTokens or 0
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": usage.totalTokens if usage.totalTokens is not None else prompt + completion,
+    }
+
+
+def _completion_finish(reason: Any) -> str:
+    """OpenAI's two words for a legacy completion: `length` when the budget
+    ran out, `stop` for every other end."""
+    return "length" if getattr(reason, "value", reason) == "length" else "stop"
+
+
+@router.post("/v1/completions", dependencies=_auth)
+async def create_completion(request: Request) -> Any:
+    """OpenAI's legacy completions (P6, 2026-09-28): a prompt continued as
+    written, or filled in the middle with `suffix`.
+
+    **A translation at the edge**, as the Messages and Responses doors are:
+    `completion_door` turns the sampling fields into a chat-shaped request
+    so `_prepare` serves it unchanged (tiers, wake, commit point, the row),
+    and the prompt reaches the driver as `completion`. Only a model with
+    the `completion` surface is picked, in every tier, and a suffix only a
+    model that fills in the middle.
+    """
+    try:
+        raw = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        return _error(
+            code=400,
+            message="body: must be valid JSON.",
+            error_type="invalid_request_error",
+            param="body",
+        )
+    try:
+        ask = completion_door.parse(raw, max_images=max_images(_store(request)))
+    except completion_door.Refusal as exc:
+        return _error(
+            code=400, message=exc.message, error_type="invalid_request_error", param=exc.field
+        )
+    body = ask.body
+    prepared = await _prepare(
+        request, body, surface="completion", instead="/v1/chat/completions", completion=ask.prompt
+    )
+    if isinstance(prepared, _Failure):
+        return prepared.as_openai()
+    response_id = f"cmpl-{uuid.uuid4().hex[:24]}"
+    created = int(time.time())
+    if ask.stream:
+        return StreamingResponse(
+            _stream_text_completion(
+                body,
+                prepared,
+                response_id=response_id,
+                created=created,
+                include_usage=ask.include_usage,
+            ),
+            media_type="text/event-stream",
+        )
+    with collect_attempts() as tries:
+        try:
+            response = await serve_while_connected(
+                request, prepared.client.generate(prepared.generate), what="a completion"
+            )
+        except ClientGone:
+            _record(prepared.rec, body, tries, door="completion")
+            return _error(
+                code=499,
+                message="The client disconnected; the backend call was cancelled.",
+                error_type="client_disconnected",
+            )
+        except DriverError as e:
+            _record(prepared.rec, body, tries, door="completion")
+            return _driver_failure(e).as_openai()
+        except httpx.TimeoutException as e:
+            _record(prepared.rec, body, tries, door="completion")
+            return _error(
+                code=504,
+                message=(
+                    f"No backend serving {body.model!r} answered within the gateway's "
+                    f"requestTimeoutSeconds ({_timeout_seconds(_store(request)):g}s). "
+                    f"({type(e).__name__})"
+                ),
+                error_type="timeout",
+            )
+        except httpx.HTTPError as e:
+            _record(prepared.rec, body, tries, door="completion")
+            return _error(
+                code=502,
+                message=f"A backend serving {body.model!r} failed ({type(e).__name__}).",
+                error_type="upstream_error",
+            )
+        served_model = getattr(prepared.client, "served_model", None) or body.model
+        _record(
+            prepared.rec,
+            body,
+            tries,
+            served_model=served_model,
+            tier=getattr(prepared.client, "tier", 1),
+            usage=response.usage,
+            backend_ms=response.latencyMs,
+            door="completion",
+        )
+    content: dict[str, Any] = _text_completion(
+        response_id,
+        created,
+        served_model,
+        [
+            {
+                "text": response.content or "",
+                "index": 0,
+                "logprobs": None,
+                "finish_reason": _completion_finish(response.finishReason),
+            }
+        ],
+    )
+    usage = _completion_usage(response.usage)
+    if usage is not None:
+        content["usage"] = usage
+    return JSONResponse(content=content)
+
+
+async def _stream_text_completion(
+    body: ChatCompletionRequest,
+    prepared: _Serving,
+    *,
+    response_id: str,
+    created: int,
+    include_usage: bool,
+) -> AsyncIterator[str]:
+    """The driver's stream as OpenAI's `text_completion` chunks (P6).
+
+    A sibling of `_stream_completion`, as `_stream_anthropic` is: the same
+    `client.stream`, the same commit point at the first token, the same
+    `_record`, a different frame.
+    """
+
+    def frame(payload: dict[str, Any]) -> str:
+        return "data: " + json.dumps(payload) + "\n\n"
+
+    model = body.model
+    with collect_attempts() as tries:
+        response: GenerateResponse | None = None
+        try:
+            async for event in prepared.client.stream(prepared.generate):
+                if event.done:
+                    # Captured, not broken out of: abandoning the generator
+                    # loses the attempt bookkeeping (R1.4).
+                    response = event.result
+                    continue
+                if event.text:
+                    yield frame(
+                        _text_completion(
+                            response_id,
+                            created,
+                            getattr(prepared.client, "served_model", None) or model,
+                            [
+                                {
+                                    "text": event.text,
+                                    "index": 0,
+                                    "logprobs": None,
+                                    "finish_reason": None,
+                                }
+                            ],
+                        )
+                    )
+        except (DriverError, httpx.HTTPError) as e:
+            log.warning("streaming text completion for %r failed: %s", model, e)
+            _record(prepared.rec, body, tries, door="completion")
+            yield frame(
+                {
+                    "error": {
+                        "message": str(e),
+                        "type": "upstream_error",
+                        "param": None,
+                        "code": None,
+                    }
+                }
+            )
+            yield "data: [DONE]\n\n"
+            return
+        if response is None:
+            log.warning("driver stream for %r ended without a done event", model)
+            _record(prepared.rec, body, tries, door="completion")
+            yield frame(
+                {
+                    "error": {
+                        "message": "The backend stopped before it finished. What "
+                        "arrived above is partial.",
+                        "type": "upstream_error",
+                        "param": None,
+                        "code": None,
+                    }
+                }
+            )
+            yield "data: [DONE]\n\n"
+            return
+        served_model = response.modelId or getattr(prepared.client, "served_model", None) or model
+        _record(
+            prepared.rec,
+            body,
+            tries,
+            served_model=served_model,
+            tier=getattr(prepared.client, "tier", 1),
+            usage=response.usage,
+            backend_ms=response.latencyMs,
+            door="completion",
+        )
+        yield frame(
+            _text_completion(
+                response_id,
+                created,
+                served_model,
+                [
+                    {
+                        "text": "",
+                        "index": 0,
+                        "logprobs": None,
+                        "finish_reason": _completion_finish(response.finishReason),
+                    }
+                ],
+            )
+        )
+        usage = _completion_usage(response.usage)
+        if include_usage and usage is not None:
+            yield frame(_text_completion(response_id, created, served_model, [], usage=usage))
+        yield "data: [DONE]\n\n"
 
 
 # --------------------------------------------------------------------------- #
@@ -2956,6 +3224,12 @@ _UNCONFIRMED_INPUT = {
         "audio_output",
         "nothing was sent",
     ),
+    "fill_in_middle": (
+        "fill-in-the-middle (the suffix)",
+        "Select a model that fills in the middle, or send the prompt alone.",
+        "fill_in_middle",
+        "the suffix was not dropped",
+    ),
 }
 
 
@@ -2982,7 +3256,8 @@ def _unconfirmed_input(needs: frozenset[str], resolution: Resolution) -> _Failur
     return _Failure(
         code=400,
         error_type="invalid_request_error",
-        param="messages",
+        # A completion's suffix is its own field, not a message part (P6).
+        param="suffix" if missing[0] == "fill_in_middle" else "messages",
         message=f"No ready backend serving this model confirms {what}. {select} "
         f"GET /v1/models reports x_eugene_plexus.{field}; {kept}.",
     )
