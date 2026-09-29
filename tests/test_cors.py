@@ -91,6 +91,17 @@ def test_a_real_response_carries_the_header(cors_client: TestClient) -> None:
     r = cors_client.get("/v1/models", headers={"origin": ORIGIN})
     assert r.status_code == 401
     assert r.headers["access-control-allow-origin"] == "*"
+    # A browser's script reads only the headers named here, and the
+    # playground's direct mode reads what served a clip or a transcript
+    # off `x-eugene-plexus-*` (U4).
+    exposed = {h.strip().lower() for h in r.headers["access-control-expose-headers"].split(",")}
+    assert {
+        "retry-after",
+        "x-request-id",
+        "x-eugene-plexus-driver",
+        "x-eugene-plexus-tier",
+    } <= exposed
+    assert "x-eugene-plexus-ignored-settings" in exposed
 
 
 def test_a_request_with_no_origin_is_untouched(cors_client: TestClient) -> None:

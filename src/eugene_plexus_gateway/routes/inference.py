@@ -2249,7 +2249,15 @@ async def create_speech(request: Request) -> Any:
                     characters=len(body.input),
                 )
 
-        return StreamingResponse(audio(), media_type=str(media))
+        # What served it rides response headers, as on /v1/messages: the
+        # body is the audio, with nowhere else to say (U4).
+        return StreamingResponse(
+            audio(),
+            media_type=str(media),
+            headers=anthropic.envelope_headers(
+                _routing_info(client, table, body.model, rec.started)
+            ),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -2275,12 +2283,19 @@ def _transcription_usage(result: TranscribeResponse) -> dict[str, Any] | None:
     }
 
 
-def _transcription_body(result: TranscribeResponse, fmt: str, *, translate: bool = False) -> Any:
+def _transcription_body(
+    result: TranscribeResponse,
+    fmt: str,
+    *,
+    translate: bool = False,
+    headers: dict[str, str] | None = None,
+) -> Any:
     """The answer in the shape `response_format` asked for (P3b): `text` is
     rendered here, because llama-server refuses it (measured). A verbose
-    translation says `task: translate` and carries no words (P3-4)."""
+    translation says `task: translate` and carries no words (P3-4). What
+    served it rides `headers`, since `text` has no body to carry it (U4)."""
     if fmt == "text":
-        return PlainTextResponse(result.text)
+        return PlainTextResponse(result.text, headers=headers)
     body: dict[str, Any] = {"text": result.text}
     if fmt == "verbose_json":
         body = {
@@ -2295,7 +2310,7 @@ def _transcription_body(result: TranscribeResponse, fmt: str, *, translate: bool
     usage = _transcription_usage(result)
     if usage is not None:
         body["usage"] = usage
-    return JSONResponse(content=body)
+    return JSONResponse(content=body, headers=headers)
 
 
 @router.post("/v1/audio/transcriptions", dependencies=_auth)
@@ -2449,7 +2464,12 @@ async def _audio_to_text(request: Request, *, translate: bool) -> Any:
                 error_type="upstream_error",
             )
         record(result)
-    return _transcription_body(result, ask.response_format, translate=translate)
+    return _transcription_body(
+        result,
+        ask.response_format,
+        translate=translate,
+        headers=anthropic.envelope_headers(_routing_info(client, table, ask.model, rec.started)),
+    )
 
 
 # --------------------------------------------------------------------------- #

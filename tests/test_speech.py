@@ -104,6 +104,18 @@ def test_the_sdks_request_is_spoken_and_streamed_back(settings: Settings) -> Non
     assert (sent.speed, sent.instructions, sent.localOnly) == (1.1, "cheerful", False)
 
 
+def test_what_served_the_clip_rides_the_headers(settings: Settings) -> None:
+    """The body is the audio, so the envelope rides response headers, as on
+    /v1/messages (U4): the playground's report reads them."""
+    with serve(settings, Speaker(name="kokoro-a", model_id="narrator")) as client:
+        response = client.post("/v1/audio/speech", json=speech())
+    assert response.status_code == 200, response.text
+    assert response.headers["x-eugene-plexus-driver"] == "kokoro-a"
+    assert response.headers["x-eugene-plexus-attempts"] == "1"
+    assert response.headers["x-eugene-plexus-tier"] == "1"
+    assert int(response.headers["x-eugene-plexus-latency-ms"]) >= 0
+
+
 def test_the_format_is_always_sent_mp3_by_default(settings: Settings) -> None:
     voice = Speaker(name="a", model_id="narrator")
     with serve(settings, voice) as client:

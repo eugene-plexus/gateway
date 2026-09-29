@@ -197,6 +197,31 @@ def _is_preflight(method: str, headers: Headers) -> bool:
     return method == "OPTIONS" and "access-control-request-method" in headers
 
 
+#: The response headers a browser's script may read. `x-eugene-plexus-*`
+#: is where a door whose body cannot carry `x_eugene_plexus` says what
+#: served it (`/v1/messages`, `/v1/responses`, speech, transcription); a
+#: browser hides any header not named here, so the playground's direct
+#: mode could not see them (U4, 2026-09-28). Listed, not `*`, so what is
+#: exposed is written down.
+EXPOSED_HEADERS = b", ".join(
+    [
+        b"Retry-After",
+        b"X-Request-ID",
+        b"X-Eugene-Plexus-Driver",
+        b"X-Eugene-Plexus-Runtime",
+        b"X-Eugene-Plexus-Backend",
+        b"X-Eugene-Plexus-Latency-Ms",
+        b"X-Eugene-Plexus-Attempts",
+        b"X-Eugene-Plexus-Tier",
+        b"X-Eugene-Plexus-Swapped-In",
+        b"X-Eugene-Plexus-Waited-Ms",
+        b"X-Eugene-Plexus-Context-Length",
+        b"X-Eugene-Plexus-Prompt-Truncated",
+        b"X-Eugene-Plexus-Ignored-Settings",
+    ]
+)
+
+
 class FrontDoorCors:
     """ASGI middleware: CORS on `FRONT_DOOR_PATHS`, configured live."""
 
@@ -238,7 +263,7 @@ class FrontDoorCors:
             if message["type"] == "http.response.start":
                 raw = list(message.get("headers", []))
                 raw.append((b"access-control-allow-origin", allow.encode("latin-1")))
-                raw.append((b"access-control-expose-headers", b"Retry-After, X-Request-ID"))
+                raw.append((b"access-control-expose-headers", EXPOSED_HEADERS))
                 if allow != "*":
                     raw.append((b"vary", b"origin"))
                 message["headers"] = raw

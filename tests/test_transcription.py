@@ -108,6 +108,17 @@ def test_text_is_rendered_here(settings: Settings) -> None:
     assert response.headers["content-type"].startswith("text/plain") and response.text == SAID
 
 
+@pytest.mark.parametrize("fmt", ["json", "text", "verbose_json"])
+def test_what_served_the_transcript_rides_the_headers(settings: Settings, fmt: str) -> None:
+    """`text` has no body to carry `x_eugene_plexus`, so every format says
+    what served it in headers, as /v1/messages does (U4)."""
+    with serve(settings, Scribe(name="scribe-a", model_id="scribe")) as client:
+        response = upload(client, response_format=fmt)
+    assert response.status_code == 200, response.text
+    assert response.headers["x-eugene-plexus-driver"] == "scribe-a"
+    assert response.headers["x-eugene-plexus-attempts"] == "1"
+
+
 def test_verbose_json_asks_the_backend_and_carries_its_granularities(settings: Settings) -> None:
     scribe = Scribe(name="a", model_id="scribe")
     with serve(settings, scribe) as client:
