@@ -531,11 +531,13 @@ def test_no_max_output_tokens_means_no_install_cap(settings: Settings) -> None:
     five times before failing (measured). So the install's
     `defaultMaxTokens` is not applied here -- while the chat door, given the
     same request, still gets it. The pair is what tells the fix from an
-    accident."""
+    accident. The cap is blank by default since 2026-09-28, so the operator
+    sets one here for the pair to mean anything."""
     responses_fake = driver()
     chat_fake = FakeDriverClient(name="d2", model_id="chat-model")
     chat_fake.responses = ["ok"]
     with serve(settings, responses_fake, chat_fake) as client:
+        assert client.patch("/v1/config", json={"defaultMaxTokens": 2048}).status_code == 200
         client.post("/v1/responses", json=codex_request(stream=False))
         client.post(
             "/v1/chat/completions",

@@ -260,7 +260,7 @@ def test_no_profile_retains_gateway_defaults(app: FastAPI, library: Library) -> 
             json={"model": "alias", "messages": [{"role": "user", "content": "hello"}]},
         )
         assert r.status_code == 200
-        assert driver.calls[-1].maxTokens == 2048
+        assert driver.calls[-1].maxTokens is None
         assert driver.calls[-1].temperature == 0.7
         assert driver.calls[-1].topP is None
         client.portal.call(profiles.aclose)
@@ -295,7 +295,7 @@ def test_hosted_backend_does_not_inherit_a_library_model(app: FastAPI, library: 
             json={"model": "alias", "messages": [{"role": "user", "content": "hello"}]},
         )
         assert r.status_code == 200
-        assert driver.calls[-1].maxTokens == 2048
+        assert driver.calls[-1].maxTokens is None
         assert not library.calls
         client.portal.call(profiles.aclose)
 

@@ -15,6 +15,7 @@ and a few operational knobs.
 
 from __future__ import annotations
 
+import logging
 import threading
 from pathlib import Path
 from typing import Any
@@ -82,15 +83,17 @@ FIELDS: list[ConfigField] = [
         description=(
             "Cap on a single response when neither the request nor the model's "
             "default Library profile specifies one (roughly 0.75 words per token; 2048 is 1,500 "
-            "words). Raise it for long-form work; keep it low for "
-            "snappier chat. Not applied to /v1/responses (Codex CLI): that "
-            "protocol reads a missing cap as no cap, and Codex regenerates an "
-            "answer cut short five times before failing. Set Max tokens on a "
-            "model's profile to cap it there."
+            "words). Blank, the default, sets no cap: an answer runs until the model "
+            "finishes, bounded by its context window and the request deadline. A cap "
+            "cuts off a reasoning model that is still thinking, so it never answers. "
+            "Not applied to /v1/responses (Codex CLI) either way. Set Max tokens on a "
+            "model's profile to cap one model."
         ),
         category="generation",
         valueType=ConfigValueType.integer,
-        default=2048,
+        # Blank since 2026-09-28: 2048 cut a reasoning model off mid-thought, so
+        # it thought and never answered (found by a tester on Qwen).
+        default=None,
         minimum=1,
     ),
     ConfigField(
@@ -420,6 +423,16 @@ def _defaults() -> dict[str, Any]:
     return {f.key: f.default for f in FIELDS if f.default is not None}
 
 
+log = logging.getLogger(__name__)
+
+#: The cap every install before 2026-09-28 wrote into its file, because the
+#: store writes defaults out on first start. Read once as "never chosen".
+_OLD_DEFAULT_MAX_TOKENS = 2048
+#: Beside the config file: the old default has been cleared from it once, so a
+#: 2048 an operator sets afterwards is theirs and stays.
+_MAX_TOKENS_MARKER = ".default-max-tokens-cleared"
+
+
 def _validate_value(field: ConfigField, value: Any) -> str | None:
     if value is None:
         return None
@@ -546,9 +559,44 @@ class ConfigStore:
                     if k in _FIELDS_BY_KEY:
                         merged[k] = v
                 self._values = merged
+                self._clear_old_max_tokens_locked()
             else:
                 self._values = _defaults()
                 self._write_locked()
+                self._mark_max_tokens_locked()
+
+    def _clear_old_max_tokens_locked(self) -> None:
+        """Clear the 2048 cap an older install wrote into its file, once.
+
+        The store writes every default out on first start, so an install
+        from before 2026-09-28 holds `defaultMaxTokens: 2048` as though
+        someone chose it, and changing the default alone would reach no
+        existing install. It cut reasoning models off mid-thought. Read
+        once, as the old default it almost always is; the marker keeps a
+        2048 set after that.
+        """
+        marker = self._path.parent / _MAX_TOKENS_MARKER
+        if marker.exists():
+            return
+        if self._values.get("defaultMaxTokens") == _OLD_DEFAULT_MAX_TOKENS:
+            self._values.pop("defaultMaxTokens", None)
+            self._write_locked()
+            log.warning(
+                "defaultMaxTokens was %d, the old shipped default, and is now blank: no "
+                "cap unless a request or a model's profile sets one. Set it again under "
+                "Gateway config to keep a cap.",
+                _OLD_DEFAULT_MAX_TOKENS,
+            )
+        self._mark_max_tokens_locked()
+
+    def _mark_max_tokens_locked(self) -> None:
+        try:
+            (self._path.parent / _MAX_TOKENS_MARKER).write_text(
+                "defaultMaxTokens: the old 2048 default was cleared once; see config.py.\n",
+                encoding="utf-8",
+            )
+        except OSError as e:
+            log.warning("could not record that the old max tokens default was cleared: %s", e)
 
     def as_document(self) -> ConfigDocument:
         with self._lock:

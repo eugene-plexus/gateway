@@ -239,13 +239,13 @@ def test_a_completion_travels_the_whole_chain(
     assert body["x_eugene_plexus"]["driver"] == "qwen-box"
     assert body["x_eugene_plexus"]["attempts"] == 1
 
-    # The driver got a camelCase GenerateRequest with every param filled
-    # in — the caller's temperature, and the install default for the
-    # max-tokens it didn't send.
+    # The driver got a camelCase GenerateRequest: the caller's temperature,
+    # and no max-tokens, since the caller sent none and the install sets no
+    # cap by default (2026-09-28).
     assert len(generate_calls) == 1
     sent = generate_calls[0]
     assert sent["temperature"] == 0.2
-    assert sent["maxTokens"] == 2048
+    assert sent.get("maxTokens") is None
     assert sent["messages"] == [{"role": "user", "content": "hi"}]
 
 

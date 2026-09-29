@@ -108,8 +108,9 @@ def test_invalid_limit_is_safe_400(
         ({"max_tokens": 25, "max_completion_tokens": 25}, 25),
         ({"max_tokens": None, "max_completion_tokens": 25}, 25),
         ({"max_tokens": 25, "max_completion_tokens": None}, 25),
-        ({"max_tokens": None, "max_completion_tokens": None}, 2048),
-        ({}, 2048),
+        # No cap by default since 2026-09-28: 2048 cut reasoning models off.
+        ({"max_tokens": None, "max_completion_tokens": None}, None),
+        ({}, None),
     ],
 )
 def test_limit_resolution(

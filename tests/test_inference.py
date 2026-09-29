@@ -129,12 +129,14 @@ def test_gateway_fills_in_the_generation_params(
     """The gateway owns every output-affecting parameter. A driver never
     substitutes a default of its own, so an omitted value must be filled
     in here and sent explicitly — not left unset for the backend to
-    decide."""
+    decide. The output cap is the one the install leaves blank by default
+    (2026-09-28): no cap unless the request, a profile or the operator sets
+    one, since a cap cut reasoning models off before they answered."""
     client.post("/v1/chat/completions", json=_chat())
 
     sent = fake_driver.calls[-1]
     assert sent.temperature == 0.7
-    assert sent.maxTokens == 2048
+    assert sent.maxTokens is None
 
 
 def test_caller_params_win_over_the_defaults(
