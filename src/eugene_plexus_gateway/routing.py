@@ -1448,11 +1448,15 @@ class RoutingTable:
             context = capabilities.get("contextLength") if isinstance(capabilities, dict) else None
             slots = capabilities.get("parallelSlots") if isinstance(capabilities, dict) else None
             idle = entry.get("idleUnloadSeconds")
-            # `node` as the agent reports it (its own identity), else the
-            # node we asked — which is the same thing, and fills it in
-            # for an unenrolled agent.
-            reported_node = entry.get("node")
-            owner = reported_node if isinstance(reported_node, str) and reported_node else node
+            # **The node we asked, never the one the agent reports.** The
+            # drivers from this same agent are keyed by the node we asked,
+            # and a runtime must join them. The two were read as "the same
+            # thing" until A4 (2026-09-30) found where they differ: a
+            # sealed control root leaves the gateway keying its own agent
+            # as `None`, while an enrolled agent stamps its name on every
+            # runtime, so nothing joined and every engine on the machine,
+            # stopped or loading, was routable on faith.
+            owner = node
             facts[(owner, name)] = _RuntimeFacts(
                 name=name,
                 alias=entry.get("modelAlias") if isinstance(entry.get("modelAlias"), str) else None,
