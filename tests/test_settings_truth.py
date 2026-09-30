@@ -88,3 +88,34 @@ def test_nan_is_refused(tmp_path: Path) -> None:
     result = _patch(store, {"requestTimeoutSeconds": float("nan")})
     assert result.applied == [] and "finite" in result.rejected[0].message
     assert store.get("requestTimeoutSeconds") == 600.0
+
+
+def test_zero_days_of_metrics_is_zero(settings: Any, fake_driver: Any) -> None:
+    """GET said 0 and the store ran a week, because of `or 7`."""
+    from fastapi.testclient import TestClient
+
+    from eugene_plexus_gateway.app import create_app
+
+    from .conftest import make_routing_table
+
+    settings.config_file.write_text(yaml.safe_dump({"metricsRetentionDays": 0}), encoding="utf-8")
+    app = create_app(settings=settings)
+    app.state.routing = make_routing_table(fake_driver)
+    with TestClient(app):
+        assert app.state.metrics is not None
+        assert app.state.metrics._retention_days == 0
+
+
+def test_the_refresh_interval_is_read_at_every_sleep() -> None:
+    """It was captured at start, so GET showed the new interval while the
+    loop slept the old one."""
+    from eugene_plexus_gateway.routing import RoutingTable
+
+    values: dict[str, float] = {"routingRefreshSeconds": 15}
+    table = RoutingTable(
+        agent_url="http://127.0.0.1:1",
+        refresh_seconds=lambda: float(values["routingRefreshSeconds"]),
+    )
+    assert table._refresh_seconds() == 15
+    values["routingRefreshSeconds"] = 40
+    assert table._refresh_seconds() == 40
