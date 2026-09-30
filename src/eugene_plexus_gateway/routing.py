@@ -639,7 +639,7 @@ class RoutingTable:
         agent_url: str,
         outbound: Outbound | None = None,
         request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
-        refresh_seconds: float = 15.0,
+        refresh_seconds: float | Callable[[], float] = 15.0,
         slots: Callable[[], Any] | None = None,
         strategy: Callable[[], Any] | None = None,
         control_url: str | Callable[[], Any] | None = None,
@@ -661,7 +661,12 @@ class RoutingTable:
         # runs unauthenticated, as a test table and a dev install do.
         self._outbound = outbound
         self._request_timeout = request_timeout_seconds
-        self._refresh_seconds = refresh_seconds
+        # Read at each sleep, so a PATCH to `routingRefreshSeconds` takes
+        # effect after the current wait rather than at the next restart --
+        # GET used to show the new interval while the loop slept the old.
+        self._refresh_seconds: Callable[[], float] = (
+            refresh_seconds if callable(refresh_seconds) else (lambda: float(refresh_seconds))
+        )
         # Read live on every resolve, so a PATCH to `modelSlots` or
         # `loadBalancing` takes effect without a restart.
         self._slots = slots or (lambda: [])
@@ -797,7 +802,7 @@ class RoutingTable:
     async def _refresh_loop(self) -> None:
         try:
             while True:
-                await asyncio.sleep(self._refresh_seconds)
+                await asyncio.sleep(self._refresh_seconds())
                 try:
                     await self.refresh()
                 except Exception as e:
@@ -2420,6 +2425,15 @@ class RoutingTable:
         answered -- for the no-models 404, which used to name two
         healthy places and never this."""
         return self._snapshot.control_root
+
+    def derived_control_url(self) -> str | None:
+        """Where the last refresh found the control root through this
+        machine's agent, when `controlUrl` is unset -- what an unset value
+        stands for right now (settings never lie, 2026-09-30)."""
+        facts = self._snapshot.control_root
+        if facts.source != "agent" or not facts.url:
+            return None
+        return str(facts.url).rstrip("/")
 
     def _control_root_view(self) -> ControlRootView:
         facts = self._snapshot.control_root

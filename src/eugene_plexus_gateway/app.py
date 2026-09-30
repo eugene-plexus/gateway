@@ -97,7 +97,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         if not settings.safe_mode and bool(store.get("metricsEnabled")):
             candidate = MetricsStore(
                 settings.metrics_file,
-                retention_days=int(store.get("metricsRetentionDays") or 7),
+                # 0 is a real answer -- keep no individual requests -- and
+                # `or 7` turned it into a week while GET said 0.
+                retention_days=int(
+                    7
+                    if store.get("metricsRetentionDays") is None
+                    else store.get("metricsRetentionDays")
+                ),
                 rollup_enabled=bool(store.get("metricsRollupEnabled")),
             )
             try:
@@ -154,7 +160,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 request_timeout_seconds=float(
                     store.get("requestTimeoutSeconds") or DEFAULT_REQUEST_TIMEOUT_SECONDS
                 ),
-                refresh_seconds=float(store.get("routingRefreshSeconds") or 15),
+                refresh_seconds=lambda: float(store.get("routingRefreshSeconds") or 15),
                 # Read live, so a PATCH takes effect on the next request.
                 slots=lambda: store.get("modelSlots"),
                 strategy=lambda: store.get("loadBalancing"),

@@ -715,6 +715,19 @@ class ConfigValueType(StrEnum):
     string_list = 'string_list'
 
 
+class ConfigFieldStatusLevel(StrEnum):
+    """
+    Named rather than inline: an inline enum here generates a class
+    called `Level`, and the next inline `level` anywhere in these
+    documents would rename it `Level1` under every caller (the S6
+    `Source` -> `Source1` trap).
+
+    """
+
+    info = 'info'
+    warning = 'warning'
+
+
 class ConfigFieldShowWhen(BaseModel):
     """
     Predicate over another `ConfigField`'s current value. The UI
@@ -735,10 +748,14 @@ class ConfigFieldShowWhen(BaseModel):
 
 class ConfigDocument(BaseModel):
     """
-    Current effective config values, keyed by `ConfigField.key`.
-    Values of fields with `sensitive: true` are returned as the
-    literal string `"<redacted>"` regardless of whether they are
-    set. Returned by `GET /v1/config`.
+    Current effective config values, keyed by `ConfigField.key`: a
+    field with a `default` and no saved value reads as the default.
+    A field with `sensitive: true` that holds a value reads as the
+    literal string `"<redacted>"`; one that holds none is absent or
+    `null`, so a UI never shows a missing key as saved (corrected
+    2026-09-30 -- this said `"<redacted>"` "regardless of whether they
+    are set", which no component did, and a UI that believed it would
+    say a key was saved that never was). Returned by `GET /v1/config`.
 
     """
 
@@ -1148,7 +1165,11 @@ class ShareCredential(BaseModel):
     )
     password: str | None = Field(
         None,
-        description="Redacted in `GET /v1/config` exactly as a `secret` scalar is\n— the value comes back as null and the entry keeps its `host`\nand `username`, so a UI can render the row without ever\nholding the secret. A `PATCH` that omits `password` on an\nentry whose `host` already exists **keeps the stored one**,\nso editing a user name does not silently blank the password;\nan explicit empty string clears it.\n\n**At rest it is sealed with the install's master key**, the\nsame envelope a driver's `apiKey` gets, so it is not\nreadable from the config file — and so it is readable only\nonce the agent is unlocked. On a host whose `securityMode`\nis `prompt_on_startup` that means shares are not reachable\nuntil somebody signs in, which is the same thing everything\nelse behind the master key already does and is reported the\nsame way rather than failing as a missing file.\n",
+        description='Redacted in `GET /v1/config` exactly as a `secret` scalar is\n— the value comes back as null and the entry keeps its `host`\nand `username`, so a UI can render the row without ever\nholding the secret. A `PATCH` that omits `password` on an\nentry whose `host` already exists **keeps the stored one**,\nso editing a user name does not silently blank the password;\nan explicit empty string clears it.\n',
+    )
+    hasPassword: bool | None = Field(
+        None,
+        description="In `GET /v1/config` only: whether a password is stored for this\nserver. The password itself never leaves the machine, so\nwithout this a row with one and a row without one were\nidentical, and a UI told somebody a password was saved that\nnever was (2026-09-30). Ignored in a `PATCH`.\n\n**At rest it is sealed with the install's master key**, the\nsame envelope a driver's `apiKey` gets, so it is not\nreadable from the config file — and so it is readable only\nonce the agent is unlocked. On a host whose `securityMode`\nis `prompt_on_startup` that means shares are not reachable\nuntil somebody signs in, which is the same thing everything\nelse behind the master key already does and is reported the\nsame way rather than failing as a missing file.\n",
     )
 
 
@@ -2129,88 +2150,18 @@ class ComputeDevice(BaseModel):
     )
 
 
-class ConfigField(BaseModel):
+class ConfigFieldStatus(BaseModel):
     """
-    UI-renderable description of a single editable config field.
-
-    """
-
-    key: str = Field(
-        ...,
-        description='Stable machine-readable id, dot-separated for grouping\n(e.g. `"adapter.modelId"`).\n',
-    )
-    label: str = Field(..., description='Human-readable label for the UI.')
-    description: str | None = Field(
-        None, description='One-sentence explanation suitable for non-programmers.'
-    )
-    category: str = Field(
-        ...,
-        description='Group key for UI tabbing or sectioning (e.g. `"adapter"`,\n`"logging"`, `"network"`). Mapped to a display label via\n`ConfigSchema.categories`.\n',
-    )
-    valueType: ConfigValueType
-    default: Any | None = Field(
-        None,
-        description='Default value if unset. Type matches `valueType`. Omitted\nfor fields with no default.\n',
-    )
-    enumValues: list[str] | None = Field(
-        None, description='Allowed values when `valueType == enum`.'
-    )
-    suggestions: list[str] | None = Field(
-        None,
-        description="Discovery-time hints — values the operator might want\nbut which AREN'T enforced by validation. UIs render\nstring-typed fields with non-empty `suggestions` as a\ncombobox (free-text input with a dropdown of suggestions)\nrather than a strict dropdown. Use when the set of\nvalid values is large, partially-discoverable, or\nextends beyond what the component knows at the moment\n(e.g. local LLM model lists that update when the operator\npulls a new model). Distinct from `enumValues`:\nsuggestions are advisory, enumValues are mandatory.\n",
-    )
-    componentKindHint: ComponentKind | None = Field(
-        None,
-        description="Declarative rendering hint: this field references a peer\ncomponent of the given kind. UIs render any kind-hinted\nfield as a dropdown sourced from the agent's\n`/v1/components` (filtered by kind), with `(off)` as the\nfirst option (saves an empty string). For single-instance\nkinds (memory, identity, etc.) the dropdown UX collapses\nto effectively a toggle; for multi-instance kinds\n(inference-driver) the operator picks one. Pairs with a\nstring/url `valueType` — the saved value is still the\npeer's URL, the hint only changes how the UI looks it up.\nAvoids the OpenClaw trap of duplicating topology into\nfree-text URL fields the operator has to type by hand.\n",
-    )
-    enumLabels: list[str] | None = Field(
-        None,
-        description='Optional human-readable display labels paired one-to-one\nwith `enumValues`. UIs that render an enum as a dropdown\nshould show `enumLabels[i]` while still submitting\n`enumValues[i]` as the saved value. When omitted (or\nshorter than `enumValues`), UIs fall back to the raw\nvalue as the label. Useful where the stored key is\nmachine-friendly but the user-facing label isn\'t —\ne.g. `claude_subscription` saved, "Claude (Pro/Max)"\nshown.\n',
-    )
-    sensitive: bool | None = Field(
-        False,
-        description='If true, the value is redacted (`"<redacted>"`) in\n`ConfigDocument` responses but is accepted in\n`ConfigUpdateRequest`. Use for API keys, passwords, etc.\n',
-    )
-    required: bool | None = Field(
-        False,
-        description='If true, the component will refuse to start without this\nfield set (either in config or via env var fallback).\n',
-    )
-    minimum: float | None = Field(
-        None, description='Validation hint for `integer` / `number` fields.'
-    )
-    maximum: float | None = Field(
-        None, description='Validation hint for `integer` / `number` fields.'
-    )
-    pattern: str | None = Field(
-        None, description='Regex validation hint for `string` / `url` / `file_path`.'
-    )
-    requiresRestart: bool | None = Field(
-        False,
-        description='If true, changes to this field via PATCH are accepted and\nstored but do not take effect until the component process\nrestarts. The UI should warn before submitting.\n',
-    )
-    showWhen: ConfigFieldShowWhen | None = Field(
-        None,
-        description="Conditional-rendering hint. When set, the UI should only\nrender this field when another field's current value matches\nthe condition. Used to hide adapter-specific fields\n(e.g. `openaiApiKey`) when a different adapter is selected.\nThe component still validates and stores the field\nregardless of UI visibility.\n",
-    )
-
-
-class ConfigSchema(BaseModel):
-    """
-    UI-renderable description of every editable config field this
-    component accepts. Returned by `GET /v1/config/schema`. UIs use
-    this to render a generic config editor without component-specific
-    code.
+    One sentence about what a field's value is doing on this machine
+    right now. `warning` when the value does not do what it says --
+    `passphrase_file` with no passphrase file configured, so this
+    machine asks at every start -- and `info` when it will, but has not
+    yet.
 
     """
 
-    component: str = Field(
-        ..., description='Component identifier (e.g. `"inference-driver"`).'
-    )
-    fields: list[ConfigField]
-    categories: dict[str, str] | None = Field(
-        None,
-        description='Map from category key (used in `ConfigField.category`) to\na human-readable section label. Optional; UIs may fall back\nto the raw key.\n',
-    )
+    level: ConfigFieldStatusLevel
+    text: str
 
 
 class DirectoryEntry(BaseModel):
@@ -2540,6 +2491,118 @@ class ChatLogprobs(BaseModel):
 
     content: list[ChatTokenLogprob] | None = None
     refusal: list[ChatTokenLogprob] | None = None
+
+
+class ConfigField(BaseModel):
+    """
+    UI-renderable description of a single editable config field.
+
+    """
+
+    key: str = Field(
+        ...,
+        description='Stable machine-readable id, dot-separated for grouping\n(e.g. `"adapter.modelId"`).\n',
+    )
+    label: str = Field(..., description='Human-readable label for the UI.')
+    description: str | None = Field(
+        None, description='One-sentence explanation suitable for non-programmers.'
+    )
+    category: str = Field(
+        ...,
+        description='Group key for UI tabbing or sectioning (e.g. `"adapter"`,\n`"logging"`, `"network"`). Mapped to a display label via\n`ConfigSchema.categories`.\n',
+    )
+    valueType: ConfigValueType
+    default: Any | None = Field(
+        None,
+        description='Default value if unset. Type matches `valueType`. Omitted\nfor fields with no default.\n',
+    )
+    enumValues: list[str] | None = Field(
+        None, description='Allowed values when `valueType == enum`.'
+    )
+    suggestions: list[str] | None = Field(
+        None,
+        description="Discovery-time hints — values the operator might want\nbut which AREN'T enforced by validation. UIs render\nstring-typed fields with non-empty `suggestions` as a\ncombobox (free-text input with a dropdown of suggestions)\nrather than a strict dropdown. Use when the set of\nvalid values is large, partially-discoverable, or\nextends beyond what the component knows at the moment\n(e.g. local LLM model lists that update when the operator\npulls a new model). Distinct from `enumValues`:\nsuggestions are advisory, enumValues are mandatory.\n",
+    )
+    componentKindHint: ComponentKind | None = Field(
+        None,
+        description="Declarative rendering hint: this field references a peer\ncomponent of the given kind. UIs render any kind-hinted\nfield as a dropdown sourced from the agent's\n`/v1/components` (filtered by kind), with `(off)` as the\nfirst option (saves an empty string). For single-instance\nkinds (memory, identity, etc.) the dropdown UX collapses\nto effectively a toggle; for multi-instance kinds\n(inference-driver) the operator picks one. Pairs with a\nstring/url `valueType` — the saved value is still the\npeer's URL, the hint only changes how the UI looks it up.\nAvoids the OpenClaw trap of duplicating topology into\nfree-text URL fields the operator has to type by hand.\n",
+    )
+    enumLabels: list[str] | None = Field(
+        None,
+        description='Optional human-readable display labels paired one-to-one\nwith `enumValues`. UIs that render an enum as a dropdown\nshould show `enumLabels[i]` while still submitting\n`enumValues[i]` as the saved value. When omitted (or\nshorter than `enumValues`), UIs fall back to the raw\nvalue as the label. Useful where the stored key is\nmachine-friendly but the user-facing label isn\'t —\ne.g. `claude_subscription` saved, "Claude (Pro/Max)"\nshown.\n',
+    )
+    sensitive: bool | None = Field(
+        False,
+        description='If true, the value is redacted (`"<redacted>"`) in\n`ConfigDocument` responses but is accepted in\n`ConfigUpdateRequest`. Use for API keys, passwords, etc.\n',
+    )
+    required: bool | None = Field(
+        False,
+        description='If true, the component will refuse to start without this\nfield set (either in config or via env var fallback).\n',
+    )
+    minimum: float | None = Field(
+        None, description='Validation hint for `integer` / `number` fields.'
+    )
+    maximum: float | None = Field(
+        None, description='Validation hint for `integer` / `number` fields.'
+    )
+    pattern: str | None = Field(
+        None, description='Regex validation hint for `string` / `url` / `file_path`.'
+    )
+    requiresRestart: bool | None = Field(
+        False,
+        description='If true, changes to this field via PATCH are accepted and\nstored but do not take effect until the component process\nrestarts. The UI should warn before submitting.\n',
+    )
+    showWhen: ConfigFieldShowWhen | None = Field(
+        None,
+        description="Conditional-rendering hint. When set, the UI should only\nrender this field when another field's current value matches\nthe condition. Used to hide adapter-specific fields\n(e.g. `openaiApiKey`) when a different adapter is selected.\nThe component still validates and stores the field\nregardless of UI visibility.\n\n**A field must be shown wherever the component reads it**\n(2026-09-30): a condition narrower than the code that reads the\nvalue hides a setting while it is in effect. The referenced\nfield's value is its effective one -- its `default` when the\ndocument leaves it out.\n",
+    )
+    defaultSource: str | None = Field(
+        None,
+        description='Where `default` comes from, as a sentence, when it is not the\ncomponent\'s own built-in value -- e.g. "Set by this container\nimage, through EUGENE_PLEXUS_AGENT_DEFAULT_UPDATE_CHANNEL." A\ndefault from the environment is shown in the UI and never\nwritten to the component\'s file. Absent for a built-in default.\n\n**Settings never lie** (2026-09-30, Troy: fundamental). The five\nproperties from here to `managedBy` exist so a widget can show\nexactly the value in effect, and say so when that value is a\ndefault, unset, derived, inherited, not yet in effect or set by\nsomething else -- never a stand-in that looks like a choice.\n',
+    )
+    unsetMeans: str | None = Field(
+        None,
+        description='What this field does while it holds no value, as a sentence a\nperson reads -- "No cap: an answer runs until the model\nfinishes." -- shown where the control would otherwise be empty,\nor show a default the component is not using. Present on every\nfield without a `default` whose absence means something, and on\nany field whose unset value means something other than\n`default` right now. For a list, it says what the EMPTY list\nmeans. May be computed per request, so it can name what an\nunset value resolves to on this machine.\n',
+    )
+    unsetResolvesTo: Any | None = Field(
+        None,
+        description="The value an unset field stands for right now, typed like the\nfield, when the component can know it: a provider's own\naddress, the advertise address derived from the route to the\ncontrol root. Absent when it cannot be known here or depends on\neach request. Never sent for a `sensitive` field.\n",
+    )
+    pendingRestart: bool | None = Field(
+        False,
+        description='The value in `GET /v1/config` is saved but not in effect: this\n`requiresRestart` field was changed since the process started,\nand the process still runs on the value it started with\n(`inEffect`). Cleared by the restart.\n',
+    )
+    inEffect: Any | None = Field(
+        None,
+        description='With `pendingRestart`, the value the running process uses,\ntyped like the field. Never sent for a `sensitive` field.\n',
+    )
+    managedBy: str | None = Field(
+        None,
+        description='The field is written by another part of the install, which\nrewrites it: a sentence saying which, and where to change it\ninstead -- "Set by this machine\'s agent from the runtime this\ndriver fronts; change the runtime." UIs show it read-only, and\n`PATCH` refuses it.\n',
+    )
+    status: ConfigFieldStatus | None = Field(
+        None,
+        description="What this field's value is doing right now, when the value alone\ndoes not say it: a mode this machine cannot carry out, a value\nnot yet acted on. Shown beside the control.\n",
+    )
+
+
+class ConfigSchema(BaseModel):
+    """
+    UI-renderable description of every editable config field this
+    component accepts. Returned by `GET /v1/config/schema`. UIs use
+    this to render a generic config editor without component-specific
+    code.
+
+    """
+
+    component: str = Field(
+        ..., description='Component identifier (e.g. `"inference-driver"`).'
+    )
+    fields: list[ConfigField]
+    categories: dict[str, str] | None = Field(
+        None,
+        description='Map from category key (used in `ConfigField.category`) to\na human-readable section label. Optional; UIs may fall back\nto the raw key.\n',
+    )
 
 
 class DirectoryListing(BaseModel):

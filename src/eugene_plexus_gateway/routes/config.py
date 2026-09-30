@@ -18,7 +18,7 @@ from .._generated.models import (
     ConfigUpdateResult,
 )
 from .._http import internal_client
-from ..config import ConfigStore, as_schema
+from ..config import DEFAULT_REQUEST_TIMEOUT_SECONDS, ConfigStore, as_schema
 from ..routing import RoutingTable
 
 router = APIRouter(tags=["config"])
@@ -31,8 +31,16 @@ async def get_config(request: Request) -> ConfigDocument:
 
 
 @router.get("/v1/config/schema", response_model=ConfigSchema)
-async def get_config_schema() -> ConfigSchema:
-    return as_schema()
+async def get_config_schema(request: Request) -> ConfigSchema:
+    store: ConfigStore | None = getattr(request.app.state, "config_store", None)
+    table: RoutingTable | None = getattr(request.app.state, "routing", None)
+    derived_control = None
+    if table is not None and (store is None or not str(store.get("controlUrl") or "").strip()):
+        derived_control = table.derived_control_url()
+    return as_schema(
+        pending=store.pending_restart() if store is not None else None,
+        derived_control_url=derived_control,
+    )
 
 
 @router.patch("/v1/config", response_model=ConfigUpdateResult)
@@ -64,7 +72,7 @@ async def test_config(
     def get(key: str) -> Any:
         return overrides[key] if key in overrides else store.get(key)
 
-    timeout = float(get("requestTimeoutSeconds") or 30)
+    timeout = float(get("requestTimeoutSeconds") or DEFAULT_REQUEST_TIMEOUT_SECONDS)
     settings = request.app.state.settings
     outbound = getattr(request.app.state, "outbound", None)
 

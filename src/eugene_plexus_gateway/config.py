@@ -16,6 +16,7 @@ and a few operational knobs.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from pathlib import Path
 from typing import Any
@@ -436,18 +437,61 @@ FIELDS: list[ConfigField] = [
 _FIELDS_BY_KEY: dict[str, ConfigField] = {f.key: f for f in FIELDS}
 
 
-def as_schema() -> ConfigSchema:
-    """Emit the gateway config schema.
+#: What an unset value does -- for a list, an empty one -- shown where the
+#: control would otherwise be blank or show a default the gateway is not
+#: using (settings never lie, 2026-09-30). An empty `corsAllowedOrigins`
+#: read "Default: none" when it means any website.
+UNSET_MEANS: dict[str, str] = {
+    "defaultMaxTokens": (
+        "No cap: an answer runs until the model finishes, bounded by its context window "
+        "and the request deadline, unless the request or the model's default profile "
+        "sets one."
+    ),
+    "imageToolModel": (
+        "Not set: the image tool uses the model the app names when this install serves "
+        "it, else the one image model the key may use."
+    ),
+    "controlUrl": (
+        "Not set: found through this machine's agent at every routing refresh -- the "
+        "control root this node is enrolled to, or the one this machine runs."
+    ),
+    "corsAllowedOrigins": (
+        "Empty: any website may call the three OpenAI paths from a browser. Every request "
+        "still needs a bearer key the page must hold; list origins to admit only yours."
+    ),
+    "modelSlots": "None: each model is served only by its own backends, with no fallback.",
+}
 
-    No dynamic fields any more: the old `voiceDriver` dropdown had to be
-    rebuilt from the configured driver slots, and there are no configured
-    driver slots — routing is derived. See `routing.py`.
+
+def as_schema(
+    *,
+    pending: dict[str, Any] | None = None,
+    derived_control_url: str | None = None,
+) -> ConfigSchema:
+    """Emit the gateway config schema, with what this process knows now.
+
+    `pending` is `ConfigStore.pending_restart()`: a field saved but not in
+    effect says so, and what the running gateway uses. `derived_control_url`
+    is where the last refresh found the control root, which is what an
+    unset `controlUrl` stands for right now.
     """
-    return ConfigSchema(
-        component="gateway",
-        fields=list(FIELDS),
-        categories=CATEGORY_LABELS,
-    )
+    fields: list[ConfigField] = []
+    for field in FIELDS:
+        update: dict[str, Any] = {}
+        if field.key in UNSET_MEANS:
+            update["unsetMeans"] = UNSET_MEANS[field.key]
+        if field.key == "controlUrl" and derived_control_url:
+            update["unsetMeans"] = (
+                f"Not set: found through this machine's agent -- {derived_control_url} at "
+                "the last routing refresh."
+            )
+            update["unsetResolvesTo"] = derived_control_url
+        if pending and field.key in pending:
+            update["pendingRestart"] = True
+            if not field.sensitive:
+                update["inEffect"] = pending[field.key]
+        fields.append(field.model_copy(update=update) if update else field)
+    return ConfigSchema(component="gateway", fields=fields, categories=CATEGORY_LABELS)
 
 
 def _defaults() -> dict[str, Any]:
@@ -499,6 +543,11 @@ def _validate_value(field: ConfigField, value: Any) -> str | None:
     if vt in (ConfigValueType.number, ConfigValueType.duration):
         if isinstance(value, bool) or not isinstance(value, int | float):
             return f"expected number, got {type(value).__name__}"
+        if not math.isfinite(value):
+            # JSON's `NaN` parses, and every comparison with it is false,
+            # so it passed the range check and a timeout of NaN ended
+            # every request at once.
+            return "must be a finite number"
         if field.minimum is not None and value < field.minimum:
             return f"must be >= {field.minimum}"
         if field.maximum is not None and value > field.maximum:
@@ -577,7 +626,11 @@ class ConfigStore:
         self._path = path
         self._lock = threading.Lock()
         self._values: dict[str, Any] = _defaults()
-        self._pending_restart: set[str] = set()
+        # What this process runs on, for every `requiresRestart` field: the
+        # value it had when the store was loaded. A field is pending a
+        # restart while its saved value differs from this, and the schema
+        # says so (`ConfigField.pendingRestart` / `inEffect`).
+        self._started: dict[str, Any] = dict(self._values)
 
     def load(self) -> None:
         with self._lock:
@@ -587,14 +640,21 @@ class ConfigStore:
                     raise ValueError(f"config file {self._path} must be a YAML mapping at the root")
                 merged = _defaults()
                 for k, v in raw.items():
-                    if k in _FIELDS_BY_KEY:
-                        merged[k] = v
+                    field = _FIELDS_BY_KEY.get(k)
+                    if field is None:
+                        continue
+                    # A `null` in the file for a field with a default is the
+                    # default, as a PATCH of null is. `metricsEnabled: null`
+                    # used to turn metrics off while GET said null and the
+                    # schema said the default was on.
+                    merged[k] = field.default if v is None and field.default is not None else v
                 self._values = merged
                 self._clear_old_max_tokens_locked()
             else:
                 self._values = _defaults()
                 self._write_locked()
                 self._mark_max_tokens_locked()
+            self._started = dict(self._values)
 
     def _clear_old_max_tokens_locked(self) -> None:
         """Clear the 2048 cap an older install wrote into its file, once.
@@ -665,20 +725,33 @@ class ConfigStore:
                     self._values[key] = new_value
 
                 applied.append(key)
-                if field.requiresRestart:
-                    self._pending_restart.add(key)
+                # Only this PATCH's keys, and only those that now differ from
+                # what the process runs on (the contract: a subset of
+                # `applied`). This used to be every restart key saved since
+                # the process started, so a later save of a live field said
+                # a restart was needed and the UI restarted the gateway.
+                if field.requiresRestart and self._values.get(key) != self._started.get(key):
                     pending_restart.append(key)
 
             if applied:
                 self._write_locked()
 
-            requires_restart = bool(self._pending_restart)
             return ConfigUpdateResult(
                 applied=applied,
                 rejected=rejected,
-                requiresRestart=requires_restart,
-                pendingRestart=sorted(self._pending_restart),
+                requiresRestart=bool(pending_restart),
+                pendingRestart=pending_restart,
             )
+
+    def pending_restart(self) -> dict[str, Any]:
+        """`requiresRestart` fields whose saved value is not the one this
+        process runs on, with the value it runs on."""
+        with self._lock:
+            return {
+                f.key: self._started.get(f.key)
+                for f in FIELDS
+                if f.requiresRestart and self._values.get(f.key) != self._started.get(f.key)
+            }
 
     def get(self, key: str) -> Any:
         with self._lock:

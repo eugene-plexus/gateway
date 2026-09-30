@@ -722,6 +722,19 @@ class ConfigValueType(StrEnum):
     string_list = 'string_list'
 
 
+class ConfigFieldStatusLevel(StrEnum):
+    """
+    Named rather than inline: an inline enum here generates a class
+    called `Level`, and the next inline `level` anywhere in these
+    documents would rename it `Level1` under every caller (the S6
+    `Source` -> `Source1` trap).
+
+    """
+
+    info = 'info'
+    warning = 'warning'
+
+
 class ConfigFieldShowWhen(BaseModel):
     """
     Predicate over another `ConfigField`'s current value. The UI
@@ -742,10 +755,14 @@ class ConfigFieldShowWhen(BaseModel):
 
 class ConfigDocument(BaseModel):
     """
-    Current effective config values, keyed by `ConfigField.key`.
-    Values of fields with `sensitive: true` are returned as the
-    literal string `"<redacted>"` regardless of whether they are
-    set. Returned by `GET /v1/config`.
+    Current effective config values, keyed by `ConfigField.key`: a
+    field with a `default` and no saved value reads as the default.
+    A field with `sensitive: true` that holds a value reads as the
+    literal string `"<redacted>"`; one that holds none is absent or
+    `null`, so a UI never shows a missing key as saved (corrected
+    2026-09-30 -- this said `"<redacted>"` "regardless of whether they
+    are set", which no component did, and a UI that believed it would
+    say a key was saved that never was). Returned by `GET /v1/config`.
 
     """
 
@@ -1155,7 +1172,11 @@ class ShareCredential(BaseModel):
     )
     password: str | None = Field(
         None,
-        description="Redacted in `GET /v1/config` exactly as a `secret` scalar is\n— the value comes back as null and the entry keeps its `host`\nand `username`, so a UI can render the row without ever\nholding the secret. A `PATCH` that omits `password` on an\nentry whose `host` already exists **keeps the stored one**,\nso editing a user name does not silently blank the password;\nan explicit empty string clears it.\n\n**At rest it is sealed with the install's master key**, the\nsame envelope a driver's `apiKey` gets, so it is not\nreadable from the config file — and so it is readable only\nonce the agent is unlocked. On a host whose `securityMode`\nis `prompt_on_startup` that means shares are not reachable\nuntil somebody signs in, which is the same thing everything\nelse behind the master key already does and is reported the\nsame way rather than failing as a missing file.\n",
+        description='Redacted in `GET /v1/config` exactly as a `secret` scalar is\n— the value comes back as null and the entry keeps its `host`\nand `username`, so a UI can render the row without ever\nholding the secret. A `PATCH` that omits `password` on an\nentry whose `host` already exists **keeps the stored one**,\nso editing a user name does not silently blank the password;\nan explicit empty string clears it.\n',
+    )
+    hasPassword: bool | None = Field(
+        None,
+        description="In `GET /v1/config` only: whether a password is stored for this\nserver. The password itself never leaves the machine, so\nwithout this a row with one and a row without one were\nidentical, and a UI told somebody a password was saved that\nnever was (2026-09-30). Ignored in a `PATCH`.\n\n**At rest it is sealed with the install's master key**, the\nsame envelope a driver's `apiKey` gets, so it is not\nreadable from the config file — and so it is readable only\nonce the agent is unlocked. On a host whose `securityMode`\nis `prompt_on_startup` that means shares are not reachable\nuntil somebody signs in, which is the same thing everything\nelse behind the master key already does and is reported the\nsame way rather than failing as a missing file.\n",
     )
 
 
@@ -1404,6 +1425,73 @@ class ComputeDevice(BaseModel):
     )
 
 
+class ConfigFieldStatus(BaseModel):
+    """
+    One sentence about what a field's value is doing on this machine
+    right now. `warning` when the value does not do what it says --
+    `passphrase_file` with no passphrase file configured, so this
+    machine asks at every start -- and `info` when it will, but has not
+    yet.
+
+    """
+
+    level: ConfigFieldStatusLevel
+    text: str
+
+
+class DirectoryEntry(BaseModel):
+    name: str
+    path: str = Field(
+        ..., description='Absolute path, ready to be used as a config value.'
+    )
+    kind: DirectoryEntryKind
+    hidden: bool | None = Field(
+        False,
+        description='A dot-prefixed name, or the hidden attribute on Windows.\nOnly present in a listing that asked for `showHidden`.\n',
+    )
+
+
+class WebSearchResponse(BaseModel):
+    results: list[WebSearchResult]
+    answer: str | None = Field(
+        None,
+        description="Text the provider itself wrote in answer to the query (SearXNG's\ninstant answers), or null. A provider that searches by asking a\nhosted model answers here, with its citations in `results`.\n",
+    )
+    provider: str
+    latencyMs: float | None = None
+    ignored: list[str] | None = Field(
+        None, description='Request settings this provider could not honour, by name.'
+    )
+
+
+class InputAudioContentPart(BaseModel):
+    """
+    A recording the model hears, in OpenAI's chat shape. Carried only
+    to a model whose backend confirms audio input
+    (`capabilities.audioInput`); nothing else is asked, so a model
+    that cannot hear it never answers as though it had.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    type: Literal['input_audio']
+    input_audio: InputAudio
+
+
+class ChatLogprobs(BaseModel):
+    """
+    The chosen tokens' log probabilities, OpenAI's shape (P2c). Asked
+    for with `logprobs` (and `top_logprobs` for alternatives). Streamed,
+    each frame carries the entries for its own tokens.
+
+    """
+
+    content: list[ChatTokenLogprob] | None = None
+    refusal: list[ChatTokenLogprob] | None = None
+
+
 class ConfigField(BaseModel):
     """
     UI-renderable description of a single editable config field.
@@ -1465,7 +1553,35 @@ class ConfigField(BaseModel):
     )
     showWhen: ConfigFieldShowWhen | None = Field(
         None,
-        description="Conditional-rendering hint. When set, the UI should only\nrender this field when another field's current value matches\nthe condition. Used to hide adapter-specific fields\n(e.g. `openaiApiKey`) when a different adapter is selected.\nThe component still validates and stores the field\nregardless of UI visibility.\n",
+        description="Conditional-rendering hint. When set, the UI should only\nrender this field when another field's current value matches\nthe condition. Used to hide adapter-specific fields\n(e.g. `openaiApiKey`) when a different adapter is selected.\nThe component still validates and stores the field\nregardless of UI visibility.\n\n**A field must be shown wherever the component reads it**\n(2026-09-30): a condition narrower than the code that reads the\nvalue hides a setting while it is in effect. The referenced\nfield's value is its effective one -- its `default` when the\ndocument leaves it out.\n",
+    )
+    defaultSource: str | None = Field(
+        None,
+        description='Where `default` comes from, as a sentence, when it is not the\ncomponent\'s own built-in value -- e.g. "Set by this container\nimage, through EUGENE_PLEXUS_AGENT_DEFAULT_UPDATE_CHANNEL." A\ndefault from the environment is shown in the UI and never\nwritten to the component\'s file. Absent for a built-in default.\n\n**Settings never lie** (2026-09-30, Troy: fundamental). The five\nproperties from here to `managedBy` exist so a widget can show\nexactly the value in effect, and say so when that value is a\ndefault, unset, derived, inherited, not yet in effect or set by\nsomething else -- never a stand-in that looks like a choice.\n',
+    )
+    unsetMeans: str | None = Field(
+        None,
+        description='What this field does while it holds no value, as a sentence a\nperson reads -- "No cap: an answer runs until the model\nfinishes." -- shown where the control would otherwise be empty,\nor show a default the component is not using. Present on every\nfield without a `default` whose absence means something, and on\nany field whose unset value means something other than\n`default` right now. For a list, it says what the EMPTY list\nmeans. May be computed per request, so it can name what an\nunset value resolves to on this machine.\n',
+    )
+    unsetResolvesTo: Any | None = Field(
+        None,
+        description="The value an unset field stands for right now, typed like the\nfield, when the component can know it: a provider's own\naddress, the advertise address derived from the route to the\ncontrol root. Absent when it cannot be known here or depends on\neach request. Never sent for a `sensitive` field.\n",
+    )
+    pendingRestart: bool | None = Field(
+        False,
+        description='The value in `GET /v1/config` is saved but not in effect: this\n`requiresRestart` field was changed since the process started,\nand the process still runs on the value it started with\n(`inEffect`). Cleared by the restart.\n',
+    )
+    inEffect: Any | None = Field(
+        None,
+        description='With `pendingRestart`, the value the running process uses,\ntyped like the field. Never sent for a `sensitive` field.\n',
+    )
+    managedBy: str | None = Field(
+        None,
+        description='The field is written by another part of the install, which\nrewrites it: a sentence saying which, and where to change it\ninstead -- "Set by this machine\'s agent from the runtime this\ndriver fronts; change the runtime." UIs show it read-only, and\n`PATCH` refuses it.\n',
+    )
+    status: ConfigFieldStatus | None = Field(
+        None,
+        description="What this field's value is doing right now, when the value alone\ndoes not say it: a mode this machine cannot carry out, a value\nnot yet acted on. Shown beside the control.\n",
     )
 
 
@@ -1486,59 +1602,6 @@ class ConfigSchema(BaseModel):
         None,
         description='Map from category key (used in `ConfigField.category`) to\na human-readable section label. Optional; UIs may fall back\nto the raw key.\n',
     )
-
-
-class DirectoryEntry(BaseModel):
-    name: str
-    path: str = Field(
-        ..., description='Absolute path, ready to be used as a config value.'
-    )
-    kind: DirectoryEntryKind
-    hidden: bool | None = Field(
-        False,
-        description='A dot-prefixed name, or the hidden attribute on Windows.\nOnly present in a listing that asked for `showHidden`.\n',
-    )
-
-
-class WebSearchResponse(BaseModel):
-    results: list[WebSearchResult]
-    answer: str | None = Field(
-        None,
-        description="Text the provider itself wrote in answer to the query (SearXNG's\ninstant answers), or null. A provider that searches by asking a\nhosted model answers here, with its citations in `results`.\n",
-    )
-    provider: str
-    latencyMs: float | None = None
-    ignored: list[str] | None = Field(
-        None, description='Request settings this provider could not honour, by name.'
-    )
-
-
-class InputAudioContentPart(BaseModel):
-    """
-    A recording the model hears, in OpenAI's chat shape. Carried only
-    to a model whose backend confirms audio input
-    (`capabilities.audioInput`); nothing else is asked, so a model
-    that cannot hear it never answers as though it had.
-
-    """
-
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    type: Literal['input_audio']
-    input_audio: InputAudio
-
-
-class ChatLogprobs(BaseModel):
-    """
-    The chosen tokens' log probabilities, OpenAI's shape (P2c). Asked
-    for with `logprobs` (and `top_logprobs` for alternatives). Streamed,
-    each frame carries the entries for its own tokens.
-
-    """
-
-    content: list[ChatTokenLogprob] | None = None
-    refusal: list[ChatTokenLogprob] | None = None
 
 
 class DirectoryListing(BaseModel):
