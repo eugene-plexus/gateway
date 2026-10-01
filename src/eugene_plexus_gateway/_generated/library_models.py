@@ -1303,12 +1303,15 @@ class MlxQuantization(BaseModel):
     directory packs its weights as integer tensors that no other
     engine here can load.
 
-    Two honest caveats, recorded rather than papered over: an
+    One honest caveat, recorded rather than papered over: an
     *unquantized* MLX conversion carries no such block and reads as
     a plain safetensors directory — absence means unknown, not
-    incompatible — and `parameters` for an MLX-quantized directory
-    counts packed storage elements rather than model parameters, so
-    per-parameter arithmetic must not be built on it.
+    incompatible. `parameters` for an MLX-quantized directory is the
+    model's parameter count, recovered from the packed storage (each
+    quantized module holds its `scales` times its group size); it
+    is absent when a group size cannot be read. Until A4
+    (2026-09-30) it counted packed storage elements instead, which
+    read a 0.6B model as 93M.
 
     """
 
@@ -1366,88 +1369,24 @@ class RecommendedSampling(BaseModel):
     topP: float | None = None
 
 
-class ModelProfileSpec(BaseModel):
+class ProfileBuiltAccuracy(StrEnum):
     """
-    Declarative half of a profile — launch settings and generation
-    defaults for one model. Used for create and replace bodies.
-
-    Launch field names match `RuntimeSpec`, on purpose:
-    composing a profile into a runtime declaration is a copy, not a
-    translation, which is what lets the launch flow live in the
-    caller and keep this component free of engine knowledge.
-
+    The accuracy level the build was asked for; the agent's `ProfileBuildAccuracy`.
     """
 
-    name: str = Field(
-        ...,
-        description='Operator-supplied label, unique per model — "long context",\n"cpu only", "gpu 1". Names rather than numbers because the\nreason a profile exists is the thing worth remembering about\nit.\n',
-        min_length=1,
-    )
-    default: bool | None = Field(
-        False,
-        description='The profile offered first when launching this model.\nIts maxTokens, temperature and topP also supply omitted\ngeneration parameters at the gateway, without restarting\nan existing runtime. Explicit request values always win.\nSetting it clears the flag on whichever profile held it; the\nfirst profile saved for a model gets it whether it asks or\nnot.\n',
-    )
-    maxTokens: int | None = Field(
-        None,
-        description='Maximum output tokens when the request omits a limit. Absent uses the gateway default.',
-        ge=1,
-    )
-    temperature: float | None = Field(
-        None,
-        description='Sampling temperature when omitted by the caller. Zero is an explicit value.',
-        ge=0.0,
-        le=2.0,
-    )
-    topP: float | None = Field(
-        None,
-        description='Nucleus sampling cutoff when omitted by the caller. Absent leaves it unspecified.',
-        ge=0.0,
-        le=1.0,
-    )
-    engine: EngineKind = Field(
-        ...,
-        description='Which engine these flags are written for. Flags are not\nportable between engines, so a profile is only ever offered\nfor the engine it names — and a model whose format no\ninstalled engine can load has nowhere to use one at all. The\nengine side of that answer is\n`EngineDescriptor.modelFormats` on the agent.\n',
-    )
-    flags: dict[str, Any] | None = Field(
-        None,
-        description="Curated engine flags, keyed by the field names in the\nadapter's `flagSchema` — context size, GPU layers, batch\nsize, parallel slots. Copied onto `RuntimeSpec.flags`\nverbatim.\n\n**Stored, not validated.** The validator is the agent's\nadapter schema, at runtime-creation time. A profile is\nallowed to be wrong; the runtime that uses it is not, and\nthat is where an unknown key becomes a 400. Validating in\nboth places would mean two copies of engine knowledge and\none of them going stale.\n",
-    )
-    extraArgs: list[str] | None = Field(
-        None,
-        description='Verbatim extra arguments, for the long tail a curated\nsurface always misses. `--lora` lives here, which is why\nadapters are not modelled as their own thing yet.\n',
-    )
-    env: dict[str, str] | None = Field(
-        None,
-        description='Extra environment for the engine process. This is where\n`CUDA_VISIBLE_DEVICES` goes, and therefore where the\ntwo-replicas-on-two-GPUs case comes from: the same profile\ntwice with a different device pinned. It is also the\nstrongest argument for profiles being plural.\n',
-    )
-    notes: str | None = Field(
-        None,
-        description='Free text from the operator. Tuning a model is empirical and\nthe reasoning evaporates — "OOMs above 24 layers on the\n3090" is worth more later than the flag value it explains.\n',
-    )
+    max = 'max'
+    high = 'high'
+    medium = 'medium'
+    low = 'low'
 
 
-class ModelProfile(BaseModel):
+class ProfileBuiltEvaluationSource(StrEnum):
     """
-    A saved profile, as stored: the spec plus server-owned
-    identifiers and timestamps.
-
+    The agent's `EvaluationTextSource`. A custom text is identified by the build, never stored.
     """
 
-    id: str = Field(
-        ..., description='Server-assigned profile id, unique within the model.'
-    )
-    name: str
-    default: bool
-    maxTokens: int | None = Field(None, ge=1)
-    temperature: float | None = Field(None, ge=0.0, le=2.0)
-    topP: float | None = Field(None, ge=0.0, le=1.0)
-    engine: EngineKind
-    flags: dict[str, Any] | None = None
-    extraArgs: list[str] | None = None
-    env: dict[str, str] | None = None
-    notes: str | None = None
-    createdAt: AwareDatetime | None = None
-    updatedAt: AwareDatetime | None = None
+    bundled = 'bundled'
+    custom = 'custom'
 
 
 class ScanRequest(BaseModel):
@@ -1740,7 +1679,7 @@ class StarterRecommendation(BaseModel):
     )
     reason: str = Field(
         ...,
-        description='Prose naming the numbers, the same rule\n`CatalogueRecommendation` follows: the largest of the set\nthat runs entirely on this GPU with room for the scored\ncontext, said with the sizes that make it checkable.\n',
+        description='Prose naming the numbers, the same rule\n`CatalogueRecommendation` follows: the largest of the set\nthat runs entirely on this GPU with room for the scored\ncontext, said with the sizes that make it checkable.\n\nA mixture-of-experts entry may be recommended where it runs\nwith its experts in system memory: the card holds the rest\nand the cache, and system memory holds the experts. It wins\nonly over a dense entry of a smaller size class; between two\nentries of one class that both fit, the dense one is\nrecommended. The prose names what goes where. No speed is\npredicted.\n',
     )
 
 
@@ -1863,6 +1802,26 @@ class Basis(StrEnum):
     estimate = 'estimate'
 
 
+class FitOffload(StrEnum):
+    """
+    How a verdict of `tight` or `split` would run, because the two
+    differ by an order of magnitude and one word covered both
+    (`docs/design/moe-aware-fit.md` §0 M2-M3):
+    * `experts` — a MoE model whose non-expert weights, cache and
+      overhead fit in free VRAM. llama.cpp keeps every layer on the
+      card and moves only expert weights to system memory: measured
+      at 46.5 tok/s for a 30B-A3B on an 8 GB budget.
+    * `layers` — whole layers move to system memory: measured at 4.9
+      tok/s for a dense 27B on the same budget.
+    It describes placement, never a predicted speed; the profile
+    builder measures that.
+
+    """
+
+    experts = 'experts'
+    layers = 'layers'
+
+
 class FitVerdict(StrEnum):
     """
     * `fits` — inside **free** VRAM. Fully offloaded, no host memory
@@ -1871,8 +1830,9 @@ class FitVerdict(StrEnum):
       an idle GPU; something is holding memory right now, and
       closing it is the operator's call.
     * `split` — needs host memory as well. Runnable with partial
-      offload, materially slower, and a decision rather than a
-      failure.
+      offload, and a decision rather than a failure. How much slower
+      depends on what moves, which `Fit.offload` says: experts (a
+      MoE model, little slower) or whole layers (much slower).
     * `no` — larger than VRAM and RAM together.
     * `unknown` — there is a GPU here and we could not read how much
       memory it has, so no comparison against it can be made. Added
@@ -2218,6 +2178,11 @@ class GgufDetail(BaseModel):
         description='Token count. Worth reporting for its own sake and because it\nexplains the scan cost: the tokenizer lives in the KV block,\nso a 248k-token vocab means ~10.9 MB of metadata to walk\npast before the quant can be read.\n',
         ge=0,
     )
+    expertBytes: int | None = Field(
+        None,
+        description='Bytes of mixture-of-experts expert tensors (names carrying\n`_exps`), summed from the tensor table that follows the KV\nblock: names, shapes and offsets, never a weight. 0 for a\ndense model. Null when the table was not read (a scan from\nbefore 2026-09-30, or a header cut short).\n\nThe number that tells a MoE model from a dense one of the\nsame size: on Qwen3-30B-A3B Q4_K_M it is 16.35 GiB of 17.28,\nand everything else is 0.93 GiB, so a small card holds all of\nthat plus the cache and llama.cpp moves only experts to system\nmemory (`docs/design/moe-aware-fit.md` §0).\n',
+        ge=0,
+    )
     projectorPath: str | None = Field(
         None,
         description='Absolute path to the vision projector found beside this\nmodel, if any. Becomes `--mmproj` on the launch line.\nllama-server can also find it unaided, but it is reported\nbecause "this model can see" is a fact the browser should\nshow and a profile should be able to override.\n',
@@ -2264,8 +2229,81 @@ class SafetensorsDetail(BaseModel):
     )
 
 
-class ModelProfileList(BaseModel):
-    profiles: list[ModelProfile]
+class ProfileBuiltBy(BaseModel):
+    """
+    What the settings builder set on a profile, and what it measured,
+    on which machine. The UI compares `flags` with the profile's own
+    flags to say which settings the builder set and whether any has
+    been edited since; once one has, the measured numbers no longer
+    describe the profile and are labelled so.
+
+    """
+
+    buildId: str = Field(
+        ..., description="The agent's `ProfileBuild.id`.", min_length=1
+    )
+    node: str = Field(..., description='The machine it was measured on.', min_length=1)
+    accuracy: ProfileBuiltAccuracy
+    builtAt: AwareDatetime
+    engineVersion: str | None = Field(
+        None, description='The llama.cpp build it was measured with.'
+    )
+    flags: dict[str, Any] = Field(
+        ...,
+        description="The flags the builder set, as it set them: `contextSize`,\n`cacheType`, `flashAttention` when the cache is quantised,\nand `memoryMargin` when a margin was asked for. `gpuLayers`\nis never among them: placement is llama.cpp's at every launch.\n",
+    )
+    decodeTokensPerSecond: float | None = Field(
+        None, description='Measured decode speed with an empty context.', gt=0.0
+    )
+    deepDepth: int | None = Field(
+        None,
+        description='The context depth of the second measurement (2,048 for every candidate).',
+        ge=0,
+    )
+    deepDecodeTokensPerSecond: float | None = Field(None, gt=0.0)
+    graphicsMemoryBytes: int | None = Field(
+        None,
+        description='Graphics memory used when the result was loaded to confirm it, where the machine can measure it.',
+        ge=0,
+    )
+    sameTopTokenPercent: float | None = Field(
+        None,
+        description='How often the chosen cache picks the same next token as the\nf16 cache on the evaluation text. Null when the f16 cache was\nchosen, since nothing that changes answers was set.\n',
+        ge=0.0,
+        le=100.0,
+    )
+    evaluationSource: ProfileBuiltEvaluationSource | None = Field(
+        None,
+        description='Which text the quality measurement used; null when none was made.',
+    )
+
+
+class ModelProfile(BaseModel):
+    """
+    A saved profile, as stored: the spec plus server-owned
+    identifiers and timestamps.
+
+    """
+
+    id: str = Field(
+        ..., description='Server-assigned profile id, unique within the model.'
+    )
+    name: str
+    default: bool
+    maxTokens: int | None = Field(None, ge=1)
+    temperature: float | None = Field(None, ge=0.0, le=2.0)
+    topP: float | None = Field(None, ge=0.0, le=1.0)
+    engine: EngineKind
+    flags: dict[str, Any] | None = None
+    extraArgs: list[str] | None = None
+    env: dict[str, str] | None = None
+    notes: str | None = None
+    builtBy: ProfileBuiltBy | None = Field(
+        None,
+        description="The settings builder's record, when it wrote this profile. Kept by a replace that omits it.",
+    )
+    createdAt: AwareDatetime | None = None
+    updatedAt: AwareDatetime | None = None
 
 
 class SkippedPath(BaseModel):
@@ -2387,6 +2425,15 @@ class Fit(BaseModel):
         description='`metadata` when the model\'s own declared shape produced the\nKV term, whether read locally or by remote preflight.\n`estimate` when only file size was available or when a\nscalar fallback replaces declared per-layer attention terms\nthat were not retained. Local models and preflighted files\ncan therefore still report `estimate`; `notes` explains why.\n\nThe honest distinction between "this is arithmetic" and\n"this is a guess with a number on it", and the field a UI\nshould hang a "check this file" affordance off.\n',
     )
     budget: MemoryBudget | None = None
+    expertBytes: int | None = Field(
+        None,
+        description='The part of `weightsBytes` that is MoE expert tensors; null when unknown, 0 for a dense model.',
+        ge=0,
+    )
+    offload: FitOffload | None = Field(
+        None,
+        description='Null for `fits`, `no` and `unknown`, and when expert sizes are not known.',
+    )
     notes: list[str] | None = Field(
         None,
         description='The assumptions in words: full offload, F16 KV cache, layer\ncount assumed to be attention count, the overhead allowance\nused. Guidance that does not state its assumptions cannot be\nargued with, and this one will sometimes be wrong.\n',
@@ -2409,6 +2456,11 @@ class ModelFit(BaseModel):
     modelContextLength: int | None = Field(
         None,
         description="What the model was trained for, for comparison. These two\nare frequently far apart — a current 27B declares 262144 and\nalmost nobody can hold that — and showing only the model's\nnumber is the comfortable lie M2 named.\n",
+        ge=0,
+    )
+    maxContextExpertsInRam: int | None = Field(
+        None,
+        description='For a MoE model: the largest context whose non-expert\nweights, cache and overhead fit in free VRAM with every expert\nin system memory (which must hold them). The number for a card\nsmaller than the file, where `maxContextLength` is absent or\nsmall: it is how long a conversation can be while llama.cpp\nkeeps every layer on the card. Null for a dense model, or when\nexpert sizes or system memory do not allow it.\n',
         ge=0,
     )
 
@@ -2735,6 +2787,74 @@ class LibraryModel(BaseModel):
     )
 
 
+class ModelProfileList(BaseModel):
+    profiles: list[ModelProfile]
+
+
+class ModelProfileSpec(BaseModel):
+    """
+    Declarative half of a profile — launch settings and generation
+    defaults for one model. Used for create and replace bodies.
+
+    Launch field names match `RuntimeSpec`, on purpose:
+    composing a profile into a runtime declaration is a copy, not a
+    translation, which is what lets the launch flow live in the
+    caller and keep this component free of engine knowledge.
+
+    """
+
+    name: str = Field(
+        ...,
+        description='Operator-supplied label, unique per model — "long context",\n"cpu only", "gpu 1". Names rather than numbers because the\nreason a profile exists is the thing worth remembering about\nit.\n',
+        min_length=1,
+    )
+    default: bool | None = Field(
+        False,
+        description='The profile offered first when launching this model.\nIts maxTokens, temperature and topP also supply omitted\ngeneration parameters at the gateway, without restarting\nan existing runtime. Explicit request values always win.\nSetting it clears the flag on whichever profile held it; the\nfirst profile saved for a model gets it whether it asks or\nnot.\n',
+    )
+    maxTokens: int | None = Field(
+        None,
+        description='Maximum output tokens when the request omits a limit. Absent uses the gateway default.',
+        ge=1,
+    )
+    temperature: float | None = Field(
+        None,
+        description='Sampling temperature when omitted by the caller. Zero is an explicit value.',
+        ge=0.0,
+        le=2.0,
+    )
+    topP: float | None = Field(
+        None,
+        description='Nucleus sampling cutoff when omitted by the caller. Absent leaves it unspecified.',
+        ge=0.0,
+        le=1.0,
+    )
+    engine: EngineKind = Field(
+        ...,
+        description='Which engine these flags are written for. Flags are not\nportable between engines, so a profile is only ever offered\nfor the engine it names — and a model whose format no\ninstalled engine can load has nowhere to use one at all. The\nengine side of that answer is\n`EngineDescriptor.modelFormats` on the agent.\n',
+    )
+    flags: dict[str, Any] | None = Field(
+        None,
+        description="Curated engine flags, keyed by the field names in the\nadapter's `flagSchema` — context size, GPU layers, batch\nsize, parallel slots. Copied onto `RuntimeSpec.flags`\nverbatim.\n\n**Stored, not validated.** The validator is the agent's\nadapter schema, at runtime-creation time. A profile is\nallowed to be wrong; the runtime that uses it is not, and\nthat is where an unknown key becomes a 400. Validating in\nboth places would mean two copies of engine knowledge and\none of them going stale.\n",
+    )
+    extraArgs: list[str] | None = Field(
+        None,
+        description='Verbatim extra arguments, for the long tail a curated\nsurface always misses. `--lora` lives here, which is why\nadapters are not modelled as their own thing yet.\n',
+    )
+    env: dict[str, str] | None = Field(
+        None,
+        description='Extra environment for the engine process. This is where\n`CUDA_VISIBLE_DEVICES` goes, and therefore where the\ntwo-replicas-on-two-GPUs case comes from: the same profile\ntwice with a different device pinned. It is also the\nstrongest argument for profiles being plural.\n',
+    )
+    notes: str | None = Field(
+        None,
+        description='Free text from the operator. Tuning a model is empirical and\nthe reasoning evaporates — "OOMs above 24 layers on the\n3090" is worth more later than the flag value it explains.\n',
+    )
+    builtBy: ProfileBuiltBy | None = Field(
+        None,
+        description="The settings builder's record, for a profile it wrote\n(`docs/design/profile-builder.md` §6). **The one field a\nreplace does not replace by omission:** absent from a `PUT`\nbody keeps the stored record, and only an explicit `null`\nclears it. It is a record of a past measurement rather than\na setting, and every edit path that writes a whole profile\nwould otherwise drop it on the first edit -- where the\ndesign says an edited profile's numbers are labelled, not\ndeleted.\n",
+    )
+
+
 class Scan(BaseModel):
     """
     State of the current or most recent walk of the configured
@@ -2859,7 +2979,7 @@ class StarterModel(BaseModel):
 
     sizeClass: str = Field(
         ...,
-        description='The bucket this entry fills, by total parameter count:\n`4B`, `8B`, `14B`, `30B`, `70B`. Total, not active -- a\nmixture-of-experts model holds every expert in memory, so\n30B-A3B is a 30B for the only purpose this number serves.\n',
+        description='The bucket this entry fills, by total parameter count:\n`4B`, `8B`, `14B`, `30B`, `70B`, and `30B MoE`. Total, not\nactive -- a mixture-of-experts model holds every expert in\nmemory, so 30B-A3B is a 30B. It has a class of its own\nbecause where those bytes can go differs: its experts can sit\nin system memory while the rest runs on the card, which is\nhow a small card reaches a 30B (`fit.offload` is `experts`).\n',
     )
     baseModel: str = Field(
         ...,
@@ -2895,6 +3015,11 @@ class StarterModel(BaseModel):
     maxContextLength: int | None = Field(
         None,
         description='The largest context this entry fits entirely in GPU memory\nat, on the scored machine. The number a profile takes, and\nthe reason a client can say *fits at 75,520* rather than\njust *fits*.\n',
+    )
+    maxContextExpertsInRam: int | None = Field(
+        None,
+        description='For a mixture-of-experts entry: the largest context with its\nexperts in system memory and everything else on the card,\nthe same number `ModelFit.maxContextExpertsInRam` gives for a\nmodel on disk. Null for a dense entry, or where the experts do\nnot fit in system memory.\n',
+        ge=0,
     )
     alreadyOwned: AlreadyOwned | None = None
 

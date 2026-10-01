@@ -28,6 +28,7 @@ class Authority(FakeAgent):
         self.refuse_renew = None
         self.lease = 30
         self.local_only = False
+        self.write_logs = False
 
     def _handle(self, request):
         if request.url.path.endswith("/admission"):
@@ -50,6 +51,7 @@ class Authority(FakeAgent):
                     "keyName": "Verified app",
                     "limits": {
                         **({"localOnly": True} if self.local_only else {}),
+                        **({"writeLogs": True} if self.write_logs else {}),
                         "allowedModels": self.allowed,
                         "maxConcurrentRequests": 1,
                         "requestsPerMinute": 2,
@@ -276,3 +278,15 @@ async def test_renewal_outage_cancels_generation_before_lease_expiry(setup):
             await asyncio.gather(task, return_exceptions=True)
             await app.state.client_key_guard.aclose()
             await app.state.routing.aclose()
+
+
+def test_an_apps_key_that_may_send_logs_still_reaches_the_models(setup):
+    """C1: every app's key carries `writeLogs` for the agent's log ingress.
+    The gateway's model of the limits refuses fields it does not know, so
+    before it knew this one, an app's every request failed admission."""
+    app, authority, allowed, _excluded, headers, _ = setup
+    authority.write_logs = True
+    with TestClient(app) as c:
+        response = c.post("/v1/chat/completions", json=body(model="allowed"), headers=headers)
+        assert response.status_code == 200, response.text
+        assert len(allowed.calls) == 1

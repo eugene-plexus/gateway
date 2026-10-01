@@ -39,6 +39,10 @@ class ClientKeyLimits(BaseModel):
         description='The tools the hub runs itself (P8) that this key may have run\non its behalf -- `web_search` today. **Null permits every tool\nthe install runs** (design call #5: a key is allowed search once\na search account exists, and can be denied it here). Empty\npermits none. An entry is a tool name or a pattern with `*`,\nmatched by the same matcher as `allowedModels`.\n\nA key denied a tool is not refused for asking: the door says\nwhy the search did not run, as it does for an install with no\nsearch account (`gateway.yaml`, "Server-run tools"). A\n`localOnly` key never has a tool run whatever this says,\nbecause a search sends a query derived from the prompt to the\npublic internet.\n',
         max_length=100,
     )
+    writeLogs: bool | None = Field(
+        False,
+        description="Whether this key may send log records to an agent's log ingress\n(`POST /v1/logs` on `agent.yaml`, C1 in `workbench.md`). It\ngrants nothing else: reading logs stays operator-only.\n\nEvery app the registry installs gets a key with this on,\nbecause the launcher that runs an app in its own account\nforwards what the app prints. Any other key gets it when the\noperator turns it on, so a tool outside the registry sends its\nlogs the same way ours do.\n",
+    )
     maxConcurrentRequests: int | None = Field(2, ge=1, le=64)
     requestsPerMinute: int | None = Field(60, ge=1, le=10000)
 
