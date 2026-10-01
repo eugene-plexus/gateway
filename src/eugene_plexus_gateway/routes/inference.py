@@ -114,6 +114,7 @@ from .._generated.models import (
     FunctionCall,
     FunctionCallDelta,
     ModelList,
+    ModelListInfo,
     Object,
     Object1,
     PromptTokensDetails,
@@ -130,6 +131,7 @@ from .._generated.models import (
     Tool,
     ToolCall,
     ToolCallDelta,
+    WebSearchAvailability,
 )
 from .._generated.models import Stage as StreamStage
 from ..config import ConfigStore
@@ -612,13 +614,20 @@ async def list_models(request: Request) -> ModelList:
     await admission.authorize(request)
     context = admission.current.get()
     table = _routing(request)
+    # C3: whether a search can run for this key here, in the words a
+    # refused request would carry, so a client can say so before it asks.
+    reason = server_tools.why_not(table, context)
+    if table is None and getattr(request.app.state, "safe_mode", False):
+        reason = "this gateway is in safe mode, which routes nothing and runs no search"
+    info = ModelListInfo(web_search=WebSearchAvailability(available=reason is None, reason=reason))
     if table is None:
-        return ModelList(object="list", data=[])
+        return ModelList(object="list", data=[], x_eugene_plexus=info)
     return ModelList(
         object="list",
         data=table.as_model_list(
             context.allowed_models if context else None, local_only=admission.local_only()
         ),
+        x_eugene_plexus=info,
     )
 
 

@@ -1233,6 +1233,24 @@ class DirectoryEntryKind(StrEnum):
     file = 'file'
 
 
+class WebSearchAvailability(BaseModel):
+    """
+    Whether a web search (P8, "Server-run tools") can run for **this
+    key** on **this install**: a reachable search account runs
+    `web_search`, the key's `allowedTools` permits it, and the key is
+    not `localOnly`. Which models it can reach is each model's own
+    `x_eugene_plexus.web_search`; a client offering a search needs
+    both.
+
+    """
+
+    available: bool
+    reason: str | None = Field(
+        None,
+        description='Why not, in the words a refused request would carry -- e.g.\n*no search account is set up; add one under Backends, then\nAdd a search account*. Null when `available` is true.\n',
+    )
+
+
 class Surface(StrEnum):
     chat = 'chat'
     embeddings = 'embeddings'
@@ -1323,6 +1341,10 @@ class ModelRoutingInfo(BaseModel):
     tool_calling: bool | None = Field(
         None,
         description='Whether a request for this model may carry `tools`.\n\n**True only when every backend serving it can**, by the same\nreasoning as `context_length` above: a request may land on\nany of them, so the honest answer is the weakest one. A\nharness can read this and pick a model rather than discover\nthe limit as a 400 halfway through a task.\n',
+    )
+    web_search: bool | None = Field(
+        None,
+        description="Whether a web search can reach this model: at least one\nbackend serving it searches itself (its model lists\n`webSearchOptions`) or calls tools, so the gateway can run the\nsearch for it. Says nothing about the caller's key or whether\nthe install has a search account; that is\n`ModelList.x_eugene_plexus.web_search`. Added 2026-10-01 (C3).\n",
     )
     tiers: list[list[str]] | None = Field(
         None,
@@ -3255,6 +3277,21 @@ class DirectoryEntry(BaseModel):
     )
 
 
+class ModelListInfo(BaseModel):
+    """
+    Namespaced extension: what this install can do for this caller
+    beyond any one model. OpenAI clients ignore it.
+
+    Added 2026-10-01 (C3, `workbench-v1.md` §3). Before it a client
+    could learn whether a search would run only by sending one: the
+    chat door's 400 was the first word, so a switch offering *Search
+    the web* could not say beforehand that it would fail, or why.
+
+    """
+
+    web_search: WebSearchAvailability | None = None
+
+
 class Model(BaseModel):
     """
     One routable model, in OpenAI's shape plus one namespaced
@@ -4117,6 +4154,7 @@ class DirectoryListing(BaseModel):
 class ModelList(BaseModel):
     object: Literal['list']
     data: list[Model]
+    x_eugene_plexus: ModelListInfo | None = None
 
 
 class CompletionResponse(BaseModel):

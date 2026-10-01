@@ -2293,6 +2293,12 @@ class RoutingTable:
                         surfaces=[Surface(value) for value in resolution.surfaces()],
                         context_length=_smallest_context(backends),
                         tool_calling=_all_carry_tools(backends),
+                        # Said for a chat model only (C3): a search is a
+                        # chat-turn thing, and `false` on an embedding or
+                        # speech model would be noise in every picker.
+                        web_search=_reaches_search(backends)
+                        if "chat" in resolution.surfaces()
+                        else None,
                         image_input=any(takes(b.caps, _IMAGE) for b in backends),
                         audio_input=any(takes(b.caps, _AUDIO) for b in backends),
                         fill_in_middle=any(takes(b.caps, _FILLS) for b in backends),
@@ -2480,6 +2486,24 @@ def _backend_kind(backend: _Backend) -> BackendKind:
     explicit instead of hiding it behind a cast.
     """
     return BackendKind(backend.info.backend.value)
+
+
+def _reaches_search(backends: list[_Backend]) -> bool:
+    """Whether a web search can reach this model (C3).
+
+    The backends `server_tools.searchable` keeps: one whose model lists
+    `webSearchOptions` searches itself, and one that calls tools can be
+    offered the gateway's own search. **Any** of them is enough, because a
+    searched request is routed only to those -- unlike `tools`, where the
+    weakest backend decides.
+    """
+    for b in backends:
+        caps = b.caps
+        if caps is None:
+            continue
+        if "webSearchOptions" in set(caps.supportedSettings or []) or caps.toolCalling is True:
+            return True
+    return False
 
 
 def _all_carry_tools(backends: list[_Backend]) -> bool:

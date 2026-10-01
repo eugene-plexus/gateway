@@ -93,7 +93,13 @@ def test_models_is_empty_but_not_an_error_in_safe_mode(
     "nothing available" is a valid answer to "what have you got"."""
     response = safe_mode_client.get("/v1/models")
     assert response.status_code == 200
-    assert response.json() == {"object": "list", "data": []}
+    body = response.json()
+    assert (body["object"], body["data"]) == ("list", [])
+    # C3: and no search, saying why in safe mode's words, not "starting up".
+    assert body["x_eugene_plexus"]["web_search"] == {
+        "available": False,
+        "reason": "this gateway is in safe mode, which routes nothing and runs no search",
+    }
 
 
 def test_patch_config_writes_to_disk_in_safe_mode(

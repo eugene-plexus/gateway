@@ -632,6 +632,36 @@ def test_a_local_only_key_and_a_key_denied_search_never_search(
     assert server_tools.why_not(table, allowed) is None
 
 
+def test_the_model_list_says_whether_a_search_can_run_and_where(settings, search) -> None:
+    """C3 (workbench-v1.md section 3): a client can say why a search switch is
+    off before it asks. The install-and-key answer is on the list, the
+    reach on each model: one that calls tools or searches itself is
+    reachable, one that does neither is not."""
+    caller = ScriptedDriver(turns=[])
+    hosted = FakeDriverClient(name="hosted", model_id="hosted-model", supports_tools=False)
+    hosted.supported_settings = [*hosted.supported_settings, "webSearchOptions"]
+    plain = FakeDriverClient(name="plain", model_id="plain-model", supports_tools=False)
+    with TestClient(
+        app_with(settings, caller, hosted, plain, searches=[account(search)])
+    ) as client:
+        listing = client.get("/v1/models").json()
+    assert listing["x_eugene_plexus"]["web_search"] == {"available": True, "reason": None}
+    reach = {m["id"]: m["x_eugene_plexus"]["web_search"] for m in listing["data"]}
+    assert reach == {MODEL: True, "hosted-model": True, "plain-model": False}
+
+
+def test_with_no_search_account_the_list_says_what_a_refusal_would(settings) -> None:
+    model = ScriptedDriver(turns=[Turn("x")])
+    with TestClient(app_with(settings, model)) as client:
+        listing = client.get("/v1/models").json()
+        refused = chat(client)
+    web = listing["x_eugene_plexus"]["web_search"]
+    assert web["available"] is False
+    assert "no search account is set up" in web["reason"]
+    assert web["reason"] in refused.json()["error"]["message"], "the same words, before and after"
+    assert listing["data"][0]["x_eugene_plexus"]["web_search"] is True, "the model could be reached"
+
+
 def test_an_account_that_is_not_set_up_is_named(settings) -> None:
     from eugene_plexus_gateway import server_tools
 

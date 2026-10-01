@@ -29,6 +29,7 @@ class Authority(FakeAgent):
         self.lease = 30
         self.local_only = False
         self.write_logs = False
+        self.allowed_tools = None
 
     def _handle(self, request):
         if request.url.path.endswith("/admission"):
@@ -52,6 +53,11 @@ class Authority(FakeAgent):
                     "limits": {
                         **({"localOnly": True} if self.local_only else {}),
                         **({"writeLogs": True} if self.write_logs else {}),
+                        **(
+                            {"allowedTools": self.allowed_tools}
+                            if self.allowed_tools is not None
+                            else {}
+                        ),
                         "allowedModels": self.allowed,
                         "maxConcurrentRequests": 1,
                         "requestsPerMinute": 2,
@@ -290,3 +296,22 @@ def test_an_apps_key_that_may_send_logs_still_reaches_the_models(setup):
         response = c.post("/v1/chat/completions", json=body(model="allowed"), headers=headers)
         assert response.status_code == 200, response.text
         assert len(allowed.calls) == 1
+
+
+def test_a_key_denied_search_is_told_so_by_the_model_list(setup):
+    """C3: the list's search answer is this key's, not the install's: a key
+    whose tool scope leaves out web_search reads `available: false` with
+    the refusal's own words, while the operator reads the install."""
+    app, authority, _allowed, _excluded, headers, operator = setup
+    authority.allowed_tools = []
+    with TestClient(app) as c:
+        mine = c.get("/v1/models", headers=headers).json()["x_eugene_plexus"]["web_search"]
+        assert mine["available"] is False
+        assert "tool scope does not include web_search" in mine["reason"]
+        authority.allowed_tools = ["web_search"]
+        allowed = c.get("/v1/models", headers=headers).json()["x_eugene_plexus"]["web_search"]
+        assert "tool scope" not in (allowed["reason"] or ""), (
+            "permitted: only the account is missing"
+        )
+        theirs = c.get("/v1/models", headers=operator).json()["x_eugene_plexus"]["web_search"]
+        assert "tool scope" not in (theirs["reason"] or "")
