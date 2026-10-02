@@ -46,8 +46,11 @@ def test_total_deadline_cancels_owned_work_releases_admission_and_never_replays(
     # A stream's deadline must fire after its headers are sent, or the answer
     # is the 504 a stream that never started gets. 0.08 s raced the route's
     # own preparation on a slow CI runner; 0.5 s does not, and the backend
-    # still hangs for 30.
-    budget = 0.5 if extra.get("stream") else 0.08
+    # still hangs for 30. The same race reached the batch cases too
+    # (2026-10-02, /v1/embeddings on a runner: the deadline fired before the
+    # backend call began, so there was nothing yet to cancel), so every case
+    # gets the budget that leaves preparation out of it.
+    budget = 0.5
     with TestClient(app) as client:
         original = app.state.config_store.get
         app.state.config_store.get = lambda key: (
