@@ -50,7 +50,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # Bounded because the alternative to dropping rows is stalling
 # completions, and that trade is never worth making. Sized so a burst
@@ -408,7 +408,9 @@ class MetricsStore:
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
         # v10 added a table and no column: the DDL above created it, so a
         # v9 file needs only its version moved on. v11 (PC5) adds columns.
-        if row is not None and int(row[0]) in (2, 3, 4, 5, 6, 7, 8, 9, 10):
+        # v12 (CB5) adds a value, `evicted`, to the affinity column and no
+        # column, so a v11 file needs only its version moved on.
+        if row is not None and int(row[0]) in (2, 3, 4, 5, 6, 7, 8, 9, 10, 11):
             columns = {r[1] for r in conn.execute("PRAGMA table_info(request)")}
             for column in ("client_key_id", "client_key_name"):
                 if column not in columns:
@@ -915,7 +917,7 @@ class MetricsStore:
                     "_routing": [],
                     "_overhead": [],
                     "_cache": [0, 0, 0],
-                    "_affinity": {"hit": 0, "new": 0, "moved": 0},
+                    "_affinity": {"hit": 0, "new": 0, "moved": 0, "evicted": 0},
                     "tierCounts": {},
                 }
             g["requests"] += 1

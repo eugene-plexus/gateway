@@ -2888,12 +2888,19 @@ class MetricsPromptCache(BaseModel):
 
 class MetricsAffinity(BaseModel):
     """
-    Requests by what `conversation` balancing did with them.
+    Requests by what conversation affinity did with them. `evicted`
+    (CB5, schema v12) is a turn that went back to its replica and
+    found its history gone there: the engine reused less than the
+    whole of the conversation's previous prompt. Grouped by backend,
+    it says which model needs more context or another replica, where
+    an operator saw only a slow model.
+
     """
 
     hit: int = Field(..., ge=0)
     new: int = Field(..., ge=0)
     moved: int = Field(..., ge=0)
+    evicted: int = Field(..., ge=0)
 
 
 class RetryDisposition1(StrEnum):
@@ -4012,7 +4019,7 @@ class MetricRequest(BaseModel):
     )
     affinity: str | None = Field(
         None,
-        description='What conversation affinity did with this request (PC4;\n`conversationAffinity` since CB1): `hit`, sent back to the\nreplica its conversation used before; `new`, a conversation\nnot seen before; `moved`, its replica was full or gone and it\nwent elsewhere. Null when there was no choice to make or\naffinity was off (before CB1, when another strategy was in\neffect).\n',
+        description="What conversation affinity did with this request (PC4;\n`conversationAffinity` since CB1): `hit`, sent back to the\nreplica its conversation used before; `evicted` (CB5, schema\nv12), sent back there and the engine reused less than the\nwhole of the conversation's previous prompt, so its history\nwas gone; `new`, a conversation not seen before; `moved`, its\nreplica was full or gone and it went elsewhere. Null when\nthere was no choice to make or affinity was off (before CB1,\nwhen another strategy was in effect). A backend that does not\nreport cached tokens cannot be judged, and its turns stay\n`hit`.\n",
     )
     door: str | None = Field(
         None,

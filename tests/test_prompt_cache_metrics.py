@@ -65,8 +65,11 @@ def test_cached_tokens_and_the_affinity_outcome_are_recorded(two_backends) -> No
     _ask(client, "one conversation", "its second turn")
     body = _drain(client, 2)
     rows = list(reversed(body["requests"]))  # served newest first
-    assert [r["affinity"] for r in rows] == ["new", "hit"]
     home = reports if reports.calls else silent
+    # The reporting replica reuses 900 of every 1,000-token prompt, so its
+    # second turn reused less than the first turn's whole prompt: evicted
+    # (CB5). The silent one cannot be judged, and its hit stays a hit.
+    assert [r["affinity"] for r in rows] == ["new", "evicted" if home is reports else "hit"]
     expected = 900 if home is reports else None
     assert [r["cachedTokens"] for r in rows] == [expected, expected]
     served = rows[0]["tries"][0]
@@ -87,7 +90,7 @@ def test_the_share_counts_only_requests_that_reported(two_backends) -> None:  # 
         "promptTokens": 1000 * reported,
         "cachedTokens": 900 * reported,
     }
-    assert total["affinity"] == {"hit": 0, "new": 6, "moved": 0}
+    assert total["affinity"] == {"hit": 0, "new": 6, "moved": 0, "evicted": 0}
 
 
 def test_nothing_reported_is_null_not_zero(settings: Settings) -> None:

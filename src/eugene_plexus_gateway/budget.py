@@ -74,6 +74,19 @@ def request_chars(request: Any) -> int:
 
 
 @dataclass(frozen=True)
+class Conversation:
+    """The conversation a turn continues: where its sizes are kept, and, on
+    an affinity hit, the replica it went home to and the prompt that replica
+    held after the last turn (CB5)."""
+
+    sizes: ConversationSizes
+    target: str
+    key: str
+    home: Any = None
+    previous_prompt: int | None = None
+
+
+@dataclass(frozen=True)
 class _Seen:
     prompt_tokens: int
     chars: int
@@ -251,10 +264,10 @@ class TurnBudget:
         self._release()
         self._reserve(candidate)
 
-    def served(self, prompt_tokens: int | None) -> None:
-        """Remember what the engine counted, for this conversation's next turn."""
-        if self._conversation and isinstance(prompt_tokens, int) and prompt_tokens > 0:
-            self._sizes.put(self._target, self._conversation, prompt_tokens, self._chars)
+    @property
+    def chars(self) -> int:
+        """The request's size as `admit` measured it."""
+        return self._chars
 
     def _release(self) -> None:
         if self._lease is not None:

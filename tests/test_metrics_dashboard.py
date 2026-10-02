@@ -329,7 +329,7 @@ def test_a_v6_store_migrates_in_place_gaining_the_door_and_its_units(tmp_path: P
                 version = conn.execute(
                     "SELECT value FROM meta WHERE key = 'schema_version'"
                 ).fetchone()
-            assert version == (str(SCHEMA_VERSION),) == ("11",)
+            assert version == (str(SCHEMA_VERSION),) == ("12",)
         finally:
             await store.aclose()
 

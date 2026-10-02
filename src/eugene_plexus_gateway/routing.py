@@ -85,7 +85,7 @@ from ._generated.models import (
 )
 from ._http import internal_client
 from .affinity import HIT, MOVED, NEW, AffinityTable
-from .budget import ConversationSizes, PoolLedger, TurnBudget
+from .budget import Conversation, ConversationSizes, PoolLedger, TurnBudget
 from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from .driver_client import BoundClient, DriverClient, HttpDriverClient, TieredClient, VideoJobs
 from .driver_client import Key as DriverKey
@@ -1999,6 +1999,15 @@ class RoutingTable:
         client = TieredClient(name=resolution.model, tiers=tiers, hooks=self)
         client.affinity = outcome
         client.budget = self._budget_for(resolution, picked, affinity, outcome)
+        if affinity is not None:
+            seen = self._sizes.get(resolution.model, affinity)
+            client.conversation = Conversation(
+                sizes=self._sizes,
+                target=resolution.model,
+                key=affinity,
+                home=client.candidates[0] if outcome == HIT else None,
+                previous_prompt=seen.prompt_tokens if seen is not None else None,
+            )
         return client
 
     def _budget_for(

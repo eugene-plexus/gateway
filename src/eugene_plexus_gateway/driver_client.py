@@ -52,7 +52,8 @@ from ._generated.driver_models import (
     VideoRequest,
 )
 from ._http import internal_client
-from .budget import TurnBudget
+from .affinity import EVICTED, HIT
+from .budget import Conversation, TurnBudget, request_chars
 from .circuit import Circuit
 
 log = logging.getLogger(__name__)
@@ -997,6 +998,10 @@ class TieredClient:
         #: CB3: this turn's place in its replicas' shared pools, when any
         #: has one. Set by `RoutingTable.pick`; see `budget.py`.
         self.budget: TurnBudget | None = None
+        #: The conversation this turn continues, when it has a key: its
+        #: last prompt is kept for the budget's next estimate, and a hit is
+        #: told from an eviction by it (CB5). Set by `RoutingTable.pick`.
+        self.conversation: Conversation | None = None
         #: `TieredClient` is passed where a `DriverClient` is expected,
         #: so it carries the protocol's `node` too. It is a slot over
         #: several machines' backends and has no one node of its own;
@@ -1065,9 +1070,31 @@ class TieredClient:
         if self.budget is not None:
             self.budget.enter(candidate)
 
-    def _served(self, usage: Any) -> None:
-        if self.budget is not None and usage is not None:
-            self.budget.served(getattr(usage, "promptTokens", None))
+    def _served(self, usage: Any, candidate: DriverClient, request: GenerateRequest) -> None:
+        """What the answer said about the cache: remember this conversation's
+        prompt, and call a hit whose home no longer held it `evicted` (CB5).
+
+        Evicted is the measured definition: the turn went back to the replica
+        that served its last one, and the engine reused less than that turn's
+        whole prompt. A backend that does not report cached tokens cannot be
+        judged, and its hit stays a hit.
+        """
+        convo = self.conversation
+        if convo is None or usage is None:
+            return
+        cached = getattr(usage, "cachedPromptTokens", None)
+        if (
+            self.affinity == HIT
+            and candidate is convo.home
+            and convo.previous_prompt is not None
+            and isinstance(cached, int)
+            and cached < convo.previous_prompt
+        ):
+            self.affinity = EVICTED
+        prompt = getattr(usage, "promptTokens", None)
+        if isinstance(prompt, int) and prompt > 0:
+            chars = self.budget.chars if self.budget is not None else request_chars(request)
+            convo.sizes.put(convo.target, convo.key, prompt, chars)
 
     def _release(self) -> None:
         if self.budget is not None:
@@ -1146,7 +1173,7 @@ class TieredClient:
                             usage=result.usage,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                         )
-                    self._served(result.usage)
+                    self._served(result.usage, candidate, request)
                     self.served_by = driver
                     self.served_model = getattr(candidate, "public_model", None)
                     self.served_by_node = node
@@ -1725,7 +1752,7 @@ class TieredClient:
                             first_ms=first_ms,
                         )
                     if saw_done:
-                        self._served(usage)
+                        self._served(usage, candidate, request)
                     self.served_by = driver
                     self.served_model = getattr(candidate, "public_model", None)
                     self.served_by_node = node

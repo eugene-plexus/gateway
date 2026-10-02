@@ -38,6 +38,10 @@ MAX_KEYS = 4096
 HIT = "hit"
 NEW = "new"
 MOVED = "moved"
+#: CB5: a hit whose replica no longer held the conversation -- the engine
+#: reused less of the prompt than the whole of the previous turn's. Known
+#: only after the answer, from its cached-token count.
+EVICTED = "evicted"
 
 
 def _text(content: Any) -> str | None:
