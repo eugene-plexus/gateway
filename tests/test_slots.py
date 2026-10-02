@@ -436,7 +436,11 @@ def test_a_stopped_first_tier_with_no_wake_falls_to_the_second(settings: Setting
 
 def test_replicas_are_attributed_by_name(settings: Settings) -> None:
     a, b = _replicas()
-    table = make_routing_table(a, b, runtimes=[runtime_facts("qwen3-a"), runtime_facts("qwen3-b")])
+    # One prompt four times is the benchmarking shape conversationAffinity's
+    # off switch exists for (CB1): on, it would stay on one replica.
+    table = make_routing_table(
+        a, b, runtimes=[runtime_facts("qwen3-a"), runtime_facts("qwen3-b")], affinity=False
+    )
     with _app(settings, table) as c:
         seen = {
             c.post("/v1/chat/completions", json=_chat()).json()["x_eugene_plexus"]["runtime"]

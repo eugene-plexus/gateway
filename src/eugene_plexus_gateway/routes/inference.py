@@ -999,7 +999,7 @@ async def _prepare(
             swapped_in=swapped_in,
             routing_ms=max(0, routing_ms),
             refreshed=refreshed,
-            strategy=str(store.get("loadBalancing")) if store is not None else None,
+            strategy=table.placement() if table is not None else None,
             candidates=considered,
             streamed=bool(body.stream),
         ),

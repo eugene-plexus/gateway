@@ -3924,7 +3924,7 @@ class MetricsGroup(BaseModel):
     )
     affinity: MetricsAffinity | None = Field(
         None,
-        description='What `conversation` balancing did (PC4). Null when it never\nhad a choice to make in this group.\n',
+        description='What conversation affinity did (PC4; `conversationAffinity`\nsince CB1). Null when it never had a choice to make in this\ngroup.\n',
     )
     tierCounts: dict[str, int] | None = Field(
         None,
@@ -3992,7 +3992,7 @@ class MetricRequest(BaseModel):
     )
     strategy: str | None = Field(
         None,
-        description='The `loadBalancing` value in effect when this request was\nrouted. Recorded per request because the config can change\nbetween them, and `conversation`, `least_busy` and\n`round_robin` explain different orderings.\n',
+        description="Where a new conversation went when this request was routed:\nthe `loadBalancing` value in effect, or its default when it is\nunset. Recorded per request because the config can change\nbetween them, and `least_busy` and `round_robin` explain\ndifferent orderings. Rows from before CB1 (2026-10-02) may say\n`conversation`, PC4's value, which placed new conversations by\nleast busy and kept the rest on their replicas. Whether this\nrequest went back to its replica is `affinity`.\n",
     )
     candidates: list[MetricCandidate] | None = Field(
         None,
@@ -4012,7 +4012,7 @@ class MetricRequest(BaseModel):
     )
     affinity: str | None = Field(
         None,
-        description='What `conversation` balancing did with this request (PC4):\n`hit`, sent back to the replica its conversation used before;\n`new`, a conversation not seen before; `moved`, its replica\nwas full or gone and it went elsewhere. Null when there was\nno choice to make or another strategy was in effect.\n',
+        description='What conversation affinity did with this request (PC4;\n`conversationAffinity` since CB1): `hit`, sent back to the\nreplica its conversation used before; `new`, a conversation\nnot seen before; `moved`, its replica was full or gone and it\nwent elsewhere. Null when there was no choice to make or\naffinity was off (before CB1, when another strategy was in\neffect).\n',
     )
     door: str | None = Field(
         None,
@@ -4481,7 +4481,8 @@ class RoutingTableView(BaseModel):
 
     refreshed_at: AwareDatetime
     load_balancing: str | None = Field(
-        None, description='The strategy in effect — the `loadBalancing` config value.'
+        None,
+        description='Where a new conversation goes now: the `loadBalancing` value,\nor its default when it is unset or the old `conversation`.\n',
     )
     slots: list[RoutingSlotView]
     unreachable_drivers: list[str] | None = Field(

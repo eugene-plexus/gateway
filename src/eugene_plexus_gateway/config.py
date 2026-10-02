@@ -58,7 +58,12 @@ CATEGORY_LABELS: dict[str, str] = {
     "clients": "Browser clients",
 }
 
-LOAD_BALANCING_VALUES = ["conversation", "least_busy", "round_robin"]
+#: Where a NEW conversation goes (CB1). Every value keeps a conversation on
+#: its replica too, unless `conversationAffinity` is off.
+LOAD_BALANCING_VALUES = ["least_busy", "round_robin"]
+#: PC4's value, from before affinity was its own setting: read as the
+#: default placement with affinity, which is what it did.
+LEGACY_CONVERSATION = "conversation"
 
 FIELDS: list[ConfigField] = [
     ConfigField(
@@ -275,30 +280,44 @@ FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="loadBalancing",
-        label="Load balancing",
+        label="New conversations go to",
         description=(
-            "How a request picks among the replicas serving one model. "
-            "`conversation` (the default) sends each conversation back to the "
-            "replica that served it before, because only that replica's engine "
-            "holds its prompt in cache; a new conversation, or one whose replica "
-            "is full while another has a free slot, goes to the least busy. "
-            "Measured: one agent session on two replicas read half its prompt "
-            "again every turn without it. `least_busy` sends every request to the "
-            "driver with the fewest requests in flight per slot of capacity, "
-            "breaking ties round-robin. `round_robin` alternates strictly, which "
-            "is worth having when comparing two replicas or reproducing a report. "
-            "The load signal is the gateway's own in-flight count, so all three "
-            "work for every engine."
+            "Where a NEW conversation goes among the replicas serving one model. "
+            "A conversation already under way goes back to the replica that served "
+            "it whatever this says (see Keep each conversation on its replica). "
+            "`least_busy` sends it to the driver with the fewest requests in flight "
+            "per slot of capacity, breaking ties round-robin. `round_robin` "
+            "alternates strictly, which is worth having when comparing two replicas "
+            "or reproducing a report. The load signal is the gateway's own in-flight "
+            "count, so both work for every engine. Until 2026-10-02 this also held "
+            "`conversation`, which kept conversations on their replicas: a file "
+            "that still says it is read as the default."
         ),
         category="lifecycle",
         valueType=ConfigValueType.enum,
-        default="conversation",
+        default="least_busy",
         enumValues=LOAD_BALANCING_VALUES,
         enumLabels=[
-            "Keep each conversation on its replica",
-            "Least busy (ties round-robin)",
-            "Round-robin",
+            "The least busy replica (ties round-robin)",
+            "Each replica in turn",
         ],
+    ),
+    ConfigField(
+        key="conversationAffinity",
+        label="Keep each conversation on its replica",
+        description=(
+            "Send each turn of a conversation back to the replica that served its "
+            "last one, because only that replica's engine holds its prompt in cache; "
+            "it moves only when that replica is full and another has a free slot. "
+            "Measured with twelve agent sessions on three replicas: on, 80.8% of "
+            "prompt tokens were reused and the median first token came in 0.71 s; "
+            "off, 67.7% and 1.49 s. Turn it off only to benchmark replicas against "
+            "each other, where a tool repeating one prompt would otherwise land on "
+            "one replica every time."
+        ),
+        category="lifecycle",
+        valueType=ConfigValueType.boolean,
+        default=True,
     ),
     ConfigField(
         key="swapWaitSeconds",
@@ -533,6 +552,11 @@ _OLD_DEFAULT_MAX_TOKENS = 2048
 #: Beside the config file: the old default has been cleared from it once, so a
 #: 2048 an operator sets afterwards is theirs and stays.
 _MAX_TOKENS_MARKER = ".default-max-tokens-cleared"
+#: Beside the config file: the `loadBalancing` in it was written as the
+#: default, not chosen, so a later default reaches it. The store writes every
+#: default out, and without this a default written once looks like a choice
+#: for ever. Removed when an operator sets the field.
+_LOAD_BALANCING_DEFAULT_MARKER = ".load-balancing-default"
 
 
 def _validate_value(field: ConfigField, value: Any) -> str | None:
@@ -677,10 +701,12 @@ class ConfigStore:
                     merged[k] = field.default if v is None and field.default is not None else v
                 self._values = merged
                 self._clear_old_max_tokens_locked()
+                self._settle_load_balancing_locked(raw.get("loadBalancing"))
             else:
                 self._values = _defaults()
                 self._write_locked()
                 self._mark_max_tokens_locked()
+                self._mark_load_balancing_default_locked(True)
             self._started = dict(self._values)
 
     def _clear_old_max_tokens_locked(self) -> None:
@@ -706,6 +732,45 @@ class ConfigStore:
                 _OLD_DEFAULT_MAX_TOKENS,
             )
         self._mark_max_tokens_locked()
+
+    def _settle_load_balancing_locked(self, raw: Any) -> None:
+        """A `loadBalancing` nobody chose follows the default (CB1).
+
+        Unset, the old `conversation` (which since CB1 is the default plus
+        affinity, always on), or written out as a default before -- the
+        marker says which -- each reads as today's default. Anything else
+        was chosen and stays.
+        """
+        default = _FIELDS_BY_KEY["loadBalancing"].default
+        marker = self._path.parent / _LOAD_BALANCING_DEFAULT_MARKER
+        unchosen = raw is None or raw == LEGACY_CONVERSATION or marker.exists()
+        if not unchosen:
+            return
+        if raw == LEGACY_CONVERSATION:
+            log.info(
+                "loadBalancing was %r, which kept conversations on their replicas: that is "
+                "conversationAffinity now, on by default, and new conversations go to %r.",
+                LEGACY_CONVERSATION,
+                default,
+            )
+        if self._values.get("loadBalancing") != default:
+            self._values["loadBalancing"] = default
+            self._write_locked()
+        self._mark_load_balancing_default_locked(True)
+
+    def _mark_load_balancing_default_locked(self, unchosen: bool) -> None:
+        marker = self._path.parent / _LOAD_BALANCING_DEFAULT_MARKER
+        try:
+            if unchosen:
+                marker.parent.mkdir(parents=True, exist_ok=True)
+                marker.write_text(
+                    "loadBalancing in this file is the default, not a choice; see config.py.\n",
+                    encoding="utf-8",
+                )
+            else:
+                marker.unlink(missing_ok=True)
+        except OSError as e:
+            log.warning("could not record whether loadBalancing was chosen: %s", e)
 
     def _mark_max_tokens_locked(self) -> None:
         try:
@@ -750,6 +815,9 @@ class ConfigStore:
                     self._values[key] = field.default
                 else:
                     self._values[key] = new_value
+                if key == "loadBalancing":
+                    # Chosen now -- or, set back to null, the default again.
+                    self._mark_load_balancing_default_locked(new_value is None)
 
                 applied.append(key)
                 # Only this PATCH's keys, and only those that now differ from

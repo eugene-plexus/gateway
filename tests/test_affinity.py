@@ -94,11 +94,43 @@ def test_one_conversation_stays_on_one_replica() -> None:
     assert len(set(firsts)) == 1
 
 
-def test_least_busy_still_alternates() -> None:
-    """The pair that says the strategy, not something else, does it."""
-    table = _table("least_busy")
+def test_every_strategy_keeps_a_conversation_on_its_replica() -> None:
+    """CB1: affinity is not a strategy any more. `loadBalancing` says only
+    where a NEW conversation goes."""
+    for strategy in ("least_busy", "round_robin", "conversation", None):
+        table = _table(strategy)  # type: ignore[arg-type]
+        firsts = [_first(table, "k:session") for _ in range(4)]
+        assert len(set(firsts)) == 1, strategy
+
+
+def test_with_affinity_off_least_busy_alternates() -> None:
+    """The pair that says the setting, not something else, does it: off is
+    for benchmarking replicas, where one prompt repeats."""
+    a, b = _replicas()
+    table = make_routing_table(
+        a,
+        b,
+        runtimes=[runtime_facts("qwen3-a"), runtime_facts("qwen3-b")],
+        strategy="least_busy",
+        affinity=False,
+    )
     firsts = [_first(table, "k:session") for _ in range(4)]
     assert firsts == ["qwen3-a-driver", "qwen3-b-driver", "qwen3-a-driver", "qwen3-b-driver"]
+    assert table.pick(table.resolve(LOCAL), affinity="k:session").affinity is None
+
+
+def test_round_robin_places_new_conversations_in_turn() -> None:
+    table = _table("round_robin")
+    firsts = [_first(table, f"k:s{i}") for i in range(4)]
+    assert firsts == ["qwen3-a-driver", "qwen3-b-driver", "qwen3-a-driver", "qwen3-b-driver"]
+
+
+def test_the_old_conversation_value_is_the_default_placement() -> None:
+    """What every request records: the placement that ran, never a value
+    that no longer means anything."""
+    for strategy in ("conversation", None, "something-else"):
+        assert _table(strategy).placement() == "least_busy"  # type: ignore[arg-type]
+    assert _table("round_robin").placement() == "round_robin"
 
 
 def test_new_conversations_are_still_spread() -> None:

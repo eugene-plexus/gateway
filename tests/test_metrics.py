@@ -453,7 +453,9 @@ def test_the_routing_phase_is_measured_separately_from_the_backend(
     assert record["refreshed"] is False
     # Present and not conflated with the wake, which is its own field.
     assert record["routingMs"] >= 0
-    assert record["strategy"] == "conversation"  # the default since PC4
+    # Where a new conversation went: the default placement since CB1, when
+    # affinity became its own setting.
+    assert record["strategy"] == "least_busy"
 
 
 def test_the_control_planes_own_overhead_is_derivable(metrics_client: TestClient) -> None:

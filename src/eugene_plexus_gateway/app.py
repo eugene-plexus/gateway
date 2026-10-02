@@ -164,6 +164,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 # Read live, so a PATCH takes effect on the next request.
                 slots=lambda: store.get("modelSlots"),
                 strategy=lambda: store.get("loadBalancing"),
+                affinity=lambda: store.get("conversationAffinity"),
                 # Live, like the two above it: `controlUrl` is documented
                 # as taking effect on the next routing refresh.
                 control_url=lambda: store.get("controlUrl"),

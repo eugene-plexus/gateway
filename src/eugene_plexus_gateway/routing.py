@@ -142,9 +142,11 @@ READY = "ready"
 STOPPED = "stopped"
 LEAST_BUSY = "least_busy"
 ROUND_ROBIN = "round_robin"
-#: PC4: a conversation goes back to the replica that holds its prompt;
-#: otherwise exactly `least_busy`. See `affinity.py`.
+#: PC4's `loadBalancing` value, from before affinity was its own setting
+#: (CB1): read as the default placement, with affinity, which is what it did.
 CONVERSATION = "conversation"
+#: Where a new conversation goes when `loadBalancing` is unset (CB1).
+DEFAULT_PLACEMENT = LEAST_BUSY
 
 # Statuses that mean "this runtime is on its way to `ready`, wait rather
 # than despair". Deliberately a set of strings and not a generated enum:
@@ -663,6 +665,7 @@ class RoutingTable:
         strategy: Callable[[], Any] | None = None,
         control_url: str | Callable[[], Any] | None = None,
         room_wait_seconds: Callable[[], float] | None = None,
+        affinity: Callable[[], Any] | None = None,
     ) -> None:
         self._agent_url = agent_url.rstrip("/")
         # CB3: the prompt tokens in flight on each runtime with a shared
@@ -696,7 +699,10 @@ class RoutingTable:
         # Read live on every resolve, so a PATCH to `modelSlots` or
         # `loadBalancing` takes effect without a restart.
         self._slots = slots or (lambda: [])
-        self._strategy = strategy or (lambda: CONVERSATION)
+        self._strategy = strategy or (lambda: None)
+        # CB1: a conversation goes back to its replica under every strategy
+        # unless this is off -- for benchmarking replicas, nothing else.
+        self._affinity_on: Callable[[], Any] = affinity or (lambda: True)
         self._snapshot = _Snapshot(agents={None: self._agent_url})
         # Clients are cached by (node, name, url) and reused across
         # refreshes. Rebuilding an httpx.AsyncClient every 15s would
@@ -1884,18 +1890,20 @@ class RoutingTable:
         eligibility, which was settled before this is called.
         """
         self.last_affinity = None
+        if not self.affinity_on():
+            affinity = None
         if len(backends) <= 1:
-            if affinity is not None and backends and self._strategy() == CONVERSATION:
+            if affinity is not None and backends:
                 self._affinity.put(target, affinity, backends[0].key)
             return list(backends)
         cursor = self._cursor.get(target, 0)
         self._cursor[target] = cursor + 1
         rotated = backends[cursor % len(backends) :] + backends[: cursor % len(backends)]
-        strategy = self._strategy()
-        if strategy == ROUND_ROBIN:
-            return rotated
-        ordered = sorted(rotated, key=lambda b: self.inflight(b.key) / b.parallel_slots)
-        if strategy != CONVERSATION or affinity is None:
+        if self.placement() == ROUND_ROBIN:
+            ordered = rotated
+        else:
+            ordered = sorted(rotated, key=lambda b: self.inflight(b.key) / b.parallel_slots)
+        if affinity is None:
             return ordered
         pinned_key = self._affinity.get(target, affinity)
         pinned = next((b for b in backends if b.key == pinned_key), None)
@@ -1910,6 +1918,19 @@ class RoutingTable:
             self.last_affinity = MOVED
         self._affinity.put(target, affinity, ordered[0].key)
         return ordered
+
+    def placement(self) -> str:
+        """Where a new conversation goes now: `loadBalancing`, with PC4's
+        `conversation` and unset read as the default (CB1). What every
+        request records as its strategy, so the record says what ran."""
+        value = self._strategy()
+        if value in (LEAST_BUSY, ROUND_ROBIN):
+            return str(value)
+        return DEFAULT_PLACEMENT
+
+    def affinity_on(self) -> bool:
+        """`conversationAffinity`: anything but an explicit off is on."""
+        return self._affinity_on() is not False
 
     def pick(
         self,
@@ -2517,7 +2538,7 @@ class RoutingTable:
             )
         return RoutingTableView(
             refreshed_at=self._snapshot.refreshed_at,
-            load_balancing=str(self._strategy() or CONVERSATION),
+            load_balancing=self.placement(),
             slots=slots,
             unreachable_drivers=sorted(u.name for u in self._snapshot.unreachable),
             outdated_drivers=[

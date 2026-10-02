@@ -484,6 +484,7 @@ def make_routing_table(
     strategy: str = "least_busy",
     agent_url: str = "http://fake-agent",
     room_wait_seconds: float = 120.0,
+    affinity: bool = True,
 ) -> RoutingTable:
     """A RoutingTable pre-loaded with fakes, without any HTTP.
 
@@ -500,6 +501,7 @@ def make_routing_table(
         slots=lambda: list(slots or []),
         strategy=lambda: strategy,
         room_wait_seconds=lambda: room_wait_seconds,
+        affinity=lambda: affinity,
     )
     install_snapshot(table, *fakes, unreachable=unreachable, runtimes=runtimes)
     return table

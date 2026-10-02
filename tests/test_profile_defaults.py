@@ -271,12 +271,14 @@ def test_replica_names_and_aliases_do_not_cross_model_paths(app: FastAPI, librar
     b = FakeDriverClient(name="same", node="b", model_id="alias", runtime="same")
     profiles = setup_routes(app, library, a, b)
     with TestClient(app) as client:
-        for _ in range(2):
+        # Two conversations, so each replica answers one (CB1 keeps one
+        # conversation on one replica).
+        for turn in range(2):
             r = client.post(
                 "/v1/chat/completions",
                 json={
                     "model": "alias",
-                    "messages": [{"role": "user", "content": "hello"}],
+                    "messages": [{"role": "user", "content": f"hello {turn}"}],
                     "temperature": 0.6,
                 },
             )

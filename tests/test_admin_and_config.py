@@ -163,6 +163,7 @@ def test_config_schema_lists_the_gateway_fields(client: TestClient) -> None:
         "modelSlots",
         "inConversationSystem",
         "loadBalancing",
+        "conversationAffinity",
         "swapWaitSeconds",
         "idleCheckSeconds",
         "controlUrl",
