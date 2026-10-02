@@ -110,3 +110,20 @@ def test_a_patch_of_conversation_is_refused(tmp_path: Path) -> None:
         ConfigUpdateRequest.model_validate({"loadBalancing": "conversation"})
     )
     assert [r.key for r in result.rejected] == ["loadBalancing"]
+
+
+def test_the_setting_reaches_the_routing_table(settings) -> None:  # type: ignore[no-untyped-def]
+    """Read live, like loadBalancing: a PATCH takes effect on the next request."""
+    from fastapi.testclient import TestClient
+
+    from eugene_plexus_gateway.app import create_app
+
+    app = create_app(settings=settings)
+    with TestClient(app) as client:
+        table = app.state.routing
+        assert table.affinity_on() is True
+        r = client.patch("/v1/config", json={"conversationAffinity": False})
+        assert r.status_code == 200, r.text
+        assert table.affinity_on() is False
+        client.patch("/v1/config", json={"loadBalancing": "round_robin"})
+        assert table.placement() == "round_robin"
