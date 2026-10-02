@@ -58,7 +58,7 @@ CATEGORY_LABELS: dict[str, str] = {
     "clients": "Browser clients",
 }
 
-LOAD_BALANCING_VALUES = ["least_busy", "round_robin"]
+LOAD_BALANCING_VALUES = ["conversation", "least_busy", "round_robin"]
 
 FIELDS: list[ConfigField] = [
     ConfigField(
@@ -278,19 +278,27 @@ FIELDS: list[ConfigField] = [
         label="Load balancing",
         description=(
             "How a request picks among the replicas serving one model. "
-            "`least_busy` sends it to the driver with the fewest requests "
-            "in flight per slot of capacity, breaking ties round-robin — "
-            "the default, and what fills capacity before queueing on a "
-            "saturated replica. `round_robin` alternates strictly, which is "
-            "worth having when comparing two replicas or reproducing a "
-            "report. The signal is the gateway's own in-flight count, so it "
-            "works for every engine."
+            "`conversation` (the default) sends each conversation back to the "
+            "replica that served it before, because only that replica's engine "
+            "holds its prompt in cache; a new conversation, or one whose replica "
+            "is full while another has a free slot, goes to the least busy. "
+            "Measured: one agent session on two replicas read half its prompt "
+            "again every turn without it. `least_busy` sends every request to the "
+            "driver with the fewest requests in flight per slot of capacity, "
+            "breaking ties round-robin. `round_robin` alternates strictly, which "
+            "is worth having when comparing two replicas or reproducing a report. "
+            "The load signal is the gateway's own in-flight count, so all three "
+            "work for every engine."
         ),
         category="lifecycle",
         valueType=ConfigValueType.enum,
-        default="least_busy",
+        default="conversation",
         enumValues=LOAD_BALANCING_VALUES,
-        enumLabels=["Least busy (ties round-robin)", "Round-robin"],
+        enumLabels=[
+            "Keep each conversation on its replica",
+            "Least busy (ties round-robin)",
+            "Round-robin",
+        ],
     ),
     ConfigField(
         key="swapWaitSeconds",

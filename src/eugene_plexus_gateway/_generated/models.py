@@ -3956,7 +3956,7 @@ class MetricRequest(BaseModel):
     )
     strategy: str | None = Field(
         None,
-        description='The `loadBalancing` value in effect when this request was\nrouted. Recorded per request because the config can change\nbetween them, and `least_busy` and `round_robin` explain\ndifferent orderings.\n',
+        description='The `loadBalancing` value in effect when this request was\nrouted. Recorded per request because the config can change\nbetween them, and `conversation`, `least_busy` and\n`round_robin` explain different orderings.\n',
     )
     candidates: list[MetricCandidate] | None = Field(
         None,

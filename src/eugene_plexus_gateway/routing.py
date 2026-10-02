@@ -84,6 +84,7 @@ from ._generated.models import (
     Surface,
 )
 from ._http import internal_client
+from .affinity import HIT, MOVED, NEW, AffinityTable
 from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from .driver_client import BoundClient, DriverClient, HttpDriverClient, TieredClient, VideoJobs
 from .driver_client import Key as DriverKey
@@ -140,6 +141,9 @@ READY = "ready"
 STOPPED = "stopped"
 LEAST_BUSY = "least_busy"
 ROUND_ROBIN = "round_robin"
+#: PC4: a conversation goes back to the replica that holds its prompt;
+#: otherwise exactly `least_busy`. See `affinity.py`.
+CONVERSATION = "conversation"
 
 # Statuses that mean "this runtime is on its way to `ready`, wait rather
 # than despair". Deliberately a set of strings and not a generated enum:
@@ -670,7 +674,7 @@ class RoutingTable:
         # Read live on every resolve, so a PATCH to `modelSlots` or
         # `loadBalancing` takes effect without a restart.
         self._slots = slots or (lambda: [])
-        self._strategy = strategy or (lambda: LEAST_BUSY)
+        self._strategy = strategy or (lambda: CONVERSATION)
         self._snapshot = _Snapshot(agents={None: self._agent_url})
         # Clients are cached by (node, name, url) and reused across
         # refreshes. Rebuilding an httpx.AsyncClient every 15s would
@@ -719,6 +723,10 @@ class RoutingTable:
         # By model, which really is install-wide: the balancer's rotation
         # cursor for one slot.
         self._cursor: dict[str, int] = {}
+        # PC4: model and conversation key -> the backend it was sent to.
+        self._affinity = AffinityTable()
+        #: What the last `_order` did for a conversation; read by `pick`.
+        self.last_affinity: str | None = None
         # Runtimes with a stop in flight, counted rather than flagged
         # because `idle_pass` and `_evict_for` can both be stopping one.
         # Shared by reference with every `_Backend` in the snapshot; see
@@ -1832,22 +1840,51 @@ class RoutingTable:
             for facts in self._snapshot.runtimes.values()
         )
 
-    def _order(self, target: str, backends: list[_Backend]) -> list[_Backend]:
+    def _order(
+        self, target: str, backends: list[_Backend], affinity: str | None = None
+    ) -> list[_Backend]:
         """Balance one tier.
 
         Rotate by a per-target cursor so an idle install alternates, then
         under `least_busy` stable-sort by in-flight requests per slot of
         capacity so a busy one fills capacity before queueing on a
         saturated replica. `round_robin` is the rotation alone.
+
+        Under `conversation` (PC4, the default) a request whose
+        conversation was sent to one of these backends before goes there
+        again, ahead of the least-busy order, **unless that backend is
+        saturated while another has a free slot**: then the least-busy
+        order stands and the conversation moves with it. A warm cache is
+        worth a short queue, not a long one, and it never outranks
+        eligibility, which was settled before this is called.
         """
+        self.last_affinity = None
         if len(backends) <= 1:
+            if affinity is not None and backends and self._strategy() == CONVERSATION:
+                self._affinity.put(target, affinity, backends[0].key)
             return list(backends)
         cursor = self._cursor.get(target, 0)
         self._cursor[target] = cursor + 1
         rotated = backends[cursor % len(backends) :] + backends[: cursor % len(backends)]
-        if self._strategy() == ROUND_ROBIN:
+        strategy = self._strategy()
+        if strategy == ROUND_ROBIN:
             return rotated
-        return sorted(rotated, key=lambda b: self.inflight(b.key) / b.parallel_slots)
+        ordered = sorted(rotated, key=lambda b: self.inflight(b.key) / b.parallel_slots)
+        if strategy != CONVERSATION or affinity is None:
+            return ordered
+        pinned_key = self._affinity.get(target, affinity)
+        pinned = next((b for b in backends if b.key == pinned_key), None)
+        if pinned is None:
+            self.last_affinity = MOVED if pinned_key is not None else NEW
+        elif self.inflight(pinned.key) < pinned.parallel_slots or all(
+            self.inflight(b.key) >= b.parallel_slots for b in backends
+        ):
+            ordered = [pinned, *(b for b in ordered if b is not pinned)]
+            self.last_affinity = HIT
+        else:
+            self.last_affinity = MOVED
+        self._affinity.put(target, affinity, ordered[0].key)
+        return ordered
 
     def pick(
         self,
@@ -1855,6 +1892,7 @@ class RoutingTable:
         *,
         needs: frozenset[str] = frozenset(),
         surface: str | None = None,
+        affinity: str | None = None,
     ) -> TieredClient | None:
         """The client to send a request through, or None when nothing in
         the slot is eligible right now.
@@ -1871,9 +1909,14 @@ class RoutingTable:
         `surface`, when given, keeps each tier to backends serving it: a
         raw completion (P6) must never reach a model that only chats, since
         it would answer the prompt as a chat turn.
+
+        `affinity` is the conversation's key (`affinity.key_for`), and under
+        `conversation` the first tier sends it back to its replica. The
+        outcome is the returned client's `affinity`.
         """
         tiers: list[list[DriverClient]] = []
-        for tier in resolution.tiers:
+        outcome: str | None = None
+        for index, tier in enumerate(resolution.tiers):
             eligible = [
                 b
                 for b in tier.eligible()
@@ -1881,10 +1924,19 @@ class RoutingTable:
             ]
             # An empty tier stays in the list, so the response's `tier`
             # counts the slot's tiers rather than the eligible ones.
-            tiers.append([b.client for b in self._order(tier.target, eligible)] if eligible else [])
+            ordered = (
+                self._order(tier.target, eligible, affinity if index == 0 else None)
+                if eligible
+                else []
+            )
+            if index == 0:
+                outcome = self.last_affinity if eligible else None
+            tiers.append([b.client for b in ordered])
         if not any(tiers):
             return None
-        return TieredClient(name=resolution.model, tiers=tiers, hooks=self)
+        client = TieredClient(name=resolution.model, tiers=tiers, hooks=self)
+        client.affinity = outcome
+        return client
 
     def pick_moderation(self, resolution: Resolution) -> TieredClient | None:
         """`pick_embedding`'s single-model tier, for moderation (P6-2): a
@@ -2412,7 +2464,7 @@ class RoutingTable:
             )
         return RoutingTableView(
             refreshed_at=self._snapshot.refreshed_at,
-            load_balancing=str(self._strategy() or LEAST_BUSY),
+            load_balancing=str(self._strategy() or CONVERSATION),
             slots=slots,
             unreachable_drivers=sorted(u.name for u in self._snapshot.unreachable),
             outdated_drivers=[

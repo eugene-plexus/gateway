@@ -976,6 +976,9 @@ class TieredClient:
         # a fresh wrapper around the shared, long-lived HttpDriverClients
         # on every call. Do not cache one of these.
         self.attempts = 0
+        #: PC4: `hit`, `new` or `moved` when the balancer had a conversation
+        #: to place, else None. Set by `RoutingTable.pick`.
+        self.affinity: str | None = None
         #: `TieredClient` is passed where a `DriverClient` is expected,
         #: so it carries the protocol's `node` too. It is a slot over
         #: several machines' backends and has no one node of its own;

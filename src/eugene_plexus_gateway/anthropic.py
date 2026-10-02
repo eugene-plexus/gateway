@@ -407,6 +407,26 @@ def _field(block: Any, name: str) -> Any:
     return getattr(block, name, None)
 
 
+def session_of(raw: Mapping[str, Any]) -> str | None:
+    """The client's own conversation id, when it says which (PC4).
+
+    Claude Code's `metadata.user_id` is a JSON string carrying `session_id`
+    (measured 2026-09-19 and 2026-10-02). A bare `user_id` names a person,
+    not a conversation, and is not used: pinning all of one person's
+    conversations to one replica is not what affinity is for.
+    """
+    metadata = raw.get("metadata")
+    user_id = metadata.get("user_id") if isinstance(metadata, Mapping) else None
+    if not isinstance(user_id, str):
+        return None
+    try:
+        parsed = json.loads(user_id)
+    except ValueError:
+        return None
+    session = parsed.get("session_id") if isinstance(parsed, dict) else None
+    return session if isinstance(session, str) and session else None
+
+
 _BILLING_HEADER = re.compile(r"\Ax-anthropic-billing-header:[^\n]*(?:\n|\Z)")
 
 

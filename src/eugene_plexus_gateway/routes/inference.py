@@ -41,6 +41,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .. import (
     admission,
+    affinity,
     anthropic,
     chat_contract,
     completion_door,
@@ -870,13 +871,17 @@ async def _prepare(
     if completion is not None:
         needs = frozenset({"fill_in_middle"}) if completion.suffix is not None else frozenset()
     wake: WakeResult | None = None
-    client = table.pick(resolution, needs=needs, surface=only)
+    # PC4: the conversation this request continues, so the balancer can
+    # send it back to the replica that holds its prompt. A door that knows
+    # the client's own session (the Anthropic door) leaves it on the request.
+    conversation = affinity.key_for(body, getattr(request.state, "affinity_key", None))
+    client = table.pick(resolution, needs=needs, surface=only, affinity=conversation)
     if client is None and await table.refresh_if_stale():
         refreshed = True
         resolution = await resolve()
         if not resolution.has_backends():
             return _no_such_model(body.model, table)
-        client = table.pick(resolution, needs=needs, surface=only)
+        client = table.pick(resolution, needs=needs, surface=only, affinity=conversation)
     # What the balancer saw, read before the wake so the numbers are the
     # ones the decision was made on. Read even when only one backend is
     # eligible; `_record` decides whether it is worth keeping.
@@ -887,7 +892,7 @@ async def _prepare(
             wake = await lifecycle.wake(resolution)
             if wake.ok:
                 resolution = await resolve()
-                client = table.pick(resolution, needs=needs, surface=only)
+                client = table.pick(resolution, needs=needs, surface=only, affinity=conversation)
                 considered = table.candidates_considered(resolution)
         if client is None:
             if needs and resolution.eligible_backends():
@@ -1307,6 +1312,8 @@ async def create_anthropic_message(request: Request) -> Any:
         body = anthropic.translate_request(raw, max_images=max_images(_store(request)))
     except anthropic.Refusal as refusal:
         return refusal.response()
+    # PC4: Claude Code names its session; the balancer keeps it on one replica.
+    request.state.affinity_key = anthropic.session_of(raw)
 
     # P8: a `web_search_<date>` server tool runs here or is refused with the
     # reason. Refused rather than dropped: Claude Code's WebSearch request
