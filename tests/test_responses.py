@@ -290,8 +290,13 @@ def test_a_developer_message_later_on_stays_where_it_was_put(settings: Settings)
     )
     with serve(settings, fake) as client:
         client.post("/v1/responses", json={**request, "stream": False})
-    roles = [m["role"] for m in sent(fake)]
-    assert roles == ["system", "user", "assistant", "tool", "system"]
+    messages = sent(fake)
+    # Where it was put, as a user turn (PC2, amended 2026-10-02): the
+    # Qwen 3.5+ templates refuse a system message anywhere but first.
+    assert [m["role"] for m in messages] == ["system", "user", "assistant", "tool", "user"]
+    assert (
+        messages[-1]["content"] == "<system-reminder>\nApproval policy changed.\n</system-reminder>"
+    )
 
 
 # --------------------------------------------------------------------------- #

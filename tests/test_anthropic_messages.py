@@ -1011,6 +1011,12 @@ def test_a_system_role_inside_messages_is_carried_in_place(settings: Settings) -
     This shape appears only once tools are in play, which is why every
     unit fixture above -- all built from a capture of a simple
     request -- missed it. A live run is not a formality.
+
+    **Amended 2026-10-02 (PC2): in place, as a user turn.** As a `system`
+    message here it is refused by every Qwen 3.5+ chat template
+    ("System message must be at the beginning"), so Claude Code could not
+    use three of the five starter classes; `inConversationSystem: system`
+    keeps the role, below.
     """
     fake = FakeDriverClient(name="d1", model_id=MODEL, supports_tools=True)
     fake.responses = ["ok"]
@@ -1028,9 +1034,30 @@ def test_a_system_role_inside_messages_is_carried_in_place(settings: Settings) -
     roles = [role for role, _ in sent]
     # The fixture's own top-level system leads; the in-message one keeps
     # its position after the user turn rather than being merged into it.
-    assert roles == ["system", "user", "system"]
-    assert sent[2][1] == "<env>cwd: /work</env>"
+    assert roles == ["system", "user", "user"]
+    assert sent[2][1] == "<system-reminder>\n<env>cwd: /work</env>\n</system-reminder>"
     assert sent[0][1].startswith("You are a Claude agent.")
+
+
+def test_the_operator_may_keep_an_in_conversation_system_message_as_system(
+    settings: Settings,
+) -> None:
+    """`inConversationSystem: system`: exactly as the client sent it."""
+    settings.config_file.write_text("inConversationSystem: system\n", encoding="utf-8")
+    fake = FakeDriverClient(name="d1", model_id=MODEL, supports_tools=True)
+    fake.responses = ["ok"]
+    request = body(
+        messages=[
+            {"role": "user", "content": [{"type": "text", "text": "list the python files"}]},
+            {"role": "system", "content": "<env>cwd: /work</env>"},
+        ]
+    )
+    with _client(_app_with(settings, fake)) as client:
+        r = client.post("/v1/messages?beta=true", json=request)
+    assert r.status_code == 200, r.text
+    sent = [(m.role.value, m.content) for m in fake.calls[0].messages]
+    assert [role for role, _ in sent] == ["system", "user", "system"]
+    assert sent[2][1] == "<env>cwd: /work</env>"
 
 
 def test_text_then_a_tool_call_closes_the_text_block_first(settings: Settings) -> None:

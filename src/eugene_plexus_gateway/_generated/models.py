@@ -3699,7 +3699,19 @@ class AnthropicInputMessage(BaseModel):
     It is carried **in place** rather than hoisted into the leading
     system prompt. The client put it after a user turn deliberately,
     and moving it would change what the model sees for the sake of
-    tidiness on a wire we do not own.
+    tidiness on a wire we do not own -- and would change the start of
+    the prompt on every turn, so the engine's prompt cache could reuse
+    nothing past it.
+
+    **By default it reaches the backend as a user turn**, its text
+    wrapped `<system-reminder>…</system-reminder>`, because the Qwen
+    3.5 and later chat templates refuse a system message anywhere but
+    first ("System message must be at the beginning") and Claude Code
+    could not use those models (measured 2026-10-02, gateway#6). The
+    gateway setting `inConversationSystem` chooses: `user_turn` (the
+    default) or `system`, as the client sent it. It applies on every
+    door, to a `developer` message after the first turn as well, and
+    a leading run of system messages becomes one.
 
     This one was found by the live run and not by the unit tests,
     because the unit fixtures came from a capture of a *simple*

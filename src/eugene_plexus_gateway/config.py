@@ -23,7 +23,7 @@ from typing import Any
 
 import yaml
 
-from . import _private_files
+from . import _private_files, system_placement
 from ._generated.models import (
     ComponentKind,
     ConfigDocument,
@@ -253,6 +253,25 @@ FIELDS: list[ConfigField] = [
         category="lifecycle",
         valueType=ConfigValueType.model_slots,
         default=[],
+    ),
+    ConfigField(
+        key="inConversationSystem",
+        label="System messages after the first",
+        description=(
+            "Where a system message that comes after the conversation has started "
+            "goes. Claude Code sends them mid-conversation, and the Qwen 3.5 and "
+            "later chat templates refuse any system message but the first, so those "
+            "models answer an error. `user_turn` (the default) keeps each one where "
+            "the client put it, as a user turn marked `<system-reminder>`, which "
+            "every model measured accepts and which keeps the start of the prompt "
+            "the same for the engine's cache; leading system messages become one. "
+            "`system` sends them exactly as the client did."
+        ),
+        category="generation",
+        valueType=ConfigValueType.enum,
+        default="user_turn",
+        enumValues=system_placement.PLACEMENTS,
+        enumLabels=["As a user turn, in place", "As a system message, as sent"],
     ),
     ConfigField(
         key="loadBalancing",

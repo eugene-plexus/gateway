@@ -49,6 +49,7 @@ from .. import (
     moderation_door,
     responses,
     server_tools,
+    system_placement,
     video_doors,
 )
 from .._generated.driver_models import AudioOutputFormat as DriverAudioOutputFormat
@@ -3622,7 +3623,13 @@ def _to_generate_request(
             )
         ]
         or None,
-        messages=[_to_driver_message(m) for m in body.messages],
+        # PC2: the Qwen 3.5+ templates refuse a system message anywhere
+        # but first; `system_placement` says why its default keeps the
+        # prompt's start stable for the engine's cache.
+        messages=system_placement.place(
+            [_to_driver_message(m) for m in body.messages],
+            store.get("inConversationSystem") if store is not None else None,
+        ),
         maxTokens=max_tokens,
         temperature=temperature,
         # **Carried since 2026-09-19 and dropped on the floor before

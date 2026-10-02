@@ -170,8 +170,14 @@ def test_a_developer_message_reaches_the_backend_as_system_in_place(settings: Se
 
     assert r.status_code == 200, r.text
     roles = [m.role.value for m in fake.calls[-1].messages]
-    assert roles == ["user", "system", "user"]
-    assert fake.calls[-1].messages[1].content == "Answer in one word."
+    # In place, as a user turn by default (PC2, amended 2026-10-02): this
+    # test asserted a `system` message after a user turn, which is the
+    # shape the Qwen 3.5+ templates refuse with a 500.
+    assert roles == ["user", "user", "user"]
+    assert (
+        fake.calls[-1].messages[1].content
+        == "<system-reminder>\nAnswer in one word.\n</system-reminder>"
+    )
 
 
 def test_an_assistant_turn_hands_its_reasoning_back_to_the_driver(settings: Settings) -> None:
