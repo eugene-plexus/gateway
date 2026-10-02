@@ -221,3 +221,58 @@ async def test_cancelled_recovery_probe_is_neither_success_nor_failure(monkeypat
         GenerateRequest(messages=[])
     )
     assert first.circuit.failures == 1 and first.circuit.successes == 1
+
+
+def pool_full():
+    """The driver's answer when llama-server's shared KV pool is full."""
+    return DriverError(
+        driver_name="primary",
+        driver_url="http://primary",
+        status_code=503,
+        problem=Problem(
+            type="https://github.com/eugene-plexus/inference-driver#backend-capacity",
+            title="Backend has no room for this request now",
+            status=503,
+            retryDisposition="safe",
+        ),
+        raw_body="",
+    )
+
+
+@pytest.mark.parametrize("operation", ["generate", "stream"])
+async def test_a_full_pool_cascades_and_does_not_cool_the_replica(operation):
+    """**A full pool is load, not a broken backend** (CB3, gateway#8).
+    Counted by the circuit, a few overflows on an 8B at 64k made every
+    healthy replica refuse as "cooling down": 158 of 204 turns failed."""
+    first, second = FakeDriverClient(name="primary"), FakeDriverClient(name="backup")
+    first.circuit = Circuit()
+    first.generate_error = pool_full()
+    if operation == "stream":
+        first.stream_error_after, first.stream_error = 0, pool_full()
+    request = GenerateRequest(messages=[{"role": "user", "content": "act"}])
+    client = FailoverDriverClient(name="alias", candidates=[first, second])
+    if operation == "stream":
+        _ = [event async for event in client.stream(request)]
+    else:
+        await client.generate(request)
+    assert second.calls, "a turn the pool refused went to the next replica"
+    assert first.circuit.failures == 0 and first.circuit.acquire()
+
+
+async def test_a_stream_cut_for_room_after_output_does_not_cool_the_replica():
+    """Past the commit point it cannot cascade, but it still says nothing
+    about the backend's health."""
+    first = FakeDriverClient(name="primary")
+    first.circuit = Circuit()
+
+    async def cut(request):
+        yield StreamEvent(text="partial")
+        raise pool_full()
+
+    first.stream = cut
+    with pytest.raises(DriverError):
+        async for _ in FailoverDriverClient(name="alias", candidates=[first]).stream(
+            GenerateRequest(messages=[])
+        ):
+            pass
+    assert first.circuit.failures == 0

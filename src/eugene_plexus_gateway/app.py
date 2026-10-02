@@ -167,6 +167,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 # Live, like the two above it: `controlUrl` is documented
                 # as taking effect on the next routing refresh.
                 control_url=lambda: store.get("controlUrl"),
+                # CB3: a turn waits for room in a shared pool as long as a
+                # request waits for a model to load.
+                room_wait_seconds=lambda: float(store.get("swapWaitSeconds") or 120),
             )
             app.state.routing = table
             owns_routing = True

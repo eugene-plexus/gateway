@@ -16,6 +16,7 @@ the one-tier case, kept under its old name.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import sys
@@ -51,6 +52,7 @@ from ._generated.driver_models import (
     VideoRequest,
 )
 from ._http import internal_client
+from .budget import TurnBudget
 from .circuit import Circuit
 
 log = logging.getLogger(__name__)
@@ -919,6 +921,19 @@ def _is_cascade_eligible(exc: Exception) -> bool:
     return retry_disposition(exc) == "safe"
 
 
+def capacity_refused(exc: BaseException) -> bool:
+    """The driver's `#backend-capacity`: the engine's shared KV pool was
+    full of other requests' prompts (CB3). Load, not a broken backend, so
+    it may cascade (`safe`) and the circuit does not count it: counted, a
+    few overflows on an 8B at 64k took every healthy replica out as
+    "cooling down" and 158 of 204 agent turns failed (gateway#8)."""
+    return (
+        isinstance(exc, DriverError)
+        and exc.problem is not None
+        and str(exc.problem.type or "").endswith("#backend-capacity")
+    )
+
+
 def _cooling_error(delay: float = 1) -> DriverError:
     return DriverError(
         driver_name="routing",
@@ -979,6 +994,9 @@ class TieredClient:
         #: PC4: `hit`, `new` or `moved` when the balancer had a conversation
         #: to place, else None. Set by `RoutingTable.pick`.
         self.affinity: str | None = None
+        #: CB3: this turn's place in its replicas' shared pools, when any
+        #: has one. Set by `RoutingTable.pick`; see `budget.py`.
+        self.budget: TurnBudget | None = None
         #: `TieredClient` is passed where a `DriverClient` is expected,
         #: so it carries the protocol's `node` too. It is a slot over
         #: several machines' backends and has no one node of its own;
@@ -1034,7 +1052,35 @@ class TieredClient:
         assert last_exc is not None  # candidates is non-empty (checked in __init__)
         raise last_exc
 
+    async def _admit(self, request: GenerateRequest) -> None:
+        """CB3: wait for room in a shared pool, and try first where there is."""
+        if self.budget is None:
+            return
+        for index, tier in enumerate(self._tiers):
+            if tier:
+                self._tiers[index] = await self.budget.admit(request, tier)
+                return
+
+    def _enter(self, candidate: DriverClient) -> None:
+        if self.budget is not None:
+            self.budget.enter(candidate)
+
+    def _served(self, usage: Any) -> None:
+        if self.budget is not None and usage is not None:
+            self.budget.served(getattr(usage, "promptTokens", None))
+
+    def _release(self) -> None:
+        if self.budget is not None:
+            self.budget.close()
+
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
+        await self._admit(request)
+        try:
+            return await self._generate(request)
+        finally:
+            self._release()
+
+    async def _generate(self, request: GenerateRequest) -> GenerateResponse:
         last_exc: Exception | None = None
         total = len(self.candidates)
         index = 0
@@ -1054,6 +1100,7 @@ class TieredClient:
                 runtime: Key | None = None
                 if self._hooks is not None and driver:
                     runtime = self._hooks.on_attempt_start(driver, node=node)
+                self._enter(candidate)
                 started = time.perf_counter()
                 try:
                     prepared = (
@@ -1099,6 +1146,7 @@ class TieredClient:
                             usage=result.usage,
                             elapsed_ms=int((time.perf_counter() - started) * 1000),
                         )
+                    self._served(result.usage)
                     self.served_by = driver
                     self.served_model = getattr(candidate, "public_model", None)
                     self.served_by_node = node
@@ -1515,6 +1563,19 @@ class TieredClient:
         raise last_exc
 
     async def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]:
+        """`_stream`, inside this turn's room in a shared pool (CB3).
+
+        The inner generator is closed explicitly, so a consumer abandoning
+        this one still runs its attempt accounting at once."""
+        await self._admit(request)
+        try:
+            async with contextlib.aclosing(self._stream(request)) as events:
+                async for event in events:
+                    yield event
+        finally:
+            self._release()
+
+    async def _stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]:
         """`generate()`'s cascade, with a commit point.
 
         **The rule this method exists for:** failover is possible until
@@ -1558,6 +1619,7 @@ class TieredClient:
                 runtime: Key | None = None
                 if self._hooks is not None and driver:
                     runtime = self._hooks.on_attempt_start(driver, node=node)
+                self._enter(candidate)
                 started = time.perf_counter()
                 committed = False
                 # Whether the driver ever said the answer was finished.
@@ -1662,6 +1724,8 @@ class TieredClient:
                             error=None if saw_done else "IncompleteStream",
                             first_ms=first_ms,
                         )
+                    if saw_done:
+                        self._served(usage)
                     self.served_by = driver
                     self.served_model = getattr(candidate, "public_model", None)
                     self.served_by_node = node
@@ -1731,7 +1795,9 @@ class TieredClient:
                 else None
             )
             circuit.finish(
-                failed=error is not None and retry_disposition(error) != "terminal",
+                failed=error is not None
+                and retry_disposition(error) != "terminal"
+                and not capacity_refused(error),
                 retry_after=delay,
                 probe_epoch=probe_epoch,
             )

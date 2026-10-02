@@ -85,6 +85,7 @@ from ._generated.models import (
 )
 from ._http import internal_client
 from .affinity import HIT, MOVED, NEW, AffinityTable
+from .budget import ConversationSizes, PoolLedger, TurnBudget
 from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from .driver_client import BoundClient, DriverClient, HttpDriverClient, TieredClient, VideoJobs
 from .driver_client import Key as DriverKey
@@ -221,6 +222,10 @@ class _RuntimeFacts:
     start_on_demand: bool
     stop_reason: str | None
     spec: dict[str, Any] = field(default_factory=dict)
+    #: CB3: the context this runtime's slots share, from its agent's
+    #: `capabilities.contextPoolTokens`. None when they do not share one,
+    #: or the agent cannot say, and then the gateway does not budget it.
+    context_pool: int | None = None
 
     @property
     def key(self) -> Key:
@@ -423,6 +428,16 @@ class _Backend:
         if caps is None or caps.decision is None:
             return None
         return caps.decision.maxConcurrent
+
+    @property
+    def context_pool(self) -> int | None:
+        return self.runtime.context_pool if self.runtime is not None else None
+
+    @property
+    def pool_key(self) -> Key | None:
+        """What owns `context_pool`: the runtime, which every driver in
+        front of one engine shares."""
+        return self.runtime.key if self.runtime is not None else None
 
     @property
     def parallel_slots(self) -> int:
@@ -647,8 +662,15 @@ class RoutingTable:
         slots: Callable[[], Any] | None = None,
         strategy: Callable[[], Any] | None = None,
         control_url: str | Callable[[], Any] | None = None,
+        room_wait_seconds: Callable[[], float] | None = None,
     ) -> None:
         self._agent_url = agent_url.rstrip("/")
+        # CB3: the prompt tokens in flight on each runtime with a shared
+        # pool, each conversation's last prompt, and how long a turn waits
+        # for room. See `budget.py`.
+        self._ledger = PoolLedger()
+        self._sizes = ConversationSizes()
+        self._room_wait: Callable[[], float] = room_wait_seconds or (lambda: 120.0)
         # Read live on every refresh, for the same reason `slots` and
         # `strategy` are: `controlUrl` is a config field whose own
         # description promises it "takes effect on the next routing
@@ -1455,6 +1477,7 @@ class RoutingTable:
             capabilities = entry.get("capabilities")
             context = capabilities.get("contextLength") if isinstance(capabilities, dict) else None
             slots = capabilities.get("parallelSlots") if isinstance(capabilities, dict) else None
+            pool = capabilities.get("contextPoolTokens") if isinstance(capabilities, dict) else None
             idle = entry.get("idleUnloadSeconds")
             # **The node we asked, never the one the agent reports.** The
             # drivers from this same agent are keyed by the node we asked,
@@ -1477,6 +1500,7 @@ class RoutingTable:
                 start_on_demand=bool(entry.get("startOnDemand")),
                 stop_reason=str(entry["stopReason"]) if entry.get("stopReason") else None,
                 spec={k: entry[k] for k in _SPEC_FIELDS if entry.get(k) is not None},
+                context_pool=pool if isinstance(pool, int) and pool > 0 else None,
             )
         return facts, True
 
@@ -1917,6 +1941,7 @@ class RoutingTable:
         """
         tiers: list[list[DriverClient]] = []
         outcome: str | None = None
+        picked: list[_Backend] = []
         for index, tier in enumerate(resolution.tiers):
             eligible = [
                 b
@@ -1932,12 +1957,39 @@ class RoutingTable:
             )
             if index == 0:
                 outcome = self.last_affinity if eligible else None
+            picked.extend(ordered)
             tiers.append([b.client for b in ordered])
         if not any(tiers):
             return None
         client = TieredClient(name=resolution.model, tiers=tiers, hooks=self)
         client.affinity = outcome
+        client.budget = self._budget_for(resolution, picked, affinity, outcome)
         return client
+
+    def _budget_for(
+        self,
+        resolution: Resolution,
+        picked: list[_Backend],
+        conversation: str | None,
+        outcome: str | None,
+    ) -> TurnBudget | None:
+        """CB3: a budget when any backend this turn may reach shares a pool."""
+        pools = {
+            id(b.client): (key, pool)
+            for b in picked
+            if (key := b.pool_key) is not None and (pool := b.context_pool)
+        }
+        if not pools:
+            return None
+        return TurnBudget(
+            ledger=self._ledger,
+            sizes=self._sizes,
+            pools=pools,
+            target=resolution.model,
+            conversation=conversation,
+            held=outcome == HIT,
+            wait_seconds=self._room_wait,
+        )
 
     def pick_moderation(self, resolution: Resolution) -> TieredClient | None:
         """`pick_embedding`'s single-model tier, for moderation (P6-2): a

@@ -524,3 +524,23 @@ async def test_a_free_search_account_is_tried_before_one_that_bills(route_http: 
     await table.refresh()
     assert [a.name for a in table.search_accounts()] == ["searx", "brave", "unsaid"]
     await table.aclose()
+
+
+async def test_a_runtimes_shared_context_is_read_off_its_agent(route_http: Any) -> None:
+    """CB3: `contextPoolTokens` is what the budget runs on, and absent means
+    the slots do not share one (or the agent cannot say): no budget."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/components":
+            return httpx.Response(200, json=_components(_driver_entry("a", 8081)))
+        return httpx.Response(200, json=_info("qwen"))
+
+    entry = _runtime_entry("qwen3-27b", "qwen", context=65536)
+    entry["capabilities"]["contextPoolTokens"] = 65536
+    route_http(handler, runtimes=[entry])
+    table = RoutingTable(agent_url="http://agent")
+    await table.refresh()
+    [backend] = table.backends_for("qwen")
+    assert backend.context_pool == 65536
+    assert table.pick(table.resolve("qwen")).budget is not None
+    await table.aclose()
