@@ -140,7 +140,13 @@ from .._generated.models import Stage as StreamStage
 from ..config import ConfigStore
 from ..dependencies import require_authorized
 from ..disconnect import ClientGone, serve_while_connected
-from ..driver_client import DriverClient, DriverError, TieredClient, VideoJobs
+from ..driver_client import (
+    DriverClient,
+    DriverError,
+    TieredClient,
+    VideoJobs,
+    capacity_refused,
+)
 from ..images import attachment_kinds, max_images
 from ..lifecycle import LifecycleManager, WakeResult
 from ..metrics import AttemptRow, CandidateRow, MetricsStore, RequestRow, ToolExecutionRow
@@ -1231,7 +1237,12 @@ async def _stream_anthropic(
             _record(prepared.rec, body, tries)
             if not translator.started:
                 yield translator.start()
-            for chunk in translator.failed(str(e) or type(e).__name__):
+            # A full pool is Anthropic's `overloaded_error`, which Claude
+            # Code retries (CB3); anything else stays `api_error`.
+            for chunk in translator.failed(
+                str(e) or type(e).__name__,
+                kind="overloaded_error" if capacity_refused(e) else "api_error",
+            ):
                 yield chunk
             return
 
@@ -4611,6 +4622,20 @@ def _driver_failure_status(e: DriverError) -> _Failure:
                 f"the gateway (Config -> Gateway -> Routing) if this model needs longer."
             ),
             error_type="timeout",
+        )
+    if capacity_refused(e):
+        # CB3: every replica tried was full of other requests' prompts.
+        # Load, so the client is told to retry -- and never that the
+        # context is full (Codex stops on `context_length_exceeded`) or
+        # that an engine is loading (measured: both, on the 8B shape).
+        return _Failure(
+            code=503,
+            message=(
+                f"Every replica of this model that was tried had no room for this request "
+                f"now: {detail} Retry the request. If this happens often, give the model "
+                f"more context or another replica."
+            ),
+            error_type=responses.OVERLOADED,
         )
     if upstream == 503:
         return _Failure(

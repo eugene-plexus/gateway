@@ -692,6 +692,35 @@ def test_a_rejected_key_is_401_in_openais_envelope(
 # --------------------------------------------------------------------------- #
 
 
+def _pool_full() -> DriverError:
+    return DriverError(
+        driver_name="d1",
+        driver_url="http://fake-driver",
+        status_code=503,
+        problem=Problem(
+            type="https://github.com/eugene-plexus/inference-driver#backend-capacity",
+            title="Backend has no room for this request now",
+            status=503,
+            retryDisposition="safe",
+            detail="openai_compat_http stream error: Context size has been exceeded.",
+        ),
+        raw_body="",
+    )
+
+
+def test_a_full_pool_before_the_stream_is_load_not_a_full_context(settings: Settings) -> None:
+    """Refused by every replica before anything streamed: a 5xx Codex
+    retries, with no `context_length_exceeded` and no "still loading"."""
+    fake = driver()
+    fake.generate_error = _pool_full()
+    with serve(settings, fake) as client:
+        r = client.post("/v1/responses", json={**codex_request(), "stream": False})
+    assert r.status_code == 503
+    error = r.json()["error"]
+    assert error.get("code") != "context_length_exceeded"
+    assert "not ready" not in error["message"] and "no room" in error["message"]
+
+
 def _driver_error(status: int, detail: str) -> DriverError:
     return DriverError(
         driver_name="d1",
@@ -717,6 +746,10 @@ def _driver_error(status: int, detail: str) -> DriverError:
         (httpx.ReadTimeout("slow"), "invalid_prompt"),
         (httpx.ConnectError("gone"), "server_error"),
         (_driver_error(503, "still loading"), "server_error"),
+        # CB3: llama-server's words for a full pool name the context, and
+        # it is not full. Measured on the 8B shape: Codex was told
+        # `context_length_exceeded`, which stops it.
+        (_pool_full(), "server_error"),
     ],
 )
 def test_a_failure_is_response_failed_with_a_code_codex_acts_on(

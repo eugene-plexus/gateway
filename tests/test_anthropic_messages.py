@@ -859,6 +859,33 @@ def test_a_backend_that_dies_mid_stream_reports_an_error_event(settings: Setting
     assert "[DONE]" not in r.text
 
 
+def test_a_full_pool_mid_stream_is_overloaded(settings: Settings) -> None:
+    """CB3: a stream llama-server cut for want of room is
+    `overloaded_error`, which Claude Code retries, and nothing else is."""
+    from .test_failover_safety import pool_full
+
+    fake = FakeDriverClient(name="d1", model_id=MODEL)
+    fake.responses = ["one two three"]
+    fake.stream_error_after = 1
+    fake.stream_error = pool_full()
+    with _client(_app_with(settings, fake)) as client:
+        r = client.post("/v1/messages", json=body(stream=True))
+    [error] = [e for e in _events(r.text) if e["type"] == "error"]
+    assert error["error"]["type"] == "overloaded_error"
+
+
+def test_a_full_pool_before_the_stream_is_overloaded(settings: Settings) -> None:
+    from .test_failover_safety import pool_full
+
+    fake = FakeDriverClient(name="d1", model_id=MODEL)
+    fake.generate_error = pool_full()
+    with _client(_app_with(settings, fake)) as client:
+        r = client.post("/v1/messages", json=body())
+    assert r.status_code == 503
+    assert r.json()["error"]["type"] == "overloaded_error"
+    assert "not ready" not in r.json()["error"]["message"]
+
+
 # --------------------------------------------------------------------------- #
 # Auth -- both headers, and the status that is not the obvious one
 # --------------------------------------------------------------------------- #

@@ -146,6 +146,11 @@ _CONTEXT_WORDS = (
 )
 
 
+#: The error type of a refusal for want of room in a shared pool (CB3):
+#: load, which another attempt may get through, and never a full context.
+OVERLOADED = "server_overloaded"
+
+
 def is_context_overflow(message: str) -> bool:
     lowered = message.lower()
     return any(word in lowered for word in _CONTEXT_WORDS)
@@ -153,6 +158,10 @@ def is_context_overflow(message: str) -> bool:
 
 def error_code(status: int, message: str, error_type: str) -> str | None:
     """The OpenAI `code` for a refusal rendered before the stream opened."""
+    if error_type == OVERLOADED:
+        # llama-server's words for a full pool ("Context size has been
+        # exceeded") read as a full context; they are not one (CB3).
+        return None
     if is_context_overflow(message):
         return "context_length_exceeded"
     if status == 404 or error_type == "model_not_found":
@@ -172,7 +181,12 @@ def stream_error_code(status: int, message: str, error_type: str) -> str:
     sends the same request), a deadline that fired while the engine was
     still computing (the next attempt computes the same prompt for as
     long, R2.5's finding), a driver refusing the gateway's own credential.
+    A full pool is `server_error` before the words are read (CB3): its
+    message says "Context size has been exceeded", and the next attempt is
+    exactly what it needs.
     """
+    if error_type == OVERLOADED:
+        return "server_error"
     if is_context_overflow(message):
         return "context_length_exceeded"
     if status in (502, 503) and error_type != "upstream_auth_error":

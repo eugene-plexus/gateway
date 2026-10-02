@@ -1470,7 +1470,7 @@ class StreamTranslator:
         out.append(frame("message_stop", {"type": "message_stop"}))
         return out
 
-    def failed(self, message: str) -> list[str]:
+    def failed(self, message: str, *, kind: str = "api_error") -> list[str]:
         """A truncation, once the 200 is long gone.
 
         Past the first token the slot is committed and cannot fail over,
@@ -1482,7 +1482,7 @@ class StreamTranslator:
         out.append(
             frame(
                 "error",
-                {"type": "error", "error": {"type": "api_error", "message": message}},
+                {"type": "error", "error": {"type": kind, "message": message}},
             )
         )
         out.append(frame("message_stop", {"type": "message_stop"}))
