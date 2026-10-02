@@ -133,6 +133,7 @@ from .._generated.models import (
     ToolCallDelta,
     WebSearchAvailability,
 )
+from .._generated.models import Phase as StreamPhase
 from .._generated.models import Stage as StreamStage
 from ..config import ConfigStore
 from ..dependencies import require_authorized
@@ -4236,9 +4237,11 @@ async def _stream_completion(
             async for event in client.stream(generate):
                 if event.search is not None:
                     # Chat has no item for a search; a caller that asked for
-                    # progress is told one is running, and nobody else sees it.
+                    # progress is told when one starts and when it finishes,
+                    # which is where one turn's text ends and the next one's
+                    # begins (gateway#4). Nobody else sees it.
                     paragraph = paragraph or spoke
-                    if event.search.phase == "started" and generate.reportProgress:
+                    if generate.reportProgress:
                         yield frame(
                             ChatCompletionChunk(
                                 id=completion_id,
@@ -4248,7 +4251,13 @@ async def _stream_completion(
                                 choices=[],
                                 x_eugene_plexus=CompletionRoutingInfo(
                                     progress=StreamProgress(
-                                        stage=StreamStage.tool, tool="web_search"
+                                        stage=StreamStage.tool,
+                                        tool="web_search",
+                                        phase=(
+                                            StreamPhase.started
+                                            if event.search.phase == "started"
+                                            else StreamPhase.finished
+                                        ),
                                     )
                                 ),
                             )

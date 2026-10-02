@@ -291,16 +291,35 @@ def test_the_chat_stream_says_a_search_ran_only_to_a_caller_that_asked(settings,
             client, stream=True, stream_options={"include_progress": True, "include_usage": True}
         )
     frames = sse(response)
-    progress = [
-        f
-        for f in frames
-        if not f.get("choices") and (f.get("x_eugene_plexus") or {}).get("progress")
+
+    def progress_of(f: dict) -> dict | None:
+        if f.get("choices"):
+            return None
+        return (f.get("x_eugene_plexus") or {}).get("progress")
+
+    def text_of(f: dict) -> str:
+        return "".join((c["delta"].get("content") or "") for c in f.get("choices") or [])
+
+    progress = [p for f in frames if (p := progress_of(f))]
+    assert progress == [
+        {"stage": "tool", "tool": "web_search", "phase": "started"},
+        {"stage": "tool", "tool": "web_search", "phase": "finished"},
     ]
-    assert progress[0]["x_eugene_plexus"]["progress"] == {"stage": "tool", "tool": "web_search"}
-    text = "".join(
-        (c["delta"].get("content") or "") for f in frames for c in f.get("choices") or []
-    )
+    text = "".join(text_of(f) for f in frames)
     assert text.startswith("Let me look. \n\nIt is a control plane.")
+    # The marks fall between the turns (gateway#4): what came before the
+    # start was written before the search, and the answer after the finish.
+    started = next(
+        i for i, f in enumerate(frames) if (progress_of(f) or {}).get("phase") == "started"
+    )
+    finished = next(
+        i for i, f in enumerate(frames) if (progress_of(f) or {}).get("phase") == "finished"
+    )
+    before = "".join(text_of(f) for f in frames[:started])
+    after = "".join(text_of(f) for f in frames[finished:])
+    assert before == "Let me look. "
+    assert after.startswith("\n\nIt is a control plane.")
+    assert not "".join(text_of(f) for f in frames[started:finished]), "no text while it searched"
     assert not any(c["delta"].get("tool_calls") for f in frames for c in f.get("choices") or []), (
         "the search call never reaches the caller"
     )
@@ -316,6 +335,20 @@ def test_the_chat_stream_says_a_search_ran_only_to_a_caller_that_asked(settings,
     assert final[-1]["x_eugene_plexus"]["web_searches"] == 1
     usage = [f for f in frames if f.get("usage") and not f.get("choices")]
     assert usage[-1]["usage"]["prompt_tokens"] == 20, "both turns' tokens are counted"
+
+
+def test_a_chat_stream_without_progress_is_not_told_a_search_ran(settings, search) -> None:
+    model = ScriptedDriver(
+        turns=[Turn("Let me look.", calls=[search_call()]), Turn(ANSWER)],
+    )
+    with TestClient(app_with(settings, model, searches=[account(search)])) as client:
+        response = chat(client, stream=True, stream_options={"include_usage": True})
+    frames = sse(response)
+    assert not [f for f in frames if not f.get("choices") and "progress" in str(f)]
+    text = "".join(
+        (c["delta"].get("content") or "") for f in frames for c in f.get("choices") or []
+    )
+    assert text.startswith("Let me look. \n\nIt is a control plane.")
 
 
 def test_a_turn_with_a_search_and_a_function_is_asked_again(settings, search) -> None:
@@ -480,6 +513,7 @@ def test_a_failed_search_is_told_to_the_model_not_turned_into_a_failed_request(s
     assert response.status_code == 200, response.text
     told = model.calls[1].messages[-1].content
     assert "could not be run" in told and "search.formats" in told
+    assert "search.formats`. Answer without it" in told
     blocks = response.json()["content"]
     result = next(b for b in blocks if b["type"] == "web_search_tool_result")
     assert result["content"] == {
@@ -982,3 +1016,22 @@ def test_a_newer_anthropic_tool_date_is_accepted_and_its_unknown_settings_named(
     with TestClient(app_with(settings, model, searches=[account(search)])) as client:
         refused = client.post("/v1/messages", json=malformed)
     assert refused.status_code == 400 and "web_search_2099" in refused.json()["error"]["message"]
+
+
+def test_a_failed_search_ends_its_reason_with_one_full_stop(settings) -> None:
+    # Brave's refusal is a sentence with its own full stop; the model was told
+    # "...(HTTP 429).. Answer without it" until 2026-10-01 (gateway#4).
+    limited = FakeSearch(
+        error=ToolDriverError(
+            driver="brave",
+            status=429,
+            detail="Brave Search says this key is over its rate or monthly limit (HTTP 429).",
+            code="rate_limited",
+        )
+    )
+    model = ScriptedDriver(turns=[Turn(calls=[search_call()]), Turn("I could not search.")])
+    with TestClient(app_with(settings, model, searches=[account(limited)])) as client:
+        assert chat(client).status_code == 200
+    told = model.calls[1].messages[-1].content
+    assert "(HTTP 429). Answer without it, and say that the search failed." in told
+    assert ".." not in told

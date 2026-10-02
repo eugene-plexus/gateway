@@ -2022,6 +2022,29 @@ class Stage(StrEnum):
     tool = 'tool'
 
 
+class Phase(StrEnum):
+    """
+    On `tool`, whether the tool has just started or has just
+    finished. Absent means `started`: a gateway before alpha.6 sends
+    only the start, and an agent backend's own tools still do.
+
+    **The tools this install runs itself** (`web_search`, P8) send
+    both. On chat, which has no item for a search, they mark where
+    one turn of the model's text ends and the next begins. Text sent
+    before a `started` was written before that search ran; text
+    after the `finished` was written with its results. A model told
+    to search can write a whole answer first (llama-server does not
+    enforce a forced tool choice), so a caller that shows only the
+    last turn's text as the answer uses these marks to tell the
+    two apart. The text is still sent: a stream cannot be unsent,
+    and this layer does not hold output back to decide later.
+
+    """
+
+    started = 'started'
+    finished = 'finished'
+
+
 class StreamProgress(BaseModel):
     """
     What the backend is doing while it is not producing output, on a
@@ -2050,6 +2073,10 @@ class StreamProgress(BaseModel):
     )
     tool: str | None = Field(
         None, description="On `tool`, the tool's name as the backend gives it."
+    )
+    phase: Phase | None = Field(
+        None,
+        description="On `tool`, whether the tool has just started or has just\nfinished. Absent means `started`: a gateway before alpha.6 sends\nonly the start, and an agent backend's own tools still do.\n\n**The tools this install runs itself** (`web_search`, P8) send\nboth. On chat, which has no item for a search, they mark where\none turn of the model's text ends and the next begins. Text sent\nbefore a `started` was written before that search ran; text\nafter the `finished` was written with its results. A model told\nto search can write a whole answer first (llama-server does not\nenforce a forced tool choice), so a caller that shows only the\nlast turn's text as the answer uses these marks to tell the\ntwo apart. The text is still sent: a stream cannot be unsent,\nand this layer does not hold output back to decide later.\n",
     )
     prompt_tokens: int | None = Field(
         None, description='On `prompt`, tokens in the whole prompt.', ge=0

@@ -803,8 +803,10 @@ def result_text(execution: Execution, *, limit: int) -> str:
             "Answer with what you have already found."
         )
     if execution.outcome != "ok":
+        # The error is a sentence of its own, usually with its full stop.
+        reason = (execution.error or "no reason was given").rstrip().rstrip(".")
         return (
-            f'The web search for "{execution.query}" could not be run: {execution.error}. '
+            f'The web search for "{execution.query}" could not be run: {reason}. '
             "Answer without it, and say that the search failed."
         )
     if not execution.results and not execution.answer:
