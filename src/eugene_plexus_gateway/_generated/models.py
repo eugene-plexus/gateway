@@ -2873,93 +2873,27 @@ class Throughput(BaseModel):
     samples: int = Field(..., ge=1)
 
 
-class MetricsGroup(BaseModel):
+class MetricsPromptCache(BaseModel):
     """
-    One dimension tuple's numbers over the window, or over one hour
-    of it when `bucket=hour`. Under `groupBy=model` the backend
-    dimensions (`driver`, `runtime`, `node`, `backend`) are absent;
-    under `groupBy=total`, `model` is too.
+    Prompt tokens and the part of them served from an engine's
+    prompt cache, summed over `requests` (the ones that reported).
+    `cachedTokens / promptTokens` is the share reused.
 
     """
 
-    bucketStart: AwareDatetime | None = Field(
-        None, description='Present only when `bucket=hour`.'
-    )
-    model: str | None = Field(
-        None,
-        description='The model id the client **asked for**. After a cascade this\nis not what answered — `driver` and `runtime` say that —\nand grouping by the requested id is what makes "this model\nis slow" answerable at all.\n',
-    )
-    driver: str | None = None
-    runtime: str | None = Field(
-        None,
-        description='The engine runtime behind the driver, by name so replicas\nare distinguished. Null for hosted and CLI backends, which\nhave no runtime of ours.\n',
-    )
-    node: str | None = Field(
-        None, description="Which host's agent supervises it. Null before enrollment."
-    )
-    backend: BackendKind | None = None
     requests: int = Field(..., ge=0)
-    errors: int = Field(
-        ..., description='Requests that ended with no backend having served them.', ge=0
-    )
-    cascaded: int = Field(
-        ...,
-        description='Requests with `attempts > 1`. A cascade that silently\nalways works hides a broken primary, which is why this is\ncounted rather than only logged.\n',
-        ge=0,
-    )
-    swappedIn: int = Field(
-        ...,
-        description="Requests that had to wake a `startOnDemand` runtime. The\nmeasured cost of M6's idle unload, which shipped with no\nway to see what it costs.\n",
-        ge=0,
-    )
-    latencyMs: Percentiles
-    tokensPerSecond: Throughput | None = Field(
-        None,
-        description="Null when no request in this group reported token usage.\nWhole-attempt rate: the serving attempt's elapsed time\nincludes prefill, so this understates decode speed on long\nprompts. `decodeTokensPerSecond` beside it excludes prefill;\nthe two differing is the prefill cost made visible.\n",
-    )
-    ttftMs: Percentiles | None = Field(
-        None,
-        description="Time to first token: milliseconds from the start of the\nserving attempt to its first streamed event, over streamed\nrequests only. Null when nothing in the group streamed — a\nnon-streamed request has no first token to time, the\nresponse arrives whole. Measured gateway-side, so it\nincludes the gateway→driver hop and the driver's own\ndispatch: on a local engine it is dominated by prefill but\nis not a pure prefill measurement, and deriving a\nprompt-tokens-per-second from it would be confidently\nwrong. The benchmark is the instrument for real prefill\ncurves.\n",
-    )
-    decodeTokensPerSecond: Throughput | None = Field(
-        None,
-        description='Completion tokens over the serving attempt\'s time **after**\nits first streamed event — the decode rate an enthusiast\nmeans by "tokens per second", with prefill excluded. Only\ncomputed for streamed requests that reported usage and ran\npast a minimum window (2+ tokens and 250 ms after the first\nevent, the same guard the playground\'s badge uses), so its\n`samples` can be lower than `tokensPerSecond.samples`. Null\nwhen nothing in the group qualifies.\n',
-    )
-    waitedMs: Percentiles | None = Field(
-        None,
-        description='Wake latency, over the `swappedIn` requests only. Null when\nnone of them woke anything.\n',
-    )
-    routingMs: Percentiles | None = Field(
-        None,
-        description='How long deciding where to send the request took. Null for\ngroups recorded before this was measured.\n',
-    )
-    overheadMs: Percentiles | None = Field(
-        None,
-        description="The control plane's own cost: the serving attempt's\ngateway-side time minus the driver's measurement of its\nbackend call. Null when no request in the group had a\nbackend that reported its own latency.\n",
-    )
-    tierCounts: dict[str, int] | None = Field(
-        None,
-        description='Requests served, keyed by the 1-based tier that answered. A\nslot whose tier 2 answers everything has a primary that is\nnot working, and this is where that becomes visible.\n',
-    )
+    promptTokens: int = Field(..., ge=0)
+    cachedTokens: int = Field(..., ge=0)
 
 
-class MetricsSummary(BaseModel):
-    windowStart: AwareDatetime
-    windowEnd: AwareDatetime
-    gatewayStartedAt: AwareDatetime = Field(
-        ...,
-        description='When this gateway process started. Present so a history\nthat begins mid-window reads as partial rather than as an\ninstall that served nothing — the gateway is respawned on\noperator login, so a fresh start time is routine.\n',
-    )
-    rowsDropped: int = Field(
-        ...,
-        description='Measurements discarded since startup because the write\nqueue was full. Non-zero means these numbers are a sample\nrather than a census, and the endpoint says so instead of\nquietly under-reporting. Recording degrades before\ninference does.\n',
-        ge=0,
-    )
-    truncated: bool | None = Field(
-        None,
-        description='True when the window reaches past `metricsRetentionDays`,\nso raw rows for its early part no longer exist and the\nnumbers describe less than the window asked for. Hourly\nrollups do cover that period on disk; nothing serves them\nyet.\n',
-    )
-    groups: list[MetricsGroup]
+class MetricsAffinity(BaseModel):
+    """
+    Requests by what `conversation` balancing did with them.
+    """
+
+    hit: int = Field(..., ge=0)
+    new: int = Field(..., ge=0)
+    moved: int = Field(..., ge=0)
 
 
 class RetryDisposition1(StrEnum):
@@ -2986,6 +2920,11 @@ class MetricAttempt(BaseModel):
         description='Whether token usage is known for this attempt; false is not zero cost.',
     )
     promptTokens: int | None = Field(None, ge=0)
+    cachedTokens: int | None = Field(
+        None,
+        description='Of `promptTokens`, those the backend served from its prompt\ncache (PC5, schema v11). Absent when the backend did not say,\nnever guessed: llama.cpp, vLLM (with\n`--enable-prompt-tokens-details`), MLX and hosted OpenAI and\nAnthropic report it.\n',
+        ge=0,
+    )
     completionTokens: int | None = Field(None, ge=0)
     driver: str
     model: str | None = Field(
@@ -3915,6 +3854,103 @@ class SystemOneResponse(BaseModel):
     x_eugene_plexus: CompletionRoutingInfo | None = None
 
 
+class MetricsGroup(BaseModel):
+    """
+    One dimension tuple's numbers over the window, or over one hour
+    of it when `bucket=hour`. Under `groupBy=model` the backend
+    dimensions (`driver`, `runtime`, `node`, `backend`) are absent;
+    under `groupBy=total`, `model` is too.
+
+    """
+
+    bucketStart: AwareDatetime | None = Field(
+        None, description='Present only when `bucket=hour`.'
+    )
+    model: str | None = Field(
+        None,
+        description='The model id the client **asked for**. After a cascade this\nis not what answered — `driver` and `runtime` say that —\nand grouping by the requested id is what makes "this model\nis slow" answerable at all.\n',
+    )
+    driver: str | None = None
+    runtime: str | None = Field(
+        None,
+        description='The engine runtime behind the driver, by name so replicas\nare distinguished. Null for hosted and CLI backends, which\nhave no runtime of ours.\n',
+    )
+    node: str | None = Field(
+        None, description="Which host's agent supervises it. Null before enrollment."
+    )
+    backend: BackendKind | None = None
+    requests: int = Field(..., ge=0)
+    errors: int = Field(
+        ..., description='Requests that ended with no backend having served them.', ge=0
+    )
+    cascaded: int = Field(
+        ...,
+        description='Requests with `attempts > 1`. A cascade that silently\nalways works hides a broken primary, which is why this is\ncounted rather than only logged.\n',
+        ge=0,
+    )
+    swappedIn: int = Field(
+        ...,
+        description="Requests that had to wake a `startOnDemand` runtime. The\nmeasured cost of M6's idle unload, which shipped with no\nway to see what it costs.\n",
+        ge=0,
+    )
+    latencyMs: Percentiles
+    tokensPerSecond: Throughput | None = Field(
+        None,
+        description="Null when no request in this group reported token usage.\nWhole-attempt rate: the serving attempt's elapsed time\nincludes prefill, so this understates decode speed on long\nprompts. `decodeTokensPerSecond` beside it excludes prefill;\nthe two differing is the prefill cost made visible.\n",
+    )
+    ttftMs: Percentiles | None = Field(
+        None,
+        description="Time to first token: milliseconds from the start of the\nserving attempt to its first streamed event, over streamed\nrequests only. Null when nothing in the group streamed — a\nnon-streamed request has no first token to time, the\nresponse arrives whole. Measured gateway-side, so it\nincludes the gateway→driver hop and the driver's own\ndispatch: on a local engine it is dominated by prefill but\nis not a pure prefill measurement, and deriving a\nprompt-tokens-per-second from it would be confidently\nwrong. The benchmark is the instrument for real prefill\ncurves.\n",
+    )
+    decodeTokensPerSecond: Throughput | None = Field(
+        None,
+        description='Completion tokens over the serving attempt\'s time **after**\nits first streamed event — the decode rate an enthusiast\nmeans by "tokens per second", with prefill excluded. Only\ncomputed for streamed requests that reported usage and ran\npast a minimum window (2+ tokens and 250 ms after the first\nevent, the same guard the playground\'s badge uses), so its\n`samples` can be lower than `tokensPerSecond.samples`. Null\nwhen nothing in the group qualifies.\n',
+    )
+    waitedMs: Percentiles | None = Field(
+        None,
+        description='Wake latency, over the `swappedIn` requests only. Null when\nnone of them woke anything.\n',
+    )
+    routingMs: Percentiles | None = Field(
+        None,
+        description='How long deciding where to send the request took. Null for\ngroups recorded before this was measured.\n',
+    )
+    overheadMs: Percentiles | None = Field(
+        None,
+        description="The control plane's own cost: the serving attempt's\ngateway-side time minus the driver's measurement of its\nbackend call. Null when no request in the group had a\nbackend that reported its own latency.\n",
+    )
+    promptCache: MetricsPromptCache | None = Field(
+        None,
+        description='How much of the prompt the engines did not have to read\nagain (PC5), over the requests whose backend reported a\ncached count. Null when none did.\n',
+    )
+    affinity: MetricsAffinity | None = Field(
+        None,
+        description='What `conversation` balancing did (PC4). Null when it never\nhad a choice to make in this group.\n',
+    )
+    tierCounts: dict[str, int] | None = Field(
+        None,
+        description='Requests served, keyed by the 1-based tier that answered. A\nslot whose tier 2 answers everything has a primary that is\nnot working, and this is where that becomes visible.\n',
+    )
+
+
+class MetricsSummary(BaseModel):
+    windowStart: AwareDatetime
+    windowEnd: AwareDatetime
+    gatewayStartedAt: AwareDatetime = Field(
+        ...,
+        description='When this gateway process started. Present so a history\nthat begins mid-window reads as partial rather than as an\ninstall that served nothing — the gateway is respawned on\noperator login, so a fresh start time is routine.\n',
+    )
+    rowsDropped: int = Field(
+        ...,
+        description='Measurements discarded since startup because the write\nqueue was full. Non-zero means these numbers are a sample\nrather than a census, and the endpoint says so instead of\nquietly under-reporting. Recording degrades before\ninference does.\n',
+        ge=0,
+    )
+    truncated: bool | None = Field(
+        None,
+        description='True when the window reaches past `metricsRetentionDays`,\nso raw rows for its early part no longer exist and the\nnumbers describe less than the window asked for. Hourly\nrollups do cover that period on disk; nothing serves them\nyet.\n',
+    )
+    groups: list[MetricsGroup]
+
+
 class MetricRequest(BaseModel):
     requestId: str | None = Field(
         None,
@@ -3970,6 +4006,14 @@ class MetricRequest(BaseModel):
     )
     promptTokens: int | None = None
     completionTokens: int | None = None
+    cachedTokens: int | None = Field(
+        None,
+        description='Of `promptTokens`, those the serving backend took from its\nprompt cache (PC5, schema v11). Null when it did not say.\n',
+    )
+    affinity: str | None = Field(
+        None,
+        description='What `conversation` balancing did with this request (PC4):\n`hit`, sent back to the replica its conversation used before;\n`new`, a conversation not seen before; `moved`, its replica\nwas full or gone and it went elsewhere. Null when there was\nno choice to make or another strategy was in effect.\n',
+    )
     door: str | None = Field(
         None,
         description="Which door the request came in by (P3b): `speech`,\n`transcription`, `translation` (P3-4), `images` (P4, schema v8),\n`videos` (P5, schema v9, the submit's row), `moderation` (P6)\nor `completion` (P6, a row that carries tokens as chat's does).\nNull on rows from before schema v7 and on every other door,\nwhose rows carry tokens.\n",

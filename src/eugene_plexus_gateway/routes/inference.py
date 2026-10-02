@@ -295,6 +295,8 @@ def _record(
                 images=images,
                 video_seconds=video_seconds,
                 tool_executions=_tool_rows(searched),
+                cached_tokens=getattr(usage, "cachedPromptTokens", None),
+                affinity=getattr(getattr(client, "_inner", client), "affinity", None),
             )
         )
         if (context := admission.current.get()) is not None:

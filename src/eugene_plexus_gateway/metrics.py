@@ -50,7 +50,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # Bounded because the alternative to dropping rows is stalling
 # completions, and that trade is never worth making. Sized so a burst
@@ -116,6 +116,9 @@ class AttemptRow:
     usage_known: bool = False
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    # v11 (PC5): of `prompt_tokens`, those its engine took from its prompt
+    # cache. None when the backend did not say -- never guessed.
+    cached_tokens: int | None = None
     # Time to this attempt's first streamed event — TTFT, gateway-side.
     # None for non-streamed attempts, which have no first token to time.
     first_ms: int | None = None
@@ -196,6 +199,10 @@ class RequestRow:
     video_seconds: int | None = None
     # v10 (P8): each search the install ran for this request, in order.
     tool_executions: list[ToolExecutionRow] = field(default_factory=list)
+    # v11 (PC5): the serving backend's cached prompt tokens, and what
+    # `conversation` balancing did (PC4): hit, new or moved.
+    cached_tokens: int | None = None
+    affinity: str | None = None
 
 
 _DDL = """
@@ -229,7 +236,9 @@ CREATE TABLE IF NOT EXISTS request (
     characters        INTEGER,
     audio_seconds     REAL,
     images            INTEGER,
-    video_seconds     INTEGER
+    video_seconds     INTEGER,
+    cached_tokens     INTEGER,
+    affinity          TEXT
 );
 
 CREATE INDEX IF NOT EXISTS request_started_at ON request (started_at);
@@ -251,7 +260,8 @@ CREATE TABLE IF NOT EXISTS attempt (
     usage_known INTEGER NOT NULL DEFAULT 0,
     prompt_tokens INTEGER,
     completion_tokens INTEGER,
-    first_ms   INTEGER
+    first_ms   INTEGER,
+    cached_tokens INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS attempt_request ON attempt (request_id);
@@ -397,8 +407,8 @@ class MetricsStore:
 
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
         # v10 added a table and no column: the DDL above created it, so a
-        # v9 file needs only its version moved on.
-        if row is not None and int(row[0]) in (2, 3, 4, 5, 6, 7, 8, 9):
+        # v9 file needs only its version moved on. v11 (PC5) adds columns.
+        if row is not None and int(row[0]) in (2, 3, 4, 5, 6, 7, 8, 9, 10):
             columns = {r[1] for r in conn.execute("PRAGMA table_info(request)")}
             for column in ("client_key_id", "client_key_name"):
                 if column not in columns:
@@ -415,6 +425,9 @@ class MetricsStore:
                     "images": "INTEGER",
                     # v9: the seconds of video asked for (P5).
                     "video_seconds": "INTEGER",
+                    # v11: the prompt cache and the affinity outcome (PC5).
+                    "cached_tokens": "INTEGER",
+                    "affinity": "TEXT",
                 },
                 "attempt": {
                     "retry_disposition": "TEXT",
@@ -427,6 +440,8 @@ class MetricsStore:
                     "first_ms": "INTEGER",
                     # v6: the model an attempt asked for (P1).
                     "model": "TEXT",
+                    # v11: its cached prompt tokens (PC5).
+                    "cached_tokens": "INTEGER",
                 },
             }.items():
                 existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -576,9 +591,10 @@ class MetricsStore:
                     " tier, total_ms, waited_ms, swapped_in, streamed, prompt_tokens,"
                     " completion_tokens, outcome, routing_ms, refreshed, strategy,"
                     " client_key_id, client_key_name, correlation_id, elapsed_ms,"
-                    " door, characters, audio_seconds, images, video_seconds)"
+                    " door, characters, audio_seconds, images, video_seconds,"
+                    " cached_tokens, affinity)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-                    " ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         _iso(row.started_at),
                         row.requested_model,
@@ -604,14 +620,16 @@ class MetricsStore:
                         row.audio_seconds,
                         row.images,
                         row.video_seconds,
+                        row.cached_tokens,
+                        row.affinity,
                     ),
                 )
                 request_id = cursor.lastrowid
                 conn.executemany(
                     "INSERT INTO attempt (request_id, seq, driver, model, runtime, node,"
                     " backend, elapsed_ms, served, error, backend_ms, retry_disposition,"
-                    " usage_known, prompt_tokens, completion_tokens, first_ms)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " usage_known, prompt_tokens, completion_tokens, first_ms, cached_tokens)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [
                         (
                             request_id,
@@ -630,6 +648,7 @@ class MetricsStore:
                             a.prompt_tokens,
                             a.completion_tokens,
                             a.first_ms,
+                            a.cached_tokens,
                         )
                         for seq, a in enumerate(row.tries)
                     ],
@@ -810,7 +829,8 @@ class MetricsStore:
                    r.total_ms, r.waited_ms, r.swapped_in, r.completion_tokens,
                    served.driver, served.runtime, served.node, served.backend,
                    served.elapsed_ms, r.routing_ms, served.backend_ms,
-                   served.first_ms, served.served
+                   served.first_ms, served.served, r.prompt_tokens, r.cached_tokens,
+                   r.affinity
             FROM request r
             -- The attempt a request is ATTRIBUTED to: the one that served
             -- it, or, when none did, the last one tried.
@@ -858,6 +878,9 @@ class MetricsStore:
             s_backend_ms,
             s_first_ms,
             s_served,
+            prompt_tokens,
+            cached_tokens,
+            affinity,
         ) in rows:
             bucket_start = started_at[:13] + ":00:00Z" if bucket == "hour" else None
             key: tuple[Any, ...]
@@ -891,6 +914,8 @@ class MetricsStore:
                     "_decode": [],
                     "_routing": [],
                     "_overhead": [],
+                    "_cache": [0, 0, 0],
+                    "_affinity": {"hit": 0, "new": 0, "moved": 0},
                     "tierCounts": {},
                 }
             g["requests"] += 1
@@ -933,6 +958,15 @@ class MetricsStore:
             # artefact, not a discovery.
             if s_elapsed is not None and s_backend_ms is not None:
                 g["_overhead"].append(max(0, int(s_elapsed) - int(s_backend_ms)))
+            # PC5: only requests whose backend said how much it reused count
+            # toward the share, so a backend that reports nothing cannot
+            # read as one that reused nothing.
+            if cached_tokens is not None and prompt_tokens:
+                g["_cache"][0] += 1
+                g["_cache"][1] += int(prompt_tokens)
+                g["_cache"][2] += int(cached_tokens)
+            if affinity in g["_affinity"]:
+                g["_affinity"][affinity] += 1
 
         out: list[dict[str, Any]] = []
         for g in groups.values():
@@ -943,6 +977,14 @@ class MetricsStore:
             decode = sorted(g.pop("_decode"))
             routing = sorted(g.pop("_routing"))
             overhead = sorted(g.pop("_overhead"))
+            cache = g.pop("_cache")
+            g["promptCache"] = (
+                {"requests": cache[0], "promptTokens": cache[1], "cachedTokens": cache[2]}
+                if cache[0]
+                else None
+            )
+            placed = g.pop("_affinity")
+            g["affinity"] = placed if any(placed.values()) else None
             g["routingMs"] = _spread(routing)
             g["overheadMs"] = _spread(overhead)
             g["latencyMs"] = {
@@ -1074,7 +1116,8 @@ class MetricsStore:
                        total_ms, waited_ms, swapped_in, streamed, prompt_tokens,
                        completion_tokens, outcome, routing_ms, refreshed, strategy,
                        client_key_id, client_key_name, correlation_id, elapsed_ms,
-                       door, characters, audio_seconds, images, video_seconds
+                       door, characters, audio_seconds, images, video_seconds,
+                       cached_tokens, affinity
                 FROM request r {clause}
                 ORDER BY id DESC LIMIT ?
                 """,
@@ -1108,11 +1151,12 @@ class MetricsStore:
                 completion_tokens,
                 first_ms,
                 model,
+                cached_tokens,
             ) in conn.execute(
                 f"""
                 SELECT request_id, driver, runtime, node, backend, elapsed_ms, served,
                        error, backend_ms, retry_disposition, usage_known,
-                       prompt_tokens, completion_tokens, first_ms, model
+                       prompt_tokens, completion_tokens, first_ms, model, cached_tokens
                 FROM attempt WHERE request_id IN ({placeholders}) ORDER BY request_id, seq
                 """,
                 ids,
@@ -1133,6 +1177,7 @@ class MetricsStore:
                         "promptTokens": prompt_tokens,
                         "completionTokens": completion_tokens,
                         "firstMs": first_ms,
+                        **({"cachedTokens": cached_tokens} if cached_tokens is not None else {}),
                     }
                 )
 
@@ -1223,6 +1268,8 @@ class MetricsStore:
                 "audioSeconds": r[22],
                 "images": r[23],
                 "videoSeconds": r[24],
+                "cachedTokens": r[25],
+                "affinity": r[26],
                 "tries": tries[r[0]],
                 "candidates": considered[r[0]],
                 **_tool_lists(searched[r[0]]),

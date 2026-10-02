@@ -1630,6 +1630,7 @@ class RoutingTable:
                 completion_tokens=getattr(usage, "completionTokens", 0)
                 if usage is not None
                 else None,
+                cached_tokens=getattr(usage, "cachedPromptTokens", None),
                 first_ms=first_ms,
             )
         )
