@@ -24,6 +24,7 @@ import base64
 import binascii
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import Mapping
@@ -406,22 +407,45 @@ def _field(block: Any, name: str) -> Any:
     return getattr(block, name, None)
 
 
+_BILLING_HEADER = re.compile(r"\Ax-anthropic-billing-header:[^\n]*(?:\n|\Z)")
+
+
+def _without_billing_header(text: str) -> str:
+    """The text with Claude Code's billing header line taken off its front.
+
+    **The line is Anthropic's billing telemetry, and it is the first thing
+    in the prompt, so it decides what any backend can reuse from its
+    cache.** Measured 2026-10-02 against Claude Code 2.1.283: its
+    `cc_version=…<3 hex>` suffix changes with the session's first prompt,
+    so a new session differs from every earlier one at character 47 of a
+    ~75,000-character system prompt and tool list, and the engine reads
+    all of it again (18,669 tokens, 36 s on the measuring box, where the
+    same prompt with the header equal read 1 token). Other builds add
+    `cch=`, `cc_prev_req=` and `cc_turn_index=`, which change on every
+    request, so a session missed on every turn (llama.cpp's own Anthropic
+    endpoint neutralises `cch` for the same reason, ggml-org/llama.cpp
+    #21793). It tells a model nothing, so no backend is sent it.
+    """
+    return _BILLING_HEADER.sub("", text, count=1)
+
+
 def _system_text(system: Any) -> str | None:
-    """Every system block concatenated, in order.
+    """Every system block concatenated, in order, without the billing header.
 
     **`system[0]` is not the prompt on the commonest client.** Claude
     Code puts a billing header there as prose
     (`x-anthropic-billing-header: …`), so code that reads `system[0]` as
     the instruction is wrong about the request it will see most often.
     All blocks are joined and the model sorts it out, exactly as it
-    would upstream.
+    would upstream -- except the header line, which is taken off
+    (`_without_billing_header`) because it defeats every prompt cache.
     """
     if system is None:
         return None
     if isinstance(system, str):
-        return system or None
-    parts = [b.text for b in system if getattr(b, "text", None)]
-    return "\n\n".join(parts) or None
+        return _without_billing_header(system) or None
+    parts = [_without_billing_header(b.text) for b in system if getattr(b, "text", None)]
+    return "\n\n".join(p for p in parts if p) or None
 
 
 def _tool_result_text(block: Any) -> str:

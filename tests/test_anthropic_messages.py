@@ -416,9 +416,15 @@ def test_a_tool_request_against_a_toolless_backend_is_refused(settings: Settings
 
 
 def test_system_blocks_are_concatenated_in_order(settings: Settings) -> None:
-    """Including the billing header, which is `system[0]` on every real
-    request and is not a prompt at all. Any code that treats `system[0]`
-    as the instruction is wrong about the commonest client."""
+    """Every block but the billing header, which is `system[0]` on every
+    real request and is not a prompt at all. Any code that treats
+    `system[0]` as the instruction is wrong about the commonest client.
+
+    **Amended 2026-10-02: this test asserted the header was carried, which
+    is how a defect came to be locked in as intended.** The header leads
+    the prompt and its suffix changes per session (per request on some
+    builds), so carrying it made every new Claude Code session read its
+    whole ~18,700-token system prompt again on every engine."""
     fake = FakeDriverClient(name="d1", model_id=MODEL)
     fake.responses = ["ok"]
     with _client(_app_with(settings, fake)) as client:
@@ -426,9 +432,81 @@ def test_system_blocks_are_concatenated_in_order(settings: Settings) -> None:
     sent = fake.calls[0]
     system = [m for m in sent.messages if m.role.value == "system"]
     assert len(system) == 1
-    assert "x-anthropic-billing-header" in system[0].content
-    assert "You are a Claude agent." in system[0].content
-    assert system[0].content.index("x-anthropic-billing") < system[0].content.index("You are")
+    assert "x-anthropic-billing-header" not in system[0].content
+    assert system[0].content.startswith("You are a Claude agent.")
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        "x-anthropic-billing-header: cc_version=2.1.283.485; cc_entrypoint=sdk-cli;",
+        "x-anthropic-billing-header: cc_version=2.1.283.b98; cc_entrypoint=cli;",
+        "x-anthropic-billing-header: cc_version=2.1.117.48f; cc_entrypoint=cli; cch=71fea;",
+        "x-anthropic-billing-header: cc_version=2.1.300.1a2; cch=75ba0; cc_prev_req=req_01x; "
+        "cc_prompt_id=p1; cc_turn_index=4;",
+    ],
+)
+def test_two_sessions_send_the_backend_the_same_prompt(settings: Settings, header: str) -> None:
+    """**The property the cache needs, asserted directly:** two requests
+    whose only difference is the billing header reach the backend with the
+    same system text. Each header is one a real build sends (captured here,
+    or quoted by ggml-org/llama.cpp #21793 and claude-code-router #1372)."""
+    fake = FakeDriverClient(name="d1", model_id=MODEL)
+    fake.responses = ["ok", "ok"]
+    first = body()
+    second = body()
+    second["system"] = [{"type": "text", "text": header}, *second["system"][1:]]
+    with _client(_app_with(settings, fake)) as client:
+        client.post("/v1/messages", json=first)
+        client.post("/v1/messages", json=second)
+    a, b = (
+        next(m.content for m in call.messages if m.role.value == "system") for call in fake.calls
+    )
+    assert a == b
+
+
+def test_a_header_with_prompt_text_after_it_keeps_the_text(settings: Settings) -> None:
+    """Only the header line goes: a block that carries prompt text after
+    it (llama.cpp #21793 saw "a meaningful string sometimes included at
+    the end") keeps that text."""
+    fake = FakeDriverClient(name="d1", model_id=MODEL)
+    fake.responses = ["ok"]
+    request = body()
+    request["system"] = [
+        {
+            "type": "text",
+            "text": "x-anthropic-billing-header: cc_version=1; cch=abcde;\nKeep this line.",
+        },
+    ]
+    with _client(_app_with(settings, fake)) as client:
+        client.post("/v1/messages", json=request)
+    system = next(m.content for m in fake.calls[0].messages if m.role.value == "system")
+    assert system == "Keep this line."
+
+
+def test_a_string_system_prompt_loses_the_header_too(settings: Settings) -> None:
+    """`system` may be one string rather than blocks; the rule is the same."""
+    fake = FakeDriverClient(name="d1", model_id=MODEL)
+    fake.responses = ["ok"]
+    request = body()
+    request["system"] = "x-anthropic-billing-header: cc_version=1; cch=abcde;\nYou are terse."
+    with _client(_app_with(settings, fake)) as client:
+        client.post("/v1/messages", json=request)
+    system = next(m.content for m in fake.calls[0].messages if m.role.value == "system")
+    assert system == "You are terse."
+
+
+def test_the_header_is_taken_off_only_where_it_leads(settings: Settings) -> None:
+    """The same words quoted inside a prompt are the prompt's own text."""
+    fake = FakeDriverClient(name="d1", model_id=MODEL)
+    fake.responses = ["ok"]
+    request = body()
+    quoted = "Explain this line: x-anthropic-billing-header: cc_version=1;"
+    request["system"] = [{"type": "text", "text": quoted}]
+    with _client(_app_with(settings, fake)) as client:
+        client.post("/v1/messages", json=request)
+    system = next(m.content for m in fake.calls[0].messages if m.role.value == "system")
+    assert system == quoted
 
 
 def test_a_plain_string_system_prompt_also_works(settings: Settings) -> None:
@@ -952,7 +1030,7 @@ def test_a_system_role_inside_messages_is_carried_in_place(settings: Settings) -
     # its position after the user turn rather than being merged into it.
     assert roles == ["system", "user", "system"]
     assert sent[2][1] == "<env>cwd: /work</env>"
-    assert "x-anthropic-billing-header" in sent[0][1]
+    assert sent[0][1].startswith("You are a Claude agent.")
 
 
 def test_text_then_a_tool_call_closes_the_text_block_first(settings: Settings) -> None:

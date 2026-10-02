@@ -4320,7 +4320,7 @@ class AnthropicMessagesRequest(BaseModel):
     )
     system: str | list[AnthropicSystemBlock] | None = Field(
         None,
-        description='A system prompt: a plain string, or a list of blocks.\n\nClaude Code sends three blocks, and the **first is not a\nprompt at all** — it is a billing header smuggled as prose\n(`x-anthropic-billing-header: …`). Any code that assumes\n`system[0]` is the instruction is wrong about the commonest\nclient. All blocks are concatenated in order into one\n`system` message.\n',
+        description="A system prompt: a plain string, or a list of blocks.\n\nClaude Code sends three blocks, and the **first is not a\nprompt at all** — it is a billing header smuggled as prose\n(`x-anthropic-billing-header: …`). Any code that assumes\n`system[0]` is the instruction is wrong about the commonest\nclient. All blocks are concatenated in order into one\n`system` message, **without that header line**: a leading\n`x-anthropic-billing-header:` line is taken off every block\nbefore any backend sees the prompt. It tells a model nothing,\nand it leads the prompt with a value that changes per session\n(on some client builds, per request), so carrying it made\nevery new session re-read its whole system prompt and tool\nlist from the engine's first token (measured 2026-10-02:\n~18,700 tokens, `docs/acceptance/prompt-cache-measurement.md`).\nText after the line in the same block is kept.\n",
     )
     stream: bool | None = Field(
         False,
