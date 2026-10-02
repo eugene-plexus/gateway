@@ -60,7 +60,7 @@ CATEGORY_LABELS: dict[str, str] = {
 
 #: Where a NEW conversation goes (CB1). Every value keeps a conversation on
 #: its replica too, unless `conversationAffinity` is off.
-LOAD_BALANCING_VALUES = ["least_busy", "round_robin"]
+LOAD_BALANCING_VALUES = ["spread", "least_busy", "round_robin"]
 #: PC4's value, from before affinity was its own setting: read as the
 #: default placement with affinity, which is what it did.
 LEGACY_CONVERSATION = "conversation"
@@ -285,6 +285,14 @@ FIELDS: list[ConfigField] = [
             "Where a NEW conversation goes among the replicas serving one model. "
             "A conversation already under way goes back to the replica that served "
             "it whatever this says (see Keep each conversation on its replica). "
+            "`spread` (the default) sends it to the replica holding the fewest "
+            "conversations per slot, counting every conversation it served in the "
+            "last 30 minutes whether or not a request is in flight, ties to the "
+            "fewest in flight, then in turn. Measured with 32 agent sessions on "
+            "eight replicas: 80.2% of prompt tokens reused against 60.4% by least "
+            "busy, and the median first token in 1.05 s against 4.00 s, because a "
+            "replica whose agents are all thinking between turns looks empty to a "
+            "count of requests in flight. "
             "`least_busy` sends it to the driver with the fewest requests in flight "
             "per slot of capacity, breaking ties round-robin. `round_robin` "
             "alternates strictly, which is worth having when comparing two replicas "
@@ -295,9 +303,10 @@ FIELDS: list[ConfigField] = [
         ),
         category="lifecycle",
         valueType=ConfigValueType.enum,
-        default="least_busy",
+        default="spread",
         enumValues=LOAD_BALANCING_VALUES,
         enumLabels=[
+            "The replica holding the fewest conversations",
             "The least busy replica (ties round-robin)",
             "Each replica in turn",
         ],

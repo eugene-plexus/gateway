@@ -110,5 +110,22 @@ class AffinityTable:
             while len(self._entries) > self._size:
                 self._entries.popitem(last=False)
 
+    def held(self, target: str, *, besides: str | None = None) -> dict[Any, int]:
+        """Backend -> how many live conversations of `target` it holds (CB2).
+
+        Every key seen inside its TTL counts, whether or not a request is in
+        flight for it: a replica whose agents are all thinking between turns
+        holds their prompts all the same. `besides` is left out, so a
+        conversation is not counted against the replica it is being placed on.
+        """
+        now = time.perf_counter()
+        counts: dict[Any, int] = {}
+        with self._lock:
+            for (entry_target, key), (backend, seen) in self._entries.items():
+                if entry_target != target or key == besides or now - seen > self._ttl:
+                    continue
+                counts[backend] = counts.get(backend, 0) + 1
+        return counts
+
     def __len__(self) -> int:
         return len(self._entries)

@@ -453,8 +453,8 @@ def test_the_routing_phase_is_measured_separately_from_the_backend(
     assert record["refreshed"] is False
     # Present and not conflated with the wake, which is its own field.
     assert record["routingMs"] >= 0
-    # Where a new conversation went: the default placement since CB1, when
-    # affinity became its own setting.
+    # Where a new conversation went: the placement this table runs (the
+    # fixture's), recorded since CB1 rather than the stored word.
     assert record["strategy"] == "least_busy"
 
 

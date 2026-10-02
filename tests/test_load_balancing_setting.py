@@ -43,6 +43,13 @@ def test_conversation_is_no_longer_a_placement():
     assert "conversation" not in _field("loadBalancing").enumValues
 
 
+def test_spread_is_the_default_placement():
+    """CB2: measured +20 points of prompt reuse on eight replicas, noise on
+    three, and nothing measurable lost anywhere."""
+    field = _field("loadBalancing")
+    assert field.default == "spread" and field.enumValues[0] == "spread"
+
+
 def test_a_file_saying_conversation_reads_as_the_default(tmp_path: Path) -> None:
     path = tmp_path / "gateway.yaml"
     path.write_text(yaml.safe_dump({"loadBalancing": "conversation"}))

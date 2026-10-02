@@ -3992,7 +3992,7 @@ class MetricRequest(BaseModel):
     )
     strategy: str | None = Field(
         None,
-        description="Where a new conversation went when this request was routed:\nthe `loadBalancing` value in effect, or its default when it is\nunset. Recorded per request because the config can change\nbetween them, and `least_busy` and `round_robin` explain\ndifferent orderings. Rows from before CB1 (2026-10-02) may say\n`conversation`, PC4's value, which placed new conversations by\nleast busy and kept the rest on their replicas. Whether this\nrequest went back to its replica is `affinity`.\n",
+        description="Where a new conversation went when this request was routed:\nthe `loadBalancing` value in effect, or its default when it is\nunset. Recorded per request because the config can change\nbetween them, and `spread`, `least_busy` and `round_robin`\nexplain different orderings. Rows from before CB1 (2026-10-02) may say\n`conversation`, PC4's value, which placed new conversations by\nleast busy and kept the rest on their replicas. Whether this\nrequest went back to its replica is `affinity`.\n",
     )
     candidates: list[MetricCandidate] | None = Field(
         None,

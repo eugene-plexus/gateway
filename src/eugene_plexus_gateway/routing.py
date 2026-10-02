@@ -142,11 +142,14 @@ READY = "ready"
 STOPPED = "stopped"
 LEAST_BUSY = "least_busy"
 ROUND_ROBIN = "round_robin"
+#: CB2: a new conversation goes to the replica holding the fewest
+#: conversations per slot, by the affinity table.
+SPREAD = "spread"
 #: PC4's `loadBalancing` value, from before affinity was its own setting
 #: (CB1): read as the default placement, with affinity, which is what it did.
 CONVERSATION = "conversation"
 #: Where a new conversation goes when `loadBalancing` is unset (CB1).
-DEFAULT_PLACEMENT = LEAST_BUSY
+DEFAULT_PLACEMENT = SPREAD
 
 # Statuses that mean "this runtime is on its way to `ready`, wait rather
 # than despair". Deliberately a set of strings and not a generated enum:
@@ -1899,8 +1902,19 @@ class RoutingTable:
         cursor = self._cursor.get(target, 0)
         self._cursor[target] = cursor + 1
         rotated = backends[cursor % len(backends) :] + backends[: cursor % len(backends)]
-        if self.placement() == ROUND_ROBIN:
+        placement = self.placement()
+        if placement == ROUND_ROBIN:
             ordered = rotated
+        elif placement == SPREAD:
+            # Stable on the rotation, so the last tie goes in turn.
+            held = self._affinity.held(target, besides=affinity)
+            ordered = sorted(
+                rotated,
+                key=lambda b: (
+                    held.get(b.key, 0) / b.parallel_slots,
+                    self.inflight(b.key) / b.parallel_slots,
+                ),
+            )
         else:
             ordered = sorted(rotated, key=lambda b: self.inflight(b.key) / b.parallel_slots)
         if affinity is None:
@@ -1924,7 +1938,7 @@ class RoutingTable:
         `conversation` and unset read as the default (CB1). What every
         request records as its strategy, so the record says what ran."""
         value = self._strategy()
-        if value in (LEAST_BUSY, ROUND_ROBIN):
+        if value in (SPREAD, LEAST_BUSY, ROUND_ROBIN):
             return str(value)
         return DEFAULT_PLACEMENT
 
@@ -2678,6 +2692,7 @@ __all__ = [
     "LEAST_BUSY",
     "READY",
     "ROUND_ROBIN",
+    "SPREAD",
     "STOPPED",
     "BackendKind",
     "Resolution",

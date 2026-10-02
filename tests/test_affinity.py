@@ -129,8 +129,92 @@ def test_the_old_conversation_value_is_the_default_placement() -> None:
     """What every request records: the placement that ran, never a value
     that no longer means anything."""
     for strategy in ("conversation", None, "something-else"):
-        assert _table(strategy).placement() == "least_busy"  # type: ignore[arg-type]
+        assert _table(strategy).placement() == "spread"  # type: ignore[arg-type]
     assert _table("round_robin").placement() == "round_robin"
+    assert _table("least_busy").placement() == "least_busy"
+
+
+# --- spread (CB2) ------------------------------------------------------------------
+
+
+def _three(strategy: str = "spread", slots: tuple[int, int, int] = (4, 4, 4)):  # type: ignore[no-untyped-def]
+    fakes = [
+        FakeDriverClient(
+            name=f"qwen3-{x}-driver", base_url=f"http://{x}", model_id=LOCAL, runtime=f"qwen3-{x}"
+        )
+        for x in "abc"
+    ]
+    runtimes = [
+        runtime_facts(f"qwen3-{x}", parallel_slots=n) for x, n in zip("abc", slots, strict=True)
+    ]
+    return make_routing_table(*fakes, runtimes=runtimes, strategy=strategy)
+
+
+def test_spread_places_a_new_conversation_where_fewest_are_held():
+    """**The measured case**: least busy counts requests in flight, and a
+    replica whose agents are all thinking between turns looks empty, so new
+    conversations pile onto it. Spread counts what each replica holds."""
+    table = _three()
+    for key, home in (("k:1", "a"), ("k:2", "a"), ("k:3", "b")):
+        table._affinity.put(LOCAL, key, (None, f"qwen3-{home}-driver"))
+    # Nothing in flight anywhere: least busy would see three empty replicas.
+    assert _first(table, "k:new") == "qwen3-c-driver"
+
+
+def test_least_busy_does_not_see_what_is_held():
+    """The pair that says spread, not something else, does it."""
+    table = _three("least_busy")
+    for key in ("k:1", "k:2"):
+        table._affinity.put(LOCAL, key, (None, "qwen3-a-driver"))
+    assert _first(table, "k:new") == "qwen3-a-driver"
+
+
+def test_spread_counts_per_slot():
+    table = _three(slots=(8, 2, 2))
+    for key, home in (("k:1", "a"), ("k:2", "a"), ("k:3", "b"), ("k:4", "c")):
+        table._affinity.put(LOCAL, key, (None, f"qwen3-{home}-driver"))
+    # a holds 2 of 8 slots; b and c 1 of 2 each.
+    assert _first(table, "k:new") == "qwen3-a-driver"
+
+
+def test_spread_breaks_a_tie_by_requests_in_flight():
+    table = _three()
+    table.on_attempt_start("qwen3-a-driver")
+    table.on_attempt_start("qwen3-b-driver")
+    assert _first(table, "k:new") == "qwen3-c-driver"
+
+
+def test_spread_breaks_the_last_tie_in_turn():
+    table = _three()
+    firsts = [_first(table, f"k:s{i}") for i in range(3)]
+    assert sorted(firsts) == ["qwen3-a-driver", "qwen3-b-driver", "qwen3-c-driver"]
+
+
+def test_a_conversation_is_not_counted_against_its_own_placement():
+    table = _three()
+    table._affinity.put(LOCAL, "k:mine", (None, "qwen3-a-driver"))
+    table._affinity.put(LOCAL, "k:other", (None, "qwen3-b-driver"))
+    held = table._affinity.held(LOCAL, besides="k:mine")
+    assert held == {(None, "qwen3-b-driver"): 1}
+
+
+def test_an_expired_conversation_is_not_held(monkeypatch):
+    from eugene_plexus_gateway import affinity as module
+
+    table = _three()
+    now = [1000.0]
+    monkeypatch.setattr(module.time, "perf_counter", lambda: now[0])
+    table._affinity.put(LOCAL, "k:old", (None, "qwen3-a-driver"))
+    now[0] += module.TTL_SECONDS + 1
+    assert table._affinity.held(LOCAL) == {}
+
+
+def test_a_held_conversation_still_goes_home_under_spread():
+    table = _three()
+    home = _first(table, "k:session")
+    for key in ("k:1", "k:2", "k:3"):
+        table._affinity.put(LOCAL, key, (None, home))
+    assert _first(table, "k:session") == home
 
 
 def test_new_conversations_are_still_spread() -> None:
