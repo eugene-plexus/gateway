@@ -1100,7 +1100,15 @@ class TieredClient:
         if self.budget is not None:
             self.budget.close()
 
+    def _keyed(self, request: GenerateRequest) -> GenerateRequest:
+        """The conversation key, for a driver that pins slots (CB4). Internal:
+        the driver never sends it upstream."""
+        if self.conversation is None or request.conversationKey is not None:
+            return request
+        return request.model_copy(update={"conversationKey": self.conversation.key})
+
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
+        request = self._keyed(request)
         await self._admit(request)
         try:
             return await self._generate(request)
@@ -1594,6 +1602,7 @@ class TieredClient:
 
         The inner generator is closed explicitly, so a consumer abandoning
         this one still runs its attempt accounting at once."""
+        request = self._keyed(request)
         await self._admit(request)
         try:
             async with contextlib.aclosing(self._stream(request)) as events:

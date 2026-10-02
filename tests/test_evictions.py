@@ -139,3 +139,17 @@ async def test_a_v11_store_moves_on_in_place(tmp_path) -> None:  # type: ignore[
         str(SCHEMA_VERSION),
     )
     conn.close()
+
+
+async def test_the_driver_is_told_the_conversation():
+    """CB4: a driver that pins slots needs the key; it never goes upstream."""
+    table, a, b = _table()
+    await _send(table, _usage(1_000, 0))
+    sent = [*a.calls, *b.calls]
+    assert sent and sent[-1].conversationKey == "k:s"
+
+
+async def test_a_turn_with_no_conversation_carries_no_key():
+    table, a, b = _table()
+    await table.pick(table.resolve(LOCAL)).generate(_turn())
+    assert [*a.calls, *b.calls][-1].conversationKey is None

@@ -2944,6 +2944,10 @@ class GenerateRequest(BaseModel):
     safetyIdentifier: str | None = Field(
         None, description='A hint, as `promptCacheKey`.'
     )
+    conversationKey: str | None = Field(
+        None,
+        description="**Internal, from the gateway: never forwarded upstream** (CB4,\n2026-10-02). The conversation this turn continues, as the\ngateway's affinity table keys it. A driver with\n`slotPinning` on (llama-server only, set by the agent with\n`--no-cache-idle-slots`) keeps each conversation in one\nengine slot by `id_slot`, least recently used out, and\n**never names a slot that is busy**: a turn whose slot is\nbusy, or a new conversation when no slot is idle, waits in\nthe driver. Measured: pinning a request to a busy slot\nwedged llama-server b11211 for up to 30 minutes; waiting in\nfront of it, no stall in 1,224 turns. Absent, a turn takes\nany idle slot and keeps none.\n",
+    )
     reportProgress: bool | None = Field(
         False,
         description="On `POST /v1/generate/stream` only: emit `event: progress`\nframes saying what the backend is doing when it is not yet,\nor not at the moment, producing output -- see\n`StreamProgress` for what each backend reports. Ignored by\n`POST /v1/generate`. Not an output setting: it changes what\nthe stream says about the work, never what the model says.\n\nllama.cpp's own `return_progress` flag is sent only once the\nbackend has answered as `llama-server` (its `/props`), since\na hosted API refuses a field it does not know.\n\n**The 200 commits at the first progress frame**, where it\notherwise commits at the first token, so a backend that\nfails partway through reading the prompt fails as an\n`event: error` frame instead of a status code. That is why\nit is asked for rather than sent by default.\n",
