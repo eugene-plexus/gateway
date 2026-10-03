@@ -1570,6 +1570,7 @@ async def _stream_responses(
         body.model,
         echo=translated.echo,
         include_reasoning=translated.include_reasoning,
+        namespaces=translated.namespaces,
     )
     for chunk in translator.start():
         yield chunk
@@ -1787,6 +1788,7 @@ async def create_response(request: Request) -> Any:
                 tool_calls=response.toolCalls,
                 include_reasoning=translated.include_reasoning,
                 status=status,
+                namespaces=translated.namespaces,
             )
             if searched is not None
             else responses.output_items(
@@ -1795,6 +1797,7 @@ async def create_response(request: Request) -> Any:
                 reasoning=response.reasoning,
                 include_reasoning=translated.include_reasoning,
                 status=status,
+                namespaces=translated.namespaces,
             )
         )
         return JSONResponse(

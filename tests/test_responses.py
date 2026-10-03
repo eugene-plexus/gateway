@@ -350,6 +350,186 @@ def test_a_tool_call_comes_back_as_a_function_call_item(settings: Settings, stre
     [item] = final["output"]
     assert item["type"] == "function_call" and item["call_id"] == "call_abc"
     assert json.loads(item["arguments"]) == {"command": ["echo", "hi"]}
+    # A call to a top-level function names no namespace at all.
+    assert "namespace" not in item
+
+
+# --------------------------------------------------------------------------- #
+# Namespace tools: Codex 0.133 and later (upstream drift audit, 2026-10-03)
+# --------------------------------------------------------------------------- #
+
+
+def multi_agent_namespace(*extra: dict[str, Any]) -> dict[str, Any]:
+    """Codex's sub-agent tools as 0.133+ sends them to every custom provider
+    (`codex-rs/core/src/tools/handlers/multi_agents_spec.rs` at
+    `rust-v0.160.0`): one `namespace` tool whose members are functions."""
+    return {
+        "type": "namespace",
+        "name": "multi_agent_v1",
+        "description": "Tools for spawning and managing sub-agents.",
+        "tools": [
+            {
+                "type": "function",
+                "name": "spawn_agent",
+                "description": "Spawn a sub-agent.",
+                "strict": False,
+                "parameters": {
+                    "type": "object",
+                    "properties": {"message": {"type": "string"}},
+                    "required": ["message"],
+                },
+            },
+            {
+                "type": "function",
+                "name": "wait_agent",
+                "description": "Wait for sub-agents to finish.",
+                "strict": False,
+                "parameters": {"type": "object", "properties": {}},
+            },
+            *extra,
+        ],
+    }
+
+
+#: A freeform member, as Codex's `ResponsesApiNamespaceTool::Custom` serializes.
+CUSTOM_MEMBER = {
+    "type": "custom",
+    "name": "apply_patch",
+    "description": "Apply a patch.",
+    "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"},
+}
+
+
+def with_namespace(*extra: dict[str, Any], **overrides: Any) -> dict[str, Any]:
+    request = codex_request(**overrides)
+    request["tools"] = [*request["tools"], multi_agent_namespace(*extra)]
+    return request
+
+
+def test_a_namespaces_functions_are_offered_under_their_own_names(settings: Settings) -> None:
+    """The reproduction: every Codex from 0.133 to 0.160 sends this on its
+    first request, and the door refused it as a tool it cannot run."""
+    fake = driver()
+    with serve(settings, fake) as client:
+        r = client.post("/v1/responses", json=with_namespace(CUSTOM_MEMBER, stream=False))
+    assert r.status_code == 200, r.text
+    offered = {t.function.name: t.function for t in fake.calls[-1].tools or []}
+    assert list(offered) == ["shell", "view_image", "spawn_agent", "wait_agent"]
+    assert offered["spawn_agent"].parameters == {
+        "type": "object",
+        "properties": {"message": {"type": "string"}},
+        "required": ["message"],
+    }
+    # A member that is not a function is not offered, and is named.
+    ignored = r.headers["x-eugene-plexus-ignored-settings"].split(", ")
+    assert "tools.multi_agent_v1.apply_patch" in ignored
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+def test_a_call_to_a_namespace_member_comes_back_carrying_its_namespace(
+    settings: Settings, streamed: bool
+) -> None:
+    """Codex routes a call by namespace and name together
+    (`core/src/tools/router.rs`); a call without the namespace lands on
+    `functions.spawn_agent`, which is no tool it has."""
+    fake = driver()
+    fake.tool_calls = [
+        ToolCall(
+            id="call_ns",
+            type="function",
+            function=FunctionCall(name="spawn_agent", arguments='{"message": "look around"}'),
+        ),
+        # A top-level function in the same turn keeps no namespace.
+        ToolCall(
+            id="call_top",
+            type="function",
+            function=FunctionCall(name="shell", arguments='{"command": ["dir"]}'),
+        ),
+    ]
+    with serve(settings, fake) as client:
+        if streamed:
+            r, frames = stream(client, with_namespace())
+            added = [d["item"] for n, d in frames if n == "response.output_item.added"]
+            assert [i.get("namespace") for i in added] == ["multi_agent_v1", None]
+            done = [
+                d["item"]
+                for n, d in frames
+                if n == "response.output_item.done" and d["item"]["type"] == "function_call"
+            ]
+            assert [i.get("namespace") for i in done] == ["multi_agent_v1", None]
+            final = frames[-1][1]["response"]
+        else:
+            r = client.post("/v1/responses", json=with_namespace(stream=False))
+            final = r.json()
+    assert r.status_code == 200
+    member, top = final["output"]
+    assert member["type"] == "function_call"
+    assert member["name"] == "spawn_agent" and member["namespace"] == "multi_agent_v1"
+    assert json.loads(member["arguments"]) == {"message": "look around"}
+    assert top["name"] == "shell" and "namespace" not in top
+
+
+@pytest.mark.parametrize(
+    "clash",
+    [
+        # A member named like a top-level function.
+        {"type": "function", "name": "shell", "parameters": {"type": "object"}},
+        # The same member twice.
+        {"type": "function", "name": "spawn_agent", "parameters": {"type": "object"}},
+    ],
+    ids=["top-level", "member"],
+)
+def test_two_offered_tools_with_one_name_are_refused_naming_it(
+    settings: Settings, clash: dict[str, Any]
+) -> None:
+    """The model calls a tool by name alone; two tools with one name would
+    leave the call's namespace a guess."""
+    fake = driver()
+    with serve(settings, fake) as client:
+        r = client.post("/v1/responses", json=with_namespace(clash, stream=False))
+    assert r.status_code == 400, r.text
+    assert repr(clash["name"]) in r.json()["error"]["message"]
+    assert not fake.calls
+
+
+def test_a_function_call_handed_back_with_its_namespace_is_accepted(settings: Settings) -> None:
+    """Codex resends the call it was given, `namespace` included."""
+    fake = driver()
+    request = with_namespace(stream=False)
+    request["input"] += [
+        {
+            "type": "function_call",
+            "name": "spawn_agent",
+            "namespace": "multi_agent_v1",
+            "arguments": '{"message": "look around"}',
+            "call_id": "call_ns",
+        },
+        {"type": "function_call_output", "call_id": "call_ns", "output": "spawned"},
+    ]
+    with serve(settings, fake) as client:
+        r = client.post("/v1/responses", json=request)
+    assert r.status_code == 200, r.text
+    assistant, tool = sent(fake)[-2:]
+    assert assistant["toolCalls"][0]["function"]["name"] == "spawn_agent"
+    assert tool == {"role": "tool", "content": "spawned", "toolCallId": "call_ns"}
+
+
+def test_input_tokens_counts_a_request_with_a_namespace(settings: Settings) -> None:
+    """`/v1/responses/input_tokens` translates the body exactly as the door
+    does, so it took the same refusal."""
+    fake = driver()
+    fake.prompt_tokens = 321
+    request = {k: v for k, v in with_namespace().items() if k != "stream"}
+    with serve(settings, fake) as client:
+        r = client.post("/v1/responses/input_tokens", json=request)
+    assert r.status_code == 200, r.text
+    assert r.json()["input_tokens"] == 321
+    assert [t.function.name for t in fake.count_calls[-1].tools or []] == [
+        "shell",
+        "view_image",
+        "spawn_agent",
+        "wait_agent",
+    ]
 
 
 # --------------------------------------------------------------------------- #

@@ -312,6 +312,9 @@ class Translated:
     search_reason: str | None = None
     #: An `image_generation` tool (P8e), or None. It runs or is refused.
     image: server_tools.ImagePlan | None = None
+    #: The `namespace` tool each offered member function came from, by the
+    #: function's name, so a call to one goes back carrying it.
+    namespaces: dict[str, str] = field(default_factory=dict)
 
     def headers(self) -> dict[str, str]:
         out: dict[str, str] = {}
@@ -384,11 +387,67 @@ def _response_format(text: Mapping[str, Any]) -> ResponseFormat | None:
     raise Refusal(f"text.format.type: {_name(kind)!s} is not supported.", param="text")
 
 
+def _function_tool(definition: Mapping[str, Any], where: str) -> Tool:
+    name = definition.get("name")
+    if not isinstance(name, str) or not name:
+        raise Refusal(f"{where}.name: required.", param="tools")
+    return Tool(
+        type="function",
+        function=FunctionDefinition(
+            name=name,
+            description=definition.get("description"),
+            parameters=definition.get("parameters"),
+            strict=definition.get("strict"),
+        ),
+    )
+
+
+def _namespace_members(
+    definition: Mapping[str, Any],
+    where: str,
+    ignored: list[str],
+    namespaces: dict[str, str] | None,
+) -> list[Tool]:
+    """A `namespace` tool's `function` members, each offered by its own name.
+
+    **Codex 0.133 moved its sub-agent tools into one** (`multi_agent_v1`,
+    openai/codex PR #23475), sends it to every custom provider, and sends
+    MCP servers the same way; refusing the type refused every request from
+    every Codex since (upstream drift audit, 2026-10-03). A chat wire has
+    no namespaces, so the members are flattened and `namespaces` remembers
+    where each came from: Codex routes a call by namespace and name
+    together, and one handed back without its namespace names no tool it
+    has. A member of another type -- a freeform `custom` tool -- has no
+    chat equivalent, so it is not offered and is named instead.
+    """
+    space = definition.get("name")
+    if not isinstance(space, str) or not space:
+        raise Refusal(f"{where}.name: required for a namespace.", param="tools")
+    members = definition.get("tools")
+    if not isinstance(members, list):
+        raise Refusal(f"{where}.tools: must be a list.", param="tools")
+    out: list[Tool] = []
+    for position, member in enumerate(members):
+        at = f"{where}.tools[{position}]"
+        if not isinstance(member, Mapping):
+            raise Refusal(f"{at}: must be an object.", param="tools")
+        if member.get("type") != "function":
+            label = member.get("name") or member.get("type")
+            ignored.append(f"tools.{_name(space)}.{_name(label)}")
+            continue
+        tool = _function_tool(member, at)
+        out.append(tool)
+        if namespaces is not None:
+            namespaces[tool.function.name] = space
+    return out
+
+
 def _tools(
     definitions: Any,
     ignored: list[str],
     searches: list[Mapping[str, Any]] | None = None,
     images: list[Mapping[str, Any]] | None = None,
+    namespaces: dict[str, str] | None = None,
 ) -> list[Tool] | None:
     """Function tools as the chat shape; `web_search` set aside and named.
 
@@ -399,8 +458,9 @@ def _tools(
     is kept in `searches`, so the route can run it when a search can run
     here and leave it removed when not. `image_generation` (P8e) is kept
     in `images` for the route, which runs it or refuses it naming why.
-    Every other server-side tool is refused, because the model would be
-    offered something that cannot happen.
+    A `namespace` tool's functions are offered one by one (see
+    `_namespace_members`). Every other server-side tool is refused,
+    because the model would be offered something that cannot happen.
     """
     if definitions is None:
         return None
@@ -419,27 +479,32 @@ def _tools(
         if kind == "image_generation" and images is not None:
             images.append(definition)
             continue
+        if kind == "namespace":
+            out += _namespace_members(definition, f"tools[{index}]", ignored, namespaces)
+            continue
         if kind != "function":
             raise Refusal(
                 f"tools[{index}]: {_name(kind)} is a tool this gateway cannot run. It routes to "
                 "local engines and hands function calls back to you; only `function` tools, "
-                "`web_search` and `image_generation` are accepted.",
+                "`namespace` tools of functions, `web_search` and `image_generation` are "
+                "accepted.",
                 param="tools",
             )
-        name = definition.get("name")
-        if not isinstance(name, str) or not name:
-            raise Refusal(f"tools[{index}].name: required.", param="tools")
-        out.append(
-            Tool(
-                type="function",
-                function=FunctionDefinition(
-                    name=name,
-                    description=definition.get("description"),
-                    parameters=definition.get("parameters"),
-                    strict=definition.get("strict"),
-                ),
+        out.append(_function_tool(definition, f"tools[{index}]"))
+    # The model calls a tool by its name alone, so two with one name would
+    # make which one it meant -- and so which namespace the call goes back
+    # carrying -- a guess.
+    seen: set[str] = set()
+    for tool in out:
+        name = tool.function.name
+        if name in seen:
+            raise Refusal(
+                f"tools: two tools are named {_name(name)!r}. The model calls a tool by its "
+                "name alone, so each offered function, namespace members included, needs a "
+                "name of its own.",
+                param="tools",
             )
-        )
+        seen.add(name)
     return out or None
 
 
@@ -1041,7 +1106,8 @@ def translate_request(
     messages = _messages(raw, budget, ignored)
     searches: list[Mapping[str, Any]] = []
     image_tools: list[Mapping[str, Any]] = []
-    tools = _tools(raw.get("tools"), ignored, searches, image_tools)
+    namespaces: dict[str, str] = {}
+    tools = _tools(raw.get("tools"), ignored, searches, image_tools, namespaces)
     search: server_tools.SearchPlan | None = None
     search_reason: str | None = None
     max_tool_calls = raw.get("max_tool_calls")
@@ -1090,6 +1156,7 @@ def translate_request(
         search=search,
         search_reason=search_reason,
         image=image,
+        namespaces=namespaces,
         echo={
             "instructions": raw.get("instructions"),
             "tools": raw.get("tools") or [],
@@ -1268,6 +1335,7 @@ def transcript_items(
     tool_calls: Any,
     include_reasoning: bool,
     status: str = "completed",
+    namespaces: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Output items in the order they happened: reasoning, text and each
     search and image, then the caller's function calls (P8)."""
@@ -1285,12 +1353,7 @@ def transcript_items(
             items.append(web_search_item(value))
         elif kind == "image":
             items.append(image_generation_item(value))
-    for call in tool_calls or []:
-        items.append(
-            call_item(
-                call.id, call.function.name, call.function.arguments or "{}", status=item_status
-            )
-        )
+    items += _call_items(tool_calls, item_status, namespaces)
     return items
 
 
@@ -1301,8 +1364,11 @@ def call_item(
     *,
     status: str = "completed",
     item_id: str | None = None,
+    namespace: str | None = None,
 ) -> dict:
-    return {
+    """A `function_call` item; `namespace` only for a call to a member of a
+    `namespace` tool, and absent otherwise, as OpenAI's own items are."""
+    item: dict[str, Any] = {
         "id": item_id or _item_id("fc"),
         "type": "function_call",
         "status": status,
@@ -1310,6 +1376,24 @@ def call_item(
         "name": name,
         "arguments": arguments,
     }
+    if namespace:
+        item["namespace"] = namespace
+    return item
+
+
+def _call_items(
+    tool_calls: Any, status: str, namespaces: Mapping[str, str] | None
+) -> list[dict[str, Any]]:
+    return [
+        call_item(
+            call.id,
+            call.function.name,
+            call.function.arguments or "{}",
+            status=status,
+            namespace=(namespaces or {}).get(call.function.name),
+        )
+        for call in tool_calls or []
+    ]
 
 
 def output_items(
@@ -1319,6 +1403,7 @@ def output_items(
     reasoning: str | None,
     include_reasoning: bool,
     status: str = "completed",
+    namespaces: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Reasoning first, then the answer, then one item per tool call. An
     item in a response cut short is `incomplete` too, as on the stream."""
@@ -1328,12 +1413,7 @@ def output_items(
         items.append(reasoning_item(reasoning, include_encrypted=include_reasoning))
     if content:
         items.append(message_item(content, status=item_status))
-    for call in tool_calls or []:
-        items.append(
-            call_item(
-                call.id, call.function.name, call.function.arguments or "{}", status=item_status
-            )
-        )
+    items += _call_items(tool_calls, item_status, namespaces)
     return items
 
 
@@ -1431,11 +1511,14 @@ class StreamTranslator:
         *,
         echo: Mapping[str, Any],
         include_reasoning: bool = False,
+        namespaces: Mapping[str, str] | None = None,
     ) -> None:
         self.response_id = response_id
         self.model = model
         self.echo = echo
         self.include_reasoning = include_reasoning
+        #: The `namespace` tool each offered member function came from.
+        self.namespaces: Mapping[str, str] = namespaces or {}
         self.created_at = int(time.time())
         self.output: list[dict[str, Any]] = []
         self._sequence = 0
@@ -1567,7 +1650,12 @@ class StreamTranslator:
                 continue
             arguments = "".join(call["arguments"])
             done = call_item(
-                call["call_id"], call["name"], arguments, status=status, item_id=call["id"]
+                call["call_id"],
+                call["name"],
+                arguments,
+                status=status,
+                item_id=call["id"],
+                namespace=self.namespaces.get(call["name"]),
             )
             events.append(
                 self.frame(
@@ -1680,7 +1768,12 @@ class StreamTranslator:
                 }
                 self._calls[call_index] = call
                 item = call_item(
-                    call["call_id"], call["name"], "", status="in_progress", item_id=call["id"]
+                    call["call_id"],
+                    call["name"],
+                    "",
+                    status="in_progress",
+                    item_id=call["id"],
+                    namespace=self.namespaces.get(call["name"]),
                 )
                 events.append(
                     self.frame(
