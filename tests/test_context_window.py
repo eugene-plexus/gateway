@@ -244,6 +244,145 @@ def test_a_supervised_runtimes_window_wins_over_the_drivers_own(settings) -> Non
     assert _envelope(response)["context_length"] == 4096
 
 
+# --------------------------------------------------------------------- #
+# the second test: a cut that keeps a near-full window (2026-10-03)
+# --------------------------------------------------------------------- #
+
+# Ollama's default context is 4,096 tokens on a card under 23 GiB, and it
+# still keeps the newest turns and drops the middle (upstream drift audit,
+# 2026-10-03). A 40,000-character prompt kept to a full 4k window passes
+# the ratio test -- 4,000 tokens is one per ten characters, half the
+# threshold -- so it went unflagged.
+_WINDOW = 4096
+_CUT_CHARS = 40_000
+_CUT_TOKENS = 4_000
+
+
+def _windowed_app(settings, **fake_args):  # type: ignore[no-untyped-def]
+    from eugene_plexus_gateway.app import create_app
+
+    fake = FakeDriverClient(name="ollama-box", model_id="m", supports_tools=True, **fake_args)
+    app = create_app(settings=settings)
+    app.state.routing = make_routing_table(fake)
+    return fake, app
+
+
+def _truncation_flag(settings, prompt_tokens: int, chars: int, **fake_args) -> object:  # type: ignore[no-untyped-def]
+    fake, app = _windowed_app(settings, **fake_args)
+    fake.usage = Usage(promptTokens=prompt_tokens, completionTokens=1, totalTokens=prompt_tokens)
+    with TestClient(app) as c:
+        response = c.post("/v1/chat/completions", json=_long_body("m", chars=chars))
+    assert response.status_code == 200, response.text
+    return _envelope(response)["prompt_truncated"]
+
+
+def test_a_cut_that_keeps_a_near_full_window_is_flagged(settings) -> None:  # type: ignore[no-untyped-def]
+    assert _truncation_flag(settings, _CUT_TOKENS, _CUT_CHARS, max_context_tokens=_WINDOW) is True
+
+
+@pytest.mark.parametrize(
+    ("prompt_tokens", "chars", "window"),
+    [
+        # Nearly fills the window, and the characters fit it: it arrived.
+        (3_900, 14_000, _WINDOW),
+        # The characters would overflow the window, but far from full: the
+        # backend did not stop at the window, so nothing says it cut.
+        (_CUT_TOKENS, _CUT_CHARS, 8_192),
+        # No window known: only the ratio test can speak.
+        (_CUT_TOKENS, _CUT_CHARS, None),
+    ],
+    ids=["fits", "not-near-full", "no-window"],
+)
+def test_the_window_test_does_not_fire_without_both_of_its_conditions(  # type: ignore[no-untyped-def]
+    settings, prompt_tokens: int, chars: int, window: int | None
+) -> None:
+    assert _truncation_flag(settings, prompt_tokens, chars, max_context_tokens=window) is False
+
+
+def test_the_window_test_reads_the_window_that_applied(settings) -> None:  # type: ignore[no-untyped-def]
+    """A supervised runtime's window wins over the driver's own, as for
+    `context_length` beside the flag."""
+    from eugene_plexus_gateway.app import create_app
+
+    fake = FakeDriverClient(
+        name="local", model_id="m", runtime="engine-1", max_context_tokens=99999
+    )
+    fake.usage = Usage(promptTokens=_CUT_TOKENS, completionTokens=1, totalTokens=_CUT_TOKENS)
+    app = create_app(settings=settings)
+    app.state.routing = make_routing_table(
+        fake,
+        runtimes=[
+            _RuntimeFacts(
+                name="engine-1",
+                alias=None,
+                status="ready",
+                node=None,
+                url="http://engine",
+                context_length=_WINDOW,
+                parallel_slots=1,
+                idle_unload_seconds=None,
+                start_on_demand=False,
+                stop_reason=None,
+            )
+        ],
+    )
+    with TestClient(app) as c:
+        response = c.post("/v1/chat/completions", json=_long_body("m", chars=_CUT_CHARS))
+    assert _envelope(response)["prompt_truncated"] is True
+
+
+def test_the_window_test_is_on_the_chat_stream_too(settings) -> None:  # type: ignore[no-untyped-def]
+    fake, app = _windowed_app(settings, max_context_tokens=_WINDOW)
+    fake.usage = Usage(promptTokens=_CUT_TOKENS, completionTokens=1, totalTokens=_CUT_TOKENS)
+    with TestClient(app) as c:
+        response = c.post(
+            "/v1/chat/completions", json={**_long_body("m", _CUT_CHARS), "stream": True}
+        )
+    frames = [
+        json.loads(line[6:])
+        for line in response.text.splitlines()
+        if line.startswith("data: ") and line[6:].strip() != "[DONE]"
+    ]
+    final = [f for f in frames if f.get("x_eugene_plexus")]
+    assert final[-1]["x_eugene_plexus"]["prompt_truncated"] is True
+
+
+def _anthropic_body(chars: int, stream: bool) -> dict[str, object]:
+    return {
+        "model": "m",
+        "max_tokens": 100,
+        "stream": stream,
+        "messages": [{"role": "user", "content": "x" * chars}],
+    }
+
+
+def _responses_body(chars: int, stream: bool) -> dict[str, object]:
+    return {"model": "m", "input": "x" * chars, "stream": stream}
+
+
+@pytest.mark.parametrize(
+    ("path", "build"),
+    [("/v1/messages", _anthropic_body), ("/v1/responses", _responses_body)],
+    ids=["anthropic", "responses"],
+)
+def test_the_other_doors_report_the_window_test(  # type: ignore[no-untyped-def]
+    settings, caplog: pytest.LogCaptureFixture, path: str, build
+) -> None:
+    """Non-streamed, on the envelope's header; streamed, where those doors
+    report it -- the log line."""
+    fake, app = _windowed_app(settings, max_context_tokens=_WINDOW)
+    fake.usage = Usage(promptTokens=_CUT_TOKENS, completionTokens=1, totalTokens=_CUT_TOKENS)
+    with TestClient(app) as c:
+        response = c.post(path, json=build(_CUT_CHARS, False))
+        assert response.status_code == 200, response.text
+        assert response.headers["x-eugene-plexus-prompt-truncated"] == "true"
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="eugene_plexus_gateway.routes.inference"):
+            streamed = c.post(path, json=build(_CUT_CHARS, True))
+    assert streamed.status_code == 200
+    assert any("4096-token window" in r.getMessage() for r in caplog.records)
+
+
 @pytest.fixture
 def settings_app_pair(settings):  # type: ignore[no-untyped-def]
     """Two drivers serving one name with different windows."""

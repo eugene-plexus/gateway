@@ -1294,9 +1294,10 @@ async def _stream_anthropic(
             backend_ms=response.latencyMs,
             client=prepared.client,
         )
-        truncated = _prompt_truncated(body, response.usage)
+        window = _served_window(prepared.client, prepared.table, body.model)
+        truncated = _prompt_truncated(body, response.usage, window)
         _warn_if_truncated(
-            truncated, body, response.usage, getattr(prepared.client, "served_by", None)
+            truncated, body, response.usage, getattr(prepared.client, "served_by", None), window
         )
         for chunk in translator.finish(
             reason=anthropic.stop_reason(response.finishReason),
@@ -1385,9 +1386,10 @@ async def create_anthropic_message(request: Request) -> Any:
             return _serve_failure(e, body, store).as_anthropic()
 
         served_model = response.modelId or body.model
-        truncated = _prompt_truncated(body, response.usage)
+        window = _served_window(prepared.client, prepared.table, body.model)
+        truncated = _prompt_truncated(body, response.usage, window)
         _warn_if_truncated(
-            truncated, body, response.usage, getattr(prepared.client, "served_by", None)
+            truncated, body, response.usage, getattr(prepared.client, "served_by", None), window
         )
         _record(
             prepared.rec,
@@ -1659,9 +1661,10 @@ async def _stream_responses(
             backend_ms=response.latencyMs,
             client=prepared.client,
         )
-        truncated = _prompt_truncated(body, response.usage)
+        window = _served_window(prepared.client, prepared.table, body.model)
+        truncated = _prompt_truncated(body, response.usage, window)
         _warn_if_truncated(
-            truncated, body, response.usage, getattr(prepared.client, "served_by", None)
+            truncated, body, response.usage, getattr(prepared.client, "served_by", None), window
         )
         for chunk in translator.finish(
             model=served_model, finish=response.finishReason, usage=response.usage
@@ -1779,9 +1782,10 @@ async def create_response(request: Request) -> Any:
             return _serve_failure(e, body, store).as_responses()
 
         served_model = response.modelId or body.model
-        truncated = _prompt_truncated(body, response.usage)
+        window = _served_window(prepared.client, prepared.table, body.model)
+        truncated = _prompt_truncated(body, response.usage, window)
         _warn_if_truncated(
-            truncated, body, response.usage, getattr(prepared.client, "served_by", None)
+            truncated, body, response.usage, getattr(prepared.client, "served_by", None), window
         )
         _record(
             prepared.rec,
@@ -3944,6 +3948,19 @@ _TRUNCATION_CHARS_PER_TOKEN = 20
 # short inputs are where token density varies most.
 _TRUNCATION_MIN_CHARS = 1000
 
+# The second test, where the window that applied is known (2026-10-03): the
+# backend reported a prompt filling at least this share of its window while
+# the characters sent, at four to a token, exceed the whole window. The
+# ratio alone cannot see a cut that keeps a near-full window -- Ollama's
+# default is a 4,096-token window on a card under 23 GiB, and it keeps the
+# newest turns and drops the middle, so a prompt cut to 4k went unflagged
+# below about 82,000 characters (upstream drift audit). Four to a token
+# overestimates a real tokenizer's count (`chars/4` measured 19.4% low), so
+# a prompt that genuinely fits is not accused; near-full is what a cut
+# looks like, since the backend keeps as much as fits.
+_TRUNCATION_NEAR_FULL = 0.9
+_TRUNCATION_ESTIMATE_CHARS_PER_TOKEN = 4
+
 
 def _prompt_chars(body: ChatCompletionRequest) -> int:
     """How much text we handed the backend.
@@ -3962,8 +3979,10 @@ def _prompt_chars(body: ChatCompletionRequest) -> int:
     return total
 
 
-def _prompt_truncated(body: ChatCompletionRequest, usage: Any) -> bool | None:
-    """Did the backend silently drop most of the input?
+def _prompt_truncated(
+    body: ChatCompletionRequest, usage: Any, window: int | None = None
+) -> bool | None:
+    """Did the backend silently drop input?
 
     The failure this catches: a server that fits an over-long prompt into
     its window by discarding the middle of the conversation and answering
@@ -3981,6 +4000,11 @@ def _prompt_truncated(body: ChatCompletionRequest, usage: Any) -> bool | None:
     tokenizer we do not have for the backends that do it -- Ollama
     exposes none -- while this needs nothing but the number the backend
     already returns.
+
+    Two tests, either of which is a truncation: the ratio, and -- when
+    `window`, the window that applied, is known -- a near-full window
+    holding a prompt whose characters it could not (see
+    `_TRUNCATION_NEAR_FULL`).
     """
     reported = getattr(usage, "promptTokens", None)
     if not isinstance(reported, int) or reported <= 0:
@@ -3988,7 +4012,24 @@ def _prompt_truncated(body: ChatCompletionRequest, usage: Any) -> bool | None:
     chars = _prompt_chars(body)
     if chars < _TRUNCATION_MIN_CHARS:
         return None
-    return reported * _TRUNCATION_CHARS_PER_TOKEN < chars
+    return reported * _TRUNCATION_CHARS_PER_TOKEN < chars or _cut_to_window(reported, chars, window)
+
+
+def _cut_to_window(reported: int, chars: int, window: int | None) -> bool:
+    return (
+        isinstance(window, int)
+        and window > 0
+        and reported >= _TRUNCATION_NEAR_FULL * window
+        and chars / _TRUNCATION_ESTIMATE_CHARS_PER_TOKEN > window
+    )
+
+
+def _served_window(client: Any, table: RoutingTable | None, model: str) -> int | None:
+    """The context window of the backend that answered (see `_routing_info`)."""
+    if table is None:
+        return None
+    served_by = getattr(client, "served_by", None) or getattr(client, "name", model)
+    return table.context_length_for(model, served_by, getattr(client, "served_by_node", None))
 
 
 def _warn_if_truncated(
@@ -3996,19 +4037,35 @@ def _warn_if_truncated(
     body: ChatCompletionRequest,
     usage: Any,
     driver: str | None,
+    window: int | None = None,
 ) -> None:
     """Say it in the log too, because the flag rides a field most clients
     drop. An operator chasing "the model keeps ignoring my files" needs
     this line to exist somewhere they will look."""
     if not truncated:
         return
+    reported = getattr(usage, "promptTokens", None)
+    chars = _prompt_chars(body)
+    if isinstance(reported, int) and reported * _TRUNCATION_CHARS_PER_TOKEN >= chars:
+        # The window test fired, not the ratio: what survived is a full
+        # window, not a scrap, so "most of the prompt" would overstate it.
+        log.warning(
+            "backend %r reported %s prompt tokens for %d characters of input, a full %s-token "
+            "window: it kept what fit, dropped the rest, and answered anyway. The answer is "
+            "about what survived. Raise the backend's context window, or send less.",
+            driver,
+            reported,
+            chars,
+            window,
+        )
+        return
     log.warning(
         "backend %r reported consuming only %s prompt tokens for %d characters of input: "
         "it discarded most of the prompt and answered anyway. The answer is about what "
         "survived. Raise the backend's context window, or send less.",
         driver,
-        getattr(usage, "promptTokens", None),
-        _prompt_chars(body),
+        reported,
+        chars,
     )
 
 
@@ -4163,8 +4220,9 @@ def _to_chat_completion(
     swapped_in: bool = False,
 ) -> ChatCompletionResponse:
     usage = _openai_usage(response.usage)
-    truncated = _prompt_truncated(body, response.usage)
-    _warn_if_truncated(truncated, body, response.usage, getattr(client, "served_by", None))
+    window = _served_window(client, table, body.model)
+    truncated = _prompt_truncated(body, response.usage, window)
+    _warn_if_truncated(truncated, body, response.usage, getattr(client, "served_by", None), window)
     legacy = chat_contract.uses_functions(body)
     return ChatCompletionResponse(
         id=f"chatcmpl-{uuid.uuid4().hex}",
@@ -4516,8 +4574,11 @@ async def _stream_completion(
         # path while failing the other would report one condition two
         # different ways depending on a parameter the caller chose for
         # unrelated reasons.
-        truncated = _prompt_truncated(body, response.usage)
-        _warn_if_truncated(truncated, body, response.usage, getattr(client, "served_by", None))
+        window = _served_window(client, table, body.model)
+        truncated = _prompt_truncated(body, response.usage, window)
+        _warn_if_truncated(
+            truncated, body, response.usage, getattr(client, "served_by", None), window
+        )
         # The routing extension rides the final frame, beside `usage` —
         # the same place OpenAI puts its end-of-stream extras, and the
         # earliest point at which any of it is known.
