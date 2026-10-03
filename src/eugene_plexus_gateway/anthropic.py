@@ -692,10 +692,18 @@ def _tools(definitions: Any) -> list[Tool] | None:
         if server_side and server_tools.ANTHROPIC_TOOL.match(str(server_side)):
             continue
         if server_side:
+            # `Input tag '<type>'` is Anthropic's own wording for a tool type
+            # it does not know, and the words Claude Code (2.1.280 and later)
+            # looks for before retrying without an optional server tool --
+            # its advisor above all. Without them every turn of a session
+            # with the advisor on failed here (upstream drift audit,
+            # 2026-10-03).
+            tag = chat_contract._field_name(str(server_side))
             raise Refusal(
-                f"tools: {definition.name!r} is a server-side tool ({server_side}), which this "
-                "gateway cannot execute. It runs web search itself and hands every other tool "
-                "call back to you; only client-side tools and web search work here."
+                f"tools: Input tag '{tag}' found using 'type' names a server-side tool "
+                f"({definition.name!r}), which this gateway cannot execute. It runs web search "
+                "itself and hands every other tool call back to you; only client-side tools "
+                "and web search work here."
             )
         out.append(
             Tool(

@@ -380,6 +380,22 @@ def test_a_server_side_tool_is_refused(settings: Settings) -> None:
     assert "code_execution" in r.json()["error"]["message"]
 
 
+@pytest.mark.parametrize("kind", ["advisor_20260301", "code_execution_20250522"])
+def test_a_server_tool_refusal_names_its_input_tag(settings: Settings, kind: str) -> None:
+    """Claude Code 2.1.280 and later retries without an optional server
+    tool -- its advisor above all -- only when the refusal contains
+    `Input tag '<type>'` (upstream drift audit, 2026-10-03). Without the
+    words, the advisor's every turn failed here."""
+    fake = FakeDriverClient(name="d1", model_id=MODEL, supports_tools=True)
+    request = body(tools=[{"type": kind, "name": kind.rsplit("_", 1)[0]}])
+    with _client(_app_with(settings, fake)) as client:
+        r = client.post("/v1/messages", json=request)
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["type"] == "invalid_request_error"
+    assert f"Input tag '{kind}'" in r.json()["error"]["message"]
+    assert not fake.calls
+
+
 def test_mcp_servers_is_refused(settings: Settings) -> None:
     fake = FakeDriverClient(name="d1", model_id=MODEL)
     request = body(mcp_servers=[{"type": "url", "url": "https://example.test/mcp"}])
