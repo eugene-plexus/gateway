@@ -19,8 +19,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import sys
-import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -55,6 +53,7 @@ from ._http import internal_client
 from .affinity import EVICTED, HIT
 from .budget import Conversation, TurnBudget, request_chars
 from .circuit import Circuit
+from .execution import Executor, StreamPolicy
 
 log = logging.getLogger(__name__)
 
@@ -1116,220 +1115,20 @@ class TieredClient:
             self._release()
 
     async def _generate(self, request: GenerateRequest) -> GenerateResponse:
-        last_exc: Exception | None = None
-        total = len(self.candidates)
-        index = 0
-        for tier_index, tier in enumerate(self._tiers):
-            for candidate in tier:
-                if self.authorize_attempt is not None:
-                    await self.authorize_attempt()
-                circuit = getattr(candidate, "circuit", None)
-                if circuit is not None and not circuit.acquire():
-                    if last_exc is None:
-                        last_exc = _cooling_error(circuit.until - time.perf_counter())
-                    continue
-                probe_epoch = circuit.epoch if circuit is not None and circuit.probing else None
-                self.attempts = index + 1
-                driver = getattr(candidate, "name", None)
-                node = getattr(candidate, "node", None)
-                runtime: Key | None = None
-                if self._hooks is not None and driver:
-                    runtime = self._hooks.on_attempt_start(driver, node=node)
-                self._enter(candidate)
-                started = time.perf_counter()
-                try:
-                    prepared = (
-                        await self.prepare_request(candidate, request)
-                        if self.prepare_request
-                        else request
-                    )
-                    result = await candidate.generate(prepared)
-                except BaseException as exc:
-                    self._finish_circuit(candidate, exc, probe_epoch=probe_epoch)
-                    if self._hooks is not None and driver:
-                        self._hooks.on_attempt_end(
-                            driver,
-                            node=node,
-                            model=getattr(candidate, "public_model", None),
-                            runtime=runtime,
-                            served=False,
-                            elapsed_ms=int((time.perf_counter() - started) * 1000),
-                            # The exception CLASS, never its message: a
-                            # driver error can carry a provider's response
-                            # body, and this string is retained and
-                            # rendered in a UI.
-                            error=type(exc).__name__,
-                            retry_disposition=retry_disposition(exc),
-                        )
-                    if not isinstance(exc, Exception) or not _is_cascade_eligible(exc):
-                        # 4xx / non-HTTP error — surface it without trying
-                        # the next backend. A 4xx is the same bad request
-                        # everywhere.
-                        raise
-                    last_exc = exc
-                    self._log_cascade("generate", index, candidate, exc, total=total)
-                    index += 1
-                else:
-                    self._finish_circuit(candidate, probe_epoch=probe_epoch)
-                    if self._hooks is not None and driver:
-                        self._hooks.on_attempt_end(
-                            driver,
-                            node=node,
-                            model=getattr(candidate, "public_model", None),
-                            runtime=runtime,
-                            served=True,
-                            usage=result.usage,
-                            elapsed_ms=int((time.perf_counter() - started) * 1000),
-                        )
-                    self._served(result.usage, candidate, request)
-                    self.served_by = driver
-                    self.served_model = getattr(candidate, "public_model", None)
-                    self.served_by_node = node
-                    self.served_candidate = candidate
-                    self.tier = tier_index + 1
-                    return result
-        # Every backend failed in a cascade-eligible way. Re-raise the
-        # last failure so the chat route's existing DriverError
-        # / httpx.HTTPError handlers surface it as they would for a
-        # single-backend slot — no new error path to maintain.
-        assert last_exc is not None  # candidates is non-empty (checked in __init__)
-        raise last_exc
+        async def call(candidate: DriverClient) -> GenerateResponse:
+            prepared = (
+                await self.prepare_request(candidate, request) if self.prepare_request else request
+            )
+            return await candidate.generate(prepared)
+
+        return await Executor(self).whole("generate", call, generation=request)
 
     async def embed(self, request: EmbedRequest) -> EmbedResponse:
-        """`generate()`'s cascade, over replicas of ONE model.
-
-        The failure taxonomy is identical: only proven pre-execution
-        failures cascade. What differs is what it is allowed to cascade
-        *to*, and that is enforced upstream rather than here:
-        `RoutingTable.pick_embedding` builds a single tier containing
-        only backends serving the requested model id, so there is
-        structurally no other model to reach. Replicas of one model are
-        interchangeable; two models are not, and a fallback between them
-        would write vectors from a different space into the caller's
-        store with a 200 and no marker.
-        """
-        last_exc: Exception | None = None
-        total = len(self.candidates)
-        index = 0
-        for tier_index, tier in enumerate(self._tiers):
-            for candidate in tier:
-                if self.authorize_attempt is not None:
-                    await self.authorize_attempt()
-                circuit = getattr(candidate, "circuit", None)
-                if circuit is not None and not circuit.acquire():
-                    if last_exc is None:
-                        last_exc = _cooling_error(circuit.until - time.perf_counter())
-                    continue
-                probe_epoch = circuit.epoch if circuit is not None and circuit.probing else None
-                self.attempts = index + 1
-                driver = getattr(candidate, "name", None)
-                node = getattr(candidate, "node", None)
-                runtime: Key | None = None
-                if self._hooks is not None and driver:
-                    runtime = self._hooks.on_attempt_start(driver, node=node)
-                started = time.perf_counter()
-                try:
-                    result = await candidate.embed(request)
-                except BaseException as exc:
-                    self._finish_circuit(candidate, exc, probe_epoch=probe_epoch)
-                    if self._hooks is not None and driver:
-                        self._hooks.on_attempt_end(
-                            driver,
-                            node=node,
-                            model=getattr(candidate, "public_model", None),
-                            runtime=runtime,
-                            served=False,
-                            elapsed_ms=int((time.perf_counter() - started) * 1000),
-                            error=type(exc).__name__,
-                            retry_disposition=retry_disposition(exc),
-                        )
-                    if not isinstance(exc, Exception) or not _is_cascade_eligible(exc):
-                        raise
-                    last_exc = exc
-                    self._log_cascade("embed", index, candidate, exc, total=total)
-                    index += 1
-                else:
-                    self._finish_circuit(candidate, probe_epoch=probe_epoch)
-                    if self._hooks is not None and driver:
-                        self._hooks.on_attempt_end(
-                            driver,
-                            node=node,
-                            model=getattr(candidate, "public_model", None),
-                            runtime=runtime,
-                            served=True,
-                            usage=result.usage,
-                            elapsed_ms=int((time.perf_counter() - started) * 1000),
-                        )
-                    self.served_by = driver
-                    self.served_model = getattr(candidate, "public_model", None)
-                    self.served_by_node = node
-                    self.tier = tier_index + 1
-                    return result
-        assert last_exc is not None
-        raise last_exc
+        # pick_embedding supplies only replicas of this model.
+        return await Executor(self).whole("embed", lambda candidate: candidate.embed(request))
 
     async def _over_tiers[T](self, label: str, call: Callable[[Any], Awaitable[T]]) -> T:
-        """One request over the slot's tiers, as chat's is, for a door whose
-        answer arrives whole: transcription (P3b) and images (P4). Only a
-        proven pre-execution failure moves on (`generate()`'s taxonomy)."""
-        last_exc: Exception | None = None
-        total = len(self.candidates)
-        index = 0
-        for tier_index, tier in enumerate(self._tiers):
-            for candidate in tier:
-                if self.authorize_attempt is not None:
-                    await self.authorize_attempt()
-                circuit = getattr(candidate, "circuit", None)
-                if circuit is not None and not circuit.acquire():
-                    if last_exc is None:
-                        last_exc = _cooling_error(circuit.until - time.perf_counter())
-                    continue
-                probe_epoch = circuit.epoch if circuit is not None and circuit.probing else None
-                self.attempts = index + 1
-                driver = getattr(candidate, "name", None)
-                node = getattr(candidate, "node", None)
-                runtime: Key | None = None
-                if self._hooks is not None and driver:
-                    runtime = self._hooks.on_attempt_start(driver, node=node)
-                started = time.perf_counter()
-                try:
-                    result = await call(candidate)
-                except BaseException as exc:
-                    self._finish_circuit(candidate, exc, probe_epoch=probe_epoch)
-                    if self._hooks is not None and driver:
-                        self._hooks.on_attempt_end(
-                            driver,
-                            node=node,
-                            model=getattr(candidate, "public_model", None),
-                            runtime=runtime,
-                            served=False,
-                            elapsed_ms=int((time.perf_counter() - started) * 1000),
-                            error=type(exc).__name__,
-                            retry_disposition=retry_disposition(exc),
-                        )
-                    if not isinstance(exc, Exception) or not _is_cascade_eligible(exc):
-                        raise
-                    last_exc = exc
-                    self._log_cascade(label, index, candidate, exc, total=total)
-                    index += 1
-                else:
-                    self._finish_circuit(candidate, probe_epoch=probe_epoch)
-                    if self._hooks is not None and driver:
-                        self._hooks.on_attempt_end(
-                            driver,
-                            node=node,
-                            model=getattr(candidate, "public_model", None),
-                            runtime=runtime,
-                            served=True,
-                            elapsed_ms=int((time.perf_counter() - started) * 1000),
-                        )
-                    self.served_by = driver
-                    self.served_model = getattr(candidate, "public_model", None)
-                    self.served_by_node = node
-                    self.tier = tier_index + 1
-                    return result
-        assert last_exc is not None
-        raise last_exc
+        return await Executor(self).whole(label, call)
 
     async def transcribe(self, request: TranscribeRequest) -> TranscribeResponse:
         """Transcription over the slot's tiers, as chat (P3b, call #4).
@@ -1361,241 +1160,40 @@ class TieredClient:
     async def image_stream(
         self, request: ImageRequest
     ) -> AsyncGenerator[ImagePartial | ImageResponse, None]:
-        """A streamed image over the slot's tiers, with a commit point (P4).
-
-        **The first event is the commit point**, as a first token is for
-        chat: before it a proven pre-execution failure moves on, after it a
-        failure ends the stream. `pick_image` put only models that stream in
-        these tiers (P4-3).
-        """
-        last_exc: Exception | None = None
-        total = len(self.candidates)
-        index = 0
-        for tier_index, tier in enumerate(self._tiers):
-            for candidate in tier:
-                if self.authorize_attempt is not None:
-                    await self.authorize_attempt()
-                circuit = getattr(candidate, "circuit", None)
-                if circuit is not None and not circuit.acquire():
-                    if last_exc is None:
-                        last_exc = _cooling_error(circuit.until - time.perf_counter())
-                    continue
-                probe_epoch = circuit.epoch if circuit is not None and circuit.probing else None
-                self.attempts = index + 1
-                driver = getattr(candidate, "name", None)
-                node = getattr(candidate, "node", None)
-                runtime: Key | None = None
-                if self._hooks is not None and driver:
-                    runtime = self._hooks.on_attempt_start(driver, node=node)
-                started = time.perf_counter()
-                events = candidate.image_stream(request)
-                try:
-                    first = await anext(events)
-                except BaseException as exc:
-                    await events.aclose()
-                    self._finish_circuit(candidate, exc, probe_epoch=probe_epoch)
-                    if self._hooks is not None and driver:
-                        self._hooks.on_attempt_end(
-                            driver,
-                            node=node,
-                            model=getattr(candidate, "public_model", None),
-                            runtime=runtime,
-                            served=False,
-                            elapsed_ms=int((time.perf_counter() - started) * 1000),
-                            error=type(exc).__name__,
-                            retry_disposition=retry_disposition(exc),
-                        )
-                    if not isinstance(exc, Exception) or not _is_cascade_eligible(exc):
-                        raise
-                    last_exc = exc
-                    self._log_cascade("image stream", index, candidate, exc, total=total)
-                    index += 1
-                    continue
-                # Committed: the first event is in hand.
-                self._finish_circuit(candidate, probe_epoch=probe_epoch)
-                self.served_by = driver
-                self.served_model = getattr(candidate, "public_model", None)
-                self.served_by_node = node
-                self.tier = tier_index + 1
-                first_ms = int((time.perf_counter() - started) * 1000)
-                served = False
-                try:
-                    yield first
-                    async for item in events:
-                        yield item
-                    served = True
-                finally:
-                    await events.aclose()
-                    if self._hooks is not None and driver:
-                        self._hooks.on_attempt_end(
-                            driver,
-                            node=node,
-                            model=getattr(candidate, "public_model", None),
-                            runtime=runtime,
-                            served=served,
-                            elapsed_ms=int((time.perf_counter() - started) * 1000),
-                            first_ms=first_ms,
-                        )
-                return
-        assert last_exc is not None
-        raise last_exc
+        stream = Executor(self).stream(
+            "image stream", lambda candidate: candidate.image_stream(request)
+        )
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            await stream.aclose()
 
     async def decide(self, request: DecisionRequest) -> DecisionResponse:
-        """`embed()`'s cascade, over replicas of ONE decision model.
-
-        Identical taxonomy and identical structural guarantee: the
-        single tier `RoutingTable.pick_decision` builds contains only
-        backends serving the requested model id with a decision
-        capability, so a cascade cannot reach a different model — the
-        same decision quietly answered by a different model is a
-        different decision. A fired deadline is BackendTimeout-shaped at
-        the driver (504) and is not cascade-eligible, per R2.5.
-        """
-        last_exc: Exception | None = None
-        total = len(self.candidates)
-        index = 0
-        for tier_index, tier in enumerate(self._tiers):
-            for candidate in tier:
-                if self.authorize_attempt is not None:
-                    await self.authorize_attempt()
-                circuit = getattr(candidate, "circuit", None)
-                if circuit is not None and not circuit.acquire():
-                    if last_exc is None:
-                        last_exc = _cooling_error(circuit.until - time.perf_counter())
-                    continue
-                probe_epoch = circuit.epoch if circuit is not None and circuit.probing else None
-                self.attempts = index + 1
-                driver = getattr(candidate, "name", None)
-                node = getattr(candidate, "node", None)
-                runtime: Key | None = None
-                if self._hooks is not None and driver:
-                    runtime = self._hooks.on_attempt_start(driver, node=node)
-                started = time.perf_counter()
-                try:
-                    result = await candidate.decide(request)
-                except BaseException as exc:
-                    self._finish_circuit(candidate, exc, probe_epoch=probe_epoch)
-                    if self._hooks is not None and driver:
-                        self._hooks.on_attempt_end(
-                            driver,
-                            node=node,
-                            model=getattr(candidate, "public_model", None),
-                            runtime=runtime,
-                            served=False,
-                            elapsed_ms=int((time.perf_counter() - started) * 1000),
-                            error=type(exc).__name__,
-                            retry_disposition=retry_disposition(exc),
-                        )
-                    if not isinstance(exc, Exception) or not _is_cascade_eligible(exc):
-                        raise
-                    last_exc = exc
-                    self._log_cascade("decide", index, candidate, exc, total=total)
-                    index += 1
-                else:
-                    self._finish_circuit(candidate, probe_epoch=probe_epoch)
-                    if self._hooks is not None and driver:
-                        self._hooks.on_attempt_end(
-                            driver,
-                            node=node,
-                            model=getattr(candidate, "public_model", None),
-                            runtime=runtime,
-                            served=True,
-                            usage=result.usage,
-                            elapsed_ms=int((time.perf_counter() - started) * 1000),
-                        )
-                    self.served_by = driver
-                    self.served_model = getattr(candidate, "public_model", None)
-                    self.served_by_node = node
-                    self.tier = tier_index + 1
-                    return result
-        assert last_exc is not None
-        raise last_exc
+        # pick_decision supplies only replicas of this decision model.
+        return await Executor(self).whole("decide", lambda candidate: candidate.decide(request))
 
     async def speak(self, request: SpeakRequest) -> AsyncGenerator[str | bytes, None]:
-        """Speech over replicas of ONE model (P3a), with a commit point.
+        async def call(candidate: DriverClient) -> AsyncGenerator[str | bytes, None]:
+            events = candidate.speak(request)
+            try:
+                media = await anext(events)
+                first = await anext(events, b"")
+                # Hold the media header until the first bytes are available.
+                yield media
+                if first:
+                    yield first
+                async for chunk in events:
+                    yield chunk
+            finally:
+                await events.aclose()
 
-        `RoutingTable.pick_speech` builds a single tier of backends serving
-        the requested model, so a cascade can only reach a replica: a voice
-        that changed between two clips would be embeddings' noise problem
-        in another form (§5, #4). **The first byte is the commit point**, as
-        a first token is for chat: before it, a proven pre-execution
-        failure moves to the next replica; after it, a failure ends the
-        audio. Yields the media type, then the bytes.
-        """
-        last_exc: Exception | None = None
-        total = len(self.candidates)
-        index = 0
-        for tier_index, tier in enumerate(self._tiers):
-            for candidate in tier:
-                if self.authorize_attempt is not None:
-                    await self.authorize_attempt()
-                circuit = getattr(candidate, "circuit", None)
-                if circuit is not None and not circuit.acquire():
-                    if last_exc is None:
-                        last_exc = _cooling_error(circuit.until - time.perf_counter())
-                    continue
-                probe_epoch = circuit.epoch if circuit is not None and circuit.probing else None
-                self.attempts = index + 1
-                driver = getattr(candidate, "name", None)
-                node = getattr(candidate, "node", None)
-                runtime: Key | None = None
-                if self._hooks is not None and driver:
-                    runtime = self._hooks.on_attempt_start(driver, node=node)
-                started = time.perf_counter()
-                events = candidate.speak(request)
-                try:
-                    media = await anext(events)
-                    first: str | bytes = await anext(events, b"")
-                except BaseException as exc:
-                    await events.aclose()
-                    self._finish_circuit(candidate, exc, probe_epoch=probe_epoch)
-                    if self._hooks is not None and driver:
-                        self._hooks.on_attempt_end(
-                            driver,
-                            node=node,
-                            model=getattr(candidate, "public_model", None),
-                            runtime=runtime,
-                            served=False,
-                            elapsed_ms=int((time.perf_counter() - started) * 1000),
-                            error=type(exc).__name__,
-                            retry_disposition=retry_disposition(exc),
-                        )
-                    if not isinstance(exc, Exception) or not _is_cascade_eligible(exc):
-                        raise
-                    last_exc = exc
-                    self._log_cascade("speak", index, candidate, exc, total=total)
-                    index += 1
-                    continue
-                # Committed: the first byte is in hand.
-                self._finish_circuit(candidate, probe_epoch=probe_epoch)
-                self.served_by = driver
-                self.served_model = getattr(candidate, "public_model", None)
-                self.served_by_node = node
-                self.tier = tier_index + 1
-                first_ms = int((time.perf_counter() - started) * 1000)
-                served = False
-                try:
-                    yield media
-                    if first:
-                        yield first
-                    async for chunk in events:
-                        yield chunk
-                    served = True
-                finally:
-                    await events.aclose()
-                    if self._hooks is not None and driver:
-                        self._hooks.on_attempt_end(
-                            driver,
-                            node=node,
-                            model=getattr(candidate, "public_model", None),
-                            runtime=runtime,
-                            served=served,
-                            elapsed_ms=int((time.perf_counter() - started) * 1000),
-                            first_ms=first_ms,
-                        )
-                return
-        assert last_exc is not None
-        raise last_exc
+        stream = Executor(self).stream("speak", call)
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            await stream.aclose()
 
     async def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]:
         """`_stream`, inside this turn's room in a shared pool (CB3).
@@ -1612,203 +1210,29 @@ class TieredClient:
             self._release()
 
     async def _stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]:
-        """`generate()`'s cascade, with a commit point.
+        async def call(candidate: DriverClient) -> AsyncGenerator[StreamEvent, None]:
+            prepared = (
+                await self.prepare_request(candidate, request) if self.prepare_request else request
+            )
+            events = candidate.stream(prepared)
+            try:
+                async for event in events:
+                    yield event
+            finally:
+                await events.aclose()
 
-        **The rule this method exists for:** failover is possible until
-        the first token is emitted, and impossible after it.
-
-        `generate()` can walk the whole list freely because nothing has
-        reached the client until it returns. Once a token has been
-        forwarded, retrying on another backend would splice two models'
-        output into one answer with no marker at the seam -- a wrong
-        answer that looks like a right one, which is worse than a
-        truncated one. So a failure after the first token propagates and
-        the route turns it into an OpenAI `error` frame.
-
-        The practical consequence, contracted in `gateway.yaml`: a
-        streamed request can be truncated where a non-streamed one would
-        have cascaded after a safe refusal. Neither surface replays an
-        ambiguous attempt.
-
-        Attempt accounting follows `generate()` exactly, with one
-        deliberate difference: an attempt that emitted tokens and then
-        broke is recorded `served=False`. It did not serve the request,
-        and calling it served would hide truncation from the one surface
-        that could show it.
-        """
-        last_exc: Exception | None = None
-        total = len(self.candidates)
-        index = 0
-        for tier_index, tier in enumerate(self._tiers):
-            for candidate in tier:
-                if self.authorize_attempt is not None:
-                    await self.authorize_attempt()
-                circuit = getattr(candidate, "circuit", None)
-                if circuit is not None and not circuit.acquire():
-                    if last_exc is None:
-                        last_exc = _cooling_error(circuit.until - time.perf_counter())
-                    continue
-                probe_epoch = circuit.epoch if circuit is not None and circuit.probing else None
-                self.attempts = index + 1
-                driver = getattr(candidate, "name", None)
-                node = getattr(candidate, "node", None)
-                runtime: Key | None = None
-                if self._hooks is not None and driver:
-                    runtime = self._hooks.on_attempt_start(driver, node=node)
-                self._enter(candidate)
-                started = time.perf_counter()
-                committed = False
-                # Whether the driver ever said the answer was finished.
-                # An SSE stream that simply stops is indistinguishable
-                # from one that ended, at the transport layer -- the
-                # `done` event is the only thing that tells them apart,
-                # and M10's own rule is that the absence of it is a
-                # truncation rather than a completion.
-                saw_done = False
-                usage = None
-                reported = False
-                stream = None
-                # Time to first token, this attempt alone. Stamped on the
-                # first event of any kind — the commit point — because
-                # that is the moment the backend proved it was computing
-                # rather than queueing. Recorded on failures too: a
-                # stream that emitted tokens and then broke still had a
-                # first token, and its timing is evidence.
-                first_ms: int | None = None
-                try:
-                    prepared = (
-                        await self.prepare_request(candidate, request)
-                        if self.prepare_request
-                        else request
-                    )
-                    stream = candidate.stream(prepared)
-                    async for event in stream:
-                        if event.progress is not None:
-                            # Not output. The caller has been told what
-                            # the backend is doing, not given any of its
-                            # answer, so this attempt can still fail over
-                            # -- and the first token is still to come.
-                            yield event
-                            continue
-                        if first_ms is None:
-                            first_ms = int((time.perf_counter() - started) * 1000)
-                        committed = True
-                        if event.done:
-                            saw_done = True
-                            usage = event.result.usage if event.result is not None else None
-                        yield event
-                except Exception as exc:
-                    self._finish_circuit(candidate, exc, probe_epoch=probe_epoch)
-                    reported = True
-                    if self._hooks is not None and driver:
-                        self._hooks.on_attempt_end(
-                            driver,
-                            node=node,
-                            model=getattr(candidate, "public_model", None),
-                            runtime=runtime,
-                            served=False,
-                            elapsed_ms=int((time.perf_counter() - started) * 1000),
-                            error=type(exc).__name__,
-                            retry_disposition="indeterminate"
-                            if committed
-                            else retry_disposition(exc),
-                            first_ms=first_ms,
-                        )
-                    if committed:
-                        # Past the commit point. The client already holds
-                        # part of this answer; another backend's tokens
-                        # cannot be appended to it.
-                        log.warning(
-                            "driver slot %r lost %s mid-stream after emitting tokens; "
-                            "truncating rather than failing over: %s",
-                            self.name,
-                            driver,
-                            type(exc).__name__,
-                        )
-                        raise
-                    if not _is_cascade_eligible(exc):
-                        raise
-                    last_exc = exc
-                    self._log_cascade("stream", index, candidate, exc, total=total)
-                    index += 1
-                else:
-                    self._finish_circuit(
-                        candidate,
-                        None if saw_done else RuntimeError("incomplete"),
-                        probe_epoch=probe_epoch,
-                    )
-                    reported = True
-                    if self._hooks is not None and driver:
-                        self._hooks.on_attempt_end(
-                            driver,
-                            node=node,
-                            model=getattr(candidate, "public_model", None),
-                            runtime=runtime,
-                            # A stream that stopped without a `done`
-                            # event did not serve this request, however
-                            # tidily it ended. It is NOT cascaded past
-                            # -- tokens are already out, so M10's commit
-                            # point forbids it -- but calling it served
-                            # would put a truncation in the metrics as a
-                            # completion and refresh this backend's
-                            # "last served" mark, which is what the
-                            # balancer and the idle pass read.
-                            served=saw_done,
-                            usage=usage,
-                            retry_disposition=None if saw_done else "indeterminate",
-                            elapsed_ms=int((time.perf_counter() - started) * 1000),
-                            error=None if saw_done else "IncompleteStream",
-                            first_ms=first_ms,
-                        )
-                    if saw_done:
-                        self._served(usage, candidate, request)
-                    self.served_by = driver
-                    self.served_model = getattr(candidate, "public_model", None)
-                    self.served_by_node = node
-                    self.served_candidate = candidate
-                    self.tier = tier_index + 1
-                    return
-                finally:
-                    # Runs on every path, including the consumer
-                    # abandoning this generator: that is what releases
-                    # the driver's response and, through it, the engine.
-                    #
-                    # And it is the only arm that sees the two ways this
-                    # attempt ends WITHOUT reaching either branch above.
-                    # A consumer that closes this generator -- the
-                    # playground's Stop button, a tab shut mid-answer --
-                    # gets `GeneratorExit` raised at the `yield`, and a
-                    # cancelled request task gets `CancelledError`
-                    # (starlette cancels the response task group on
-                    # `http.disconnect`). Both are `BaseException`, so
-                    # neither `except Exception` nor `else` runs, the
-                    # attempt is never closed, and the runtime's
-                    # in-flight counter stays above zero for the life of
-                    # the process -- after which it never idle-unloads
-                    # and can never be evicted to make room for a wake.
-                    if not reported:
-                        self._finish_circuit(
-                            candidate,
-                            sys.exc_info()[1] or RuntimeError("abandoned"),
-                            probe_epoch=probe_epoch,
-                        )
-                    if not reported and self._hooks is not None and driver:
-                        ending = sys.exc_info()[1]
-                        self._hooks.on_attempt_end(
-                            driver,
-                            node=node,
-                            model=getattr(candidate, "public_model", None),
-                            runtime=runtime,
-                            served=False,
-                            elapsed_ms=int((time.perf_counter() - started) * 1000),
-                            error=type(ending).__name__ if ending is not None else "Abandoned",
-                            retry_disposition="indeterminate",
-                            first_ms=first_ms,
-                        )
-                    if stream is not None:
-                        await stream.aclose()
-        assert last_exc is not None  # candidates is non-empty (checked in __init__)
-        raise last_exc
+        policy = StreamPolicy(
+            progress=lambda event: event.progress is not None,
+            complete=lambda event: bool(event.done),
+            usage=lambda event: event.result.usage if event.result is not None else None,
+            eof_is_success=False,
+        )
+        stream = Executor(self).stream("stream", call, policy=policy, generation=request)
+        try:
+            async for event in stream:
+                yield event
+        finally:
+            await stream.aclose()
 
     @staticmethod
     def _finish_circuit(

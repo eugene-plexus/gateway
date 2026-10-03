@@ -1,0 +1,12 @@
+name: Candidate integration
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  integration:
+    uses: eugene-plexus/specs/.github/workflows/ci.yml@main
+    with:
+      gateway_ref: ${{ github.event.pull_request.head.sha || github.sha }}
