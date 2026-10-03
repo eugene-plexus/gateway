@@ -136,6 +136,16 @@ def test_each_setting_reaches_the_driver_and_is_named_as_explicit(settings: Sett
     }
 
 
+def test_reasoning_effort_max_reaches_the_driver(settings: Settings) -> None:
+    """`max` joined `ReasoningEffort` at specs 8c41b85 (2026-10-03): GPT-6
+    and OpenRouter accept it, and a caller sending it was refused here."""
+    rich = Rich(name="rich", model_id="m")
+    with serve(settings, rich) as client:
+        response = client.post("/v1/chat/completions", json=chat(reasoning_effort="max"))
+    assert response.status_code == 200, response.text
+    assert rich.calls[-1].reasoningEffort.value == "max"
+
+
 def test_logprobs_false_asks_for_nothing(settings: Settings) -> None:
     plain = Rich(False, name="plain", model_id="m")
     with serve(settings, plain) as client:
