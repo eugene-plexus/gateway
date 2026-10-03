@@ -46,6 +46,8 @@ from ._generated.models import (
     ImageUrl,
     InputFile,
     NamedToolChoice,
+    ResponseFormat,
+    ResponseJsonSchema,
     Role1,
     Stop,
     TextContentPart,
@@ -274,9 +276,14 @@ _DROPPED_TOP_LEVEL = (
     "output_config",
 )
 
-# The only `output_config` key this door accepts. Anything else --
-# structured output's `format` above all -- changes what the answer is.
-_ACCEPTED_OUTPUT_CONFIG = frozenset({"effort"})
+# The `output_config` keys this door accepts: `effort`, named and not
+# enforced, and since 2026-10-03 `format`, honoured (see `_output_format`).
+# Anything else changes what the answer is in a way this door cannot carry.
+_ACCEPTED_OUTPUT_CONFIG = frozenset({"effort", "format"})
+
+# The keys of a `json_schema` output format, as Anthropic defines it and
+# Claude Code sends it (`{type: "json_schema", schema: ...}`, 2.1.283).
+_OUTPUT_FORMAT_KEYS = frozenset({"type", "schema"})
 
 # Fields whose presence means the caller wants something this control
 # plane cannot do at all, as opposed to something it can ignore. `top_k`
@@ -342,6 +349,9 @@ def compatibility_headers(raw: Mapping[str, Any]) -> dict[str, str]:
         value = raw.get(name)
         if name == "metadata" or value is None:
             return False
+        if name == "output_config":
+            # `format` is honoured; only an effort goes unenforced.
+            return not isinstance(value, Mapping) or value.get("effort") is not None
         if name != "thinking":
             return True
         # `thinking` decides whether reasoning is returned and whether its
@@ -773,14 +783,17 @@ def translate_request(
         raise _validation_refusal(e) from e
 
     output_config = raw.get("output_config")
+    response_format: ResponseFormat | None = None
     if isinstance(output_config, Mapping):
         for key in output_config:
             if key not in _ACCEPTED_OUTPUT_CONFIG:
                 raise Refusal(
                     f"output_config.{chat_contract._field_name(str(key))}: unsupported "
-                    "setting. Only `effort` is accepted here (and not enforced: the "
-                    "model's settings profile governs how it thinks)."
+                    "setting. Only `effort` (accepted and not enforced: the model's settings "
+                    "profile governs how it thinks) and a `json_schema` `format` are "
+                    "accepted here."
                 )
+        response_format = _output_format(output_config.get("format"))
 
     for name in _REFUSED_TOP_LEVEL:
         if raw.get(name) is not None:
@@ -937,6 +950,49 @@ def translate_request(
         tools=_tools(body.tools),
         tool_choice=_tool_choice(body.tool_choice),
         parallel_tool_calls=_parallel_tool_calls(body.tool_choice),
+        response_format=response_format,
+    )
+
+
+def _output_format(fmt: Any) -> ResponseFormat | None:
+    """`output_config.format` as the chat path's `response_format`.
+
+    **Claude Code sends it to any base URL** (the structured-outputs beta),
+    for session titles, memory recall and prompt hooks; while this door
+    refused it, all three failed here (upstream drift audit, 2026-10-03).
+    Anthropic's `{"type": "json_schema", "schema": ...}` is the chat wire's
+    `{"type": "json_schema", "json_schema": {"name", "schema"}}`, built as
+    the Responses door builds it from its flat `text.format` -- so the
+    answer's text is JSON matching the schema, and a backend that cannot
+    constrain its output is routed past as for any `response_format`.
+    Another format type, or a key this door does not read, changes the
+    answer in a way it cannot carry, and is refused by name.
+    """
+    if fmt is None:
+        return None
+    if not isinstance(fmt, Mapping):
+        raise Refusal("output_config.format: must be an object.")
+    kind = fmt.get("type")
+    if kind != "json_schema":
+        raise Refusal(
+            f"output_config.format.type: {chat_contract._field_name(str(kind))} is not "
+            "supported. Only `json_schema` output is carried here."
+        )
+    for key in fmt:
+        if key not in _OUTPUT_FORMAT_KEYS:
+            raise Refusal(
+                f"output_config.format.{chat_contract._field_name(str(key))}: unsupported setting."
+            )
+    schema = fmt.get("schema")
+    if not isinstance(schema, Mapping):
+        raise Refusal("output_config.format.schema: required for json_schema output.")
+    return ResponseFormat.model_validate(
+        {
+            "type": "json_schema",
+            "json_schema": ResponseJsonSchema.model_validate(
+                {"name": "response", "schema": dict(schema)}
+            ),
+        }
     )
 
 

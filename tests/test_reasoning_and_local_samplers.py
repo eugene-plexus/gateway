@@ -653,20 +653,90 @@ def test_output_config_effort_is_accepted_and_disclosed(settings: Settings) -> N
 
 
 @pytest.mark.parametrize(
-    "config",
-    [{"format": {"type": "json_schema", "schema": {"type": "object"}}}, {"task_budget": {}}],
-    ids=["structured-output", "unknown-key"],
+    ("config", "named"),
+    [
+        ({"task_budget": {}}, "output_config.task_budget"),
+        # A structured-output format other than a JSON schema.
+        ({"format": {"type": "regex", "pattern": "a+"}}, "output_config.format.type"),
+        # A JSON schema format missing its schema.
+        ({"format": {"type": "json_schema"}}, "output_config.format.schema"),
+        # A key inside the format this door does not read.
+        (
+            {"format": {"type": "json_schema", "schema": {"type": "object"}, "grammar": "x"}},
+            "output_config.format.grammar",
+        ),
+    ],
+    ids=["unknown-key", "other-format-type", "no-schema", "unknown-format-key"],
 )
 def test_any_other_output_config_key_is_refused_by_name(
-    settings: Settings, config: dict[str, Any]
+    settings: Settings, config: dict[str, Any], named: str
 ) -> None:
+    """Amended 2026-10-03: `format` with a JSON schema is honoured now (the
+    next test), so the structured-output case that stood here moved there.
+    What still changes the answer in a way this door cannot carry is
+    refused, by name."""
     fake = _fake(responses=["ok"])
     with TestClient(_app(settings, fake)) as client:
         r = client.post("/v1/messages", json=claude_code_body(output_config=config))
 
     assert r.status_code == 400, r.text
-    assert f"output_config.{next(iter(config))}" in r.json()["error"]["message"]
+    assert named in r.json()["error"]["message"]
     assert not fake.calls
+
+
+SCHEMA = {
+    "type": "object",
+    "properties": {"title": {"type": "string"}},
+    "required": ["title"],
+    "additionalProperties": False,
+}
+
+
+@pytest.mark.parametrize("effort", [None, "high"])
+def test_output_config_format_is_the_chat_paths_json_schema(
+    settings: Settings, effort: str | None
+) -> None:
+    """Claude Code sends `output_config.format` (structured-outputs beta) for
+    session titles, memory recall and prompt hooks, to any base URL; while
+    it was refused, all three failed through this door (upstream drift
+    audit, 2026-10-03). It is carried as the chat path's `response_format`,
+    the shape the Responses door builds from its own `text.format`."""
+    fake = _fake(responses=['{"title": "A session"}'])
+    config: dict[str, Any] = {"format": {"type": "json_schema", "schema": SCHEMA}}
+    if effort is not None:
+        config["effort"] = effort
+    with TestClient(_app(settings, fake)) as client:
+        r = client.post("/v1/messages", json=claude_code_body(output_config=config))
+
+    assert r.status_code == 200, r.text
+    sent = fake.calls[-1].responseFormat
+    assert sent is not None
+    assert sent.type.value == "json_schema"
+    assert sent.json_schema is not None
+    assert sent.json_schema.schema_ == SCHEMA
+    assert sent.json_schema.name == "response"
+    assert "responseFormat" in (fake.calls[-1].callerSettings or [])
+    # The format is honoured, so only an effort makes `output_config` an
+    # ignored setting.
+    ignored = r.headers.get("x-eugene-plexus-ignored-settings", "").split(", ")
+    assert ("output_config" in ignored) is (effort is not None)
+
+
+def test_count_tokens_counts_a_request_with_an_output_format(settings: Settings) -> None:
+    fake = _fake()
+    fake.prompt_tokens = 77
+    body = {
+        k: v
+        for k, v in claude_code_body(
+            output_config={"format": {"type": "json_schema", "schema": SCHEMA}}
+        ).items()
+        if k not in ("max_tokens", "stream")
+    }
+    with TestClient(_app(settings, fake)) as client:
+        r = client.post("/v1/messages/count_tokens", json=body)
+
+    assert r.status_code == 200, r.text
+    assert r.json() == {"input_tokens": 77}
 
 
 def test_a_null_output_config_is_neither_refused_nor_disclosed(settings: Settings) -> None:
