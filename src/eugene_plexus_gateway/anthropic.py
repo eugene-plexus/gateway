@@ -133,6 +133,26 @@ class Refusal(Exception):
         return error_response(self.status, self.message, kind=self.kind)
 
 
+def prompt_too_long(prompt_tokens: int | None, context_tokens: int | None, why: str) -> str:
+    """An overflow in the words Claude Code acts on.
+
+    **Claude Code compacts the conversation and retries only when the
+    message says `prompt is too long`** (2.1.283: a case-folded substring
+    test on the error's message), and reads `N tokens > M maximum` after it
+    to know by how much. A local model's overflow relayed in the engine's
+    own words ended the session instead (upstream drift audit,
+    2026-10-03). The numbers appear only when the backend reported both;
+    the engine's words follow ours, for whoever reads the message.
+    """
+    head = "prompt is too long"
+    if prompt_tokens is not None and context_tokens is not None:
+        head += f": {prompt_tokens} tokens > {context_tokens} maximum"
+    return (
+        f"{head}. The conversation does not fit the context window of the model serving it; "
+        f"compact it, or serve the model with a larger context. {why}"
+    )
+
+
 def status_for(openai_status: int) -> int:
     """Our internal failure status, as this door should report it.
 

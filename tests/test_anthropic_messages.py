@@ -19,6 +19,7 @@ event stream, because an unmodified SDK is the audience.
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Iterator
 from typing import Any
@@ -29,8 +30,9 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from eugene_plexus_gateway import tokens
-from eugene_plexus_gateway._generated.driver_models import FunctionCall, ToolCall
+from eugene_plexus_gateway._generated.driver_models import FunctionCall, Problem, ToolCall
 from eugene_plexus_gateway.app import create_app
+from eugene_plexus_gateway.driver_client import DriverError
 from eugene_plexus_gateway.settings import Settings
 
 from .conftest import FakeDriverClient, FakeInstall, make_routing_table
@@ -394,6 +396,147 @@ def test_a_server_tool_refusal_names_its_input_tag(settings: Settings, kind: str
     assert r.json()["error"]["type"] == "invalid_request_error"
     assert f"Input tag '{kind}'" in r.json()["error"]["message"]
     assert not fake.calls
+
+
+#: llama-server's refusal of a prompt its context cannot hold, as the
+#: driver relays it (`openai_compat_http returned 400: <body>`); the body is
+#: b11375's `exceed_context_size_error`, both numbers included.
+LLAMA_OVERFLOW = (
+    'openai_compat_http returned 400: {"error":{"code":400,"message":"request (15010 tokens) '
+    'exceeds the available context size (512 tokens), try increasing it",'
+    '"type":"exceed_context_size_error","n_prompt_tokens":15010,"n_ctx":512}}'
+)
+
+#: Claude Code 2.1.283's own reader of the numbers (read from the binary).
+CLAUDE_CODE_TOO_LONG = re.compile(r"prompt is too long[^0-9]*(\d+)\s*tokens?\s*>\s*(\d+)", re.I)
+
+
+def _rejected(detail: str) -> DriverError:
+    return DriverError(
+        driver_name="d1",
+        driver_url="http://fake-driver",
+        status_code=400,
+        problem=Problem(type="about:blank", title="Backend rejected", status=400, detail=detail),
+        raw_body="",
+    )
+
+
+def _overflowing(stream: bool, detail: str) -> FakeDriverClient:
+    fake = FakeDriverClient(name="d1", model_id=MODEL)
+    if stream:
+        fake.stream_error_after = 0
+        fake.stream_error = _rejected(detail)
+    else:
+        fake.generate_error = _rejected(detail)
+    return fake
+
+
+def _error_of(r: Any, stream: bool) -> dict[str, Any]:
+    if not stream:
+        assert r.status_code == 400, r.text
+        return r.json()["error"]
+    # Streamed, the 200 went out on acceptance; the refusal is the
+    # stream's `error` event, which the client's SDK raises with the same
+    # message.
+    [event] = [e for e in _events(r.text) if e["type"] == "error"]
+    return event["error"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_prompt_too_long_for_the_context_says_so_in_claude_codes_words(
+    settings: Settings, stream: bool
+) -> None:
+    """Claude Code compacts the conversation and retries only when the
+    error says `prompt is too long` (upstream drift audit, 2026-10-03), and
+    reads `N tokens > M maximum` to know by how much. Relayed in the
+    engine's own words, a local model's full window ended the session."""
+    fake = _overflowing(stream, LLAMA_OVERFLOW)
+    with _client(_app_with(settings, fake)) as client:
+        r = client.post("/v1/messages", json=body(stream=stream))
+    error = _error_of(r, stream)
+    assert error["type"] == "invalid_request_error"
+    assert error["message"].startswith("prompt is too long: 15010 tokens > 512 maximum")
+    match = CLAUDE_CODE_TOO_LONG.search(error["message"])
+    assert match is not None and match.groups() == ("15010", "512")
+    # The engine's own words are kept for whoever reads the message.
+    assert "exceeds the available context size" in error["message"]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_prompt_too_long_without_numbers_still_begins_so(
+    settings: Settings, stream: bool
+) -> None:
+    """A backend that names neither number gets the words without them,
+    never invented ones."""
+    fake = _overflowing(
+        stream, "openai_compat_http returned 400: the prompt exceeds the maximum context length"
+    )
+    with _client(_app_with(settings, fake)) as client:
+        r = client.post("/v1/messages", json=body(stream=stream))
+    error = _error_of(r, stream)
+    assert error["type"] == "invalid_request_error"
+    assert error["message"].startswith("prompt is too long")
+    assert CLAUDE_CODE_TOO_LONG.search(error["message"]) is None
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_another_backend_refusal_keeps_its_own_words(settings: Settings, stream: bool) -> None:
+    """The twin: only an overflow is reworded. A template refusal read as
+    `prompt is too long` would send Claude Code compacting a conversation
+    that fits."""
+    fake = _overflowing(stream, "openai_compat_http returned 400: Jinja Exception: bad role")
+    with _client(_app_with(settings, fake)) as client:
+        r = client.post("/v1/messages", json=body(stream=stream))
+    error = _error_of(r, stream)
+    assert "prompt is too long" not in error["message"].lower()
+    assert "Jinja Exception" in error["message"]
+
+
+@pytest.mark.parametrize(
+    ("detail", "numbers"),
+    [
+        (LLAMA_OVERFLOW, (15010, 512)),
+        # llama-server's message alone, its fields cut off by the driver's
+        # 500-character relay.
+        (
+            '{"error":{"code":400,"message":"request (9000 tokens) exceeds the available '
+            'context size (8192 tokens), try increasing it"',
+            (9000, 8192),
+        ),
+        (
+            "This model's maximum context length is 4096 tokens. However, you requested "
+            "5000 tokens (4000 in the messages, 1000 in the completion).",
+            (5000, 4096),
+        ),
+        (
+            "This model's maximum context length is 128000 tokens. However, your messages "
+            "resulted in 130000 tokens.",
+            (130000, 128000),
+        ),
+        # One number is no pair: none is invented.
+        ('{"n_ctx":512}', (None, None)),
+        ("the prompt exceeds the maximum context length", (None, None)),
+    ],
+    ids=["llama-fields", "llama-message", "vllm", "openai", "one-number", "none"],
+)
+def test_an_overflows_two_numbers_are_read_as_each_backend_writes_them(
+    detail: str, numbers: tuple[int | None, int | None]
+) -> None:
+    from eugene_plexus_gateway import responses
+
+    assert responses.overflow_numbers(detail) == numbers
+
+
+def test_the_openai_door_keeps_the_engines_words_for_an_overflow(settings: Settings) -> None:
+    """Claude Code's wording is this door's; the chat door relays as before."""
+    fake = _overflowing(False, LLAMA_OVERFLOW)
+    with _client(_app_with(settings, fake)) as client:
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": MODEL, "messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert r.status_code == 400, r.text
+    assert r.json()["error"]["message"].startswith("The backend rejected the request")
 
 
 def test_mcp_servers_is_refused(settings: Settings) -> None:

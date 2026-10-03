@@ -396,6 +396,17 @@ class _Failure:
     error_type: str
     param: str | None = None
     retry_after: str | None = None
+    #: The backend refused a prompt too long for the model's context, and
+    #: the two numbers when it named both: the Anthropic door words this as
+    #: Claude Code's `prompt is too long`, the one wording it compacts on.
+    context_overflow: bool = False
+    prompt_tokens: int | None = None
+    context_tokens: int | None = None
+
+    def anthropic_message(self) -> str:
+        if not self.context_overflow:
+            return self.message
+        return anthropic.prompt_too_long(self.prompt_tokens, self.context_tokens, self.message)
 
     def as_openai(self) -> JSONResponse:
         response = _error(
@@ -426,7 +437,7 @@ class _Failure:
         # would throw away the available-model list and the
         # sealed-control-root diagnosis.
         status = anthropic.status_for(self.code)
-        response = anthropic.error_response(status, self.message)
+        response = anthropic.error_response(status, self.anthropic_message())
         if self.retry_after:
             response.headers["Retry-After"] = self.retry_after
         return response
@@ -1238,11 +1249,18 @@ async def _stream_anthropic(
             if not translator.started:
                 yield translator.start()
             # A full pool is Anthropic's `overloaded_error`, which Claude
-            # Code retries (CB3); anything else stays `api_error`.
-            for chunk in translator.failed(
-                str(e) or type(e).__name__,
-                kind="overloaded_error" if capacity_refused(e) else "api_error",
-            ):
+            # Code retries (CB3). A prompt too long for the context is an
+            # `invalid_request_error` in the words Claude Code compacts on:
+            # its SDK raises a streamed `error` event with the event's text
+            # as the message, which is what it reads. Anything else stays
+            # `api_error`.
+            failure = _driver_failure(e) if isinstance(e, DriverError) else None
+            if failure is not None and failure.context_overflow:
+                message, kind = failure.anthropic_message(), "invalid_request_error"
+            else:
+                message = str(e) or type(e).__name__
+                kind = "overloaded_error" if capacity_refused(e) else "api_error"
+            for chunk in translator.failed(message, kind=kind):
                 yield chunk
             return
 
@@ -4679,10 +4697,17 @@ def _driver_failure_status(e: DriverError) -> _Failure:
             error_type="upstream_auth_error",
         )
     if 400 <= upstream < 500:
+        overflow = responses.is_context_overflow(detail)
+        prompt_tokens, context_tokens = (
+            responses.overflow_numbers(detail) if overflow else (None, None)
+        )
         return _Failure(
             code=400,
             message=f"The backend rejected the request: {detail}",
             error_type="invalid_request_error",
+            context_overflow=overflow,
+            prompt_tokens=prompt_tokens,
+            context_tokens=context_tokens,
         )
     return _Failure(
         code=502,

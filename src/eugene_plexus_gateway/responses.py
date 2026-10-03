@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Mapping
@@ -154,6 +155,44 @@ OVERLOADED = "server_overloaded"
 def is_context_overflow(message: str) -> bool:
     lowered = message.lower()
     return any(word in lowered for word in _CONTEXT_WORDS)
+
+
+# How each backend names the two numbers of an overflow, prompt first and
+# window second. llama-server's body carries them as fields
+# (`n_prompt_tokens`, `n_ctx`, b11375) and in its message ("request (N
+# tokens) exceeds the available context size (M tokens)"); vLLM and
+# OpenAI say "maximum context length is M tokens. However, you requested
+# N tokens" (or "your messages resulted in", or "your request has").
+_OVERFLOW_FIELDS = (
+    re.compile(r'n_prompt_tokens\\?"?\s*:\s*(\d+)'),
+    re.compile(r'n_ctx\\?"?\s*:\s*(\d+)'),
+)
+_OVERFLOW_PHRASES = (
+    (re.compile(r"request \((\d+) tokens?\) exceeds the available context size \((\d+)"), 1, 2),
+    (
+        re.compile(
+            r"maximum context length is (\d+) tokens?\.?\s*However, (?:you requested|"
+            r"your messages resulted in|your request has) (\d+)",
+            re.IGNORECASE,
+        ),
+        2,
+        1,
+    ),
+)
+
+
+def overflow_numbers(message: str) -> tuple[int | None, int | None]:
+    """`(prompt tokens, context window)` as the backend reported them, or
+    `(None, None)` unless it named both: a client reads the gap between
+    them as how much to compact, so a guessed one is worse than none."""
+    fields = [pattern.search(message) for pattern in _OVERFLOW_FIELDS]
+    if fields[0] is not None and fields[1] is not None:
+        return int(fields[0].group(1)), int(fields[1].group(1))
+    for pattern, prompt, window in _OVERFLOW_PHRASES:
+        found = pattern.search(message)
+        if found is not None:
+            return int(found.group(prompt)), int(found.group(window))
+    return None, None
 
 
 def error_code(status: int, message: str, error_type: str) -> str | None:
