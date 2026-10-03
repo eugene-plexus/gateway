@@ -33,7 +33,9 @@ The rules, each for a reason recorded in the design:
   search failed and why, and answers without it.
 * **When search is the only tool the caller offered, the first call must
   call a tool**: the caller asked for a search, not for the model's
-  opinion on whether to search.
+  opinion on whether to search. A model that refuses a forced tool choice
+  (hosted Claude 5.5 and Fable 5.1 do) is asked that turn once more with
+  `auto` and told in words to search.
 
 `image_generation` (P8e, Responses only) rides the same loop: an
 `ImagePlan`, `image_model` to choose which image model answers, and an
@@ -995,6 +997,9 @@ class SearchingClient:
         self._tool_name = WEB_SEARCH
         self._image_name = IMAGE_GENERATION
         self._base: GenerateRequest | None = None
+        #: Whether the first turn's `required` was this loop's own choice
+        #: rather than the caller's -- the only kind it may soften.
+        self._forced_first = False
         previous: Prepare | None = getattr(inner, "prepare_request", None)
         if hasattr(inner, "prepare_request"):
             inner.prepare_request = self._prepared(previous)
@@ -1085,6 +1090,7 @@ class SearchingClient:
             # The caller asked for a search; the first call makes one. Not
             # when an image tool rides too: "hi" is not a request for either.
             choice = ToolChoice.required
+            self._forced_first = True
         return base.model_copy(
             update={
                 "messages": history,
@@ -1094,6 +1100,71 @@ class SearchingClient:
                 "callerSettings": sorted(settings) or None,
             }
         )
+
+    def _may_unforce(self, turn: int, error: Exception) -> bool:
+        """Was the first turn refused for the tool choice this loop forced?
+
+        **Some models refuse a forced tool choice outright**: Anthropic's
+        docs say Claude Opus 5.5, Sonnet 5.5 and Fable 5.1 reject
+        `tool_choice` `any` and `tool`, so a slot backed by one answered
+        Claude Code's WebSearch -- whose only tool is the search -- with a
+        400 (upstream drift audit, 2026-10-03). Model-agnostic on purpose:
+        a list of model ids would be wrong for the next model and for every
+        alias an operator gives one, while the refusal names the parameter
+        it refuses. So a 400 on the forced first turn whose words name
+        `tool_choice` is asked once more with `auto` (`_unforced`). Never a
+        caller's own forced choice: that refusal is the caller's answer.
+        """
+        if turn != 0 or not self._forced_first or not isinstance(error, DriverError):
+            return False
+        if error.status_code != 400:
+            return False
+        detail = error.problem.detail if error.problem is not None else None
+        words = f"{detail or ''} {error.raw_body or ''}".lower()
+        return "tool_choice" in words or "tool choice" in words
+
+    def _unforced(self, request: GenerateRequest) -> GenerateRequest:
+        """The first turn again, with `auto` and the forcing said in words."""
+        log.info(
+            "the backend refused a forced tool choice; asking again with tool_choice auto "
+            "and an instruction to search"
+        )
+        instruction = (
+            f"Search the web before you answer: call the {self._tool_name} tool with a query "
+            "for what you were asked."
+        )
+        messages = list(request.messages)
+        first = messages[0] if messages else None
+        if first is not None and first.role == Role.system and isinstance(first.content, str):
+            messages[0] = first.model_copy(update={"content": f"{first.content}\n\n{instruction}"})
+        else:
+            messages.insert(0, Message(role=Role.system, content=instruction))
+        return request.model_copy(update={"toolChoice": ToolChoice.auto, "messages": messages})
+
+    async def _turn_generate(self, turn_request: GenerateRequest, turn: int) -> GenerateResponse:
+        try:
+            response: GenerateResponse = await self._inner.generate(turn_request)
+        except DriverError as e:
+            if not self._may_unforce(turn, e):
+                raise
+            response = await self._inner.generate(self._unforced(turn_request))
+        return response
+
+    async def _turn_stream(
+        self, turn_request: GenerateRequest, turn: int
+    ) -> AsyncGenerator[StreamEvent, None]:
+        produced = False
+        try:
+            async for event in self._inner.stream(turn_request):
+                produced = True
+                yield event
+        except DriverError as e:
+            # Only before anything was sent on: a refusal comes before the
+            # first token, and past it the answer is committed.
+            if produced or not self._may_unforce(turn, e):
+                raise
+            async for event in self._inner.stream(self._unforced(turn_request)):
+                yield event
 
     def _after_turn(self, turn: int) -> None:
         self.turns = turn + 1
@@ -1210,7 +1281,7 @@ class SearchingClient:
         history = list(request.messages)
         usage: Usage | None = None
         for turn in range(self.max_turns):
-            response = await self._inner.generate(self._turn_request(request, history, turn))
+            response = await self._turn_generate(self._turn_request(request, history, turn), turn)
             self._after_turn(turn)
             usage = _sum_usage(usage, response.usage)
             if response.reasoning:
@@ -1241,7 +1312,7 @@ class SearchingClient:
             result: GenerateResponse | None = None
             text: list[str] = []
             thought: list[str] = []
-            async for event in self._inner.stream(self._turn_request(request, history, turn)):
+            async for event in self._turn_stream(self._turn_request(request, history, turn), turn):
                 if event.done:
                     result = event.result
                     continue

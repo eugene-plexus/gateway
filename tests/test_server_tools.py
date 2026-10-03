@@ -41,11 +41,12 @@ from eugene_plexus_gateway._generated.driver_models import (
     FunctionCall,
     GenerateRequest,
     GenerateResponse,
+    Problem,
     ToolCall,
     Usage,
 )
 from eugene_plexus_gateway.app import create_app
-from eugene_plexus_gateway.driver_client import StreamEvent
+from eugene_plexus_gateway.driver_client import DriverError, StreamEvent
 from eugene_plexus_gateway.routing import ToolAccount
 from eugene_plexus_gateway.server_tools import citations, query_of, tool_name_for
 from eugene_plexus_gateway.settings import Settings
@@ -896,6 +897,89 @@ def test_the_messages_stream_carries_the_search_blocks_in_order(settings, search
     assert stops == [0, 1, 2], "every block that opened also closed"
     delta = next(d for n, d in events(response) if n == "message_delta")
     assert delta["usage"]["server_tool_use"] == {"web_search_requests": 1}
+
+
+def _backend_400(detail: str) -> DriverError:
+    return DriverError(
+        driver_name="local",
+        driver_url="http://local.invalid",
+        status_code=400,
+        problem=Problem(type="about:blank", title="Backend rejected", status=400, detail=detail),
+        raw_body="",
+    )
+
+
+#: A hosted Claude 5.5 refusing a forced tool choice, as OpenRouter relays
+#: an Anthropic 400 through the driver. Anthropic's docs say Opus 5.5,
+#: Sonnet 5.5 and Fable 5.1 reject `tool_choice` `any` and `tool`; the exact
+#: words are not captured here, so the rule keys on the parameter's name.
+FORCED_REFUSED = (
+    'openai_compat_http returned 400: {"error":{"message":"Provider returned error","code":400,'
+    '"metadata":{"raw":"{\\"type\\":\\"error\\",\\"error\\":{\\"type\\":'
+    '\\"invalid_request_error\\",\\"message\\":\\"tool_choice: forcing tool use is not '
+    'supported with this model.\\"}}","provider_name":"Anthropic"}}}'
+)
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_model_that_refuses_a_forced_first_search_is_asked_again_with_auto(
+    settings, search, stream: bool
+) -> None:
+    """The loop forces the first call when search is the only tool; a model
+    that rejects forced tool choice failed Claude Code's WebSearch outright
+    (upstream drift audit, 2026-10-03). Asked once more with `auto` and told
+    to search, it searches."""
+    model = ScriptedDriver(
+        turns=[
+            Turn(error=_backend_400(FORCED_REFUSED)),
+            Turn(calls=[search_call()]),
+            Turn(ANSWER),
+        ]
+    )
+    with TestClient(app_with(settings, model, searches=[account(search)])) as client:
+        response = client.post("/v1/messages", json={**CLAUDE_CODE_SEARCH, "stream": stream})
+    assert response.status_code == 200, response.text
+    if stream:
+        kinds = [
+            d["content_block"]["type"] for n, d in events(response) if n == "content_block_start"
+        ]
+        assert not [n for n, _ in events(response) if n == "error"]
+    else:
+        kinds = [b["type"] for b in response.json()["content"]]
+    assert kinds == ["server_tool_use", "web_search_tool_result", "text"]
+    forced, unforced, answered = model.calls
+    assert str(forced.toolChoice) == "required"
+    assert str(unforced.toolChoice) == "auto"
+    assert [t.function.name for t in unforced.tools] == ["web_search"]
+    # Told in words what the forced choice said in a parameter.
+    instruction = unforced.messages[0]
+    assert instruction.role.value == "system" and "web_search" in instruction.content
+    assert instruction.content.startswith(forced.messages[0].content)
+    assert [r.query for r in search.asked] == ["eugene plexus"]
+    assert str(answered.toolChoice) != "required"
+
+
+def test_a_400_that_is_not_about_tool_choice_is_not_asked_again(settings, search) -> None:
+    """The twin: a refusal of anything else is the caller's answer, once."""
+    model = ScriptedDriver(
+        turns=[Turn(error=_backend_400("Jinja Exception: bad role")), Turn(ANSWER)]
+    )
+    with TestClient(app_with(settings, model, searches=[account(search)])) as client:
+        response = client.post("/v1/messages", json=CLAUDE_CODE_SEARCH)
+    assert response.status_code == 400
+    assert len(model.calls) == 1
+    assert not search.asked
+
+
+def test_a_callers_own_forced_choice_is_never_loosened(settings, search) -> None:
+    """Only the loop's own forcing is softened: a caller that asked for a
+    forced call and got a refusal is told so, not answered some other way."""
+    model = ScriptedDriver(turns=[Turn(error=_backend_400(FORCED_REFUSED)), Turn(ANSWER)])
+    asked_for_any = {**CLAUDE_CODE_SEARCH, "tool_choice": {"type": "any"}}
+    with TestClient(app_with(settings, model, searches=[account(search)])) as client:
+        response = client.post("/v1/messages", json=asked_for_any)
+    assert response.status_code == 400
+    assert len(model.calls) == 1
 
 
 def test_search_blocks_handed_back_become_the_turns_history(settings) -> None:
