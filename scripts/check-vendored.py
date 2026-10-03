@@ -14,7 +14,7 @@ def check(root: Path) -> None:
         if not path.is_relative_to(root.resolve()):
             raise ValueError(f"path outside repository: {name}")
         actual = hashlib.sha256(path.read_text(encoding="utf-8").encode()).hexdigest()
-        if actual != expected:
+        if actual != expected["sha256"]:
             raise ValueError(f"{name}: edited vendored code; update specs/platform and regenerate")
 
 
