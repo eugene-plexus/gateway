@@ -227,6 +227,46 @@ def test_metadata_and_context_management_are_dropped(settings: Settings) -> None
     assert "context_management" not in sent
 
 
+#: What Claude Code 2.1.288's request builder can add at the top level
+#: (upstream drift audit, 2026-10-03). The values are stand-ins: the door
+#: reads none of them, so their shape must not matter.
+CLAUDE_CODE_288_FIELDS: dict[str, Any] = {
+    "safeguards": {"mode": "standard"},
+    "speed": "fast",
+    "thread": {"id": "thread_1"},
+    "diagnostics": {"request_trace": True},
+}
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_claude_code_2_1_288s_top_level_fields_are_accepted_and_named(
+    settings: Settings, stream: bool
+) -> None:
+    """Refused as unknown fields until 2026-10-03, which 400'd the request
+    -- `output_config`'s 2026-09-23 failure again, one release on.
+    Anthropic's own gateway guide now says not to reject unknown input."""
+    fake = FakeDriverClient(name="d1", model_id=MODEL)
+    fake.responses = ["ok"]
+    with _client(_app_with(settings, fake)) as client:
+        r = client.post("/v1/messages", json=body(stream=stream, **CLAUDE_CODE_288_FIELDS))
+    assert r.status_code == 200, r.text
+    ignored = r.headers["x-eugene-plexus-ignored-settings"].split(", ")
+    for name in CLAUDE_CODE_288_FIELDS:
+        assert name in ignored
+    sent = fake.calls[0].model_dump()
+    assert not set(CLAUDE_CODE_288_FIELDS) & set(sent)
+
+
+def test_any_other_unknown_top_level_field_is_still_refused(settings: Settings) -> None:
+    """The positive twin: four names were accepted, not every name."""
+    fake = FakeDriverClient(name="d1", model_id=MODEL)
+    with _client(_app_with(settings, fake)) as client:
+        r = client.post("/v1/messages", json=body(frobnicate=True))
+    assert r.status_code == 400, r.text
+    assert "frobnicate" in r.json()["error"]["message"]
+    assert not fake.calls
+
+
 # --------------------------------------------------------------------------- #
 # What is refused, with the field named
 # --------------------------------------------------------------------------- #

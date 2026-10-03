@@ -274,6 +274,14 @@ _DROPPED_TOP_LEVEL = (
     # 2026-09-23) as `{"effort": "high"}`. Refused as an unknown field until
     # then, which failed the first request of every session.
     "output_config",
+    # What Claude Code 2.1.288's request builder can add (upstream drift
+    # audit, 2026-10-03), refused as unknown fields until then -- the
+    # `output_config` failure again, one release on. None changes what a
+    # local model answers, so each is accepted and named, not enforced.
+    "safeguards",
+    "speed",
+    "thread",
+    "diagnostics",
 )
 
 # The `output_config` keys this door accepts: `effort`, named and not
