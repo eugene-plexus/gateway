@@ -208,7 +208,8 @@ class ReasoningEffort(StrEnum):
     `reasoning_effort` (P2c, 2026-09-28). Measured on
     `openai/gpt-oss-20b` through OpenRouter: 17 reasoning tokens at
     `low`, 275 at `high`. A setting, so it routes only to a model
-    that lists it (A2).
+    that lists it (A2). `max` was added 2026-10-03: GPT-6 and
+    OpenRouter accept it, and a caller sending it was refused here.
 
     """
 
@@ -218,6 +219,7 @@ class ReasoningEffort(StrEnum):
     medium = 'medium'
     high = 'high'
     xhigh = 'xhigh'
+    max = 'max'
 
 
 class Verbosity(StrEnum):
@@ -2393,7 +2395,9 @@ class AnthropicToolDefinition(BaseModel):
     search** (`web_search_<date>`), which this install's search
     account runs since P8. There is no sandbox to run code in, and
     pretending otherwise would fail at the moment the model chose to
-    use one.
+    use one. The refusal's message contains `Input tag '<type>'`, the
+    wording Claude Code (2.1.280 and later) looks for to retry
+    without an optional server tool such as its advisor.
 
     """
 
@@ -2572,7 +2576,7 @@ class Error(BaseModel):
     )
     message: str = Field(
         ...,
-        description="Human-readable, and **it has to carry the whole\nexplanation** — measured, a 400 and a 403 are shown to\nthe user verbatim while a 404's message is discarded,\nwhich is why this door answers 400 for a model nothing\nserves.\n",
+        description="Human-readable, and **it has to carry the whole\nexplanation** — measured, a 400 and a 403 are shown to\nthe user verbatim while a 404's message is discarded,\nwhich is why this door answers 400 for a model nothing\nserves. A prompt too long for the model's context begins\n`prompt is too long`, the wording Claude Code compacts on.\n",
     )
 
 
@@ -2623,7 +2627,8 @@ class ResponsesInputItem(BaseModel):
 
     Carried: `message` (`role` user, assistant, system or developer;
     `content` a string or parts; `type` may be omitted), `function_call`
-    (`call_id`, `name`, `arguments` as a JSON string),
+    (`call_id`, `name`, `arguments` as a JSON string, and `namespace`
+    when the call was to a member of a `namespace` tool),
     `function_call_output` (`call_id`, `output` as a string or a list
     of `input_text` / `input_image` parts), and `reasoning`
     (`content` of `reasoning_text` parts, `encrypted_content`), and a
@@ -2646,6 +2651,10 @@ class ResponsesInputItem(BaseModel):
     content: Any | None = Field(None, description='A string, or a list of parts.')
     call_id: str | None = None
     name: str | None = None
+    namespace: str | None = Field(
+        None,
+        description='The `namespace` tool a `function_call` was to (Codex 0.133 and later).',
+    )
     arguments: str | None = None
     output: Any | None = Field(
         None, description='A string, or a list of `input_text` / `input_image` parts.'
@@ -2657,11 +2666,13 @@ class ResponsesInputItem(BaseModel):
 class ResponsesTool(BaseModel):
     """
     A `function` tool (`name`, `description`, `parameters`, `strict`)
-    maps onto an OpenAI chat function. `web_search` runs on this
-    install's search account, or is removed and named when it cannot
-    (see the endpoint); `image_generation` runs on this install's
-    image models, or is refused naming why (P8e); any other `type` is
-    refused.
+    maps onto an OpenAI chat function. A `namespace` tool (`name`,
+    `description`, `tools`) offers each of its `function` members the
+    same way and marks calls to them with its `namespace` (see the
+    endpoint). `web_search` runs on this install's search account, or
+    is removed and named when it cannot (see the endpoint);
+    `image_generation` runs on this install's image models, or is
+    refused naming why (P8e); any other `type` is refused.
 
     """
 
@@ -2670,6 +2681,9 @@ class ResponsesTool(BaseModel):
     )
     type: str
     name: str | None = None
+    tools: list[dict[str, Any]] | None = Field(
+        None, description="A `namespace` tool's members, each a tool object of its own."
+    )
     description: str | None = None
     parameters: dict[str, Any] | None = None
     strict: bool | None = None
@@ -2708,7 +2722,8 @@ class ResponsesOutputItem(BaseModel):
     `{"type": "message", "id", "role": "assistant", "status",
     "content": [{"type": "output_text", "text", "annotations": []}]}`,
     `{"type": "function_call", "id", "status", "call_id", "name",
-    "arguments"}`, for a search this install ran (P8),
+    "arguments", "namespace"?}` (`namespace` when the call is to a
+    member of a `namespace` tool), for a search this install ran (P8),
     `{"type": "web_search_call", "id", "status", "action": {"type":
     "search", "query", "sources": [{"type": "url", "url"}]}}`, or for
     an image it made (P8e), `{"type": "image_generation_call", "id",
@@ -3600,7 +3615,7 @@ class CompletionRoutingInfo(BaseModel):
     )
     prompt_truncated: bool | None = Field(
         None,
-        description="**The backend silently dropped input.** True when the prompt\nwe sent was far larger than the token count the backend\nreported consuming — the signature of a server that fits an\nover-long prompt into the window by discarding the middle of\nthe conversation and answering anyway, with a 200 and no\nflag of its own.\n\nThis is the failure that makes a coding harness loop: it\nsends file contents, the model never receives them, and the\nconfident answer that comes back is about code nobody read.\nMeasured on this project's own hardware: 66,389 characters\nacross six messages came back as `prompt_tokens: 86`, HTTP\n200, nothing anywhere saying so.\n\nDetected, not predicted. It is computed from\n`usage.prompt_tokens` **after** the answer, by a ratio\nchosen to be far below any real tokenizer's — so it cannot\nfire on a merely token-dense prompt, and it needs no\ntokenizer of ours.\n\n**Three states, and the difference matters.** `null` means\nnot evaluated — the backend reported no usage, or the prompt\nwas too small for the test to mean anything — and must not\nbe read as reassurance. `false` means it was checked and the\ninput arrived. `true` means it did not. Null and not absent:\nthis envelope serializes its unset fields, as `runtime` has\nsince M0.\n\n**Why a flag and not an error.** The answer has already been\ngenerated, and on a streamed request it has already been\ndelivered — M10's rule is that a stream cannot be unsent.\nFailing one path and flagging the other would make the same\ncondition report two different ways, so both flag. A backend\nthat refuses instead of truncating needs none of this: its\nrefusal is exact and is passed straight through as a 400.\n",
+        description="**The backend silently dropped input.** True when the prompt\nwe sent was far larger than the token count the backend\nreported consuming — the signature of a server that fits an\nover-long prompt into the window by discarding the middle of\nthe conversation and answering anyway, with a 200 and no\nflag of its own.\n\nThis is the failure that makes a coding harness loop: it\nsends file contents, the model never receives them, and the\nconfident answer that comes back is about code nobody read.\nMeasured on this project's own hardware: 66,389 characters\nacross six messages came back as `prompt_tokens: 86`, HTTP\n200, nothing anywhere saying so.\n\nDetected, not predicted. It is computed from\n`usage.prompt_tokens` **after** the answer, by a ratio\nchosen to be far below any real tokenizer's — so it cannot\nfire on a merely token-dense prompt, and it needs no\ntokenizer of ours.\n\n**And by a second test where the window is known**\n(2026-10-03): `prompt_tokens` reached at least 90% of\n`context_length` while the prompt's characters, at four to a\ntoken, exceed the whole window. The ratio alone cannot see a\ncut that keeps a near-full window: Ollama's default context is\n4,096 tokens on a card under 23 GiB and it still keeps the\nnewest turns and drops the middle, so a prompt cut to 4k went\nunflagged below about 82,000 characters.\n\n**Three states, and the difference matters.** `null` means\nnot evaluated — the backend reported no usage, or the prompt\nwas too small for the test to mean anything — and must not\nbe read as reassurance. `false` means it was checked and the\ninput arrived. `true` means it did not. Null and not absent:\nthis envelope serializes its unset fields, as `runtime` has\nsince M0.\n\n**Why a flag and not an error.** The answer has already been\ngenerated, and on a streamed request it has already been\ndelivered — M10's rule is that a stream cannot be unsent.\nFailing one path and flagging the other would make the same\ncondition report two different ways, so both flag. A backend\nthat refuses instead of truncating needs none of this: its\nrefusal is exact and is passed straight through as a 400.\n",
     )
     progress: StreamProgress | None = None
 
@@ -4354,7 +4369,9 @@ class AnthropicMessagesRequest(BaseModel):
     Measured Claude Code hints (`cache_control`, `context_management`)
     are accepted with a response header naming ignored settings;
     `thinking` chooses whether reasoning is returned. Metadata is
-    discarded. Unknown top-level settings are explicitly rejected.
+    discarded. Claude Code's `safeguards`, `speed`, `thread` and
+    `diagnostics` are accepted and named as ignored; any other unknown
+    top-level setting is explicitly rejected.
     This is a text, image, document and tool translation, not full parity.
 
     Consequently **this schema does not decide what is refused**.
@@ -4420,7 +4437,7 @@ class AnthropicMessagesRequest(BaseModel):
     )
     output_config: dict[str, Any] | None = Field(
         None,
-        description='**Accepted for `effort` only, and not enforced.** Claude Code\nsends `{"effort": "high"}` on every request -- measured\n2026-09-23 (2.1.207 with agent-sdk 0.3.280, beta header\n`effort-2025-11-24`), absent from the 2026-09-19 capture --\nand the unknown-field refusal A2 added turned that into a\n400 on the first request of every session: **Claude Code\ncould not use this door at all** until this field was named.\nHow hard a local model thinks is the operator\'s\n`thinkingMode`, exactly as for `thinking.budget_tokens`, so a\nnon-null value is named on the ignored-settings header.\n\nAny other key -- structured output\'s `format` above all --\nis refused with a 400 naming it: it changes what the answer\nis, and this door does not implement it.\n',
+        description='**Accepted for `effort` only, and not enforced.** Claude Code\nsends `{"effort": "high"}` on every request -- measured\n2026-09-23 (2.1.207 with agent-sdk 0.3.280, beta header\n`effort-2025-11-24`), absent from the 2026-09-19 capture --\nand the unknown-field refusal A2 added turned that into a\n400 on the first request of every session: **Claude Code\ncould not use this door at all** until this field was named.\nHow hard a local model thinks is the operator\'s\n`thinkingMode`, exactly as for `thinking.budget_tokens`, so a\nnon-null value is named on the ignored-settings header.\n\n**`format` is honoured** (2026-10-03): `{"type":\n"json_schema", "schema": {...}}` becomes the chat path\'s\n`response_format` of type `json_schema`. Claude Code sends it\nfor session titles, memory recall and prompt hooks. Any other\n`format` type, and any other key, is refused with a 400\nnaming it: it changes what the answer is, and this door does\nnot implement it.\n',
     )
     cache_control: dict[str, Any] | None = Field(
         None,
