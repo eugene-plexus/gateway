@@ -70,6 +70,7 @@ from ._generated.driver_models import (
 )
 from ._generated.driver_models import WebSearchOptions as DriverWebSearchOptions
 from ._generated.tool_driver_models import WebSearchRequest
+from .chat_contract import _field_name
 from .driver_client import DriverClient, DriverError, StreamEvent
 from .image_doors import ImageAsk, format_name, to_driver
 from .model_patterns import permits
@@ -175,20 +176,52 @@ def plan_from_chat(options: Any, *, has_tools: bool) -> SearchPlan:
     )
 
 
+#: What this gateway reads off a Responses `web_search` tool. Every other
+#: key -- `search_content_types`, `image_settings`, `return_token_budget`,
+#: Codex's `indexed_web_access` -- is named, never assumed honoured.
+#: `external_web_access` is read by the door, which decides from it whether
+#: the search may run at all.
+RESPONSES_KNOWN = frozenset(
+    {"type", "filters", "user_location", "search_context_size", "external_web_access"}
+)
+RESPONSES_FILTERS = frozenset({"allowed_domains", "blocked_domains"})
+
+
 def plan_from_responses(
     definition: Mapping[str, Any], *, max_tool_calls: Any, has_functions: bool
 ) -> SearchPlan:
+    """A Responses `web_search` tool.
+
+    `filters.blocked_domains` was dropped while `allowed_domains` beside it
+    was honoured, and the tool's other settings went unread and unnamed,
+    until 2026-10-03 (upstream drift audit). Both filters ride on the
+    search now, and any other key is named on the ignored-settings header,
+    as `plan_from_anthropic` names Anthropic's.
+    """
     given = definition.get("filters")
     filters: Mapping[str, Any] = given if isinstance(given, Mapping) else {}
+    # Keys are the caller's words on a response header: never reflected raw.
+    ignored = [
+        f"tools.{WEB_SEARCH}.{_field_name(str(key))}"
+        for key in definition
+        if key not in RESPONSES_KNOWN
+    ]
+    ignored += [
+        f"tools.{WEB_SEARCH}.filters.{_field_name(str(key))}"
+        for key in filters
+        if key not in RESPONSES_FILTERS
+    ]
     return SearchPlan(
         version=str(definition.get("type") or WEB_SEARCH),
         max_uses=max_tool_calls if isinstance(max_tool_calls, int) and max_tool_calls > 0 else None,
         allowed_domains=_domains(filters.get("allowed_domains")),
+        blocked_domains=_domains(filters.get("blocked_domains")),
         user_location=_location(definition.get("user_location")),
         context_size=definition.get("search_context_size")
         if definition.get("search_context_size") in ("low", "medium", "high")
         else None,
         only_tool=not has_functions,
+        ignored=ignored,
     )
 
 

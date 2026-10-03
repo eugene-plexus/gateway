@@ -754,6 +754,58 @@ def test_responses_streams_a_search_as_openai_does(settings, search) -> None:
     assert sequence == sorted(sequence)
 
 
+def test_responses_web_search_blocks_domains_and_names_what_it_does_not_read(
+    settings, search
+) -> None:
+    """`filters.blocked_domains` was dropped on the floor while
+    `allowed_domains` beside it was honoured, and every other setting on the
+    tool went unread and unnamed (upstream drift audit, 2026-10-03). The
+    shape is Codex 0.160's `ToolSpec::WebSearch` with its search config set."""
+    model = ScriptedDriver(turns=[Turn(calls=[search_call()]), Turn(ANSWER)])
+    tool = {
+        "type": "web_search",
+        "external_web_access": True,
+        "indexed_web_access": True,
+        "filters": {
+            "allowed_domains": ["github.com"],
+            "blocked_domains": ["example.com"],
+            "a_future_filter": True,
+        },
+        "user_location": {"type": "approximate", "country": "US"},
+        "search_context_size": "low",
+        "search_content_types": ["text", "image"],
+        "image_settings": {"max_results": 4, "caption": True},
+        "return_token_budget": 2000,
+    }
+    with TestClient(app_with(settings, model, searches=[account(search)])) as client:
+        response = client.post(
+            "/v1/responses", json={"model": MODEL, "input": "q", "tools": [tool]}
+        )
+    assert response.status_code == 200, response.text
+    (asked,) = search.asked
+    assert [d.root for d in asked.allowedDomains] == ["github.com"]
+    assert [d.root for d in asked.blockedDomains] == ["example.com"]
+    ignored = response.headers["x-eugene-plexus-ignored-settings"].split(", ")
+    for name in (
+        "tools.web_search.search_content_types",
+        "tools.web_search.image_settings",
+        "tools.web_search.return_token_budget",
+        "tools.web_search.indexed_web_access",
+        "tools.web_search.filters.a_future_filter",
+    ):
+        assert name in ignored, ignored
+    # What is honoured is not named, and the tool itself ran.
+    assert not [i for i in ignored if i.startswith("tools.web_search.filters.") and "domains" in i]
+    for honoured in (
+        "tools.web_search",
+        "tools.web_search.user_location",
+        "tools.web_search.search_context_size",
+        "tools.web_search.external_web_access",
+        "tools.web_search.type",
+    ):
+        assert honoured not in ignored, ignored
+
+
 def test_a_web_search_call_handed_back_becomes_history(settings) -> None:
     model = ScriptedDriver(turns=[Turn("ok")])
     with TestClient(app_with(settings, model)) as client:

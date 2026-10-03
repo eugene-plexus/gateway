@@ -1164,6 +1164,7 @@ def translate_request(
             search = server_tools.plan_from_responses(
                 searches[0], max_tool_calls=max_tool_calls, has_functions=bool(tools)
             )
+            ignored.extend(search.ignored)
     image: server_tools.ImagePlan | None = None
     if image_tools:
         image = server_tools.plan_from_image_tool(image_tools[0], max_tool_calls=max_tool_calls)
