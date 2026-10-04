@@ -193,6 +193,7 @@ class LifecycleManager:
         # share a name, and a wake in flight for one of them must not be
         # returned as the wake for the other (R1.6).
         self._waking: dict[Key, asyncio.Task[WakeResult]] = {}
+        self._switching: set[str | None] = set()
         self.stopped_idle: list[str] = []
         """Runtimes this gateway unloaded for idleness, most recent last.
         For the admin view and the acceptance run; not authoritative."""
@@ -215,6 +216,70 @@ class LifecycleManager:
         await self._client.aclose()
 
     # --- idle unload ------------------------------------------------------
+
+    async def switch(self, node: str | None, source: str, target: str) -> None:
+        """Explicit model switching; never retarget an alias or replay a request."""
+        await self._table.refresh()
+        node = self._table.runtime_node(node)
+        if node in self._switching:
+            raise ValueError("A model switch is already running on this node.")
+        if source == target:
+            raise ValueError("Choose two different saved runtimes.")
+        self._switching.add(node)
+        try:
+            facts = {f.name: f for f in self._table.runtimes() if f.node == node}
+            old, new = facts.get(source), facts.get(target)
+            if old is None or new is None:
+                raise ValueError("Both saved runtimes must be visible on the selected node.")
+            if old.spec.get("engine") != new.spec.get("engine") or old.alias == new.alias:
+                raise ValueError(
+                    "Choose runtimes for the same engine with different model aliases."
+                )
+            if old.start_on_demand or new.start_on_demand:
+                raise ValueError("Turn off start on demand for both runtimes before switching.")
+            if old.status != READY or new.status not in {"stopped", "crashed"}:
+                raise ValueError("The source must be ready and the target stopped.")
+            agent = self._table.agent_url_for(old)
+            with self._table.stopping(old.key), self._table.stopping(new.key):
+                deadline = time.perf_counter() + 30
+                while self._table.runtime_inflight(old.key) or self._table.runtime_inflight(
+                    new.key
+                ):
+                    if time.perf_counter() >= deadline:
+                        raise ValueError(
+                            "The current answer is still running. Nothing was stopped; "
+                            "try again when it finishes."
+                        )
+                    await asyncio.sleep(self._poll)
+                admission = await self._client.admission(agent, new.spec, node=node)
+                if admission is None:
+                    raise ValueError("Cannot check the target runtime. Nothing was stopped.")
+                if new.spec.get("engine") == "strata" and admission.get("decision") == "refuse":
+                    raise ValueError(
+                        f"Cannot start {target}: {admission.get('reason', 'preflight failed')}. "
+                        "Nothing was stopped."
+                    )
+                # Tight memory may be freed by the explicit source stop. Missing
+                # assets and unknown launch failures still surface on the target.
+                if not await self._client.stop(agent, old.name, reason="operator", node=node):
+                    raise ValueError(
+                        "Could not stop the source runtime; the target was not started."
+                    )
+                observed = await self._client.runtime(agent, old.name, node=node)
+                if not observed or observed.get("status") != "stopped":
+                    raise ValueError(
+                        "Source shutdown was not confirmed; the target was not started."
+                    )
+                await self._table.record_stopped(old.key)
+                status, detail = await self._client.start(agent, new.name, node=node)
+                if status != 202:
+                    raise ValueError(
+                        f"{source} is stopped; {target} could not start: {detail}. "
+                        f"Start {source} to restore it."
+                    )
+                await self._table.refresh()
+        finally:
+            self._switching.discard(node)
 
     async def _idle_loop(self) -> None:
         try:

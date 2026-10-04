@@ -17,6 +17,7 @@ from .._generated.models import (
     Problem,
     RestartResult,
     RoutingTableView,
+    RuntimeSwitchRequest,
 )
 from ..driver_client import DriverClient, HttpDriverClient
 from ..routing import RoutingTable
@@ -30,6 +31,25 @@ log = logging.getLogger(__name__)
 # wait on a hung URL. Real generation calls use the full
 # `requestTimeoutSeconds` from config.
 _PROBE_TIMEOUT_SECONDS = 10.0
+
+
+@router.post("/v1/runtimes/switch", response_model=RestartResult, status_code=202)
+async def switch_runtime(request: Request, body: RuntimeSwitchRequest) -> RestartResult:
+    lifecycle = getattr(request.app.state, "lifecycle", None)
+    if lifecycle is None:
+        raise HTTPException(status_code=409, detail="Runtime lifecycle is unavailable.")
+    try:
+        await lifecycle.switch(body.node, body.source, body.target)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return RestartResult(
+        scheduled=True,
+        delayMs=0,
+        message=(
+            f"{body.source} stopped; {body.target} is starting. "
+            "Watch its status for readiness or errors."
+        ),
+    )
 
 
 async def _driver_health(client: DriverClient) -> DriverHealth:

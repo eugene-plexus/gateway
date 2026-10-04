@@ -1731,6 +1731,27 @@ class RoutingTable:
     def is_stopping(self, runtime: Key) -> bool:
         return self._stopping.get(runtime, 0) > 0
 
+    async def record_stopped(self, runtime: Key) -> None:
+        """Keep a confirmed agent stop even if the following refresh fails.
+
+        Serialize with refresh so a read already in flight cannot restore an
+        older ready snapshot after the switch releases its reservation.
+        """
+        async with self._refresh_lock:
+            facts = self._snapshot.runtimes.get(runtime)
+            if facts is None:
+                return
+            stopped = replace(facts, status="stopped", stop_reason="operator")
+            self._snapshot.runtimes[runtime] = stopped
+            self._last_facts.setdefault(runtime[0], {})[runtime] = stopped
+            self._ready_since.pop(runtime, None)
+            backends = self._snapshot.reachable + [
+                b for group in self._snapshot.by_model.values() for b in group
+            ]
+            for backend in backends:
+                if backend.runtime is not None and backend.runtime.key == runtime:
+                    backend.runtime = stopped
+
     def inflight(self, driver: Key) -> int:
         return self._inflight.get(driver, 0)
 
@@ -2378,6 +2399,12 @@ class RoutingTable:
 
     def runtimes(self) -> list[_RuntimeFacts]:
         return list(self._snapshot.runtimes.values())
+
+    def runtime_node(self, node: str | None) -> str | None:
+        """Resolve this node's named/local spellings to the routing snapshot's key."""
+        if self._is_own_node(node):
+            return next((f.node for f in self.runtimes() if self._is_own_node(f.node)), node)
+        return node
 
     def known_models(self) -> list[str]:
         """Every model a request could name: each served model id, plus
