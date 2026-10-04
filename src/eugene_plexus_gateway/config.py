@@ -67,6 +67,55 @@ LEGACY_CONVERSATION = "conversation"
 
 FIELDS: list[ConfigField] = [
     ConfigField(
+        key="repetitionMode",
+        label="Repeated response protection",
+        description=(
+            "Observe records repeated passages without stopping. Stop cancels streaming "
+            "plain-text loops. Reasoning, tool arguments, structured output and whole "
+            "responses are observation-only. A request can override this setting."
+        ),
+        category="generation",
+        valueType=ConfigValueType.enum,
+        enumValues=["off", "observe", "stop"],
+        default="observe",
+    ),
+    ConfigField(
+        key="repetitionStopModels",
+        label="Models with automatic loop stopping",
+        description=(
+            "When protection is Stop, limit automatic stopping to these exact model or "
+            "slot IDs, separated by commas. Other models observe only. Blank applies "
+            "the selected mode to all models."
+        ),
+        category="generation",
+        valueType=ConfigValueType.string,
+        default="",
+    ),
+    ConfigField(
+        key="repetitionMinChars",
+        label="Minimum repeated passage length",
+        description=(
+            "Minimum whitespace-normalized characters per repeated passage. "
+            "Initial evaluation threshold: 100. Patterns above 2048 characters "
+            "are outside this detector's bounded window. This is not a token cap."
+        ),
+        category="generation",
+        valueType=ConfigValueType.integer,
+        default=100,
+        minimum=64,
+        maximum=2048,
+    ),
+    ConfigField(
+        key="repetitionRepeats",
+        label="Consecutive passage copies",
+        description="Copies required before detection. Initial evaluation threshold: four.",
+        category="generation",
+        valueType=ConfigValueType.integer,
+        default=4,
+        minimum=3,
+        maximum=8,
+    ),
+    ConfigField(
         key="defaultTemperature",
         label="Default temperature",
         description=(

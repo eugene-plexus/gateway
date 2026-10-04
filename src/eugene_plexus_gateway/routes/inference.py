@@ -48,6 +48,7 @@ from .. import (
     decisions,
     image_doors,
     moderation_door,
+    repetition,
     responses,
     server_tools,
     system_placement,
@@ -143,6 +144,7 @@ from ..disconnect import ClientGone, serve_while_connected
 from ..driver_client import (
     DriverClient,
     DriverError,
+    RepetitionStopped,
     TieredClient,
     VideoJobs,
     capacity_refused,
@@ -736,6 +738,14 @@ async def _prepare(
     # triggered it, so "before the clock starts" was not the same as
     # "free".
     await admission.authorize(request, body.model, streamed=bool(body.stream))
+    repetition_override = request.headers.get(repetition.HEADER)
+    if repetition_override is not None and repetition_override not in repetition.MODES:
+        return _Failure(
+            code=400,
+            message=f"{repetition.HEADER} must be off, observe, or stop.",
+            error_type="invalid_request_error",
+            param=repetition.HEADER,
+        )
     arrived = time.perf_counter()
     refreshed = False
 
@@ -921,6 +931,11 @@ async def _prepare(
     store = _store(request)
     if isinstance(client, TieredClient):
         client.authorize_attempt = admission.before_attempt
+        client.repetition_policy = repetition.Policy.resolve(
+            store.get if store is not None else lambda key: None,
+            body.model,
+            repetition_override,
+        )
     generate = _to_generate_request(body, store, install_max_tokens=install_max_tokens)
     generate.localOnly = admission.local_only()
     if completion is not None:
@@ -1259,7 +1274,13 @@ async def _stream_anthropic(
                 message, kind = failure.anthropic_message(), "invalid_request_error"
             else:
                 message = str(e) or type(e).__name__
-                kind = "overloaded_error" if capacity_refused(e) else "api_error"
+                kind = (
+                    "invalid_request_error"
+                    if isinstance(e, RepetitionStopped)
+                    else "overloaded_error"
+                    if capacity_refused(e)
+                    else "api_error"
+                )
             for chunk in translator.failed(message, kind=kind):
                 yield chunk
             return
@@ -2210,9 +2231,11 @@ async def _stream_text_completion(
                 {
                     "error": {
                         "message": str(e),
-                        "type": "upstream_error",
+                        "type": "repetition_detected"
+                        if isinstance(e, RepetitionStopped)
+                        else "upstream_error",
                         "param": None,
-                        "code": None,
+                        "code": "repetition_detected" if isinstance(e, RepetitionStopped) else None,
                     }
                 }
             )
@@ -4509,9 +4532,13 @@ async def _stream_completion(
                     {
                         "error": {
                             "message": str(e),
-                            "type": "upstream_error",
+                            "type": "repetition_detected"
+                            if isinstance(e, RepetitionStopped)
+                            else "upstream_error",
                             "param": None,
-                            "code": None,
+                            "code": "repetition_detected"
+                            if isinstance(e, RepetitionStopped)
+                            else None,
                         }
                     }
                 )
@@ -4669,6 +4696,8 @@ def _driver_failure_status(e: DriverError) -> _Failure:
     worth retrying, which is why it is not folded into the 502 that means
     "the cascade ran and every backend lost".
     """
+    if isinstance(e, RepetitionStopped):
+        return _Failure(code=422, message=str(e), error_type="repetition_detected")
     upstream = e.status_code
     detail = e.problem.detail if e.problem is not None and e.problem.detail else str(e)
 

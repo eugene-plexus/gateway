@@ -54,6 +54,7 @@ from .affinity import EVICTED, HIT
 from .budget import Conversation, TurnBudget, request_chars
 from .circuit import Circuit
 from .execution import Executor, StreamPolicy
+from .repetition import STOP_MESSAGE, Guard, Policy
 
 log = logging.getLogger(__name__)
 
@@ -102,6 +103,28 @@ class DriverError(Exception):
             return " — ".join(parts)
         snippet = self.raw_body[:300] if self.raw_body else "<empty body>"
         return f"{prefix} (no problem+json body): {snippet}"
+
+
+class RepetitionStopped(DriverError):
+    """An intentional, terminal gateway stop, never a backend health failure."""
+
+    def __init__(self, candidate: DriverClient) -> None:
+        super().__init__(
+            driver_name=candidate.name,
+            driver_url=candidate.base_url,
+            status_code=422,
+            problem=Problem(
+                type="urn:eugene-plexus:problem#repetition-detected",
+                title="Response repetition detected",
+                status=422,
+                detail=STOP_MESSAGE,
+                retryDisposition=RetryDisposition.terminal,
+            ),
+            raw_body="",
+        )
+
+    def _summary(self) -> str:
+        return STOP_MESSAGE
 
 
 @dataclass(frozen=True)
@@ -977,6 +1000,7 @@ class TieredClient:
         self._tiers = [list(tier) for tier in tiers]
         self._hooks = hooks
         self.authorize_attempt: Callable[[], Awaitable[None]] | None = None
+        self.repetition_policy = Policy()
         self.prepare_request: (
             Callable[[DriverClient, GenerateRequest], Awaitable[GenerateRequest]] | None
         ) = None
@@ -1119,7 +1143,26 @@ class TieredClient:
             prepared = (
                 await self.prepare_request(candidate, request) if self.prepare_request else request
             )
-            return await candidate.generate(prepared)
+            result = await candidate.generate(prepared)
+            # Whole replies have already consumed their compute. Observe them
+            # without cutting or reinterpreting an otherwise complete answer.
+            guard = Guard(
+                self.repetition_policy,
+                structured=True,
+                request_id=str(prepared.requestId) if prepared.requestId else None,
+            )
+            guard.take(
+                StreamEvent(
+                    text=result.content or "",
+                    reasoning=result.reasoning or "",
+                    tool_calls=[
+                        {"index": i, "function": {"arguments": call.function.arguments}}
+                        for i, call in enumerate(result.toolCalls or [])
+                    ],
+                )
+            )
+            guard.take(StreamEvent(done=True))
+            return result
 
         return await Executor(self).whole("generate", call, generation=request)
 
@@ -1215,9 +1258,24 @@ class TieredClient:
                 await self.prepare_request(candidate, request) if self.prepare_request else request
             )
             events = candidate.stream(prepared)
+            guard = Guard(
+                self.repetition_policy,
+                structured=(
+                    prepared.responseFormat is not None and prepared.responseFormat.type != "text"
+                )
+                or prepared.audioOutput is not None,
+                request_id=str(prepared.requestId) if prepared.requestId else None,
+            )
             try:
                 async for event in events:
+                    stopped = guard.take(event)
+                    if stopped:
+                        # Close the owned transport before yielding to a slow
+                        # downstream client. Its partial output still stands.
+                        await events.aclose()
                     yield event
+                    if stopped:
+                        raise RepetitionStopped(candidate)
             finally:
                 await events.aclose()
 
@@ -1243,7 +1301,7 @@ class TieredClient:
     ) -> None:
         circuit = getattr(candidate, "circuit", None)
         if circuit is not None:
-            if isinstance(error, asyncio.CancelledError | GeneratorExit):
+            if isinstance(error, asyncio.CancelledError | GeneratorExit | RepetitionStopped):
                 # A caller's Stop/disconnect/deadline is not a failed backend.
                 # Nor is it a successful recovery probe. Keep uncertain usage
                 # in attempt metrics, but do not punish the next caller.

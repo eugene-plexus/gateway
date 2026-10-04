@@ -69,7 +69,7 @@ class Attempt:
         if self.finished:
             return
         self.finished = True
-        from .driver_client import retry_disposition
+        from .driver_client import RepetitionStopped, retry_disposition
 
         self.owner._finish_circuit(
             self.candidate,
@@ -90,7 +90,9 @@ class Attempt:
                 if error
                 else ("IncompleteStream" if incomplete else None),
                 retry_disposition=(
-                    "indeterminate"
+                    "terminal"
+                    if isinstance(error, RepetitionStopped)
+                    else "indeterminate"
                     if incomplete or (error and self.committed)
                     else retry_disposition(error)
                     if error
