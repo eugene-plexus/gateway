@@ -38,6 +38,7 @@ def install() -> dict[str, object]:
     root = _signer("control")
     nas = _signer("node:nas")
     gpu = _signer("node:gpu-box")
+    site = _signer("node:desk")
     bundle = tokens.build_bundle(
         authority=authority,
         version=10,
@@ -46,9 +47,17 @@ def install() -> dict[str, object]:
             root.trust_key([tokens.GRANT_AUTHORITY]),
             nas.trust_key([tokens.GRANT_NODE, tokens.GRANT_GATEWAY]),
             gpu.trust_key([tokens.GRANT_NODE]),
+            site.trust_key([tokens.GRANT_FILES]),
         ],
     )
-    return {"authority": authority, "root": root, "nas": nas, "gpu": gpu, "bundle": bundle}
+    return {
+        "authority": authority,
+        "root": root,
+        "nas": nas,
+        "gpu": gpu,
+        "site": site,
+        "bundle": bundle,
+    }
 
 
 def _verify(install: dict[str, object], token: str, recipient: str, *classes: str) -> tokens.Claims:
@@ -92,7 +101,7 @@ def test_a_bundle_round_trips_against_its_pinned_authority(install: dict[str, ob
     authority = install["authority"]
     assert isinstance(bundle, tokens.TrustBundle) and isinstance(authority, Ed25519PrivateKey)
     again = tokens.parse_bundle(bundle.jws, authority=tokens.public_b64(authority))
-    assert again.version == 10 and again.members == frozenset({"nas", "gpu-box"})
+    assert again.version == 10 and again.members == frozenset({"nas", "gpu-box", "desk"})
 
 
 def test_a_bundle_signed_by_anything_else_is_refused(install: dict[str, object]) -> None:
@@ -248,6 +257,26 @@ def test_a_gateway_token_leaves_only_a_machine_granted_gateway(install: dict[str
     bad, _ = gpu.mint(typ=tokens.TYP_SERVICE, sub="gateway", aud=["node:nas"], ttl_seconds=900)
     with pytest.raises(tokens.TokenError, match="no gateway grant"):
         _verify(install, bad, "node:nas")
+
+
+def test_a_job_site_key_reaches_the_control_root_and_its_own_machine_only(
+    install: dict[str, object],
+) -> None:
+    """Job Sites (remote-nodes.md §3.2): `files` in place of `node`. A site
+    that joined with a leaked token reaches nothing but the root's node routes."""
+    site = install["site"]
+    assert isinstance(site, tokens.Signer)
+    to_root, _ = site.mint(typ=tokens.TYP_SERVICE, sub="agent", aud=["control"], ttl_seconds=600)
+    assert _verify(install, to_root, "control").issuer_node == "desk"
+    own, _ = site.mint(typ=tokens.TYP_SERVICE, sub="agent", aud=["node:desk"], ttl_seconds=600)
+    assert _verify(install, own, "node:desk").is_local_service("node:desk")
+    for sub, aud in (("agent", "node:nas"), ("gateway", "control"), ("control", "node:nas")):
+        token, _ = site.mint(typ=tokens.TYP_SERVICE, sub=sub, aud=[aud], ttl_seconds=600)
+        with pytest.raises(tokens.TokenError, match="job site"):
+            _verify(install, token, aud)
+    session, _ = site.mint(typ=tokens.TYP_SESSION, sub="operator", aud=["control"], ttl_seconds=60)
+    with pytest.raises(tokens.TokenError, match="only the authority"):
+        _verify(install, session, "control")
 
 
 # --------------------------------------------------------------------------- verify: refused

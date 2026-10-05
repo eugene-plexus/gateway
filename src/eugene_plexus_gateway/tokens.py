@@ -59,6 +59,11 @@ TYP_BUNDLE = "ep-trust-bundle+jwt"
 GRANT_AUTHORITY = "authority"
 GRANT_NODE = "node"
 GRANT_GATEWAY = "gateway"
+GRANT_FILES = "files"
+"""A Job Site's key, held **instead of** `node` (remote-nodes.md §3.2):
+`sub: agent` service tokens to the control root and to its own machine,
+and nothing else, so a site joined with a leaked token reaches no other
+machine and no other component."""
 
 ISSUER_CONTROL = "control"
 RECIPIENT_CONTROL = "control"
@@ -552,6 +557,15 @@ def _check_grants(key: TrustKey, typ: str, sub: str, aud: tuple[str, ...]) -> No
     if typ in (TYP_SESSION, TYP_CLIENT):
         raise TokenError(f"{key.issuer} may not issue a {typ}: only the authority mints one")
     if GRANT_NODE not in key.grants:
+        if GRANT_FILES in key.grants:
+            if all(a == key.issuer for a in aud) or (
+                sub == SUB_AGENT and all(a in (key.issuer, RECIPIENT_CONTROL) for a in aud)
+            ):
+                return
+            raise TokenError(
+                f"{key.issuer} is a job site: its tokens reach the control root's "
+                "node routes and its own machine, nothing else"
+            )
         raise TokenError(f"{key.issuer} holds no grant that issues a service token")
     if all(a == key.issuer for a in aud):
         return

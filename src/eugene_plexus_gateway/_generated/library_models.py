@@ -946,12 +946,18 @@ class TrustGrant(StrEnum):
     * `gateway`: given to a node by the operator's join token, never
       claimed by the node. Service tokens with `sub: gateway` to
       other machines and to `control`.
+    * `files`: a Job Site's token key, **instead of** `node`, never
+      beside it (`docs/design/remote-nodes.md` §3.2). Service tokens
+      with `sub: agent` to `control`, and to **its own machine**.
+      Nothing else: a site that joined with a leaked token reaches no
+      other machine and no other component, on any network.
 
     """
 
     authority = 'authority'
     node = 'node'
     gateway = 'gateway'
+    files = 'files'
 
 
 class TrustKey(BaseModel):
