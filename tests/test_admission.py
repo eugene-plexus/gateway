@@ -264,6 +264,150 @@ async def test_disconnect_cancels_work_and_releases_reservation(setup, surface):
         await app.state.routing.aclose()
 
 
+@pytest.mark.parametrize(
+    "path,extra,failing",
+    [
+        ("/v1/chat/completions", {}, False),
+        ("/v1/chat/completions", {}, True),
+        ("/v1/chat/completions", {"stream": True}, False),
+        ("/v1/messages", {"max_tokens": 10}, False),
+        ("/v1/messages", {"max_tokens": 10, "stream": True}, False),
+    ],
+)
+async def test_the_slot_is_free_before_the_client_can_read_the_end(setup, path, extra, failing):
+    """gateway #9: released after the last byte, a key limited to one request
+    was refused 429 by its next request, sent at once through another gateway."""
+    app, authority, allowed, _, headers, _ = setup
+    if failing:
+        allowed.generate_error = httpx.ConnectError("offline")
+    payload = json.dumps(body("allowed", **extra)).encode()
+    delivered = False
+    at_end: list[str] = []
+    status = None
+
+    async def receive():
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {"type": "http.request", "body": payload, "more_body": False}
+        await asyncio.Event().wait()
+
+    async def send(message):
+        nonlocal status
+        if message["type"] == "http.response.start":
+            status = message["status"]
+        elif not message.get("more_body", False):
+            at_end.extend(x["action"] for x in authority.calls)
+
+    scope = _SCOPE | {
+        "path": path,
+        "raw_path": path.encode(),
+        "headers": [
+            (b"authorization", headers["Authorization"].encode()),
+            (b"content-type", b"application/json"),
+        ],
+    }
+    try:
+        await asyncio.wait_for(app(scope, receive, send), 3)
+        assert status == (502 if failing else 200)
+        assert at_end and at_end[-1] == "release", at_end
+        assert [x["action"] for x in authority.calls].count("release") == 1
+    finally:
+        await app.state.client_key_guard.aclose()
+        await app.state.routing.aclose()
+
+
+async def test_no_renewal_after_the_release(setup):
+    """A renewal that reached the authority after the release would be refused
+    409 and cut the reply short, so a released request renews nothing."""
+    app, authority, *_ = setup
+    from eugene_plexus_gateway.admission import ClientRequest
+
+    context = ClientRequest({"type": "http"})
+    context.key_id, context.guard, context.attempted = "key-1", app.state.client_key_guard, True
+    context.ready.set()
+    try:
+        await context.release()
+        await context.renew()
+        monitor = asyncio.create_task(context.monitor())
+        await asyncio.sleep(0.05)
+        assert not monitor.done()  # Parked until cancelled, not finished.
+        monitor.cancel()
+        await asyncio.gather(monitor, return_exceptions=True)
+        assert [x["action"] for x in authority.calls] == ["release"]
+    finally:
+        await app.state.client_key_guard.aclose()
+        await app.state.routing.aclose()
+
+
+async def test_a_release_waits_for_a_renewal_in_flight(setup):
+    """Otherwise the renewal can reach the authority second and be refused."""
+    app, authority, _, _, _, _ = setup
+    from eugene_plexus_gateway.admission import ClientRequest
+
+    gate = asyncio.Event()
+    answered: list[str] = []
+
+    async def handle(request):
+        action = json.loads(request.content)["action"]
+        if action == "renew":
+            await gate.wait()
+        response = authority._handle(request)
+        answered.append(action)
+        return response
+
+    guard = app.state.client_key_guard
+    guard._client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    context = ClientRequest({"type": "http"})
+    context.key_id, context.guard, context.attempted = "key-1", guard, True
+    context.deadline = time.perf_counter() + 10
+    context.ready.set()
+    try:
+        renewing = asyncio.create_task(context.renew())
+        await asyncio.sleep(0.05)
+        releasing = asyncio.create_task(context.release())
+        await asyncio.sleep(0.05)
+        assert answered == []  # The release waits its turn.
+        gate.set()
+        await asyncio.wait_for(asyncio.gather(renewing, releasing), 2)
+        assert answered == ["renew", "release"]
+    finally:
+        await guard.aclose()
+        await app.state.routing.aclose()
+
+
+async def test_a_cancelled_release_is_tried_again(setup):
+    """A client leaving during the last-byte release cancels it; the
+    middleware's `finally` must still free the slot."""
+    app, authority, *_ = setup
+    from eugene_plexus_gateway.admission import ClientRequest
+
+    gate = asyncio.Event()
+    answered: list[str] = []
+
+    async def handle(request):
+        await gate.wait()
+        response = authority._handle(request)
+        answered.append(json.loads(request.content)["action"])
+        return response
+
+    guard = app.state.client_key_guard
+    guard._client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    context = ClientRequest({"type": "http"})
+    context.key_id, context.guard, context.attempted = "key-1", guard, True
+    try:
+        first = asyncio.create_task(context.release())
+        await asyncio.sleep(0.05)
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+        gate.set()
+        await asyncio.wait_for(context.release(), 2)
+        assert answered == ["release"]
+    finally:
+        await guard.aclose()
+        await app.state.routing.aclose()
+
+
 async def test_renewal_outage_cancels_generation_before_lease_expiry(setup):
     app, authority, allowed, _, headers, _ = setup
     authority.lease = 0.6

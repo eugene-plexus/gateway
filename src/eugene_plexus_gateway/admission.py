@@ -54,6 +54,10 @@ class ClientRequest:
         self.deadline = 0.0
         self.lease_seconds = 30.0
         self.expires = float("inf")
+        # Renew and release take turns, so a renewal in flight cannot land
+        # after the release and be refused (which would cut the reply short).
+        self.lease_lock = asyncio.Lock()
+        self.released = False
 
     @property
     def allowed_models(self) -> set[str] | None:
@@ -139,21 +143,32 @@ class ClientRequest:
             self.ready.set()
 
     async def renew(self) -> None:
-        if self.ready.is_set():
-            self.access = await self.contact("renew")
+        async with self.lease_lock:
+            if self.ready.is_set() and not self.released:
+                self.access = await self.contact("renew")
 
     async def monitor(self) -> None:
-        while True:
+        while not self.released:
             await asyncio.sleep(
                 min(self.lease_seconds / 3, max(0.0, self.deadline - time.perf_counter()))
             )
             await self.renew()
+        # Released: nothing left to renew. Wait to be cancelled with the
+        # request; returning would leave a finished task in the wait set.
+        await asyncio.Event().wait()
 
     async def release(self) -> None:
-        if self.attempted and self.guard is not None:
+        """Release once. A cancelled release stays unreleased, so the
+        middleware's `finally` tries again."""
+        if not self.attempted or self.guard is None:
+            return
+        async with self.lease_lock:
+            if self.released:
+                return
             with contextlib.suppress(Exception):
                 async with asyncio.timeout(2):
                     await self.contact("release")
+            self.released = True
 
     def record_missing(self, app: Any, status: int) -> None:
         metrics = getattr(app.state, "metrics", None)
@@ -386,6 +401,10 @@ class ClientAdmissionMiddleware:
                 response_status = message["status"]
                 message.setdefault("headers", []).append((b"x-request-id", context.id.encode()))
             elif message["type"] == "http.response.body" and not message.get("more_body", False):
+                # The answer is decided: free the key's slot before the client
+                # can read it, or a next request sent at once (on any gateway)
+                # can be refused 429 for a slot still held (gateway #9).
+                await context.release()
                 response_complete = True
             await send(message)
 
