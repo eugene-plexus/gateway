@@ -64,6 +64,10 @@ GRANT_FILES = "files"
 `sub: agent` service tokens to the control root and to its own machine,
 and nothing else, so a site joined with a leaked token reaches no other
 machine and no other component."""
+GRANT_STANDBY = "standby"
+"""The one node an owner made the warm standby, held **beside** `node`
+(warm-standby.md, SB1): `sub: standby` service tokens to the control root,
+and nowhere else. The root opens its replication routes to them alone."""
 
 ISSUER_CONTROL = "control"
 RECIPIENT_CONTROL = "control"
@@ -74,6 +78,7 @@ SUB_OPERATOR = "operator"
 SUB_AGENT = "agent"
 SUB_GATEWAY = "gateway"
 SUB_CONTROL = "control"
+SUB_STANDBY = "standby"
 
 LEEWAY_SECONDS = 300
 """Clock skew tolerated between two hosts (Kerberos's `MaxClockSkew`).
@@ -573,9 +578,16 @@ def _check_grants(key: TrustKey, typ: str, sub: str, aud: tuple[str, ...]) -> No
         return
     if sub == SUB_GATEWAY and GRANT_GATEWAY in key.grants:
         return
+    if sub == SUB_STANDBY and GRANT_STANDBY in key.grants:
+        if all(a == RECIPIENT_CONTROL for a in aud):
+            return
+        raise TokenError(f"{key.issuer} is the standby: its standby token reaches control only")
     raise TokenError(
         f"{key.issuer} may not send a {sub!r} service token off its own machine"
-        + ("" if sub != SUB_GATEWAY else ": it holds no gateway grant")
+        + {
+            SUB_GATEWAY: ": it holds no gateway grant",
+            SUB_STANDBY: ": it holds no standby grant",
+        }.get(sub, "")
     )
 
 

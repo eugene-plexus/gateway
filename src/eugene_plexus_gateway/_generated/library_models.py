@@ -951,6 +951,13 @@ class TrustGrant(StrEnum):
       with `sub: agent` to `control`, and to **its own machine**.
       Nothing else: a site that joined with a leaked token reaches no
       other machine and no other component, on any network.
+    * `standby`: given to **one** node, beside `node`, by an owner's
+      `PUT /v1/nodes/{name}/standby` at the control root, never by a
+      join token and never claimed by the node
+      (`docs/design/warm-standby.md`, SB1). Service tokens with
+      `sub: standby` to `control`, and nothing else. The control root
+      accepts them on its replication routes alone, and only while
+      its applied state still names that node the standby (SB2).
 
     """
 
@@ -958,6 +965,7 @@ class TrustGrant(StrEnum):
     node = 'node'
     gateway = 'gateway'
     files = 'files'
+    standby = 'standby'
 
 
 class TrustKey(BaseModel):

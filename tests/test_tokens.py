@@ -279,6 +279,45 @@ def test_a_job_site_key_reaches_the_control_root_and_its_own_machine_only(
         _verify(install, session, "control")
 
 
+def test_a_standby_token_reaches_control_only_and_only_from_the_granted_node(
+    install: dict[str, object],
+) -> None:
+    """warm-standby.md SB2: `sub: standby` leaves its machine only from the
+    node holding `standby`, and only to `control`."""
+    spare = _signer("node:spare")
+    gpu = install["gpu"]
+    authority = install["authority"]
+    bundle = install["bundle"]
+    assert isinstance(gpu, tokens.Signer) and isinstance(bundle, tokens.TrustBundle)
+    assert isinstance(authority, Ed25519PrivateKey)
+    with_spare = tokens.build_bundle(
+        authority=authority,
+        version=11,
+        epoch=1,
+        keys=[*bundle.keys.values(), spare.trust_key([tokens.GRANT_NODE, tokens.GRANT_STANDBY])],
+    )
+    install = {**install, "bundle": with_spare}
+    good, _ = spare.mint(typ=tokens.TYP_SERVICE, sub="standby", aud=["control"], ttl_seconds=900)
+    claims = _verify(install, good, "control")
+    assert (claims.sub, claims.issuer_node) == ("standby", "spare")
+    elsewhere, _ = spare.mint(
+        typ=tokens.TYP_SERVICE, sub="standby", aud=["node:nas"], ttl_seconds=900
+    )
+    with pytest.raises(tokens.TokenError, match="reaches control only"):
+        _verify(install, elsewhere, "node:nas")
+    ungranted, _ = gpu.mint(typ=tokens.TYP_SERVICE, sub="standby", aud=["control"], ttl_seconds=900)
+    with pytest.raises(tokens.TokenError, match="no standby grant"):
+        _verify(install, ungranted, "control")
+    # The grant widens nothing else: the standby's other tokens are a node's.
+    as_gateway, _ = spare.mint(
+        typ=tokens.TYP_SERVICE, sub="gateway", aud=["node:nas"], ttl_seconds=900
+    )
+    with pytest.raises(tokens.TokenError, match="no gateway grant"):
+        _verify(install, as_gateway, "node:nas")
+    own, _ = spare.mint(typ=tokens.TYP_SERVICE, sub="standby", aud=["node:spare"], ttl_seconds=60)
+    assert _verify(install, own, "node:spare").is_local_service("node:spare")
+
+
 # --------------------------------------------------------------------------- verify: refused
 
 
