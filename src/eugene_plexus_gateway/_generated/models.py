@@ -3265,6 +3265,10 @@ class ModelRoutingInfo(BaseModel):
         None,
         description='For a `speech` model: the voices its provider lists, in the\nprovider\'s own ids (P3a). Absent when the provider does not say,\nwhich is not the same as having none -- any voice is passed\nthrough and an unknown one is the provider\'s 400 (P3-3).\n\n**When every backend that would speak the request lists its\nvoices, a voice none of them lists is refused before anything\nis sent** (400, `param: voice`), naming the listed ones: a\nprovider\'s own refusal named nothing (OpenRouter: *"Provider\nreturned 400"*, measured 2026-10-08). OpenAI\'s TTS models list\nthe voices measured for their family that day. Added\n2026-10-08 (Workbench media screens, M10).\n',
     )
+    voice_names: dict[str, str] | None = Field(
+        None,
+        description="For a `speech` model: a display name for each voice in\n`voices` that its provider names, keyed by the voice's id\n(ElevenLabs: `21m00Tcm4TlvDq8ikWAM` is *Rachel*), from the\nbackends that list `voices`. A request still sends the id; a\nvoice with no name here is shown by its id. Absent when no\nbackend names any. Added 2026-10-08 (Workbench media screens:\nElevenLabs voices showed as ids).\n",
+    )
     speech_formats: list[SpeechFormat] | None = Field(
         None,
         description='For a `speech` model: the formats every backend serving it can\ngive, `wav` included where it is made from `pcm`.\n',

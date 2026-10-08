@@ -2765,6 +2765,10 @@ class DriverModel(BaseModel):
         None,
         description="The voices a speech model offers, when the backend lists\nthem (OpenRouter's `supported_voices`). For P3's\n`/v1/audio/speech`; reported now so nothing changes shape\nlater.\n",
     )
+    voiceNames: dict[str, str] | None = Field(
+        None,
+        description="A display name for each voice in `voices` that the backend\nnames, keyed by the voice's id (ElevenLabs' `name` from\n`GET /v1/voices`: `21m00Tcm4TlvDq8ikWAM` is *Rachel*). The id\nis still what a request sends; a voice with no name here is\nshown by its id. Absent when the backend names none. Added\n2026-10-08 (Workbench media screens: ElevenLabs voices showed\nas ids).\n",
+    )
     capabilities: Capabilities | None = None
 
 

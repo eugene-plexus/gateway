@@ -38,6 +38,7 @@ class Speaker(FakeDriverClient):
         *,
         formats: list[str] | None = None,
         voices: list[str] | None = None,
+        voice_names: dict[str, str] | None = None,
         fail: Exception | None = None,
         fail_after_first: bool = False,
         **kw: Any,
@@ -45,6 +46,7 @@ class Speaker(FakeDriverClient):
         super().__init__(**kw)
         self.formats = formats or ["mp3", "pcm", "wav"]
         self.voices = voices
+        self.voice_names = voice_names
         self.fail = fail
         self.fail_after_first = fail_after_first
         self.spoken: list[SpeakRequest] = []
@@ -54,6 +56,7 @@ class Speaker(FakeDriverClient):
         for model in info.models or []:
             model.surfaces = ["speech"]
             model.voices = self.voices
+            model.voiceNames = self.voice_names
             base = model.capabilities or Capabilities()
             model.capabilities = base.model_copy(
                 update={"speechFormats": [SpeechFormat(f) for f in self.formats]}
@@ -88,6 +91,34 @@ def test_a_speech_model_is_listed_with_its_voices_and_formats(settings: Settings
     assert models["narrator"]["surfaces"] == ["speech"]
     assert models["narrator"]["voices"] == ["af_heart", "af_bella"]
     assert models["narrator"]["speech_formats"] == ["mp3", "wav", "pcm"]
+    # Nothing names these voices: no names are listed, not an empty map.
+    assert "voice_names" not in models["narrator"] or models["narrator"]["voice_names"] is None
+
+
+def test_a_speech_model_lists_the_names_its_providers_give_its_voices(
+    settings: Settings,
+) -> None:
+    """ElevenLabs' voice ids say nothing; the names ride beside them. The
+    first backend's name wins, and a name for a voice not listed is not
+    carried."""
+    first = Speaker(
+        name="a",
+        model_id="narrator",
+        voices=["21m00Tcm4TlvDq8ikWAM", "EXAVITQu4vr4xnSDxMaL"],
+        voice_names={"21m00Tcm4TlvDq8ikWAM": "Rachel", "unlisted": "Ghost"},
+    )
+    second = Speaker(
+        name="b",
+        model_id="narrator",
+        voices=["21m00Tcm4TlvDq8ikWAM", "EXAVITQu4vr4xnSDxMaL"],
+        voice_names={"21m00Tcm4TlvDq8ikWAM": "Other", "EXAVITQu4vr4xnSDxMaL": "Sarah"},
+    )
+    with serve(settings, first, second) as client:
+        models = {m["id"]: m["x_eugene_plexus"] for m in client.get("/v1/models").json()["data"]}
+    assert models["narrator"]["voice_names"] == {
+        "21m00Tcm4TlvDq8ikWAM": "Rachel",
+        "EXAVITQu4vr4xnSDxMaL": "Sarah",
+    }
 
 
 def test_the_sdks_request_is_spoken_and_streamed_back(settings: Settings) -> None:

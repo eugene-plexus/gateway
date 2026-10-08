@@ -2317,6 +2317,22 @@ class RoutingTable:
         return list(seen) if listed else None
 
     @staticmethod
+    def voice_names_for(resolution: Resolution) -> dict[str, str] | None:
+        """The name a provider gives each voice `voices_for` lists, where it
+        gives one (ElevenLabs' ids say nothing); the first backend's name
+        wins. None when no backend names any."""
+        names: dict[str, str] = {}
+        for backend in resolution.tiers[0].backends if resolution.tiers else []:
+            model = backend.model if backend.speaks else None
+            if model is None or model.voices is None:
+                continue
+            for voice in model.voices:
+                name = (model.voiceNames or {}).get(voice)
+                if name:
+                    names.setdefault(voice, name)
+        return names or None
+
+    @staticmethod
     def checked_voices(resolution: Resolution) -> list[str] | None:
         """The voices a speech request to this model may name, when every
         backend that would speak it lists its own; None as soon as one
@@ -2547,6 +2563,7 @@ class RoutingTable:
                         **_image_listing(backends),
                         locality=_locality(backends),
                         voices=self.voices_for(resolution),
+                        voice_names=self.voice_names_for(resolution),
                         speech_formats=self.speech_formats_for(resolution) or None,
                         tiers=[[b.name for b in t.backends] for t in resolution.tiers],
                         ready_backends=len(eligible),
