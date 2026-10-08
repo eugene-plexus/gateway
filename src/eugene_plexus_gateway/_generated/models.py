@@ -1286,101 +1286,23 @@ class Surface(StrEnum):
     completion = 'completion'
 
 
-class ModelRoutingInfo(BaseModel):
+class ModelLocality(StrEnum):
     """
-    Namespaced extension: how this install serves the model. Present
-    so the UI can render the routing table straight off the standard
-    endpoint instead of needing a parallel admin call, and so an
-    operator can see that a name is backed by two replicas.
+    Where a request for this model may run, from the serving drivers'
+    own `locality` (their configured trust classification): `local`
+    only when every backend serving it is local, `external` when any
+    is (a cloud API, a subscription, someone else's server), and
+    `unknown` otherwise. A client can say *runs on <account>* before
+    it sends. External is not the same as billed; it names where the
+    request goes, not what it costs. A `localOnly` key sees only
+    local backends, so it sees `local`. Added 2026-10-08 (Workbench
+    media screens).
 
     """
 
-    drivers: list[str] | None = Field(
-        None, description='Names of the inference-drivers currently serving this model.'
-    )
-    backends: list[BackendKind] | None = Field(
-        None, description='Distinct wire protocols behind this model.'
-    )
-    context_length: int | None = Field(
-        None,
-        description='Smallest context window among the serving backends — the\nhonest number, since a request may land on any of them.\n',
-    )
-    surfaces: list[Surface] | None = Field(
-        None,
-        description="Which surfaces this model can be sent to. `decisions` means\n`POST /v1/systemone`; a decision-only model lists nothing\nelse, and a chat request naming it is refused with the\ndoor's name. `speech` means `POST /v1/audio/speech` (P3a),\n`transcription` `POST /v1/audio/transcriptions` (P3b),\n`translation` `POST /v1/audio/translations` (P3-4), `image`\n`POST /v1/images/generations` and `/edits` (P4), `video`\n`POST /v1/videos` (P5), `moderation` `POST /v1/moderations`\n(P6), `completion` `POST /v1/completions` (P6).\n\nOpenAI's own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Measured, not assumed, and the two are not always\ndisjoint**: an Ollama runner started for chat refuses to\nembed, `nomic-embed-text` refuses to chat -- but\n`llama-server` given `--embedding` still serves chat\nperfectly well. Hence a list.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n",
-    )
-    image_input: bool | None = Field(
-        None,
-        description='At least one backend confirms image input for its loaded model.\nImage requests route only to those backends, including fallback.\nInline PNG/JPEG only; see MessageContent for request limits.\n',
-    )
-    audio_input: bool | None = Field(
-        None,
-        description='At least one backend confirms audio input for this model. A\nrequest carrying `input_audio` routes only to those backends,\nincluding fallback. Added 2026-09-28 (P2).\n',
-    )
-    fill_in_middle: bool | None = Field(
-        None,
-        description='At least one backend fills in the middle for this model (P6): a\n`/v1/completions` request with `suffix` routes only to those\nbackends, including fallback.\n',
-    )
-    file_input: bool | None = Field(
-        None,
-        description='At least one backend confirms file (PDF) input for this\nmodel, with the same routing rule. Added 2026-09-28 (P2).\n',
-    )
-    voices: list[str] | None = Field(
-        None,
-        description="For a `speech` model: the voices its provider lists, in the\nprovider's own ids (P3a). Absent when the provider does not say,\nwhich is not the same as having none -- any voice is passed\nthrough and an unknown one is the provider's 400 (P3-3).\n",
-    )
-    speech_formats: list[SpeechFormat] | None = Field(
-        None,
-        description='For a `speech` model: the formats every backend serving it can\ngive, `wav` included where it is made from `pcm`.\n',
-    )
-    image_streaming: bool | None = Field(
-        None,
-        description='For an `image` model: at least one backend streams partial\nimages. A request with `stream: true` routes only to those\n(P4-3).\n',
-    )
-    image_edits: bool | None = Field(
-        None,
-        description='For an `image` model: at least one backend takes reference\nimages, so `/v1/images/edits` can reach it.\n',
-    )
-    image_mask: bool | None = Field(
-        None,
-        description="For an `image` model: at least one backend honours `mask`\n(OpenAI's API only, measured).\n",
-    )
-    video_durations: list[int] | None = Field(
-        None,
-        description='For a `video` model, the whole seconds its backends list (P5).',
-    )
-    video_sizes: list[str] | None = Field(
-        None, description='For a `video` model, the sizes its backends list.'
-    )
-    video_first_frame: bool | None = Field(
-        None,
-        description='For a `video` model, at least one backend takes an `input_reference`.',
-    )
-    audio_output: bool | None = Field(
-        None,
-        description='At least one backend confirms this model answers with audio.\nA request with `modalities` including `audio` routes only to\nthose backends, including fallback. Added 2026-09-28 (P2b).\n',
-    )
-    tool_calling: bool | None = Field(
-        None,
-        description='Whether a request for this model may carry `tools`.\n\n**True only when every backend serving it can**, by the same\nreasoning as `context_length` above: a request may land on\nany of them, so the honest answer is the weakest one. A\nharness can read this and pick a model rather than discover\nthe limit as a 400 halfway through a task.\n',
-    )
-    web_search: bool | None = Field(
-        None,
-        description="Whether a web search can reach this model: at least one\nbackend serving it searches itself (its model lists\n`webSearchOptions`) or calls tools, so the gateway can run the\nsearch for it. Says nothing about the caller's key or whether\nthe install has a search account; that is\n`ModelList.x_eugene_plexus.web_search`. Added 2026-10-01 (C3).\n",
-    )
-    tiers: list[list[str]] | None = Field(
-        None,
-        description='The slot\'s tiers in priority order, each the driver names\nin it. One tier for an unconfigured model; more when a\n`modelSlots` entry adds targets.\n\n**An empty tier is kept.** Its index is the `tier` a\ncompletion reports, so dropping one renumbers every tier\nafter it and a fallback comes back claiming to be the\nprimary. A configured target with nothing serving it reads\nas `[]` here, which is also the diagnosis an operator\nwants: *you asked for `local-8b` and nothing serves it*.\n(This said "empty tiers are omitted" until 2026-09-19; it\nhad been untrue since the 2026-09-10 fix that made it so.)\n\nThe one tier that can be **absent** is the slot\'s own name,\nwhich is implicit rather than something the operator listed.\nIt is there whenever any node in the install declares a\nruntime under that name — a primary that is merely down is\nstill a primary — and gone for a purely virtual alias, where\nkeeping it would renumber the operator\'s own targets.\n',
-    )
-    ready_backends: int | None = Field(
-        None,
-        description='How many of those drivers can take a request right now — a\nreachable driver whose runtime is `ready`, or that follows\nno runtime. Zero with the model still listed means every\nruntime behind it is asleep and at least one will wake on\ndemand.\n',
-        ge=0,
-    )
-    on_demand: bool | None = Field(
-        None,
-        description='True when a request for this model may have to wait for a\nruntime to start — every eligible backend is `stopped` and\nat least one declared `startOnDemand`.\n',
-    )
+    local = 'local'
+    external = 'external'
+    unknown = 'unknown'
 
 
 class Stop(RootModel[list[str]]):
@@ -3300,28 +3222,129 @@ class ModelListInfo(BaseModel):
     web_search: WebSearchAvailability | None = None
 
 
-class Model(BaseModel):
+class ModelRoutingInfo(BaseModel):
     """
-    One routable model, in OpenAI's shape plus one namespaced
-    extension. Unknown fields are ignored by OpenAI clients, which
-    is what makes it safe to answer "which of my backends is behind
-    this name" without breaking compatibility.
+    Namespaced extension: how this install serves the model. Present
+    so the UI can render the routing table straight off the standard
+    endpoint instead of needing a parallel admin call, and so an
+    operator can see that a name is backed by two replicas.
 
     """
 
-    id: str = Field(
-        ...,
-        description="What the client puts in `ChatCompletionRequest.model`. For a\nlocal runtime this is its `modelAlias`, which defaults to\nthe model's own filename — so the name a user sees is the\nname of the file they downloaded. For a provider account\nit is `<driver name>/<the provider's id>`\n(`openrouter/anthropic/claude-opus-5.5`, `ollama/qwen3:8b`),\nso two accounts never collide and one model through two\nproviders stays two ids.\n\nListed only when a door serves one of the model's surfaces\n(P1-4): an account's speech, image, video and transcription\nmodels appear as their doors are built, under the ids they\nalready have.\n",
+    drivers: list[str] | None = Field(
+        None, description='Names of the inference-drivers currently serving this model.'
     )
-    object: Literal['model']
-    created: int | None = Field(
-        None, description='Unix timestamp. Model file mtime for local models.'
+    backends: list[BackendKind] | None = Field(
+        None, description='Distinct wire protocols behind this model.'
     )
-    owned_by: str | None = Field(
+    context_length: int | None = Field(
         None,
-        description='OpenAI sends an organisation here. We send the provider —\n`local`, or the cloud provider key for a subscription\nbackend.\n',
+        description='Smallest context window among the serving backends — the\nhonest number, since a request may land on any of them.\n',
     )
-    x_eugene_plexus: ModelRoutingInfo | None = None
+    surfaces: list[Surface] | None = Field(
+        None,
+        description="Which surfaces this model can be sent to. `decisions` means\n`POST /v1/systemone`; a decision-only model lists nothing\nelse, and a chat request naming it is refused with the\ndoor's name. `speech` means `POST /v1/audio/speech` (P3a),\n`transcription` `POST /v1/audio/transcriptions` (P3b),\n`translation` `POST /v1/audio/translations` (P3-4), `image`\n`POST /v1/images/generations` and `/edits` (P4), `video`\n`POST /v1/videos` (P5), `moderation` `POST /v1/moderations`\n(P6), `completion` `POST /v1/completions` (P6).\n\nOpenAI's own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Measured, not assumed, and the two are not always\ndisjoint**: an Ollama runner started for chat refuses to\nembed, `nomic-embed-text` refuses to chat -- but\n`llama-server` given `--embedding` still serves chat\nperfectly well. Hence a list.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n",
+    )
+    image_input: bool | None = Field(
+        None,
+        description='At least one backend confirms image input for its loaded model.\nImage requests route only to those backends, including fallback.\nInline PNG/JPEG only; see MessageContent for request limits.\n',
+    )
+    audio_input: bool | None = Field(
+        None,
+        description='At least one backend confirms audio input for this model. A\nrequest carrying `input_audio` routes only to those backends,\nincluding fallback. Added 2026-09-28 (P2).\n',
+    )
+    fill_in_middle: bool | None = Field(
+        None,
+        description='At least one backend fills in the middle for this model (P6): a\n`/v1/completions` request with `suffix` routes only to those\nbackends, including fallback.\n',
+    )
+    file_input: bool | None = Field(
+        None,
+        description='At least one backend confirms file (PDF) input for this\nmodel, with the same routing rule. Added 2026-09-28 (P2).\n',
+    )
+    voices: list[str] | None = Field(
+        None,
+        description="For a `speech` model: the voices its provider lists, in the\nprovider's own ids (P3a). Absent when the provider does not say,\nwhich is not the same as having none -- any voice is passed\nthrough and an unknown one is the provider's 400 (P3-3).\n",
+    )
+    speech_formats: list[SpeechFormat] | None = Field(
+        None,
+        description='For a `speech` model: the formats every backend serving it can\ngive, `wav` included where it is made from `pcm`.\n',
+    )
+    image_streaming: bool | None = Field(
+        None,
+        description='For an `image` model: at least one backend streams partial\nimages. A request with `stream: true` routes only to those\n(P4-3).\n',
+    )
+    image_edits: bool | None = Field(
+        None,
+        description='For an `image` model: at least one backend takes reference\nimages, so `/v1/images/edits` can reach it.\n',
+    )
+    image_mask: bool | None = Field(
+        None,
+        description="For an `image` model: at least one backend honours `mask`\n(OpenAI's API only, measured).\n",
+    )
+    image_max_images: int | None = Field(
+        None,
+        description="For an `image` model: the largest `n` a request may ask for,\nacross the backends serving it. Null when any of them checks\n`n` itself (an OpenAI account's, whose API lists nothing per\nmodel), which is not the same as no limit: the backend's own\nrefusal is relayed. A larger `n` is refused before anything\nis sent. Added 2026-10-08 (Workbench media screens, so a form\ncan offer what the gateway would take).\n",
+        ge=1,
+    )
+    image_qualities: list[str] | None = Field(
+        None,
+        description='For an `image` model: the `quality` values its backends take.\nNull when any backend checks `quality` itself; empty when none\ntakes one. `auto` is always taken. Added 2026-10-08.\n',
+    )
+    image_backgrounds: list[str] | None = Field(
+        None,
+        description='For an `image` model, the `background` values taken, with the same null and empty as `image_qualities`. Added 2026-10-08.',
+    )
+    image_output_formats: list[str] | None = Field(
+        None,
+        description='For an `image` model, the `output_format` values taken, with the same null and empty as `image_qualities`. Added 2026-10-08.',
+    )
+    image_min_references: int | None = Field(
+        None,
+        description='For an `image` model: the fewest reference images some backend\nserving it needs. 1 for a model that only edits; 0 when one\nmakes images from a prompt alone. Added 2026-10-08.\n',
+        ge=0,
+    )
+    image_max_references: int | None = Field(
+        None,
+        description='For an `image` model: the most reference images some backend\nserving it takes; 0 cannot edit. Null when any backend checks\nthe count itself. Added 2026-10-08.\n',
+        ge=0,
+    )
+    locality: ModelLocality | None = None
+    video_durations: list[int] | None = Field(
+        None,
+        description='For a `video` model, the whole seconds its backends list (P5).',
+    )
+    video_sizes: list[str] | None = Field(
+        None, description='For a `video` model, the sizes its backends list.'
+    )
+    video_first_frame: bool | None = Field(
+        None,
+        description='For a `video` model, at least one backend takes an `input_reference`.',
+    )
+    audio_output: bool | None = Field(
+        None,
+        description='At least one backend confirms this model answers with audio.\nA request with `modalities` including `audio` routes only to\nthose backends, including fallback. Added 2026-09-28 (P2b).\n',
+    )
+    tool_calling: bool | None = Field(
+        None,
+        description='Whether a request for this model may carry `tools`.\n\n**True only when every backend serving it can**, by the same\nreasoning as `context_length` above: a request may land on\nany of them, so the honest answer is the weakest one. A\nharness can read this and pick a model rather than discover\nthe limit as a 400 halfway through a task.\n',
+    )
+    web_search: bool | None = Field(
+        None,
+        description="Whether a web search can reach this model: at least one\nbackend serving it searches itself (its model lists\n`webSearchOptions`) or calls tools, so the gateway can run the\nsearch for it. Says nothing about the caller's key or whether\nthe install has a search account; that is\n`ModelList.x_eugene_plexus.web_search`. Added 2026-10-01 (C3).\n",
+    )
+    tiers: list[list[str]] | None = Field(
+        None,
+        description='The slot\'s tiers in priority order, each the driver names\nin it. One tier for an unconfigured model; more when a\n`modelSlots` entry adds targets.\n\n**An empty tier is kept.** Its index is the `tier` a\ncompletion reports, so dropping one renumbers every tier\nafter it and a fallback comes back claiming to be the\nprimary. A configured target with nothing serving it reads\nas `[]` here, which is also the diagnosis an operator\nwants: *you asked for `local-8b` and nothing serves it*.\n(This said "empty tiers are omitted" until 2026-09-19; it\nhad been untrue since the 2026-09-10 fix that made it so.)\n\nThe one tier that can be **absent** is the slot\'s own name,\nwhich is implicit rather than something the operator listed.\nIt is there whenever any node in the install declares a\nruntime under that name — a primary that is merely down is\nstill a primary — and gone for a purely virtual alias, where\nkeeping it would renumber the operator\'s own targets.\n',
+    )
+    ready_backends: int | None = Field(
+        None,
+        description='How many of those drivers can take a request right now — a\nreachable driver whose runtime is `ready`, or that follows\nno runtime. Zero with the model still listed means every\nruntime behind it is asleep and at least one will wake on\ndemand.\n',
+        ge=0,
+    )
+    on_demand: bool | None = Field(
+        None,
+        description='True when a request for this model may have to wait for a\nruntime to start — every eligible backend is `stopped` and\nat least one declared `startOnDemand`.\n',
+    )
 
 
 class SpeechRequest(BaseModel):
@@ -4276,10 +4299,28 @@ class DirectoryListing(BaseModel):
     )
 
 
-class ModelList(BaseModel):
-    object: Literal['list']
-    data: list[Model]
-    x_eugene_plexus: ModelListInfo | None = None
+class Model(BaseModel):
+    """
+    One routable model, in OpenAI's shape plus one namespaced
+    extension. Unknown fields are ignored by OpenAI clients, which
+    is what makes it safe to answer "which of my backends is behind
+    this name" without breaking compatibility.
+
+    """
+
+    id: str = Field(
+        ...,
+        description="What the client puts in `ChatCompletionRequest.model`. For a\nlocal runtime this is its `modelAlias`, which defaults to\nthe model's own filename — so the name a user sees is the\nname of the file they downloaded. For a provider account\nit is `<driver name>/<the provider's id>`\n(`openrouter/anthropic/claude-opus-5.5`, `ollama/qwen3:8b`),\nso two accounts never collide and one model through two\nproviders stays two ids.\n\nListed only when a door serves one of the model's surfaces\n(P1-4): an account's speech, image, video and transcription\nmodels appear as their doors are built, under the ids they\nalready have.\n",
+    )
+    object: Literal['model']
+    created: int | None = Field(
+        None, description='Unix timestamp. Model file mtime for local models.'
+    )
+    owned_by: str | None = Field(
+        None,
+        description='OpenAI sends an organisation here. We send the provider —\n`local`, or the cloud provider key for a subscription\nbackend.\n',
+    )
+    x_eugene_plexus: ModelRoutingInfo | None = None
 
 
 class CompletionResponse(BaseModel):
@@ -4483,6 +4524,12 @@ class AnthropicCountTokensRequest(BaseModel):
     system: str | list[AnthropicSystemBlock] | None = None
     tools: list[AnthropicToolDefinition] | None = None
     tool_choice: AnthropicToolChoice | None = None
+
+
+class ModelList(BaseModel):
+    object: Literal['list']
+    data: list[Model]
+    x_eugene_plexus: ModelListInfo | None = None
 
 
 class ModerationRequest(BaseModel):

@@ -74,6 +74,7 @@ from ._generated.models import (
     ControlRootView,
     DriverHealth,
     Model,
+    ModelLocality,
     ModelRoutingInfo,
     OutdatedDriver,
     RoutingBackendView,
@@ -271,6 +272,54 @@ def _video_listing(backends: list[_Backend]) -> dict[str, Any]:
             b.video_caps is not None and bool(b.video_caps.firstFrame) for b in makers
         ),
     }
+
+
+def _image_listing(backends: list[_Backend]) -> dict[str, Any]:
+    """An image model's listing on `GET /v1/models` (P4, and the media
+    screens' settings, 2026-10-08). Nothing for a model that makes no
+    images: `false` on every chat model would be noise in every picker.
+
+    The settings say what `rules_out` would let through on SOME backend,
+    since a request routes to any backend that takes it. So a limit is the
+    largest across backends, a choice list their union, and either is null
+    as soon as one backend leaves the field to its own API to check."""
+    makers = [b for b in backends if b.makes_images]
+    if not makers:
+        return {}
+    caps = [b.image_caps for b in makers]
+
+    def largest(field_name: str) -> int | None:
+        values = [getattr(c, field_name) if c is not None else None for c in caps]
+        return None if any(v is None for v in values) else max(cast(list[int], values))
+
+    def union(field_name: str) -> list[str] | None:
+        lists = [getattr(c, field_name) if c is not None else None for c in caps]
+        if any(v is None for v in lists):
+            return None
+        return list(dict.fromkeys(v for values in cast(list[list[str]], lists) for v in values))
+
+    return {
+        "image_streaming": any(c is not None and c.streaming for c in caps),
+        "image_edits": any(c is None or c.maxReferences != 0 for c in caps),
+        "image_mask": any(c is not None and bool(c.mask) for c in caps),
+        "image_max_images": largest("maxImages"),
+        "image_qualities": union("qualities"),
+        "image_backgrounds": union("backgrounds"),
+        "image_output_formats": union("outputFormats"),
+        "image_min_references": min((c.minReferences or 0) if c is not None else 0 for c in caps),
+        "image_max_references": largest("maxReferences"),
+    }
+
+
+def _locality(backends: list[_Backend]) -> ModelLocality:
+    """Where a request for this model may run (2026-10-08): `local` only
+    when every backend says local, `external` when any says external."""
+    said = {str(getattr(b.info.locality, "value", b.info.locality) or "unknown") for b in backends}
+    if "external" in said:
+        return ModelLocality.external
+    if said == {"local"}:
+        return ModelLocality.local
+    return ModelLocality.unknown
 
 
 def takes(caps: Capabilities | None, needs: frozenset[str]) -> bool:
@@ -2452,7 +2501,6 @@ class RoutingTable:
                 # chat picker.
                 continue
             backends = resolution.backends()
-            makes_images = any(b.makes_images for b in backends)
             providers = {b.info.provider for b in backends if b.info.provider}
             eligible = resolution.eligible_backends()
             out.append(
@@ -2481,27 +2529,8 @@ class RoutingTable:
                         file_input=any(takes(b.caps, _FILE) for b in backends),
                         audio_output=any(takes(b.caps, _SPEAKS) for b in backends),
                         **_video_listing(backends),
-                        # Said for an image model only: `false` on every chat
-                        # model would be noise in every picker.
-                        image_streaming=any(
-                            b.makes_images and b.image_caps is not None and b.image_caps.streaming
-                            for b in backends
-                        )
-                        if makes_images
-                        else None,
-                        image_edits=any(
-                            b.makes_images
-                            and (b.image_caps is None or b.image_caps.maxReferences != 0)
-                            for b in backends
-                        )
-                        if makes_images
-                        else None,
-                        image_mask=any(
-                            b.makes_images and b.image_caps is not None and bool(b.image_caps.mask)
-                            for b in backends
-                        )
-                        if makes_images
-                        else None,
+                        **_image_listing(backends),
+                        locality=_locality(backends),
                         voices=self.voices_for(resolution),
                         speech_formats=self.speech_formats_for(resolution) or None,
                         tiers=[[b.name for b in t.backends] for t in resolution.tiers],

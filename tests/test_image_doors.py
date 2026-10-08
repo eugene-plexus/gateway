@@ -185,6 +185,84 @@ def test_an_image_model_is_listed_with_what_it_takes(settings: Settings) -> None
     assert models["qwen"].get("image_streaming") is None
 
 
+def test_the_listing_names_the_settings_the_door_enforces(settings: Settings) -> None:
+    """A form can offer exactly what the door would take (media screens,
+    2026-10-08): the driver's ImageCapabilities, listed as the gateway
+    routes on them. Null keeps meaning *the backend checks*."""
+    drivers: tuple[FakeDriverClient, ...] = (
+        Painter(name="a", model_id="flux", caps=FLUX),
+        Painter(name="b", model_id="mini", caps=MINI),
+        Painter(name="c", model_id="gpt-image-1", caps=OPENAI),
+        Chatter(name="d", model_id="qwen"),
+    )
+    with serve(settings, *drivers) as client:
+        models = {m["id"]: m["x_eugene_plexus"] for m in client.get("/v1/models").json()["data"]}
+    flux, mini, oai = models["flux"], models["mini"], models["gpt-image-1"]
+    assert (flux["image_max_images"], flux["image_qualities"], flux["image_backgrounds"]) == (
+        1,
+        [],
+        [],
+    )
+    assert flux["image_output_formats"] == ["png", "jpeg"]
+    assert (flux["image_min_references"], flux["image_max_references"]) == (0, 4)
+    assert (mini["image_max_images"], mini["image_qualities"]) == (
+        10,
+        ["auto", "low", "medium", "high"],
+    )
+    assert mini["image_output_formats"] is None  # unlisted: carried, the backend decides
+    for field in (
+        "image_max_images",
+        "image_qualities",
+        "image_output_formats",
+        "image_max_references",
+    ):
+        assert oai[field] is None, field
+    # A chat model is told nothing about images, not "takes none".
+    image_fields = [k for k in flux if k.startswith("image_") and k != "image_input"]
+    assert len(image_fields) == 9, image_fields
+    assert [k for k in image_fields if models["qwen"].get(k) is not None] == []
+
+
+def test_a_slots_settings_are_what_some_backend_takes(settings: Settings) -> None:
+    """A request routes to any backend that takes it, so a slot lists the
+    largest limit and the union of choices -- and null once one backend
+    leaves a field to its own API."""
+    slots = [{"model": "pictures", "targets": ["flux", "mini"]}]
+    flux, mini = (
+        Painter(name="a", model_id="flux", caps=FLUX),
+        Painter(name="b", model_id="mini", caps=MINI),
+    )
+    with serve(settings, flux, mini, slots=slots) as client:
+        models = {m["id"]: m["x_eugene_plexus"] for m in client.get("/v1/models").json()["data"]}
+        listed = models["pictures"]
+        assert (listed["image_max_images"], listed["image_max_references"]) == (10, 16)
+        assert listed["image_qualities"] == ["auto", "low", "medium", "high"]
+        assert listed["image_output_formats"] is None
+        # What the listing says is what the door does: 10 is taken, by mini.
+        assert generate(client, "pictures", n=10).status_code == 200
+    only_flux = [{"model": "pictures", "targets": ["flux"]}]
+    flux = Painter(name="a", model_id="flux", caps=FLUX)
+    with serve(settings, flux, slots=only_flux) as client:
+        listed = {m["id"]: m["x_eugene_plexus"] for m in client.get("/v1/models").json()["data"]}[
+            "pictures"
+        ]
+        assert (listed["image_max_images"], listed["image_qualities"]) == (1, [])
+        assert "at most 1 " in _refused(generate(client, "pictures", n=2), "n")
+    # One backend that checks its own fields makes the slot's limit unknown:
+    # a larger request may route there, and its own refusal is relayed.
+    mixed = [{"model": "pictures", "targets": ["flux", "gpt-image-1"]}]
+    flux, oai = (
+        Painter(name="a", model_id="flux", caps=FLUX),
+        Painter(name="c", model_id="gpt-image-1", caps=OPENAI),
+    )
+    with serve(settings, flux, oai, slots=mixed) as client:
+        listed = {m["id"]: m["x_eugene_plexus"] for m in client.get("/v1/models").json()["data"]}[
+            "pictures"
+        ]
+        assert (listed["image_max_images"], listed["image_qualities"]) == (None, None)
+        assert generate(client, "pictures", n=2).status_code == 200
+
+
 def test_the_sdks_generation_is_answered_in_openais_shape(settings: Settings) -> None:
     painter = Painter(name="a", model_id="flux", answer=JPEG)
     before = int(time.time())
