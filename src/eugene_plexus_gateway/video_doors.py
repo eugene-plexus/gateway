@@ -251,7 +251,7 @@ def resource(handle: str, payload: dict[str, Any], job: VideoJob | None) -> dict
                 job.error if job and job.error else "The provider reported the job failed."
             ),
         }
-    return {
+    body: dict[str, Any] = {
         "id": handle,
         "object": "video",
         "model": payload.get("m"),
@@ -266,3 +266,8 @@ def resource(handle: str, payload: dict[str, Any], job: VideoJob | None) -> dict
         "remixed_from_video_id": None,
         "error": error,
     }
+    # The gateway's first money (2026-10-08): what the provider says it
+    # billed, once the job has ended and it says. Absent is unknown.
+    if job is not None and job.cost is not None and status in ("completed", "failed"):
+        body["x_eugene_plexus"] = {"cost_usd": job.cost}
+    return body

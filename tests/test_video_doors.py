@@ -24,6 +24,8 @@ from eugene_plexus_gateway._generated.driver_models import (
     VideoCapabilities,
     VideoJob,
     VideoJobStatus,
+    VideoPrice,
+    VideoPriceUnit,
     VideoRequest,
 )
 from eugene_plexus_gateway.app import create_app
@@ -37,8 +39,21 @@ PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
 MP4 = b"\x00\x00\x00 ftypisom" + bytes(range(256)) * 8
+#: grok-imagine-video's price list, as the driver reads OpenRouter's (2026-10-08).
+GROK_PRICES = [
+    VideoPrice(sku="cents_per_image_input", per=VideoPriceUnit.input_image, usd=0.002),
+    VideoPrice(
+        sku="cents_per_video_output_second_480p",
+        per=VideoPriceUnit.second,
+        usd=0.05,
+        resolution="480p",
+        sizes=["854x480"],
+    ),
+]
 #: grok-imagine-video, as measured (trimmed).
-GROK = VideoCapabilities(durations=[1, 2, 3, 4, 5], sizes=["854x480", "1280x720"], firstFrame=True)
+GROK = VideoCapabilities(
+    durations=[1, 2, 3, 4, 5], sizes=["854x480", "1280x720"], firstFrame=True, prices=GROK_PRICES
+)
 WIDE = VideoCapabilities(durations=list(range(1, 16)), sizes=None, firstFrame=False)
 
 
@@ -128,7 +143,40 @@ def test_a_video_model_is_listed_with_what_it_takes(settings: Settings) -> None:
     assert models["grok"]["video_durations"] == [1, 2, 3, 4, 5]
     assert models["grok"]["video_sizes"] == ["1280x720", "854x480"]
     assert models["grok"]["video_first_frame"] is True
+    # The price list, in the gateway's own words (first_frame, not firstFrame);
+    # the envelope sends an unset field as null, which reads as absent.
+    prices = [
+        {k: v for k, v in line.items() if v is not None} for line in models["grok"]["video_prices"]
+    ]
+    assert prices == [
+        {"sku": "cents_per_image_input", "per": "input_image", "usd": 0.002},
+        {
+            "sku": "cents_per_video_output_second_480p",
+            "per": "second",
+            "usd": 0.05,
+            "resolution": "480p",
+            "sizes": ["854x480"],
+        },
+    ]
     assert models["qwen"].get("video_durations") is None
+    assert models["qwen"].get("video_prices") is None
+
+
+def test_a_price_is_listed_only_when_every_backend_lists_the_same(settings: Settings) -> None:
+    """A request may land on any backend serving the name, so one figure is
+    true only when they agree; a backend with no list makes it unknown."""
+    dearer = VideoCapabilities.model_validate(
+        {**GROK.model_dump(), "prices": [{**GROK_PRICES[1].model_dump(), "usd": 0.07}]}
+    )
+    unpriced = VideoCapabilities.model_validate({**GROK.model_dump(), "prices": None})
+    for other, listed in ((GROK, True), (dearer, False), (unpriced, False)):
+        with serve(
+            settings,
+            Director(name="a", model_id="grok"),
+            Director(name="b", model_id="grok", caps=other),
+        ) as client:
+            info = client.get("/v1/models").json()["data"][0]["x_eugene_plexus"]
+        assert (info.get("video_prices") is not None) is listed, (other, info)
 
 
 def test_a_submit_answers_openais_resource_with_a_signed_handle(settings: Settings) -> None:
@@ -174,6 +222,9 @@ def test_the_job_is_polled_and_downloaded_through_the_same_gateway(settings: Set
         done = client.get(f"/v1/videos/{handle}").json()
         video = client.get(f"/v1/videos/{handle}/content")
     assert queued["status"] == "queued" and queued["id"] == handle
+    # What the provider billed, once the job has ended and it says (§6.4).
+    assert "x_eugene_plexus" not in queued
+    assert done["x_eugene_plexus"] == {"cost_usd": 0.05}
     assert too_soon.status_code == 400 and "no video yet" in too_soon.json()["error"]["message"]
     assert (done["status"], done["progress"]) == ("completed", 100)
     assert done["completed_at"] is not None and done["seconds"] == "1"

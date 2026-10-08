@@ -83,6 +83,8 @@ from ._generated.models import (
     RoutingTierView,
     SpeechFormat,
     Surface,
+    VideoPrice,
+    VideoPriceUnit,
 )
 from ._http import internal_client
 from .affinity import HIT, MOVED, NEW, AffinityTable
@@ -271,7 +273,31 @@ def _video_listing(backends: list[_Backend]) -> dict[str, Any]:
         "video_first_frame": any(
             b.video_caps is not None and bool(b.video_caps.firstFrame) for b in makers
         ),
+        "video_prices": _video_prices(makers),
     }
+
+
+def _video_prices(makers: list[_Backend]) -> list[VideoPrice] | None:
+    """The price list a video model is listed with (2026-10-08): its
+    backends' own, only when every one lists the same. A request may land
+    on any of them, so differing lists would make any one figure a guess,
+    and a backend with no list makes the price unknown."""
+    lists = [b.video_caps.prices if b.video_caps is not None else None for b in makers]
+    first = lists[0]
+    if not first or any(other != first for other in lists[1:]):
+        return None
+    return [
+        VideoPrice(
+            sku=line.sku,
+            per=VideoPriceUnit(line.per.value),
+            usd=line.usd,
+            resolution=line.resolution,
+            sizes=line.sizes,
+            audio=line.audio,
+            first_frame=line.firstFrame,
+        )
+        for line in first
+    ]
 
 
 def _image_listing(backends: list[_Backend]) -> dict[str, Any]:

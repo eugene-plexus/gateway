@@ -1880,24 +1880,56 @@ class CompletionPrompt(BaseModel):
     )
 
 
-class VideoCapabilities(BaseModel):
+class VideoPriceUnit(StrEnum):
     """
-    For a `video` model (P5): what OpenRouter's `GET /videos/models`
-    lists, which the gateway routes on. Null lists mean the listing did
-    not say.
+    What one unit of a `VideoPrice` is: a second of video made, one
+    image sent in (a first frame), or the least a job is billed.
+
+    """
+
+    second = 'second'
+    input_image = 'input_image'
+    minimum = 'minimum'
+
+
+class VideoPrice(BaseModel):
+    """
+    One line of a video model's price list, in US dollars. Only lines
+    that price what a request asks for are carried: a second of
+    output, an input image, a job's minimum. Lines in units a request
+    cannot be counted in (video tokens, megapixel-seconds, a
+    continuation of a video sent in, a reference) are left out.
 
     """
 
     model_config = ConfigDict(
         extra='forbid',
     )
-    durations: list[int] | None = Field(None, description='The whole seconds it makes.')
+    sku: str = Field(
+        ...,
+        description="The provider's own name for the line (`cents_per_video_output_second_480p`).",
+    )
+    per: VideoPriceUnit
+    usd: float = Field(
+        ...,
+        description='Dollars per unit; a price listed in cents is divided by 100.',
+        ge=0.0,
+    )
+    resolution: str | None = Field(
+        None,
+        description="The provider's resolution class (`480p`, `720p`, `1080p`, `2K`,\n`4K`). Absent: the line holds at every resolution.\n",
+    )
     sizes: list[str] | None = Field(
         None,
-        description='The `WIDTHxHEIGHT` sizes it makes; another is its 400 (measured).',
+        description="The model's listed sizes of that resolution: those whose\nshorter side is its height (480p: 480; 2K: 1440; 4K: 2160).\nAbsent when `resolution` is, or when the model lists no sizes.\n",
+    )
+    audio: bool | None = Field(
+        None,
+        description='True holds only with sound, false only without. Absent holds either way.',
     )
     firstFrame: bool | None = Field(
-        None, description='Whether it takes a first frame (image-to-video).'
+        None,
+        description='True holds only with a first frame (image to video), false\nonly without one. Absent holds either way.\n',
     )
 
 
@@ -2398,59 +2430,29 @@ class DecisionRequest(BaseModel):
     requestId: str | None = Field(None, description='Correlation id, echoed back.')
 
 
-class Capabilities(BaseModel):
+class VideoCapabilities(BaseModel):
     """
-    What one model can do behind this driver, which the gateway keys
-    off when routing. Was one object for the whole driver until P1;
-    each `DriverModel` carries its own now. For a backend whose
-    listing says nothing per model, each model inherits the answer
-    the driver would give for itself (P1-3).
+    For a `video` model (P5): what OpenRouter's `GET /videos/models`
+    lists, which the gateway routes on. Null lists mean the listing did
+    not say.
 
     """
 
-    supportedSettings: list[str] | None = Field(
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    durations: list[int] | None = Field(None, description='The whole seconds it makes.')
+    sizes: list[str] | None = Field(
         None,
-        description='Explicit callerSettings this active adapter can carry without\ndropping them. This does not promise the provider accepts every\npossible value. Absent means unknown; ineligible for requests\nrequiring explicit settings. The driver still validates before\nexecution, including after a configuration change.\n',
+        description='The `WIDTHxHEIGHT` sizes it makes; another is its 400 (measured).',
     )
-    streaming: bool | None = Field(
-        None, description='Whether `/v1/generate/stream` emits true incremental tokens.'
+    firstFrame: bool | None = Field(
+        None, description='Whether it takes a first frame (image-to-video).'
     )
-    fillInMiddle: bool | None = Field(
+    prices: list[VideoPrice] | None = Field(
         None,
-        description='P6: whether a `completion` with a `suffix` is filled in the\nmiddle by this model: `llama-server` answering `/infill` (the\nmodel carries fill-in-the-middle tokens), or an Ollama model\nwith the `insert` capability. Unknown is false.\n',
+        description="Its price list, read from OpenRouter's `pricing_skus`, in the\nlines a request can be priced by (`gateway.yaml`'s\n`ModelRoutingInfo.video_prices` says how). Null when the listing\nhas no line for a second of output. Added 2026-10-08.\n",
     )
-    imageInput: bool | None = Field(
-        None,
-        description='Whether the loaded model is confirmed to accept inline PNG/JPEG\nimages. Unknown or unverified backends report false. Rechecked\nbefore image generation; never inferred from the provider name.\n',
-    )
-    audioInput: bool | None = Field(
-        None,
-        description='Whether the model is confirmed to hear an `input_audio` part\n(WAV or MP3). The same rule as `imageInput`: unknown reports\nfalse, and the gateway routes a request carrying audio only\nto a model that says true. From the account\'s listing\n(`audio` in OpenRouter\'s `input_modalities`) or, for\n`llama-server`, its `/props` `modalities.audio`.\n\n**Added 2026-09-28 (P2).** Without it a text-only model is\nsent the audio: measured, OpenRouter answers *"No endpoints\nfound that support input audio"*, and a backend that drops\nthe part answers a question the caller did not ask.\n',
-    )
-    fileInput: bool | None = Field(
-        None,
-        description="Whether the model is confirmed to read a `file` part (PDF).\nThe same rule as `audioInput`. From `file` in the account's\n`input_modalities`; no local engine reads one today, so a\nsingle-model driver reports false.\n",
-    )
-    speechFormats: list[SpeechFormat] | None = Field(
-        None,
-        description='For a `speech` model: the formats this driver can give it in,\n`wav` included where it is made from `pcm` (P3a).\n',
-    )
-    audioOutput: bool | None = Field(
-        None,
-        description="Whether the model is confirmed to answer with audio\n(`GenerateRequest.audioOutput`). From `audio` in the\naccount's `output_modalities`; no local engine or CLI speaks,\nso they report false. Unknown is false, as for the inputs.\n\n**Not from `supported_parameters`** (A2's setting list): no\naudio-output model on OpenRouter lists `modalities` or\n`audio` there (measured 2026-09-28), so routing by it would\nroute nothing. Added 2026-09-28 (P2b).\n",
-    )
-    toolCalling: bool | None = Field(
-        None,
-        description='Whether this driver can carry `tools` to its backend and\nreport `toolCalls` back.\n\nThe gateway reads it to answer a question a harness\ncannot otherwise ask: a plain answer where a tool call\nwas expected looks identical whether the model declined\nor the backend never saw the tools. A driver that says\n`false` here is failed at the front door with a reason\ninstead.\n',
-    )
-    maxContextTokens: int | None = Field(
-        None,
-        description="The context window the backend **resolved**, read back\nfrom the backend itself — not the model's trained\nmaximum, and never an estimate.\n\nNull means unknown, and unknown is a real answer: a\nhosted provider exposes nothing to read, and a CLI\nsubscription has no window of its own to report. The\ngateway's `_smallest_context` folds this together with\nthe window a supervised runtime reports and publishes\nthe smallest as `x_eugene_plexus.context_length` on\n`GET /v1/models`, so a harness can size a prompt\nagainst the number that will actually apply.\n\n**Populated by a probe of the backend, which is why it\nexists at all.** A supervised runtime already tells the\nagent its window; this field is for the backend nobody\nsupervises — an Ollama or an LM Studio the operator\npoints us at — which until now reported no window\nanywhere. Contracted since M0 and populated by nothing\nuntil then, exactly as `streaming` was until M10.\n\n**Advertising, not enforcement.** Nothing here counts a\nprompt: the window is published so a caller can respect\nit, and a caller that does not is refused by the engine\nitself, whose count is exact. A backend that truncates\nsilently instead of refusing is caught after the fact —\nsee `x_eugene_plexus.prompt_truncated` in\n`gateway.yaml`.\n",
-        ge=0,
-    )
-    decision: DecisionCapability | None = None
-    image: ImageCapabilities | None = None
-    video: VideoCapabilities | None = None
 
 
 class InputAudioContentPart(BaseModel):
@@ -2726,6 +2728,61 @@ class ModerateRequest(BaseModel):
         min_length=1,
     )
     requestId: UUID | None = None
+
+
+class Capabilities(BaseModel):
+    """
+    What one model can do behind this driver, which the gateway keys
+    off when routing. Was one object for the whole driver until P1;
+    each `DriverModel` carries its own now. For a backend whose
+    listing says nothing per model, each model inherits the answer
+    the driver would give for itself (P1-3).
+
+    """
+
+    supportedSettings: list[str] | None = Field(
+        None,
+        description='Explicit callerSettings this active adapter can carry without\ndropping them. This does not promise the provider accepts every\npossible value. Absent means unknown; ineligible for requests\nrequiring explicit settings. The driver still validates before\nexecution, including after a configuration change.\n',
+    )
+    streaming: bool | None = Field(
+        None, description='Whether `/v1/generate/stream` emits true incremental tokens.'
+    )
+    fillInMiddle: bool | None = Field(
+        None,
+        description='P6: whether a `completion` with a `suffix` is filled in the\nmiddle by this model: `llama-server` answering `/infill` (the\nmodel carries fill-in-the-middle tokens), or an Ollama model\nwith the `insert` capability. Unknown is false.\n',
+    )
+    imageInput: bool | None = Field(
+        None,
+        description='Whether the loaded model is confirmed to accept inline PNG/JPEG\nimages. Unknown or unverified backends report false. Rechecked\nbefore image generation; never inferred from the provider name.\n',
+    )
+    audioInput: bool | None = Field(
+        None,
+        description='Whether the model is confirmed to hear an `input_audio` part\n(WAV or MP3). The same rule as `imageInput`: unknown reports\nfalse, and the gateway routes a request carrying audio only\nto a model that says true. From the account\'s listing\n(`audio` in OpenRouter\'s `input_modalities`) or, for\n`llama-server`, its `/props` `modalities.audio`.\n\n**Added 2026-09-28 (P2).** Without it a text-only model is\nsent the audio: measured, OpenRouter answers *"No endpoints\nfound that support input audio"*, and a backend that drops\nthe part answers a question the caller did not ask.\n',
+    )
+    fileInput: bool | None = Field(
+        None,
+        description="Whether the model is confirmed to read a `file` part (PDF).\nThe same rule as `audioInput`. From `file` in the account's\n`input_modalities`; no local engine reads one today, so a\nsingle-model driver reports false.\n",
+    )
+    speechFormats: list[SpeechFormat] | None = Field(
+        None,
+        description='For a `speech` model: the formats this driver can give it in,\n`wav` included where it is made from `pcm` (P3a).\n',
+    )
+    audioOutput: bool | None = Field(
+        None,
+        description="Whether the model is confirmed to answer with audio\n(`GenerateRequest.audioOutput`). From `audio` in the\naccount's `output_modalities`; no local engine or CLI speaks,\nso they report false. Unknown is false, as for the inputs.\n\n**Not from `supported_parameters`** (A2's setting list): no\naudio-output model on OpenRouter lists `modalities` or\n`audio` there (measured 2026-09-28), so routing by it would\nroute nothing. Added 2026-09-28 (P2b).\n",
+    )
+    toolCalling: bool | None = Field(
+        None,
+        description='Whether this driver can carry `tools` to its backend and\nreport `toolCalls` back.\n\nThe gateway reads it to answer a question a harness\ncannot otherwise ask: a plain answer where a tool call\nwas expected looks identical whether the model declined\nor the backend never saw the tools. A driver that says\n`false` here is failed at the front door with a reason\ninstead.\n',
+    )
+    maxContextTokens: int | None = Field(
+        None,
+        description="The context window the backend **resolved**, read back\nfrom the backend itself — not the model's trained\nmaximum, and never an estimate.\n\nNull means unknown, and unknown is a real answer: a\nhosted provider exposes nothing to read, and a CLI\nsubscription has no window of its own to report. The\ngateway's `_smallest_context` folds this together with\nthe window a supervised runtime reports and publishes\nthe smallest as `x_eugene_plexus.context_length` on\n`GET /v1/models`, so a harness can size a prompt\nagainst the number that will actually apply.\n\n**Populated by a probe of the backend, which is why it\nexists at all.** A supervised runtime already tells the\nagent its window; this field is for the backend nobody\nsupervises — an Ollama or an LM Studio the operator\npoints us at — which until now reported no window\nanywhere. Contracted since M0 and populated by nothing\nuntil then, exactly as `streaming` was until M10.\n\n**Advertising, not enforcement.** Nothing here counts a\nprompt: the window is published so a caller can respect\nit, and a caller that does not is refused by the engine\nitself, whose count is exact. A backend that truncates\nsilently instead of refusing is caught after the fact —\nsee `x_eugene_plexus.prompt_truncated` in\n`gateway.yaml`.\n",
+        ge=0,
+    )
+    decision: DecisionCapability | None = None
+    image: ImageCapabilities | None = None
+    video: VideoCapabilities | None = None
 
 
 class DriverModel(BaseModel):

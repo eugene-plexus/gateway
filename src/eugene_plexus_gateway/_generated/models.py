@@ -1286,6 +1286,59 @@ class Surface(StrEnum):
     completion = 'completion'
 
 
+class VideoPriceUnit(StrEnum):
+    """
+    What one unit of a `VideoPrice` is: a second of video made, one
+    image sent in (a first frame), or the least a job is billed.
+
+    """
+
+    second = 'second'
+    input_image = 'input_image'
+    minimum = 'minimum'
+
+
+class VideoPrice(BaseModel):
+    """
+    One line of a video model's price list, in US dollars. Only lines
+    that price what a request asks for are carried: a second of
+    output, an input image, a job's minimum. Lines in units a request
+    cannot be counted in (video tokens, megapixel-seconds, a
+    continuation of a video sent in) are left out.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    sku: str = Field(
+        ...,
+        description="The provider's own name for the line (`cents_per_video_output_second_480p`).",
+    )
+    per: VideoPriceUnit
+    usd: float = Field(
+        ...,
+        description='Dollars per unit; a price listed in cents is divided by 100.',
+        ge=0.0,
+    )
+    resolution: str | None = Field(
+        None,
+        description="The provider's resolution class (`480p`, `720p`, `1080p`, `2K`,\n`4K`). Absent: the line holds at every resolution.\n",
+    )
+    sizes: list[str] | None = Field(
+        None,
+        description="The model's listed sizes of that resolution: those whose\nshorter side is its height (480p: 480; 2K: 1440; 4K: 2160).\nAbsent when `resolution` is, or when the model lists no sizes.\n",
+    )
+    audio: bool | None = Field(
+        None,
+        description='True holds only with sound, false only without. Absent holds either way.',
+    )
+    first_frame: bool | None = Field(
+        None,
+        description='True holds only with a first frame (image to video), false\nonly without one. Absent holds either way.\n',
+    )
+
+
 class ModelLocality(StrEnum):
     """
     Where a request for this model may run, from the serving drivers'
@@ -3324,6 +3377,10 @@ class ModelRoutingInfo(BaseModel):
         None,
         description='For a `video` model, at least one backend takes an `input_reference`.',
     )
+    video_prices: list[VideoPrice] | None = Field(
+        None,
+        description="For a `video` model: the provider's price list, as its driver\nreads it (OpenRouter's `pricing_skus`), so a client can say\nwhat a job will cost before it sends one. **Listed only when\nevery backend serving the model lists the same prices**: a\nrequest may land on any of them. Absent when none is listed\nor they differ, which a client says as *no price listed*,\nnever as free. Added 2026-10-08 (Workbench media screens,\n§6.4).\n\n**A request's price** is its seconds times the `second` line\nthat applies, plus each input image (a first frame) times the\n`input_image` line, and at least the `minimum` line. The\n`second` line that applies is one whose `sizes` holds the\nsize sent; failing that, one with no `resolution`. Lines that\nstill differ only by `audio` (whether sound is added is the\nprovider's default) or are left open by an unsent size give a\nrange, not one figure. A line whose `first_frame` disagrees\nwith the request does not apply.\n",
+    )
     audio_output: bool | None = Field(
         None,
         description='At least one backend confirms this model answers with audio.\nA request with `modalities` including `audio` routes only to\nthose backends, including fallback. Added 2026-09-28 (P2b).\n',
@@ -3665,6 +3722,11 @@ class CompletionRoutingInfo(BaseModel):
         description="**The backend silently dropped input.** True when the prompt\nwe sent was far larger than the token count the backend\nreported consuming — the signature of a server that fits an\nover-long prompt into the window by discarding the middle of\nthe conversation and answering anyway, with a 200 and no\nflag of its own.\n\nThis is the failure that makes a coding harness loop: it\nsends file contents, the model never receives them, and the\nconfident answer that comes back is about code nobody read.\nMeasured on this project's own hardware: 66,389 characters\nacross six messages came back as `prompt_tokens: 86`, HTTP\n200, nothing anywhere saying so.\n\nDetected, not predicted. It is computed from\n`usage.prompt_tokens` **after** the answer, by a ratio\nchosen to be far below any real tokenizer's — so it cannot\nfire on a merely token-dense prompt, and it needs no\ntokenizer of ours.\n\n**And by a second test where the window is known**\n(2026-10-03): `prompt_tokens` reached at least 90% of\n`context_length` while the prompt's characters, at four to a\ntoken, exceed the whole window. The ratio alone cannot see a\ncut that keeps a near-full window: Ollama's default context is\n4,096 tokens on a card under 23 GiB and it still keeps the\nnewest turns and drops the middle, so a prompt cut to 4k went\nunflagged below about 82,000 characters.\n\n**Three states, and the difference matters.** `null` means\nnot evaluated — the backend reported no usage, or the prompt\nwas too small for the test to mean anything — and must not\nbe read as reassurance. `false` means it was checked and the\ninput arrived. `true` means it did not. Null and not absent:\nthis envelope serializes its unset fields, as `runtime` has\nsince M0.\n\n**Why a flag and not an error.** The answer has already been\ngenerated, and on a streamed request it has already been\ndelivered — M10's rule is that a stream cannot be unsent.\nFailing one path and flagging the other would make the same\ncondition report two different ways, so both flag. A backend\nthat refuses instead of truncating needs none of this: its\nrefusal is exact and is passed straight through as a 400.\n",
     )
     progress: StreamProgress | None = None
+    cost_usd: float | None = Field(
+        None,
+        description="What the provider says it billed for this request, in US\ndollars. Only a video job carries it today: on the poll that\nfinds it `completed` (or `failed`), when the provider reports\none (OpenRouter's `usage.cost`). **Absent means not known,\nnever free.** Added 2026-10-08 (Workbench's video screen; the\ngateway's first money).\n",
+        ge=0.0,
+    )
 
 
 class EmbeddingResponse(BaseModel):
