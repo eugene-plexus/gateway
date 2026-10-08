@@ -162,6 +162,40 @@ def test_a_video_model_is_listed_with_what_it_takes(settings: Settings) -> None:
     assert models["qwen"].get("video_prices") is None
 
 
+def test_a_price_lines_conditions_are_listed_in_the_gateways_words(settings: Settings) -> None:
+    """Sound, the kind of start, and a minimum: each says when its line holds."""
+    caps = VideoCapabilities(
+        durations=[4, 8],
+        sizes=None,
+        firstFrame=True,
+        prices=[
+            VideoPrice(
+                sku="duration_seconds_with_audio", per=VideoPriceUnit.second, usd=0.4, audio=True
+            ),
+            VideoPrice(
+                sku="image_to_video_duration_seconds",
+                per=VideoPriceUnit.second,
+                usd=0.15,
+                firstFrame=True,
+            ),
+            VideoPrice(sku="minimum_cents_per_generation", per=VideoPriceUnit.minimum, usd=0.56),
+        ],
+    )
+    with serve(settings, Director(name="a", model_id="veo", caps=caps)) as client:
+        info = client.get("/v1/models").json()["data"][0]["x_eugene_plexus"]
+    lines = [{k: v for k, v in line.items() if v is not None} for line in info["video_prices"]]
+    assert lines == [
+        {"sku": "duration_seconds_with_audio", "per": "second", "usd": 0.4, "audio": True},
+        {
+            "sku": "image_to_video_duration_seconds",
+            "per": "second",
+            "usd": 0.15,
+            "first_frame": True,
+        },
+        {"sku": "minimum_cents_per_generation", "per": "minimum", "usd": 0.56},
+    ]
+
+
 def test_a_price_is_listed_only_when_every_backend_lists_the_same(settings: Settings) -> None:
     """A request may land on any backend serving the name, so one figure is
     true only when they agree; a backend with no list makes it unknown."""
