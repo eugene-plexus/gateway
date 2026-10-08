@@ -2317,6 +2317,21 @@ class RoutingTable:
         return list(seen) if listed else None
 
     @staticmethod
+    def checked_voices(resolution: Resolution) -> list[str] | None:
+        """The voices a speech request to this model may name, when every
+        backend that would speak it lists its own; None as soon as one
+        leaves the voice to its provider (M10, 2026-10-08). The backends
+        are `pick_speech`'s: the first model's, never another tier's."""
+        lists = [
+            b.model.voices if b.model is not None else None
+            for b in resolution.first_model()
+            if b.speaks
+        ]
+        if not lists or any(voices is None for voices in lists):
+            return None
+        return list(dict.fromkeys(v for voices in lists for v in voices or []))
+
+    @staticmethod
     def deciders(resolution: Resolution) -> list[_Backend]:
         """The backends a decision may go to before the concurrency
         ceiling is applied -- what the route asks to tell *all busy*

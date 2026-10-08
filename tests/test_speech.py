@@ -151,6 +151,47 @@ def test_a_refused_format_names_the_ones_the_model_can_make(settings: Settings) 
     assert "mp3, wav, pcm" in response.json()["error"]["message"]
 
 
+def test_a_voice_the_model_does_not_list_is_refused_before_sending(settings: Settings) -> None:
+    """M10 (2026-10-08): OpenRouter's own refusal of an unknown voice said
+    only "Provider returned 400". Every backend lists its voices here, so
+    the gateway refuses, naming them, and nothing is sent."""
+    voice = Speaker(name="a", model_id="narrator", voices=["af_heart", "af_bella"])
+    with serve(settings, voice) as client:
+        refused = client.post("/v1/audio/speech", json=speech(voice="no_such_voice"))
+        taken = client.post("/v1/audio/speech", json=speech(voice="af_bella"))
+    assert refused.status_code == 400, refused.text
+    error = refused.json()["error"]
+    assert error["param"] == "voice"
+    assert "'no_such_voice'" in error["message"] and "af_heart, af_bella" in error["message"]
+    assert "Nothing was sent" in error["message"]
+    assert taken.status_code == 200
+    assert [s.voice for s in voice.spoken] == ["af_bella"]
+
+
+def test_a_voice_is_passed_through_when_any_backend_leaves_it_to_its_provider(
+    settings: Settings,
+) -> None:
+    """One replica that lists nothing makes the voice its provider's to
+    check (P3-3): the gateway cannot know the voice is wrong there."""
+    listed = Speaker(name="a", model_id="narrator", voices=["af_heart"])
+    unlisted = Speaker(name="b", model_id="narrator", voices=None)
+    with serve(settings, listed, unlisted) as client:
+        response = client.post("/v1/audio/speech", json=speech(voice="rachel"))
+    assert response.status_code == 200, response.text
+    with serve(settings, Speaker(name="c", model_id="narrator", voices=None)) as client:
+        assert client.post("/v1/audio/speech", json=speech(voice="any")).status_code == 200
+
+
+def test_a_slot_alias_checks_the_voices_of_its_first_model(settings: Settings) -> None:
+    first = Speaker(name="a", model_id="narrator", voices=["af_heart"])
+    second = Speaker(name="c", model_id="other-voice", voices=["rachel"])
+    slots = [{"model": "voice", "targets": ["narrator", "other-voice"]}]
+    with serve(settings, first, second, slots=slots) as client:
+        response = client.post("/v1/audio/speech", json=speech(model="voice", voice="rachel"))
+    assert response.status_code == 400 and response.json()["error"]["param"] == "voice"
+    assert not first.spoken and not second.spoken
+
+
 def test_speech_fails_over_between_replicas_and_never_to_another_model(settings: Settings) -> None:
     dead = Speaker(name="a", model_id="narrator", fail=httpx.ConnectError("refused"))
     alive = Speaker(name="b", model_id="narrator")

@@ -3263,7 +3263,7 @@ class ModelRoutingInfo(BaseModel):
     )
     voices: list[str] | None = Field(
         None,
-        description="For a `speech` model: the voices its provider lists, in the\nprovider's own ids (P3a). Absent when the provider does not say,\nwhich is not the same as having none -- any voice is passed\nthrough and an unknown one is the provider's 400 (P3-3).\n",
+        description='For a `speech` model: the voices its provider lists, in the\nprovider\'s own ids (P3a). Absent when the provider does not say,\nwhich is not the same as having none -- any voice is passed\nthrough and an unknown one is the provider\'s 400 (P3-3).\n\n**When every backend that would speak the request lists its\nvoices, a voice none of them lists is refused before anything\nis sent** (400, `param: voice`), naming the listed ones: a\nprovider\'s own refusal named nothing (OpenRouter: *"Provider\nreturned 400"*, measured 2026-10-08). OpenAI\'s TTS models list\nthe voices measured for their family that day. Added\n2026-10-08 (Workbench media screens, M10).\n',
     )
     speech_formats: list[SpeechFormat] | None = Field(
         None,
@@ -3359,7 +3359,7 @@ class SpeechRequest(BaseModel):
     input: str = Field(..., max_length=4096, min_length=1)
     voice: str = Field(
         ...,
-        description="The provider's own voice id, passed through (P3-3).",
+        description="The provider's own voice id, passed through (P3-3) -- or refused\nbefore sending when the model lists its voices and this is not\none of them (`ModelRoutingInfo.voices`, M10).\n",
         max_length=128,
         min_length=1,
     )

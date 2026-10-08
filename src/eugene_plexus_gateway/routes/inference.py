@@ -2514,6 +2514,22 @@ async def create_speech(request: Request) -> Any:
             error_type="invalid_request_error",
             param="response_format",
         )
+    # A voice nobody lists is refused here, naming the voices, rather than
+    # sent for a provider to refuse in words that name nothing (M10).
+    voices = table.checked_voices(resolution)
+    if voices is not None and body.voice not in voices:
+        named = ", ".join(voices[:30]) + (
+            f" and {len(voices) - 30} more" if len(voices) > 30 else ""
+        )
+        return _error(
+            code=400,
+            message=(
+                f"voice: {body.model!r} has no voice {body.voice!r}; it has {named} "
+                "(x_eugene_plexus.voices on GET /v1/models). Nothing was sent."
+            ),
+            error_type="invalid_request_error",
+            param="voice",
+        )
     client = table.pick_speech(resolution)
     if client is None and await table.refresh_if_stale():
         resolution = await admission.permitted(table.resolve(body.model))
