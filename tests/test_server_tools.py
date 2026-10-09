@@ -161,16 +161,27 @@ class FakeSearch:
         results: list[dict[str, Any]] | None = None,
         *,
         error: ToolDriverError | None = None,
+        suggestions: list[str | None] | None = None,
+        answer: str | None = None,
     ) -> None:
         self.results = RESULTS if results is None else results
         self.error = error
         self.asked: list[Any] = []
+        #: One per search, in order (None: that search's provider gave none).
+        self.suggestions = list(suggestions or [])
+        self.answer = answer
 
     async def web_search(self, request: Any) -> SearchAnswer:
         self.asked.append(request)
         if self.error is not None:
             raise self.error
-        return SearchAnswer(results=self.results, answer=None, provider="searxng", elapsed_ms=3)
+        return SearchAnswer(
+            results=self.results,
+            answer=self.answer,
+            provider="searxng",
+            elapsed_ms=3,
+            search_suggestions=self.suggestions.pop(0) if self.suggestions else None,
+        )
 
     async def info(self) -> ToolDriverInfo:
         return ToolDriverInfo(
@@ -181,17 +192,27 @@ class FakeSearch:
         return None
 
 
-def account(client: FakeSearch, name: str = "searx", *, configured: bool = True) -> ToolAccount:
+def account(
+    client: FakeSearch,
+    name: str = "searx",
+    *,
+    configured: bool = True,
+    node: str | None = None,
+    provider: str = "searxng",
+    label: str = "SearXNG",
+    billing: str | None = "per_search",
+) -> ToolAccount:
     return ToolAccount(
-        node=None,
+        node=node,
         name=name,
         url=f"http://{name}.invalid:8190",
         client=client,  # type: ignore[arg-type]
         info=ToolDriverInfo(
-            provider="searxng",
-            label="SearXNG",
+            provider=provider,
+            label=label,
             tools=["web_search"] if configured else [],
             configured=configured,
+            billing=billing,
         ),
     )
 
@@ -1171,3 +1192,327 @@ def test_a_failed_search_ends_its_reason_with_one_full_stop(settings) -> None:
     told = model.calls[1].messages[-1].content
     assert "(HTTP 429). Answer without it, and say that the search failed." in told
     assert ".." not in told
+
+
+# --------------------------------------------------------------------------- #
+# Search Suggestions (GS4): carried verbatim to the caller, never to the model
+# --------------------------------------------------------------------------- #
+
+#: Google's own markup is passed through whole: quotes, a newline, a style
+#: block and an entity must all survive, because its terms forbid editing it.
+SUGGEST = (
+    '<div class="container">\n<style>.chip{color:#1a73e8}</style>&amp; '
+    '<a href="https://www.google.com/search?q=a">a "b"</a> é</div>'
+)
+SUGGEST_2 = '<div class="container">second</div>'
+
+
+def _suggesting(*suggestions: str | None, answer: str | None = None) -> FakeSearch:
+    return FakeSearch(suggestions=list(suggestions), answer=answer)
+
+
+def test_chat_carries_each_searchs_suggestions_in_run_order_and_not_to_the_model(settings) -> None:
+    found = _suggesting(SUGGEST, None, SUGGEST_2, answer="Google says so.")
+    model = ScriptedDriver(
+        turns=[
+            Turn(calls=[search_call("one", "call_a")]),
+            Turn(calls=[search_call("two", "call_b")]),
+            Turn(calls=[search_call("three", "call_c")]),
+            Turn(ANSWER),
+        ]
+    )
+    with TestClient(app_with(settings, model, searches=[account(found)])) as client:
+        response = chat(client)
+    body = response.json()
+    assert body["x_eugene_plexus"]["search_suggestions"] == [SUGGEST, SUGGEST_2]
+    assert body["x_eugene_plexus"]["web_searches"] == 3
+    for call in model.calls:
+        for message in call.messages:
+            assert "container" not in (message.content or ""), "the model never reads the HTML"
+            assert "chip" not in (message.content or "")
+    told = model.calls[1].messages[-1].content
+    assert "Answer from the search provider: Google says so." in told
+
+
+def test_chat_has_no_suggestions_when_the_provider_gave_none(settings, search) -> None:
+    model = ScriptedDriver(turns=[Turn(calls=[search_call()]), Turn(ANSWER)])
+    with TestClient(app_with(settings, model, searches=[account(search)])) as client:
+        response = chat(client)
+    # The door's other extension fields read null when unset; none is null here.
+    assert response.json()["x_eugene_plexus"].get("search_suggestions") is None
+
+
+def test_the_chat_stream_carries_suggestions_in_its_final_extension_block(settings) -> None:
+    model = ScriptedDriver(turns=[Turn(calls=[search_call()]), Turn(ANSWER)])
+    with TestClient(app_with(settings, model, searches=[account(_suggesting(SUGGEST))])) as client:
+        response = chat(client, stream=True)
+    final = [f for f in sse(response) if (f.get("choices") or [{}])[0].get("finish_reason")]
+    assert final[-1]["x_eugene_plexus"]["search_suggestions"] == [SUGGEST]
+
+
+def test_the_chat_stream_has_none_when_the_provider_gave_none(settings, search) -> None:
+    model = ScriptedDriver(turns=[Turn(calls=[search_call()]), Turn(ANSWER)])
+    with TestClient(app_with(settings, model, searches=[account(search)])) as client:
+        response = chat(client, stream=True)
+    final = [f for f in sse(response) if (f.get("choices") or [{}])[0].get("finish_reason")]
+    assert "search_suggestions" not in final[-1]["x_eugene_plexus"]
+
+
+def test_responses_item_carries_its_searchs_suggestions(settings) -> None:
+    model = ScriptedDriver(turns=[Turn(calls=[search_call()]), Turn(ANSWER)])
+    with TestClient(app_with(settings, model, searches=[account(_suggesting(SUGGEST))])) as client:
+        response = client.post(
+            "/v1/responses",
+            json={"model": MODEL, "input": "q", "tools": [{"type": "web_search"}]},
+        )
+    call = response.json()["output"][0]
+    assert call["type"] == "web_search_call"
+    assert call["x_eugene_plexus"] == {"search_suggestions": SUGGEST}
+    assert "search-suggestions" not in str(dict(response.headers)).lower()
+    assert "container" not in str(model.calls[1].messages[-1].content)
+
+
+def test_responses_stream_item_done_carries_suggestions_and_the_added_one_does_not(
+    settings,
+) -> None:
+    model = ScriptedDriver(turns=[Turn(calls=[search_call()]), Turn(ANSWER)])
+    with TestClient(app_with(settings, model, searches=[account(_suggesting(SUGGEST))])) as client:
+        response = client.post(
+            "/v1/responses",
+            json={"model": MODEL, "input": "q", "tools": [{"type": "web_search"}], "stream": True},
+        )
+    seen = events(response)
+    added = next(d for n, d in seen if n == "response.output_item.added")["item"]
+    done = next(
+        d
+        for n, d in seen
+        if n == "response.output_item.done" and d["item"]["type"] == "web_search_call"
+    )["item"]
+    assert "x_eugene_plexus" not in added
+    assert done["x_eugene_plexus"] == {"search_suggestions": SUGGEST}
+    completed = next(d for n, d in seen if n == "response.completed")["response"]
+    assert completed["output"][0]["x_eugene_plexus"] == {"search_suggestions": SUGGEST}
+
+
+def test_responses_item_has_no_extension_when_the_provider_gave_none(settings, search) -> None:
+    model = ScriptedDriver(turns=[Turn(calls=[search_call()]), Turn(ANSWER)])
+    with TestClient(app_with(settings, model, searches=[account(search)])) as client:
+        response = client.post(
+            "/v1/responses",
+            json={"model": MODEL, "input": "q", "tools": [{"type": "web_search"}]},
+        )
+    assert "x_eugene_plexus" not in response.json()["output"][0]
+
+
+def test_messages_result_block_carries_its_searchs_suggestions(settings) -> None:
+    model = ScriptedDriver(turns=[Turn(calls=[search_call()]), Turn(ANSWER)])
+    with TestClient(app_with(settings, model, searches=[account(_suggesting(SUGGEST))])) as client:
+        response = client.post("/v1/messages", json=CLAUDE_CODE_SEARCH)
+    use, result, _ = response.json()["content"]
+    assert "x_eugene_plexus" not in use
+    assert result["x_eugene_plexus"] == {"search_suggestions": SUGGEST}
+    assert "search-suggestions" not in str(dict(response.headers)).lower()
+    assert "container" not in str(model.calls[1].messages[-1].content)
+
+
+def test_messages_stream_result_block_carries_suggestions(settings) -> None:
+    model = ScriptedDriver(turns=[Turn(calls=[search_call()]), Turn(ANSWER)])
+    with TestClient(app_with(settings, model, searches=[account(_suggesting(SUGGEST))])) as client:
+        response = client.post("/v1/messages", json={**CLAUDE_CODE_SEARCH, "stream": True})
+    blocks = [d["content_block"] for n, d in events(response) if n == "content_block_start"]
+    result = next(b for b in blocks if b["type"] == "web_search_tool_result")
+    assert result["x_eugene_plexus"] == {"search_suggestions": SUGGEST}
+    assert all("x_eugene_plexus" not in b for b in blocks if b is not result)
+
+
+def test_messages_result_block_has_no_extension_when_the_provider_gave_none(
+    settings, search
+) -> None:
+    model = ScriptedDriver(turns=[Turn(calls=[search_call()]), Turn(ANSWER)])
+    with TestClient(app_with(settings, model, searches=[account(search)])) as client:
+        response = client.post("/v1/messages", json=CLAUDE_CODE_SEARCH)
+    assert "x_eugene_plexus" not in response.json()["content"][1]
+
+
+def test_suggestions_are_not_in_the_metrics_row_or_its_file(settings) -> None:
+    model = ScriptedDriver(turns=[Turn(calls=[search_call()]), Turn(ANSWER)])
+    app = app_with(settings, model, searches=[account(_suggesting(SUGGEST))])
+    with TestClient(app) as client:
+        assert chat(client).status_code == 200
+        text = ""
+        for _ in range(100):
+            text = client.get("/v1/metrics/requests").text
+            if "webSearches" in text:
+                break
+            time.sleep(0.05)
+    assert "webSearches" in text
+    assert "container" not in text and "chip" not in text
+    raw = Path(settings.metrics_file).read_bytes()
+    assert b"container" not in raw and b"1a73e8" not in raw
+
+
+def test_the_models_tool_message_keeps_the_providers_answer_and_never_the_html() -> None:
+    from eugene_plexus_gateway.server_tools import Execution, result_text
+
+    execution = Execution(
+        call_id="c",
+        query="q",
+        version="web_search",
+        outcome="ok",
+        results=RESULTS,
+        answer="Words from Google.",
+        search_suggestions=SUGGEST,
+    )
+    text = result_text(execution, limit=5)
+    assert "Answer from the search provider: Words from Google." in text
+    assert "container" not in text and "1a73e8" not in text
+
+
+# --------------------------------------------------------------------------- #
+# The order a search tries its accounts (GS7)
+# --------------------------------------------------------------------------- #
+
+
+def _two_accounts() -> tuple[FakeSearch, FakeSearch, list[ToolAccount]]:
+    free, paid = FakeSearch(), FakeSearch()
+    # The snapshot's order is the default rule's: free first.
+    return (
+        free,
+        paid,
+        [
+            account(free, "searx", billing="free"),
+            account(paid, "google", provider="google", label="Google Search"),
+        ],
+    )
+
+
+def test_web_search_order_takes_effect_on_the_next_search_after_a_patch(settings) -> None:
+    free, paid, accounts = _two_accounts()
+    model = ScriptedDriver(turns=[Turn(calls=[search_call()]), Turn(ANSWER)] * 3)
+    app = app_with(settings, model, searches=accounts)
+    with TestClient(app) as client:
+        # Wired as app.py wires it: read from the live store on every call.
+        app.state.routing._search_order = lambda: app.state.config_store.get("webSearchOrder")
+        assert chat(client).status_code == 200
+        assert (len(free.asked), len(paid.asked)) == (1, 0), "default rule: free first"
+        patched = client.patch("/v1/config", json={"webSearchOrder": ["google"]})
+        assert patched.status_code == 200, patched.text
+        assert chat(client).status_code == 200
+        assert (len(free.asked), len(paid.asked)) == (1, 1), "named account first, no restart"
+        assert client.patch("/v1/config", json={"webSearchOrder": []}).status_code == 200
+        assert chat(client).status_code == 200
+        assert (len(free.asked), len(paid.asked)) == (2, 1), "emptied: the default rule again"
+
+
+def test_web_search_order_is_a_string_list_setting_that_says_what_unset_means(settings) -> None:
+    app = create_app(settings=settings)
+    with TestClient(app) as client:
+        schema = client.get("/v1/config/schema").json()
+        field = next(f for f in schema["fields"] if f["key"] == "webSearchOrder")
+        assert field["label"] == "Web search order"
+        assert field["valueType"] == "string_list"
+        assert field["requiresRestart"] is False
+        assert "free search accounts before billed ones" in field["unsetMeans"]
+        assert client.get("/v1/config").json()["webSearchOrder"] == []
+        for bad in ("google", [3], ["a", "a"], [""]):
+            body = client.patch("/v1/config", json={"webSearchOrder": bad}).json()
+            assert body["applied"] == [], bad
+            assert [r["key"] for r in body["rejected"]] == ["webSearchOrder"], bad
+        assert client.get("/v1/config").json()["webSearchOrder"] == []
+
+
+def _table_with(order: list[str] | None, *accounts: ToolAccount) -> Any:
+    from eugene_plexus_gateway.routing import RoutingTable
+
+    table = RoutingTable(agent_url="http://fake-agent", search_order=lambda: order)
+    table._snapshot.tools = list(accounts)
+    return table
+
+
+def _names(table: Any) -> list[str]:
+    return [f"{a.node}:{a.name}" for a in table.search_accounts()]
+
+
+def test_order_entries_are_bare_names_or_node_colon_name_and_the_rest_keep_the_default() -> None:
+    a = account(FakeSearch(), "g", node="box", billing="free")
+    b = account(FakeSearch(), "g", node="other")
+    c = account(FakeSearch(), "brave", node="box")
+    d = account(FakeSearch(), "searx", node="box", billing="free")
+    default = ["box:g", "other:g", "box:brave", "box:searx"]
+    assert _names(_table_with(None, a, b, c, d)) == default
+    assert _names(_table_with([], a, b, c, d)) == default
+    # node:name picks one account.
+    assert _names(_table_with(["other:g"], a, b, c, d)) == [
+        "other:g",
+        "box:g",
+        "box:brave",
+        "box:searx",
+    ]
+    # A bare name matches every node's account of it, in default order.
+    assert _names(_table_with(["g", "searx"], a, b, c, d)) == [
+        "box:g",
+        "other:g",
+        "box:searx",
+        "box:brave",
+    ]
+    # The order is the list's; unknown names and a repeat change nothing else.
+    assert _names(_table_with(["nope", "box:searx", "nobody:g", "box:searx", " "], a, b, c, d)) == [
+        "box:searx",
+        "box:g",
+        "other:g",
+        "box:brave",
+    ]
+    # A node's name alone is not an account's.
+    assert _names(_table_with(["box"], a, b, c, d)) == default
+
+
+def test_an_account_that_does_not_run_is_still_skipped_when_named() -> None:
+    off = account(FakeSearch(), "google", configured=False)
+    on = account(FakeSearch(), "searx", billing="free")
+    table = _table_with(["google"], on, off)
+    assert [x.name for x in table.search_accounts()] == ["searx"]
+
+
+def test_the_routing_view_lists_search_accounts_in_the_order_tried_with_where_from(
+    settings,
+) -> None:
+    _, _, accounts = _two_accounts()
+    idle = account(FakeSearch(), "brave", configured=False, provider="brave", label="Brave")
+    app = app_with(settings, ScriptedDriver(turns=[]), searches=[*accounts, idle])
+    with TestClient(app) as client:
+        app.state.routing._search_order = lambda: app.state.config_store.get("webSearchOrder")
+        before = client.get("/v1/admin/routing").json()["search_accounts"]
+        assert [(x["name"], x["placed_by"]) for x in before] == [
+            ("searx", "default"),
+            ("google", "default"),
+            ("brave", "default"),
+        ]
+        client.patch("/v1/config", json={"webSearchOrder": ["google", "brave", "ghost"]})
+        after = client.get("/v1/admin/routing").json()["search_accounts"]
+    assert [(x["name"], x["placed_by"]) for x in after] == [
+        ("google", "order"),
+        ("brave", "order"),
+        ("searx", "default"),
+    ]
+    assert after[0] == {
+        "name": "google",
+        "node": None,
+        "provider": "google",
+        "label": "Google Search",
+        "billing": "per_search",
+        "runs": True,
+        "placed_by": "order",
+    }
+    assert after[1]["runs"] is False, "set up or not, it is listed in its place"
+    assert after[2]["billing"] == "free"
+
+
+def test_an_account_that_reports_no_billing_is_listed_as_billed(settings) -> None:
+    """An older tool driver says nothing of billing; absent is read as
+    billed (tool-driver.yaml `ToolBilling`), and the view still answers."""
+    quiet = account(FakeSearch(), "old", billing=None)
+    app = app_with(settings, ScriptedDriver(turns=[]), searches=[quiet])
+    with TestClient(app) as client:
+        response = client.get("/v1/admin/routing")
+    assert response.status_code == 200, response.text
+    assert response.json()["search_accounts"][0]["billing"] == "per_search"

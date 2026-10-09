@@ -92,6 +92,9 @@ class SearchAnswer:
     provider: str
     ignored: list[str] = field(default_factory=list)
     elapsed_ms: int = 0
+    #: HTML the provider's terms require shown with these results (Google's
+    #: Search Suggestions), carried to the caller verbatim and never stored.
+    search_suggestions: str | None = None
 
 
 class ToolDriverClient:
@@ -170,6 +173,9 @@ class ToolDriverClient:
             provider=str(body.get("provider") or "unknown"),
             ignored=[i for i in body.get("ignored") or [] if isinstance(i, str)],
             elapsed_ms=elapsed,
+            search_suggestions=body.get("searchSuggestions")
+            if isinstance(body.get("searchSuggestions"), str) and body.get("searchSuggestions")
+            else None,
         )
 
     async def aclose(self) -> None:

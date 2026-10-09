@@ -1140,7 +1140,17 @@ def search_blocks(execution: Any) -> list[dict[str, Any]]:
             for r in execution.results
             if isinstance(r.get("url"), str)
         ]
-    return [use, {"type": "web_search_tool_result", "tool_use_id": tool_use_id, "content": content}]
+    result: dict[str, Any] = {
+        "type": "web_search_tool_result",
+        "tool_use_id": tool_use_id,
+        "content": content,
+    }
+    # The provider's terms require its Search Suggestions shown, unmodified,
+    # with its results (GS4): passed through whole, and never to the model.
+    suggestions = getattr(execution, "search_suggestions", None)
+    if execution.outcome == "ok" and suggestions:
+        result["x_eugene_plexus"] = {"search_suggestions": suggestions}
+    return [use, result]
 
 
 def transcript_blocks(
@@ -1229,6 +1239,9 @@ def envelope_headers(routing: Any) -> dict[str, str]:
     """
     out: dict[str, str] = {}
     for field, value in routing.model_dump(exclude_none=True).items():
+        if field == "search_suggestions":
+            # HTML, and a list of it: not a header's to carry.
+            continue
         if isinstance(value, bool):
             value = "true" if value else "false"
         out[f"x-eugene-plexus-{field.replace('_', '-')}"] = str(value)

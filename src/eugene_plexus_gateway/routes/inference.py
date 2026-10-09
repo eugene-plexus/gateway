@@ -4170,7 +4170,22 @@ def _routing_info(
         context_length=table.context_length_for(model, served_by, served_node),
         prompt_truncated=prompt_truncated,
         web_searches=_searches_run(client),
+        search_suggestions=_search_suggestions(client),
     )
+
+
+def _search_suggestions(client: Any) -> list[str] | None:
+    """The Search Suggestions HTML of each search this install ran, in run
+    order, verbatim (GS4); None when no search had any. Handed to the caller
+    and nowhere else: not the model, not the metrics row, not a log."""
+    if not isinstance(client, server_tools.SearchingClient):
+        return None
+    found = [
+        e.search_suggestions
+        for e in client.executions
+        if e.outcome == "ok" and e.search_suggestions
+    ]
+    return found or None
 
 
 def _searches_run(client: Any) -> int | None:

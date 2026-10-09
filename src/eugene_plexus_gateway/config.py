@@ -169,6 +169,22 @@ FIELDS: list[ConfigField] = [
         maximum=50,
     ),
     ConfigField(
+        key="webSearchOrder",
+        label="Web search order",
+        description=(
+            "Which search account a web search tries first. Accounts named here are "
+            "tried first, in this order, each as its name or node:name (a bare name "
+            "matches that account on every machine); the rest follow by the default "
+            "rule -- free accounts before billed ones, this machine's before another's. "
+            "A name that matches no account is ignored. A later account is tried only "
+            "when an earlier one could not answer. Takes effect on the next search."
+        ),
+        category="generation",
+        valueType=ConfigValueType.string_list,
+        default=[],
+        requiresRestart=False,
+    ),
+    ConfigField(
         key="imageToolModel",
         label="Image model for tools",
         description=(
@@ -551,6 +567,10 @@ UNSET_MEANS: dict[str, str] = {
         "and the request deadline, unless the request or the model's default profile "
         "sets one."
     ),
+    "webSearchOrder": (
+        "Not set: the default rule alone -- free search accounts before billed ones, "
+        "this machine's account before another machine's, then by machine and name."
+    ),
     "imageToolModel": (
         "Not set: the image tool uses the model the app names when this install serves "
         "it, else the one image model the key may use."
@@ -676,13 +696,14 @@ def _validate_value(field: ConfigField, value: Any) -> str | None:
             return f"must be one of {allowed}"
         return None
 
-    if vt == ConfigValueType.url_list:
+    if vt in (ConfigValueType.url_list, ConfigValueType.string_list):
         # Same rule as the control root's standby list: a list of
         # non-empty strings, each named once. What an entry means is the
         # field's business -- for `corsAllowedOrigins` it is an origin,
         # which is a URL with no path.
         if not isinstance(value, list):
-            return f"expected a list of URLs, got {type(value).__name__}"
+            what = "strings" if vt == ConfigValueType.string_list else "URLs"
+            return f"expected a list of {what}, got {type(value).__name__}"
         seen: dict[str, int] = {}
         for position, item in enumerate(value):
             if not isinstance(item, str):

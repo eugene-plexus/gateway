@@ -165,6 +165,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 slots=lambda: store.get("modelSlots"),
                 strategy=lambda: store.get("loadBalancing"),
                 affinity=lambda: store.get("conversationAffinity"),
+                # Live too (GS7): the next search follows a PATCH.
+                search_order=lambda: store.get("webSearchOrder"),
                 # Live, like the two above it: `controlUrl` is documented
                 # as taking effect on the next routing refresh.
                 control_url=lambda: store.get("controlUrl"),

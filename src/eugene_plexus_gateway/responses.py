@@ -1333,7 +1333,7 @@ def web_search_item(execution: Any, *, status: str = "completed") -> dict[str, A
     only way OpenAI's own API returns it, and a caller reading a search
     that says nothing about where it looked cannot check it.
     """
-    return {
+    item: dict[str, Any] = {
         "id": f"ws_{execution.item_id}",
         "type": "web_search_call",
         "status": status
@@ -1349,6 +1349,12 @@ def web_search_item(execution: Any, *, status: str = "completed") -> dict[str, A
             ],
         },
     }
+    # The provider's terms require its Search Suggestions shown, unmodified,
+    # with its results (GS4): passed through whole, and never to the model.
+    suggestions = getattr(execution, "search_suggestions", None)
+    if execution.outcome == "ok" and suggestions:
+        item["x_eugene_plexus"] = {"search_suggestions": suggestions}
+    return item
 
 
 def image_generation_item(execution: Any, *, status: str = "completed") -> dict[str, Any]:

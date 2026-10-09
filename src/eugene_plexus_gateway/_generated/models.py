@@ -2182,6 +2182,48 @@ class EmbeddingUsage(BaseModel):
     total_tokens: int | None = Field(None, ge=0)
 
 
+class Billing(StrEnum):
+    """
+    As the account reports it (`free`: SearXNG; `per_search`: Brave, Google).
+
+    """
+
+    free = 'free'
+    per_search = 'per_search'
+
+
+class PlacedBy(StrEnum):
+    """
+    `order` when `webSearchOrder` names it, `default` when it is
+    placed by the default rule after the named ones.
+
+    """
+
+    order = 'order'
+    default = 'default'
+
+
+class SearchAccountView(BaseModel):
+    name: str = Field(..., description="The account's name, as its agent declares it.")
+    node: str | None = Field(
+        None, description='The machine it runs on; null on a standalone install.'
+    )
+    provider: str = Field(..., description='`searxng`, `brave` or `google`.')
+    label: str | None = None
+    billing: Billing | None = Field(
+        None,
+        description='As the account reports it (`free`: SearXNG; `per_search`: Brave, Google).\n',
+    )
+    runs: bool = Field(
+        ...,
+        description='Set up and able to search now. An account that is not is\nlisted in its place and skipped.\n',
+    )
+    placed_by: PlacedBy = Field(
+        ...,
+        description='`order` when `webSearchOrder` names it, `default` when it is\nplaced by the default rule after the named ones.\n',
+    )
+
+
 class OutdatedDriver(BaseModel):
     name: str = Field(..., description="The driver's name, as its agent declares it.")
     node: str | None = Field(
@@ -2329,7 +2371,10 @@ class AnthropicContentBlock(BaseModel):
     an assistant turn, become that turn's history: the query, and
     each result's title, address and the excerpt the model read,
     which `encrypted_content` carries (readable only here, as a
-    thinking block's `signature` is).
+    thinking block's `signature` is). A `web_search_tool_result`
+    whose provider's terms require something shown with its results
+    carries it as `x_eugene_plexus.search_suggestions` (HTML:
+    Google's Search Suggestions).
 
     `document` was refused with a 400 until 2026-09-28, and `image`
     until 2026-09-23, on one reasoning: a model that never received
@@ -2734,7 +2779,10 @@ class ResponsesOutputItem(BaseModel):
     "arguments", "namespace"?}` (`namespace` when the call is to a
     member of a `namespace` tool), for a search this install ran (P8),
     `{"type": "web_search_call", "id", "status", "action": {"type":
-    "search", "query", "sources": [{"type": "url", "url"}]}}`, or for
+    "search", "query", "sources": [{"type": "url", "url"}]},
+    "x_eugene_plexus"?: {"search_suggestions": html}}` (the HTML the
+    search provider's terms require shown with its results: Google's
+    Search Suggestions), or for
     an image it made (P8e), `{"type": "image_generation_call", "id",
     "status", "result", "revised_prompt", "size", "quality",
     "background", "output_format", "action": "generate"}` -- `result`
@@ -3017,7 +3065,7 @@ class MetricToolExecution(BaseModel):
     node: str | None = None
     provider: str | None = Field(
         None,
-        description="The search account's provider, `searxng` or `brave`; for an\nimage, the image model that made it.\n",
+        description="The search account's provider, `searxng`, `brave` or `google`;\nfor an image, the image model that made it.\n",
     )
     version: str | None = Field(
         None,
@@ -3711,6 +3759,10 @@ class CompletionRoutingInfo(BaseModel):
         None,
         description='How many web searches this install ran for the request (P8).\nAbsent when none ran, and when the backend searched itself.\n',
         ge=0,
+    )
+    search_suggestions: list[str] | None = Field(
+        None,
+        description="For each search this install ran whose provider's terms require\nsomething shown with its results (Google's Search Suggestions,\nHTML), that HTML, in the order the searches ran. Show it to the\nperson who asked, unmodified, beside the answer\n(docs/design/google-search-account.md, GS4). Absent when none\nhad any.\n",
     )
     tier: int | None = Field(
         None,
@@ -4664,6 +4716,10 @@ class RoutingTableView(BaseModel):
         description='Drivers that answered `/v1/info` in the shape from before P1\n(a single `modelId`, no `models`). The gateway routes nothing\nto one: it would ignore the `model` a request names and\nanswer with its own. Listed so the console can say which\nmachine to update, rather than a model silently vanishing\nafter its gateway was updated and its worker was not.\n',
     )
     control_root: ControlRootView | None = None
+    search_accounts: list[SearchAccountView] | None = Field(
+        None,
+        description="Every search account that answered, in the order a web search\ntries them: those `webSearchOrder` names first, in its order,\nthen the rest by the default rule (free before billed, this\nmachine's before another's). Set or not, this is the order in\neffect (docs/design/google-search-account.md, GS7).\n",
+    )
 
 
 class MessageContent1(

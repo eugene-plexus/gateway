@@ -467,6 +467,10 @@ class Execution:
     outcome: str = "pending"
     results: list[dict[str, Any]] = field(default_factory=list)
     answer: str | None = None
+    #: The provider's Search Suggestions HTML, verbatim (GS4). Handed to the
+    #: caller through the door's extension block, never to the model, never
+    #: recorded: Google's terms forbid modifying or learning from it.
+    search_suggestions: str | None = None
     provider: str | None = None
     driver: str | None = None
     node: str | None = None
@@ -553,6 +557,7 @@ class SearchRunner:
             execution.outcome = "ok"
             execution.results = answer.results
             execution.answer = answer.answer
+            execution.search_suggestions = answer.search_suggestions
             execution.provider = answer.provider
             execution.elapsed_ms = int((time.perf_counter() - started) * 1000)
             return execution

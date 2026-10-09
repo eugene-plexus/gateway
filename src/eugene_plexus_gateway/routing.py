@@ -77,14 +77,19 @@ from ._generated.models import (
     ModelLocality,
     ModelRoutingInfo,
     OutdatedDriver,
+    PlacedBy,
     RoutingBackendView,
     RoutingSlotView,
     RoutingTableView,
     RoutingTierView,
+    SearchAccountView,
     SpeechFormat,
     Surface,
     VideoPrice,
     VideoPriceUnit,
+)
+from ._generated.models import (
+    Billing as SearchBilling,
 )
 from ._http import internal_client
 from .affinity import HIT, MOVED, NEW, AffinityTable
@@ -744,6 +749,7 @@ class RoutingTable:
         control_url: str | Callable[[], Any] | None = None,
         room_wait_seconds: Callable[[], float] | None = None,
         affinity: Callable[[], Any] | None = None,
+        search_order: Callable[[], Any] | None = None,
     ) -> None:
         self._agent_url = agent_url.rstrip("/")
         # CB3: the prompt tokens in flight on each runtime with a shared
@@ -781,6 +787,9 @@ class RoutingTable:
         # CB1: a conversation goes back to its replica under every strategy
         # unless this is off -- for benchmarking replicas, nothing else.
         self._affinity_on: Callable[[], Any] = affinity or (lambda: True)
+        # GS7: `webSearchOrder`, read at every search so a PATCH applies to
+        # the next one with no restart and no refresh.
+        self._search_order: Callable[[], Any] = search_order or (lambda: None)
         self._snapshot = _Snapshot(agents={None: self._agent_url})
         # Clients are cached by (node, name, url) and reused across
         # refreshes. Rebuilding an httpx.AsyncClient every 15s would
@@ -1629,7 +1638,35 @@ class RoutingTable:
 
     def search_accounts(self, tool: str = "web_search") -> list[ToolAccount]:
         """The accounts that run `tool` right now, in the order to try them."""
-        return [a for a in self._snapshot.tools if a.runs(tool)]
+        return [a for a, _ in self._ordered_tools() if a.runs(tool)]
+
+    def _ordered_tools(self) -> list[tuple[ToolAccount, str]]:
+        """Every search account in the order a search tries them, each with
+        where its place came from (GS7).
+
+        The accounts `webSearchOrder` names come first, in its order; an
+        entry is an account's name (every node's account of that name, in
+        the default order) or `node:name`. The rest follow in the default
+        order the snapshot holds (free before billed, this machine's before
+        another's). An entry naming no account is ignored. Computed on every
+        call from the live setting, never cached with the snapshot.
+        """
+        default = list(self._snapshot.tools)
+        raw = self._search_order()
+        entries = [e.strip() for e in raw if isinstance(e, str) and e.strip()] if raw else []
+        placed: list[tuple[ToolAccount, str]] = []
+        taken: set[int] = set()
+        for entry in entries:
+            for account in default:
+                if id(account) in taken:
+                    continue
+                if entry == account.name or (
+                    account.node is not None and entry == f"{account.node}:{account.name}"
+                ):
+                    taken.add(id(account))
+                    placed.append((account, "order"))
+        placed.extend((a, "default") for a in default if id(a) not in taken)
+        return placed
 
     def tool_accounts(self) -> list[ToolAccount]:
         """Every search account that answered, set up or not."""
@@ -2691,6 +2728,19 @@ class RoutingTable:
                 for o in sorted(self._snapshot.outdated, key=lambda o: (o.name, o.node or ""))
             ],
             control_root=self._control_root_view(),
+            search_accounts=[
+                SearchAccountView(
+                    name=a.name,
+                    node=a.node,
+                    provider=a.info.provider,
+                    label=a.info.label,
+                    # Absent is read as billed (tool-driver.yaml `ToolBilling`).
+                    billing=SearchBilling(a.info.billing or "per_search"),
+                    runs=a.runs("web_search"),
+                    placed_by=PlacedBy(placed_by),
+                )
+                for a, placed_by in self._ordered_tools()
+            ],
         )
 
     def control_root(self) -> ControlRootFacts:

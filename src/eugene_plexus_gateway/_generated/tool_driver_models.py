@@ -1300,7 +1300,9 @@ class WebSearchResult(BaseModel):
 
 
 class ToolDriverInfo(BaseModel):
-    provider: str = Field(..., description='The provider key, `searxng` or `brave`.')
+    provider: str = Field(
+        ..., description='The provider key, `searxng`, `brave` or `google`.'
+    )
     label: str | None = Field(None, description="The provider's display name.")
     tools: list[ToolName] = Field(
         ..., description='The tools this process runs. Empty until it is configured.'
@@ -1489,6 +1491,10 @@ class WebSearchResponse(BaseModel):
     latencyMs: float | None = None
     ignored: list[str] | None = Field(
         None, description='Request settings this provider could not honour, by name.'
+    )
+    searchSuggestions: str | None = Field(
+        None,
+        description="HTML the provider's terms require shown with these results, to\nthe person who asked, unmodified: Google's Search Suggestions\n(`searchEntryPoint.renderedContent`), for the `google` provider\n(docs/design/google-search-account.md, GS1, GS4). Null or absent\nfor providers with none. The gateway carries it to the caller\nand keeps none of it.\n",
     )
 
 
