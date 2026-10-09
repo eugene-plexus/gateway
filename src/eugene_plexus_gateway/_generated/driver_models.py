@@ -292,6 +292,11 @@ class BackendKind(StrEnum):
     /v1/speak` to its text-to-speech route and `POST /v1/transcribe` to
     its speech-to-text route.
 
+    `gemini_api` is Google's own Gemini API (`generateContent`, keyed by
+    `x-goog-api-key`; `docs/design/gemini-provider.md`, G1): chat,
+    embeddings, images, Veo video, speech and transcription, translated
+    both ways, with each model's capabilities from Google's own listing.
+
     """
 
     anthropic_api = 'anthropic_api'
@@ -301,6 +306,7 @@ class BackendKind(StrEnum):
     openai_compat_http = 'openai_compat_http'
     systemone_http = 'systemone_http'
     elevenlabs_http = 'elevenlabs_http'
+    gemini_api = 'gemini_api'
 
 
 class ComponentKind(StrEnum):

@@ -2500,9 +2500,14 @@ async def create_speech(request: Request) -> Any:
     if not surfaces and (reported := resolution.reported_surfaces()):
         return _no_door_yet(body.model, reported, wanted="speech").as_openai()
 
-    # Always sent: OpenRouter's own default is pcm where OpenAI's is mp3.
-    fmt = body.response_format or SpeechFormat.mp3
+    # Always sent: OpenRouter's own default is pcm where OpenAI's is mp3. A
+    # model that makes no mp3 (Gemini's speech is wav or pcm) answers an
+    # unnamed format in its first one rather than refusing a default the
+    # caller never asked for; the Content-Type says which.
     offered = table.speech_formats_for(resolution)
+    fmt = body.response_format or (
+        offered[0] if offered and SpeechFormat.mp3 not in offered else SpeechFormat.mp3
+    )
     if offered and fmt not in offered:
         return _error(
             code=400,

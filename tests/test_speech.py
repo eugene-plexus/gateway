@@ -154,6 +154,21 @@ def test_the_format_is_always_sent_mp3_by_default(settings: Settings) -> None:
     assert voice.spoken[-1].format.value == "mp3"
 
 
+def test_a_model_that_makes_no_mp3_answers_an_unnamed_format_in_its_own(
+    settings: Settings,
+) -> None:
+    """Gemini speaks wav or pcm only: a request naming no format is not
+    refused for a default the caller never asked for (gemini-provider.md)."""
+    voice = Speaker(name="a", model_id="narrator", formats=["wav", "pcm"])
+    with serve(settings, voice) as client:
+        response = client.post("/v1/audio/speech", json=speech())
+        named = client.post("/v1/audio/speech", json=speech(response_format="mp3"))
+    assert response.status_code == 200, response.text
+    assert voice.spoken[0].format.value == "wav"
+    # Asked for by name, mp3 is still refused, naming what the model makes.
+    assert named.status_code == 400 and "wav, pcm" in named.json()["error"]["message"]
+
+
 @pytest.mark.parametrize(
     ("extra", "param"),
     [
