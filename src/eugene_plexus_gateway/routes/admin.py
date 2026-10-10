@@ -74,7 +74,6 @@ async def _driver_health(client: DriverClient) -> DriverHealth:
             account=account,
             catalogueRefreshedAt=info.catalogue.refreshedAt if info.catalogue else None,
             catalogueError=info.catalogue.error if info.catalogue else None,
-            outdated=served is None,
             runtime=info.runtime,
             version=info.version,
         )

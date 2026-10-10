@@ -76,7 +76,6 @@ from ._generated.models import (
     Model,
     ModelLocality,
     ModelRoutingInfo,
-    OutdatedDriver,
     PlacedBy,
     RoutingBackendView,
     RoutingSlotView,
@@ -153,9 +152,6 @@ ROUND_ROBIN = "round_robin"
 #: CB2: a new conversation goes to the replica holding the fewest
 #: conversations per slot, by the affinity table.
 SPREAD = "spread"
-#: PC4's `loadBalancing` value, from before affinity was its own setting
-#: (CB1): read as the default placement, with affinity, which is what it did.
-CONVERSATION = "conversation"
 #: Where a new conversation goes when `loadBalancing` is unset (CB1).
 DEFAULT_PLACEMENT = SPREAD
 
@@ -541,23 +537,6 @@ class _Unreachable:
     node: str | None = None
 
 
-@dataclass
-class _Outdated:
-    """A driver that answered `/v1/info` in the shape from before P1.
-
-    It reports one `modelId` and no `models`, so it would ignore the
-    `model` a request names and answer with its own -- which is why it is
-    routed nothing, and named here so the console can say which machine to
-    update rather than letting a model silently vanish.
-    """
-
-    name: str
-    url: str
-    node: str | None
-    version: str | None
-    model_id: str | None
-
-
 @dataclass(frozen=True)
 class ControlRootFacts:
     """Where the node list came from on the last refresh, and whether it
@@ -586,7 +565,6 @@ class _Snapshot:
     #: views and for finding the runtime behind a driver.
     reachable: list[_Backend] = field(default_factory=list)
     unreachable: list[_Unreachable] = field(default_factory=list)
-    outdated: list[_Outdated] = field(default_factory=list)
     # Keyed by `(node, runtime name)`. Neither half is unique on its
     # own: an alias is shared by every replica of a model, and a NAME is
     # shared by the same model launched on two machines -- see `Key`.
@@ -1255,23 +1233,6 @@ class RoutingTable:
             if isinstance(probe, _Unreachable):
                 snapshot.unreachable.append(probe)
                 continue
-            if probe.info.models is None:
-                # **A driver from before P1.** It would ignore the `model`
-                # a request names and answer with its one model, so it is
-                # routed nothing -- and named, with its machine, so the
-                # console says to update it rather than a model silently
-                # vanishing after the gateway was updated first.
-                legacy = getattr(probe.client, "legacy_model_id", None)
-                snapshot.outdated.append(
-                    _Outdated(
-                        name=probe.name,
-                        url=probe.url,
-                        node=probe.node,
-                        version=probe.info.version,
-                        model_id=legacy if isinstance(legacy, str) else None,
-                    )
-                )
-                continue
             snapshot.reachable.append(probe)
 
         # Aliases claimed by exactly one runtime, for the drivers that do
@@ -1318,11 +1279,10 @@ class RoutingTable:
         self._snapshot = snapshot
         log.debug(
             "routing table refreshed: %d model(s) across %d reachable driver(s), "
-            "%d unreachable, %d outdated, %d runtime(s), %d agent(s)",
+            "%d unreachable, %d runtime(s), %d agent(s)",
             len(snapshot.by_model),
             len(snapshot.reachable),
             len(snapshot.unreachable),
-            len(snapshot.outdated),
             len(snapshot.runtimes),
             len(snapshot.agents),
         )
@@ -2658,7 +2618,6 @@ class RoutingTable:
                     account=catalogue is not None,
                     catalogueRefreshedAt=catalogue.refreshedAt if catalogue else None,
                     catalogueError=catalogue.error if catalogue else None,
-                    outdated=False,
                     # Straight off the driver's /v1/info: which supervised
                     # runtime it follows. A reachable driver serving
                     # nothing, next to a `ready` runtime routed to by
@@ -2667,18 +2626,6 @@ class RoutingTable:
                     version=b.info.version,
                 )
             )
-        out += [
-            DriverHealth(
-                name=o.name,
-                reachable=True,
-                url=o.url,  # type: ignore[arg-type]
-                node=o.node,
-                modelId=o.model_id,
-                outdated=True,
-                version=o.version,
-            )
-            for o in sorted(self._snapshot.outdated, key=lambda o: (o.name, o.node or ""))
-        ]
         out += [
             DriverHealth(
                 name=u.name,
@@ -2715,18 +2662,6 @@ class RoutingTable:
             load_balancing=self.placement(),
             slots=slots,
             unreachable_drivers=sorted(u.name for u in self._snapshot.unreachable),
-            outdated_drivers=[
-                OutdatedDriver.model_validate(
-                    {
-                        "name": o.name,
-                        "node": o.node,
-                        "url": o.url,
-                        "version": o.version,
-                        "modelId": o.model_id,
-                    }
-                )
-                for o in sorted(self._snapshot.outdated, key=lambda o: (o.name, o.node or ""))
-            ],
             control_root=self._control_root_view(),
             search_accounts=[
                 SearchAccountView(

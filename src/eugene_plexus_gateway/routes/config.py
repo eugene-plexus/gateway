@@ -121,10 +121,7 @@ async def test_config(
             return name, None, None
         served = info.get("models")
         if not isinstance(served, list):
-            # A driver from before P1: one `modelId`, and nothing the
-            # gateway will route to until its machine is updated.
-            legacy = info.get("modelId")
-            return name, f"{name} is outdated ({legacy or 'no model'}); update its machine", None
+            return name, None, None
         ids = [m.get("id") for m in served if isinstance(m, dict) and isinstance(m.get("id"), str)]
         if not ids:
             return name, None, None

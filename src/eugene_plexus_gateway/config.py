@@ -61,9 +61,6 @@ CATEGORY_LABELS: dict[str, str] = {
 #: Where a NEW conversation goes (CB1). Every value keeps a conversation on
 #: its replica too, unless `conversationAffinity` is off.
 LOAD_BALANCING_VALUES = ["spread", "least_busy", "round_robin"]
-#: PC4's value, from before affinity was its own setting: read as the
-#: default placement with affinity, which is what it did.
-LEGACY_CONVERSATION = "conversation"
 
 FIELDS: list[ConfigField] = [
     ConfigField(
@@ -362,9 +359,7 @@ FIELDS: list[ConfigField] = [
             "per slot of capacity, breaking ties round-robin. `round_robin` "
             "alternates strictly, which is worth having when comparing two replicas "
             "or reproducing a report. The load signal is the gateway's own in-flight "
-            "count, so both work for every engine. Until 2026-10-02 this also held "
-            "`conversation`, which kept conversations on their replicas: a file "
-            "that still says it is read as the default."
+            "count, so both work for every engine."
         ),
         category="lifecycle",
         valueType=ConfigValueType.enum,
@@ -624,12 +619,6 @@ def _defaults() -> dict[str, Any]:
 
 log = logging.getLogger(__name__)
 
-#: The cap every install before 2026-09-28 wrote into its file, because the
-#: store writes defaults out on first start. Read once as "never chosen".
-_OLD_DEFAULT_MAX_TOKENS = 2048
-#: Beside the config file: the old default has been cleared from it once, so a
-#: 2048 an operator sets afterwards is theirs and stays.
-_MAX_TOKENS_MARKER = ".default-max-tokens-cleared"
 #: Beside the config file: the `loadBalancing` in it was written as the
 #: default, not chosen, so a later default reaches it. The store writes every
 #: default out, and without this a default written once looks like a choice
@@ -779,59 +768,25 @@ class ConfigStore:
                     # schema said the default was on.
                     merged[k] = field.default if v is None and field.default is not None else v
                 self._values = merged
-                self._clear_old_max_tokens_locked()
                 self._settle_load_balancing_locked(raw.get("loadBalancing"))
             else:
                 self._values = _defaults()
                 self._write_locked()
-                self._mark_max_tokens_locked()
                 self._mark_load_balancing_default_locked(True)
             self._started = dict(self._values)
-
-    def _clear_old_max_tokens_locked(self) -> None:
-        """Clear the 2048 cap an older install wrote into its file, once.
-
-        The store writes every default out on first start, so an install
-        from before 2026-09-28 holds `defaultMaxTokens: 2048` as though
-        someone chose it, and changing the default alone would reach no
-        existing install. It cut reasoning models off mid-thought. Read
-        once, as the old default it almost always is; the marker keeps a
-        2048 set after that.
-        """
-        marker = self._path.parent / _MAX_TOKENS_MARKER
-        if marker.exists():
-            return
-        if self._values.get("defaultMaxTokens") == _OLD_DEFAULT_MAX_TOKENS:
-            self._values.pop("defaultMaxTokens", None)
-            self._write_locked()
-            log.warning(
-                "defaultMaxTokens was %d, the old shipped default, and is now blank: no "
-                "cap unless a request or a model's profile sets one. Set it again under "
-                "Gateway config to keep a cap.",
-                _OLD_DEFAULT_MAX_TOKENS,
-            )
-        self._mark_max_tokens_locked()
 
     def _settle_load_balancing_locked(self, raw: Any) -> None:
         """A `loadBalancing` nobody chose follows the default (CB1).
 
-        Unset, the old `conversation` (which since CB1 is the default plus
-        affinity, always on), or written out as a default before -- the
-        marker says which -- each reads as today's default. Anything else
-        was chosen and stays.
+        Unset, or written out as a default before -- the marker says
+        which -- reads as today's default. Anything else was chosen and
+        stays.
         """
         default = _FIELDS_BY_KEY["loadBalancing"].default
         marker = self._path.parent / _LOAD_BALANCING_DEFAULT_MARKER
-        unchosen = raw is None or raw == LEGACY_CONVERSATION or marker.exists()
+        unchosen = raw is None or marker.exists()
         if not unchosen:
             return
-        if raw == LEGACY_CONVERSATION:
-            log.info(
-                "loadBalancing was %r, which kept conversations on their replicas: that is "
-                "conversationAffinity now, on by default, and new conversations go to %r.",
-                LEGACY_CONVERSATION,
-                default,
-            )
         if self._values.get("loadBalancing") != default:
             self._values["loadBalancing"] = default
             self._write_locked()
@@ -850,15 +805,6 @@ class ConfigStore:
                 marker.unlink(missing_ok=True)
         except OSError as e:
             log.warning("could not record whether loadBalancing was chosen: %s", e)
-
-    def _mark_max_tokens_locked(self) -> None:
-        try:
-            (self._path.parent / _MAX_TOKENS_MARKER).write_text(
-                "defaultMaxTokens: the old 2048 default was cleared once; see config.py.\n",
-                encoding="utf-8",
-            )
-        except OSError as e:
-            log.warning("could not record that the old max tokens default was cleared: %s", e)
 
     def as_document(self) -> ConfigDocument:
         with self._lock:

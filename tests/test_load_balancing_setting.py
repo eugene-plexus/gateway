@@ -50,17 +50,6 @@ def test_spread_is_the_default_placement():
     assert field.default == "spread" and field.enumValues[0] == "spread"
 
 
-def test_a_file_saying_conversation_reads_as_the_default(tmp_path: Path) -> None:
-    path = tmp_path / "gateway.yaml"
-    path.write_text(yaml.safe_dump({"loadBalancing": "conversation"}))
-    store = store_at(path)
-    default = _field("loadBalancing").default
-    assert store.get("loadBalancing") == default
-    assert yaml.safe_load(path.read_text())["loadBalancing"] == default
-    assert (tmp_path / MARKER).exists()
-    assert store.get("conversationAffinity") is True
-
-
 def test_a_new_install_marks_its_value_as_the_default(tmp_path: Path) -> None:
     store_at(tmp_path / "gateway.yaml")
     assert (tmp_path / MARKER).exists()

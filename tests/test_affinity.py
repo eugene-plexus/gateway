@@ -125,10 +125,10 @@ def test_round_robin_places_new_conversations_in_turn() -> None:
     assert firsts == ["qwen3-a-driver", "qwen3-b-driver", "qwen3-a-driver", "qwen3-b-driver"]
 
 
-def test_the_old_conversation_value_is_the_default_placement() -> None:
+def test_an_unset_or_unknown_placement_is_the_default() -> None:
     """What every request records: the placement that ran, never a value
     that no longer means anything."""
-    for strategy in ("conversation", None, "something-else"):
+    for strategy in (None, "something-else"):
         assert _table(strategy).placement() == "spread"  # type: ignore[arg-type]
     assert _table("round_robin").placement() == "round_robin"
     assert _table("least_busy").placement() == "least_busy"

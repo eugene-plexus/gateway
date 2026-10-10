@@ -225,39 +225,6 @@ def test_star_is_the_only_wildcard_and_it_crosses_slashes() -> None:
     assert not permits([], "anything")
 
 
-# --------------------------------------------------------------------------- #
-# the driver that was not updated
-# --------------------------------------------------------------------------- #
-
-
-def test_an_outdated_driver_is_named_with_its_machine_and_routed_nothing(settings: Any) -> None:
-    app = create_app(settings=settings)
-    old = FakeDriverClient(name="old-driver", model_id="llama3", node="amish", outdated=True)
-    new = FakeDriverClient(name="qwen-driver", model_id="qwen3-8b", node="nas")
-    app.state.routing = make_routing_table(old, new)
-    with TestClient(app) as client:
-        routing = client.get("/v1/admin/routing").json()
-        drivers = {d["name"]: d for d in client.get("/v1/admin/drivers").json()["drivers"]}
-        ids = [m["id"] for m in client.get("/v1/models").json()["data"]]
-        asked = client.post("/v1/chat/completions", json=_chat("llama3"))
-    assert routing["outdated_drivers"] == [
-        {
-            "name": "old-driver",
-            "node": "amish",
-            "url": "http://fake-driver/",
-            "version": "0.0.0-pre-p1",
-            "modelId": "llama3",
-        }
-    ]
-    assert drivers["old-driver"]["outdated"] is True
-    assert drivers["old-driver"]["node"] == "amish"
-    assert drivers["qwen-driver"]["outdated"] is False
-    assert drivers["qwen-driver"]["modelId"] == "qwen3-8b"
-    assert ids == ["qwen3-8b"]
-    assert asked.status_code == 404
-    assert not old.calls
-
-
 def test_an_accounts_health_says_how_many_models_it_serves(settings: Any) -> None:
     app = create_app(settings=settings)
     app.state.routing = make_routing_table(_account())

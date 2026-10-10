@@ -341,7 +341,6 @@ class HttpDriverClient:
     ) -> None:
         self.name = name
         self.circuit = Circuit()
-        self.legacy_model_id: str | None = None
         self.base_url = base_url.rstrip("/")
         #: Which machine's agent reported this driver. Carried so
         #: `TieredClient` can hand it to the routing hooks, whose
@@ -382,11 +381,6 @@ class HttpDriverClient:
         response = await self._client.get("/v1/info", params=params or None)
         response.raise_for_status()
         body = response.json()
-        # A driver from before P1 answers with one `modelId` and no
-        # `models`; kept so the console can say which model went missing.
-        self.legacy_model_id = (
-            body.get("modelId") if isinstance(body, dict) and "models" not in body else None
-        )
         return DriverInfo.model_validate(body)
 
     async def generate(self, request: GenerateRequest) -> GenerateResponse:

@@ -43,7 +43,6 @@ from eugene_plexus_gateway.driver_client import DriverError, StreamEvent
 from eugene_plexus_gateway.routing import (
     RoutingTable,
     _Backend,
-    _Outdated,
     _RuntimeFacts,
     _Snapshot,
     _Unreachable,
@@ -71,7 +70,6 @@ class FakeDriverClient:
         decision_max_concurrent: int | None = None,
         models: list[str] | None = None,
         account: bool = False,
-        outdated: bool = False,
     ) -> None:
         self.name = name
         #: Several models on one driver (P1). None is the single-model
@@ -79,8 +77,6 @@ class FakeDriverClient:
         self.models = models
         #: A provider account: the gateway prefixes each id with `name/`.
         self.account = account
-        #: Answer `/v1/info` in the shape from before P1.
-        self.outdated = outdated
         self.info_calls: list[dict[str, Any]] = []
         self.base_url = base_url
         self.backend = backend
@@ -203,15 +199,6 @@ class FakeDriverClient:
             DriverModel(id=i, surfaces=list(surfaces), capabilities=capabilities.model_copy())
             for i in ids
         ]
-        if self.outdated:
-            return DriverInfo.model_validate(
-                {
-                    "backend": self.backend.value,
-                    "provider": self.provider,
-                    "runtime": self.runtime,
-                    "version": "0.0.0-pre-p1",
-                }
-            )
         return DriverInfo(
             backend=self.backend,
             provider=self.provider,
@@ -527,17 +514,6 @@ def install_snapshot(
     snapshot = _Snapshot(runtimes=facts, agents={None: table._agent_url})
     for fake in fakes:
         info = fake.describe()
-        if info.models is None:
-            snapshot.outdated.append(
-                _Outdated(
-                    name=fake.name,
-                    url=fake.base_url,
-                    node=fake.node,
-                    version=info.version,
-                    model_id=fake.model_id,
-                )
-            )
-            continue
         backend = _Backend(
             name=fake.name,
             url=fake.base_url,
