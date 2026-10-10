@@ -420,9 +420,13 @@ class EngineKind(StrEnum):
     it or tell when it is ready.
 
     `strata` is experimental. It launches Strata's Python HTTP
-    server and native engine together, using a prepared Strata JSON
-    configuration as `RuntimeSpec.modelPath`. It does not accept an
-    arbitrary GGUF or prepare model weights automatically.
+    server and native engine together, and loads a model Strata
+    prepared (`ModelFormat` `prepared`): `RuntimeSpec.modelPath`
+    names that model's provenance file (`PreparedProvenance`), whose
+    `entry` is Strata's own JSON configuration. A runtime declared
+    before LS3 may name the JSON configuration itself; that still
+    launches. It does not accept an arbitrary GGUF, and does not yet
+    prepare one itself (LS5).
 
     `kev` drives upstream `python -m kev.serve` and loads Kev
     decision checkpoints (`kev_checkpoint` format) — a decision
@@ -440,8 +444,8 @@ class EngineKind(StrEnum):
     `llama_cpp` drives upstream `llama-server` and loads GGUF.
     `vllm` drives upstream `vllm serve` and loads safetensors.
     `mlx` drives upstream `mlx_lm.server` and loads MLX-format
-    safetensors, on Apple silicon only — experimental until a
-    physical Mac run is recorded. We never ship an engine — every
+    safetensors, on Apple silicon only; not experimental since its
+    run on GitHub's macOS runners (A4, 2026-09-30). We never ship an engine — every
     one of them is an upstream project we wrap and track.
 
     They differ in far more than argv, and that is why readiness
@@ -505,19 +509,423 @@ class ModelFormat(StrEnum):
       scanner on purpose, and the decision head is what makes this
       one a launchable model instead. Decision-only —
       `ModelCapabilities.decision`, never `chat`.
+    * `prepared` — what one engine made for itself from another
+      model, in the engine's own format: Strata's expert pack,
+      lookup table and MTP helper, with its JSON configuration
+      (library-sources-and-engines.md §4.5, Troy's L6). The library
+      does not read the engine's files; a small provenance file
+      beside them, `<name>.eugene-prepared.json`
+      (`PreparedProvenance`), names the engine, its entry file and
+      what it was made from, and is the model's path. Only the
+      engine it was prepared for loads it
+      (`ModelRequirement.preparedFor`).
 
     Shared because it appears on both sides of a join: a library
-    entry declares what a model *is*, and
-    `EngineDescriptor.modelFormats` declares what an engine can
-    *load*. Nothing can serve a safetensors model until the vLLM
-    adapter lands, and that answer comes from the engine's
-    descriptor rather than from anything the library knows.
+    entry declares what a model *is*, and an engine's
+    `ModelRequirement`s declare what it can *load*. The format is
+    the first term of that join, not the whole of it
+    (library-sources-and-engines.md).
 
     """
 
     gguf = 'gguf'
     safetensors = 'safetensors'
     kev_checkpoint = 'kev_checkpoint'
+    prepared = 'prepared'
+
+
+class MlxQuantizationRule(StrEnum):
+    """
+    The one marker the library reads that decides an engine: a
+    safetensors folder whose `config.json` carries MLX's
+    quantization block packs its weights as integers only MLX reads.
+    `required`: only such a folder matches; `forbidden`: never one.
+
+    """
+
+    required = 'required'
+    forbidden = 'forbidden'
+
+
+class ModelRequirementAuthority(StrEnum):
+    """
+    Who can say a match will load. Absent means `eugene`. `eugene`:
+    the fields above are the whole rule, so a match is `runs`. `engine`: the engine decides
+    when it loads (vLLM's model registry, for one), so a match is
+    only `may_run` (Troy's L4).
+
+    """
+
+    eugene = 'eugene'
+    engine = 'engine'
+
+
+class Context(RootModel[int]):
+    root: int = Field(..., ge=1)
+
+
+class ModelPreparation(BaseModel):
+    """
+    A match that runs only after the engine prepares it (Strata builds
+    an expert pack, a lookup table and an MTP helper from a GGUF). The
+    verdict is `after_preparation`; the original file is never
+    changed.
+
+    """
+
+    recipe: str = Field(
+        ..., description="The adapter's name for the step, e.g. `strata-prepare`."
+    )
+    note: str | None = Field(None, description='What the step makes, in words.')
+    diskBytes: int | None = Field(
+        None,
+        description="About how much the preparation writes beside the files, by the\nengine's own rule on the node that reported it (LS5): set on an\nengine's `supportedModels`, where the model is known. Strata's\nsetup counts 8 GB, more when the node's RAM is short of the\nmodel's experts. The agent checks free space against it before\nthe preparation starts. Absent: not known.\n",
+        ge=0,
+    )
+    contexts: list[Context] | None = Field(
+        None,
+        description="The context sizes, in tokens, the preparation can be asked for\n(LS5): an engine that fixes the context when it prepares\noffers its own choices, and without one takes its own\nrecommendation for the node. Strata's are its setup's own.\nAbsent: the preparation takes no context.\n",
+    )
+    minEngineVersion: str | None = Field(
+        None,
+        description="The oldest version of the engine that prepares this model, as\nthe engine's own setup states it (LS7, B30): e.g. Strata's\n`v0.1.38` for UD-IQ4_XS. Absent: any version the adapter runs.\n",
+    )
+    engineTooOld: str | None = Field(
+        None,
+        description='Set by the node that reported it when its installed engine is\nolder than `minEngineVersion` (LS7, B30): the installed\nversion, so the console says *needs Strata vX: update Strata on\nthis node* before a preparation would fail halfway. Absent: the\ninstalled engine can prepare it, or none is installed.\n',
+    )
+
+
+class PreparedFile(BaseModel):
+    """
+    One file a prepared model is made of (LS7).
+    """
+
+    path: str = Field(
+        ...,
+        description='Relative to the folder holding the provenance file, with `/`.',
+        min_length=1,
+    )
+    sizeBytes: int | None = Field(None, ge=0)
+    shared: bool | None = Field(
+        False,
+        description="Used by other models the same engine prepared in this folder too\n(Strata's MTP helper): kept while any of them is.\n",
+    )
+
+
+class PreparedSource(BaseModel):
+    """
+    What a prepared model was made from, as far as it is known. Every
+    field is optional: a model adopted from outside Eugene may say
+    nothing, and "not known" is shown as such.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    path: str | None = Field(
+        None,
+        description="The source model's `LibraryModel.path`, when it is a library\nmodel. The library links the two by it (`PreparedDetail.sourceModelId`).\n",
+    )
+    repoId: str | None = Field(
+        None,
+        description='The hub repo it came from, e.g. `ISTA-DASLab/Qwen3.8-Flash-Next-GGUF`.',
+    )
+    file: str | None = Field(
+        None,
+        description='The repo-relative file, for a GGUF (its first shard when split).',
+    )
+    revision: str | None = Field(None, description='The repo commit.')
+
+
+class SupportedModel(BaseModel):
+    """
+    One model an engine's adapter publishes as supported
+    (library-sources-and-engines.md §4.4, LS4): which files on a hub,
+    and what the engine does with them. Read off the engine's own
+    documentation and setup at the version the adapter pins, never
+    written from memory. The list ships with the adapter in the agent
+    (Troy's L7, `EngineDescriptor.supportedModels`), so a new engine
+    brings its own and a node's list is the one its adapter would
+    prepare and run. A caller hands it to the library's search
+    (`EngineModelList`), which shows it as one source among the others
+    (`CatalogueSourceKind` `engine_list`).
+
+    """
+
+    id: str = Field(
+        ...,
+        description="Unique within the engine's list and stable across versions of\nit, e.g. Strata's own name for the choice (`coder-IQ1_M`).\n",
+        min_length=1,
+    )
+    title: str = Field(
+        ..., description='What to call it, e.g. `Qwen3.8-Flash-Next IQ2_XS`.'
+    )
+    about: str | None = Field(
+        None, description="The engine's own words for it, from its documentation."
+    )
+    publisher: str | None = Field(
+        None,
+        description='Who made the files, e.g. `Qwen; GSQ-RCO quants by ISTA-DASLab`.',
+    )
+    license: str | None = Field(
+        None,
+        description="When the files carry a licence of their own the person should\nread before downloading, the engine's words for it.\n",
+    )
+    format: ModelFormat
+    architecture: str | None = Field(
+        None,
+        description='As the hub reads the files (`general.architecture` for a GGUF).',
+    )
+    quantization: str | None = Field(
+        None, description="The engine's name for the size, e.g. `IQ2_XS`."
+    )
+    source: PreparedSource = Field(
+        ...,
+        description="Where the files are, all three named: `repoId`, `file` (a\nGGUF's first shard, repo-relative) and the `revision` the engine\npins. What a preparation records as its source (LS5).\n",
+    )
+    sizeBytes: int | None = Field(
+        None,
+        description='Every file of it summed, as the hub lists them at `source.revision`.',
+        ge=0,
+    )
+    preparation: ModelPreparation | None = Field(
+        None,
+        description='What the engine does to the files before it runs them, if anything.',
+    )
+    recommended: bool | None = Field(
+        False, description="The engine's own documentation recommends it."
+    )
+    experimental: bool | None = Field(
+        False, description="The engine's own documentation calls it experimental."
+    )
+
+
+class EngineModelList(BaseModel):
+    """
+    One engine's `supportedModels`, as a caller sends it to the
+    library's search (`CatalogueSearchRequest.engines`): the console the
+    picked node's, as it sends that node's `accepts` to the judge, so the
+    library calls no agent.
+
+    """
+
+    engine: EngineKind
+    models: list[SupportedModel]
+
+
+class EligibilityCandidate(BaseModel):
+    """
+    A model not in the library yet, judged by its facts
+    (library-sources-and-engines.md, LS2): a version in a catalogue
+    repo, a starter entry, or a search row. The library's catalogue
+    answers carry these ready to send back (`CatalogueCandidate.facts`,
+    `StarterModel.facts`, `CatalogueSearchResult.facts`), so a caller
+    derives nothing itself.
+
+    The same terms as a library model's, with one difference: here an
+    absent fact is *not known yet*, where on a library model it means
+    *unreadable*. A term that constrains a fact nobody knows cannot be
+    checked, so a match resting on it is at best `may_run` (an
+    `after_preparation` match stays one), its reason names what was
+    assumed, and the answer is `approximate`.
+
+    """
+
+    id: str = Field(
+        ...,
+        description="The caller's handle for it, echoed as `ModelEligibility.modelId`.\nOpaque; unique within one request.\n",
+    )
+    format: ModelFormat
+    architecture: str | None = Field(
+        None,
+        description="GGUF's `general.architecture`, as the hub read it from the\nrepo's GGUF, or a safetensors folder's `architectures[0]`, from\nits remote `config.json`.\n",
+    )
+    quantization: str | None = Field(
+        None,
+        description="The GGUF quantization, from the file's name (the scan's own fallback).",
+    )
+    file: str | None = Field(
+        None,
+        description="The file's name without its folder: a GGUF's first shard\n(`ModelRequirement.files`, LS4). Absent: not known yet, as on a\nsearch row, which names a repo rather than a file.\n",
+    )
+    sizeBytes: int | None = Field(
+        None,
+        description="The weights' size: every file the engine loads, shards included,\nwithout a separate vision projector, as the hub lists them (LS6,\nfor an engine's fit). Absent: not known yet, as on a search row,\nand then no engine's fit is estimated for it.\n",
+        ge=0,
+    )
+    mlxQuantized: bool | None = Field(
+        None,
+        description="Whether the folder's `config.json` carries MLX's quantization\nblock (`MlxQuantizationRule`). Absent: not known.\n",
+    )
+    approximate: bool | None = Field(
+        False,
+        description="Guessed from a search row's tags and the hub's repo-level\nmetadata rather than read from one version's files: a repo can\nhold many versions, and only its detail lists them.\n",
+    )
+
+
+class EngineVerdictKind(StrEnum):
+    """
+    One model against one engine. `runs`: a requirement with authority
+    `eugene` matches. `may_run`: only the engine can tell, at load, or
+    (for an `EligibilityCandidate`) a term rests on a fact not known
+    yet. `after_preparation`: it runs once the engine prepares it.
+    `no`: no requirement matches, and `reason` says which term failed.
+
+    """
+
+    runs = 'runs'
+    may_run = 'may_run'
+    after_preparation = 'after_preparation'
+    no = 'no'
+
+
+class EligibilityLevel(StrEnum):
+    """
+    The one dot a model carries (Troy's L5, 2026-10-09), in his words:
+
+    * `works_here`: *Will work on this machine now*. An available
+      engine `runs` or `may_run` it.
+    * `other_engine`: *Will work with a different engine*. An engine
+      this node could install would run it, or an available engine
+      runs it after preparation.
+    * `not_here`: *Can not work on this machine*. No engine this
+      hardware can have accepts it, or (when the request asked for fit,
+      LS6) every engine that would run it says it does not fit
+      (`EngineFit.verdict` `no`).
+
+    An engine whose fit is `no` counts as one that cannot run the
+    model, so a model too large for llama.cpp that Strata runs after
+    preparing it is `other_engine`. A fit that is *not estimated*, or
+    `unknown`, never counts against a model: only a measured `no` does.
+
+    """
+
+    works_here = 'works_here'
+    other_engine = 'other_engine'
+    not_here = 'not_here'
+
+
+class FitModelKind(StrEnum):
+    """
+    How an engine uses memory, so its fit is its own (LS6, Troy's L11;
+    library-sources-and-engines.md §6.1). Engines differ in both
+    directions, so one engine's arithmetic is never another's answer.
+
+    * `spill` (llama.cpp): weights, the KV cache for the context and an
+      overhead allowance against the cards' free memory; what does not
+      fit moves to system memory, experts first on a mixture-of-experts
+      model (`FitOffload`). The library's arithmetic since M3.
+    * `reserved_share` (vLLM): the engine takes a share of each card's
+      **total** memory when it starts (`gpuMemoryUtilization`) and
+      refuses to start when less than that is free; weights and
+      overhead come out of the share and the KV cache must hold the
+      whole context in what is left. The model is split evenly across
+      the cards it uses (tensor parallel). Nothing spills to system
+      memory, so there is no `split`. Read off vLLM's own
+      `request_memory` (upstream main, 2026-10-09).
+    * `engine_table`: the engine's own table of what each model it runs
+      needs, applied to this node by its adapter (`EngineFitModel.table`):
+      Strata's setup's RAM figures and its low-RAM and RAM-budget modes.
+
+    """
+
+    spill = 'spill'
+    reserved_share = 'reserved_share'
+    engine_table = 'engine_table'
+
+
+class FitQuestion(BaseModel):
+    """
+    Ask the judge for each engine's fit as well (LS6): the node's
+    memory as the caller measured it (the console the picked node's
+    devices, as for `GET /v1/models/{id}/fit`), and the context to score
+    at. A sum over cards is spread evenly across `gpuCount` of them.
+
+    """
+
+    contextLength: int | None = Field(
+        None, description="Absent: the library's `guidanceContextLength`.", ge=1
+    )
+    vramFreeBytes: int | None = Field(
+        None, description="Free memory on the node's cards, summed.", ge=0
+    )
+    vramTotalBytes: int | None = Field(
+        None,
+        description="Their total memory, summed. A share-taking engine's share is of\nthis (`reserved_share`). Absent: taken as `vramFreeBytes`.\n",
+        ge=0,
+    )
+    gpuCount: int | None = Field(
+        None,
+        description='How many cards the sums cover. Absent: one when there is VRAM, none otherwise.',
+        ge=0,
+    )
+    ramAvailableBytes: int | None = Field(None, ge=0)
+    ramTotalBytes: int | None = Field(None, ge=0)
+    unifiedMemory: bool | None = Field(
+        None,
+        description='One pool shared with system memory (`MemoryBudget.unifiedMemory`).',
+    )
+
+
+class FitVerdict(StrEnum):
+    """
+    Lives here since LS6, because an engine's fit (`EngineFit`) uses it
+    as well as the library's `Fit`. For a `spill` engine:
+
+    * `fits` — inside **free** VRAM. Fully offloaded, no host memory
+      in the generation path.
+    * `tight` — inside total VRAM but not free VRAM. It would fit on
+      an idle GPU; something is holding memory right now, and
+      closing it is the operator's call.
+    * `split` — needs host memory as well. Runnable with partial
+      offload, and a decision rather than a failure. How much slower
+      depends on what moves, which `Fit.offload` says: experts (a
+      MoE model, little slower) or whole layers (much slower).
+    * `no` — larger than VRAM and RAM together.
+    * `unknown` — there is a GPU here and we could not read how much
+      memory it has, so no comparison against it can be made. Added
+      2026-09-18 (roadmap R2.3, review §6.2 #28) because the
+      alternative was worse than silence: `_intel_gpus` reports
+      `vramTotalBytes: 0` for a card whose size `xpu-smi` will not
+      state, the verdict then took the *no accelerator* branch,
+      compared the weights against host memory, and told a 16 GB Arc
+      owner that a 30 GB model **fits** — with `gpuCount: 1` printed
+      beside it. Wrong in the direction that runs out of memory at
+      load.
+
+      It is a property of the machine and not of the model, so every
+      candidate on such a host reports it, including small ones: a
+      favourable answer computed against a number we do not have is
+      right by luck.
+
+    For a `reserved_share` engine: `fits` when the model and the
+    context's cache fit its share and the share is free; `tight` when
+    they fit the share but less than the share is free now (the engine
+    refuses to start until it is); `no` when they do not fit the share.
+    Never `split`.
+
+    For an `engine_table` engine, the engine's own words map onto these:
+    Strata's *fits* and RAM-budget mode are `fits`; its low-RAM mode
+    (part of the experts on the card, the rest from the SSD) is `split`;
+    *tight* (a few GB short, so the system pages) is `tight`; *does not
+    fit* is `no`; a node with no graphics card it can read is `unknown`.
+
+    Five values rather than a percentage because a percentage of
+    *what* — VRAM, or VRAM plus RAM? — is precisely the ambiguity
+    the operator is trying to resolve, and because they have
+    different advice. `tight` and `split` are the two the field
+    usually collapses into "won't fit", and they are the two worth
+    naming.
+
+    """
+
+    fits = 'fits'
+    tight = 'tight'
+    split = 'split'
+    no = 'no'
+    unknown = 'unknown'
 
 
 class RetryDisposition(StrEnum):
@@ -707,6 +1115,19 @@ class ConfigValueType(StrEnum):
     to open a directory picker or an address field. UIs render it as
     an add/remove list of text fields.
 
+    `catalogue_sources` (LS4, 2026-10-09) is an ordered JSON array of
+    the library's `CatalogueSource` — `{"id", "kind", "label",
+    "enabled", "address", "token", "engine"}`: where Discover finds
+    models (library-sources-and-engines.md §4.4). Its one user is the
+    library's `catalogueSources`, which replaced the single hub
+    address and token. Like `share_credentials`, entries hold a
+    secret: an `hf_hub` entry's `token` is redacted in `GET` (as
+    `null`, with `hasToken` saying whether one is stored), accepted in
+    `PATCH`, and an entry that omits it keeps the token stored under
+    the same `id`; `""` clears it. UIs render it as rows of a source,
+    with the token a password input, and must not display a redacted
+    token as though none were stored.
+
     """
 
     string = 'string'
@@ -727,6 +1148,7 @@ class ConfigValueType(StrEnum):
     library_folders = 'library_folders'
     share_credentials = 'share_credentials'
     string_list = 'string_list'
+    catalogue_sources = 'catalogue_sources'
 
 
 class ConfigFieldStatusLevel(StrEnum):
@@ -1296,6 +1718,49 @@ class ModelCapabilities(BaseModel):
     )
 
 
+class ModelRef(BaseModel):
+    id: str
+    name: str
+
+
+class PreparedDependent(BaseModel):
+    """
+    A prepared model made from the one being deleted (LS8).
+    """
+
+    id: str
+    name: str
+    bytesFreed: int = Field(
+        ..., description='What deleting it as well would free.', ge=0
+    )
+    refusal: str | None = Field(
+        None, description='Why it cannot be deleted now, when it cannot.'
+    )
+
+
+class ModelDeleteRequest(BaseModel):
+    token: str = Field(
+        ..., description='The `ModelDeletion.token` the person confirmed.'
+    )
+    alsoDelete: list[str] | None = Field(
+        None,
+        description='Prepared models made from it (`ModelDeletion.preparedFrom`)\nto delete with it.\n',
+    )
+
+
+class ModelDeleted(BaseModel):
+    """
+    What a delete removed (LS8).
+    """
+
+    models: list[str] = Field(
+        ..., description='The ids of the models removed from the Library.'
+    )
+    deleted: list[str] = Field(..., description='Every file removed.')
+    kept: list[str] = Field(..., description='Files kept for other models.')
+    bytesFreed: int = Field(..., ge=0)
+
+
 class ModelFileRole(StrEnum):
     """
     * `weights` — the file named on the launch line. Exactly one per
@@ -1375,6 +1840,18 @@ class KevCheckpointDetail(BaseModel):
     revision: str | None = Field(
         None, description='Snapshot revision, when the checkpoint sits in a HF cache.'
     )
+
+
+class PreparedFactMissing(BaseModel):
+    """
+    A fact about a prepared model the Library could not give, and why.
+    """
+
+    fact: str = Field(
+        ...,
+        description='Which (`architecture`, `contextLength`, `diskBytes`, `source`, ...).',
+    )
+    reason: str
 
 
 class RecommendedSampling(BaseModel):
@@ -1553,6 +2030,129 @@ class InterpretedAs(StrEnum):
 
     search = 'search'
     repo = 'repo'
+
+
+class CatalogueSourceKind(StrEnum):
+    """
+    Where a catalogue source's models come from (LS4,
+    library-sources-and-engines.md §4.4).
+
+    * `hf_hub`: a Hugging Face-compatible hub — the public one, a
+      regional mirror or an enterprise instance — at its own address,
+      with its own token.
+    * `engine_list`: the models engines publish as supported
+      (`SupportedModel`), each pointing at hub files and the
+      preparation it needs. The list ships with the engine's adapter
+      in the agent; the caller of a search sends the picked node's.
+
+    The Library folders are a source too in the design's words, and
+    stay `modelRoots`: they are scanned, not searched. ModelScope,
+    the Ollama registry or a direct address would be further kinds;
+    none is in v0.2.
+
+    """
+
+    hf_hub = 'hf_hub'
+    engine_list = 'engine_list'
+
+
+class CatalogueSource(BaseModel):
+    """
+    One entry of the library's `catalogueSources` config (a
+    `catalogue_sources` value, LS4). The default list is the public
+    hub (`huggingface`) and every engine's list (`engines`).
+
+    """
+
+    id: str = Field(
+        ...,
+        description="Stable: results, downloads and a later page name their source\nby it, and an entry's stored token is kept under it.\n",
+        pattern='^[a-z0-9][a-z0-9-]{0,39}$',
+    )
+    kind: CatalogueSourceKind
+    label: str | None = Field(
+        None, description='What the person calls it. Absent: the id.'
+    )
+    enabled: bool | None = Field(
+        True,
+        description='Off: not searched, and a call naming it answers 409. Distinct\nfrom `catalogueEnabled`, which stops every outbound request.\n',
+    )
+    address: str | None = Field(
+        None,
+        description="`hf_hub` only: the hub's address. Absent:\n`https://huggingface.co`.\n",
+    )
+    token: str | None = Field(
+        None,
+        description='`hf_hub` only: a token from the person\'s account on that hub,\nfor gated and private repos and higher rate limits. Sealed at\nrest; `GET` answers `null` and says whether one is stored in\n`hasToken`. A `PATCH` entry without it keeps the token stored\nunder the same `id`; `""` clears it.\n',
+    )
+    hasToken: bool | None = Field(
+        None,
+        description='Read-only, in `GET`: whether a token is stored for this entry.',
+    )
+    engine: EngineKind | None = Field(
+        None,
+        description='`engine_list` only: whose list. Absent: every engine that\npublishes one, including engines added later.\n',
+    )
+
+
+class CatalogueSourceStatus(BaseModel):
+    id: str
+    kind: CatalogueSourceKind
+    label: str | None = None
+    searched: bool = Field(
+        ...,
+        description='Whether it was asked. False for one switched off, or not named.',
+    )
+    results: int | None = Field(
+        None, description='How many results it gave, after filters.', ge=0
+    )
+    problem: str | None = Field(
+        None,
+        description='Why it gave none, in words naming the observed cause: the hub\nrefused, could not be reached, or is switched off; no engine\nlist came with the search (a node older than LS4).\n',
+    )
+
+
+class CatalogueSortDirection(StrEnum):
+    """
+    Hub order, highest first (`desc`) or lowest first.
+    """
+
+    asc = 'asc'
+    desc = 'desc'
+
+
+class CatalogueSearchRequest(BaseModel):
+    """
+    `POST /v1/catalogue/search` (LS4). The filters mean what they
+    mean on `GET`, for every source.
+
+    """
+
+    q: str | None = Field(
+        None,
+        description="Free text, or a pasted repo link (looked up, as on `GET`).\nAbsent: every source's listing by `sort`.\n",
+    )
+    format: ModelFormat | None = None
+    author: str | None = None
+    sort: CatalogueSort | None = None
+    direction: CatalogueSortDirection | None = 'desc'
+    limit: int | None = Field(
+        25,
+        description="Rows per hub source. An engine's list is never cut short.",
+        ge=1,
+        le=100,
+    )
+    cursor: str | None = Field(
+        None,
+        description="A previous answer's `nextCursor`: this library's own token,\nnaming each hub's continuation, never a hub's raw cursor.\n",
+    )
+    sources: list[str] | None = Field(
+        None, description='Which sources to search, by id. Absent: every enabled one.'
+    )
+    engines: list[EngineModelList] | None = Field(
+        None,
+        description="The engines' lists for the `engine_list` sources: the picked\nnode's `EngineDescriptor.supportedModels`, as its agent reports\nthem. Absent: those sources list nothing, and say so.\n",
+    )
 
 
 class GateKind(StrEnum):
@@ -1740,6 +2340,10 @@ class DownloadSpec(BaseModel):
     """
 
     repo: str = Field(..., description='Upstream repo id.')
+    source: str | None = Field(
+        None,
+        description="The `hf_hub` source to fetch from (`CatalogueSource.id`, a\nsearch result's `hubSource`, LS4). Absent: the first enabled\n`hf_hub` source. Kept on the record, so a resume asks the same\nhub with the same token.\n",
+    )
     revision: str | None = Field(
         'main',
         description='Resolved to a commit at start and pinned for the life of\nthe download, so a resume days later fetches the same bytes\nit began with.\n',
@@ -1757,27 +2361,9 @@ class DownloadSpec(BaseModel):
         None,
         description='Relative destination under `root`, overriding the configured\nlayout. Path traversal is rejected; the result must stay\ninside the root.\n',
     )
-    runWhenReady: bool | None = Field(
-        False,
-        description="The operator asked for this model to be **run** when it\nlands, not merely fetched.\n\n**This component records it and never acts on it.** The\nlibrary does not launch anything — a launch is a profile, an\nengine and a runtime on some node's agent, and which node is\na question the library has no business answering. What this\nfield buys is that the *intent* outlives the browser tab\nthat expressed it: a 16 GB download takes long enough that\nthe person will close the laptop lid, and a console opening\nlater can see that a download was started in order to run\nsomething and carry on from there.\n\nExactly one console should carry on, which is what\n`POST /v1/downloads/{id}/claim` is for.\n",
-    )
     filename: str | None = Field(
         None,
         description='Override the written name of the **single-file** case. Rarely\nwanted: the upstream name is what the operator recognises,\nwhat the library will call it, and what\n`Runtime.modelAlias` defaults to — plainly-named files are\nthe point. Rejected when `files` holds more than one entry,\nbecause renaming one shard of a set breaks the set.\n',
-    )
-
-
-class DownloadClaim(BaseModel):
-    """
-    The answer to "am I the one who continues this?". `claimed` is
-    true for exactly one caller per download.
-
-    """
-
-    claimed: bool
-    modelId: str | None = Field(
-        None,
-        description='The local model the download produced, when the scan that\nfollows a completed transfer has named it. Absent while the\nscan is still running, which is a reason to wait rather than\na reason to give up — the claim is already yours.\n',
     )
 
 
@@ -1848,50 +2434,6 @@ class FitOffload(StrEnum):
 
     experts = 'experts'
     layers = 'layers'
-
-
-class FitVerdict(StrEnum):
-    """
-    * `fits` — inside **free** VRAM. Fully offloaded, no host memory
-      in the generation path.
-    * `tight` — inside total VRAM but not free VRAM. It would fit on
-      an idle GPU; something is holding memory right now, and
-      closing it is the operator's call.
-    * `split` — needs host memory as well. Runnable with partial
-      offload, and a decision rather than a failure. How much slower
-      depends on what moves, which `Fit.offload` says: experts (a
-      MoE model, little slower) or whole layers (much slower).
-    * `no` — larger than VRAM and RAM together.
-    * `unknown` — there is a GPU here and we could not read how much
-      memory it has, so no comparison against it can be made. Added
-      2026-09-18 (roadmap R2.3, review §6.2 #28) because the
-      alternative was worse than silence: `_intel_gpus` reports
-      `vramTotalBytes: 0` for a card whose size `xpu-smi` will not
-      state, the verdict then took the *no accelerator* branch,
-      compared the weights against host memory, and told a 16 GB Arc
-      owner that a 30 GB model **fits** — with `gpuCount: 1` printed
-      beside it. Wrong in the direction that runs out of memory at
-      load.
-
-      It is a property of the machine and not of the model, so every
-      candidate on such a host reports it, including small ones: a
-      favourable answer computed against a number we do not have is
-      right by luck.
-
-    Five values rather than a percentage because a percentage of
-    *what* — VRAM, or VRAM plus RAM? — is precisely the ambiguity
-    the operator is trying to resolve, and because they have
-    different advice. `tight` and `split` are the two the field
-    usually collapses into "won't fit", and they are the two worth
-    naming.
-
-    """
-
-    fits = 'fits'
-    tight = 'tight'
-    split = 'split'
-    no = 'no'
-    unknown = 'unknown'
 
 
 class Source(StrEnum):
@@ -2138,6 +2680,179 @@ class ComputeDevice(BaseModel):
     )
 
 
+class ModelRequirement(BaseModel):
+    """
+    One kind of model an engine loads, declared by its adapter
+    (`EngineDescriptor.accepts`) and judged by the library
+    (`POST /v1/eligibility`). Data, not code (Troy's L3, 2026-10-09):
+    a model meets a requirement when every field present matches;
+    an absent field matches anything.
+
+    An engine lists several when it loads several kinds: MLX loads
+    an MLX-quantized folder outright, and a plain Hugging Face folder
+    only if mlx-lm knows its architecture, which only a load can
+    tell (`authority: engine`).
+
+    """
+
+    format: ModelFormat
+    architectures: list[str] | None = Field(
+        None,
+        description="The model's `architecture` must be one of these: GGUF's\n`general.architecture`, or a safetensors folder's\n`architectures[0]`. Absent means any. Can be long: llama.cpp\ndeclares every architecture its installed build knows.\n",
+    )
+    quantizations: list[str] | None = Field(
+        None,
+        description='The GGUF quantization must be one of these. Absent means any.',
+    )
+    files: list[str] | None = Field(
+        None,
+        description="The model's file must have one of these names: a GGUF's first\nshard, as the hub and the disk both name it, without its\nfolder. Absent means any. For an engine that runs only the files\nit names (LS4): Strata's own setup accepts a GGUF by its name\nand refuses every other one of the same architecture, so its\nadapter fills this from its `supportedModels`, and a Flash-Next\nK-quant from another publisher is `no`, naming the list.\n",
+    )
+    mlxQuantization: MlxQuantizationRule | None = None
+    preparedFor: EngineKind | None = Field(
+        None,
+        description="For `format: prepared` only: the engine a prepared model must\nhave been prepared for (`PreparedProvenance.engine`). Absent:\nthe engine declaring this requirement. A prepared model never\nmeets a requirement of an engine it was not prepared for,\nsince its files are in that engine's own format.\n",
+    )
+    preparation: ModelPreparation | None = None
+    authority: ModelRequirementAuthority | None = None
+    preference: int | None = Field(
+        100,
+        description="Among the engines that run a model, lower is offered first and\nis what Run picks, unless the person has chosen a default\nengine for the format (Troy's L10).\n",
+    )
+    note: str | None = Field(
+        None,
+        description='Words for the person beside a match, in the engine\'s own terms:\n"vLLM checks the architecture when it loads".\n',
+    )
+
+
+class PreparedProvenance(BaseModel):
+    """
+    The file `<name>.eugene-prepared.json` that makes an engine's
+    prepared files a library model (`ModelFormat` `prepared`;
+    library-sources-and-engines.md §4.5, Troy's L6). A plain JSON
+    file in a Library folder, in the person's own layout like every
+    other model file, and the prepared model's `LibraryModel.path`.
+
+    Written by the library's `POST /v1/models/prepared` when a person
+    adopts a model prepared outside Eugene, and by a preparation job
+    (LS5). Read by the library's scan, which lists a `prepared` model
+    from it, and by the agent at every launch, which hands the engine
+    its entry file. Nothing reads the engine's own files beyond what
+    launching them needs: they stay usable without the library
+    parsing them (experimental-engines.md).
+
+    A reader keeps and ignores fields it does not know, so a newer
+    Eugene can add some; a `formatVersion` above the one it knows
+    means the file was written by a newer Eugene, and the model is
+    listed as unreadable rather than guessed at.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    formatVersion: int | None = Field(
+        None,
+        description='The layout of this file. Absent means 1, the only one so far.',
+        ge=1,
+    )
+    engine: EngineKind = Field(
+        ..., description='The engine it was prepared for. Only that engine loads it.'
+    )
+    entry: str = Field(
+        ...,
+        description="The engine's own entry file: for Strata, its JSON\nconfiguration, which names the pack, tokenizer and MTP files.\nRelative to the folder holding this file, or absolute. A\nrelative entry travels with the folder (through a node's\n`pathMappings`, like any model path); an absolute one is a\npath on the node that runs the model, used as written,\nbecause an engine's prepared files belong on that node's own\nfast drive.\n",
+        min_length=1,
+    )
+    recipe: str | None = Field(
+        None,
+        description='The preparation that made it (`ModelPreparation.recipe`, e.g.\n`strata-prepare`). Absent: it was made outside Eugene and\nadopted as it is.\n',
+    )
+    recipeVersion: str | None = Field(
+        None,
+        description="The recipe's or engine's version that made it, e.g. Strata `v0.1.39`.",
+    )
+    source: PreparedSource | None = None
+    preparedAt: AwareDatetime | None = Field(
+        None, description='When this file was written.'
+    )
+    title: str | None = Field(
+        None,
+        description="What it is, in the engine's list's words when it came from the\nlist (`SupportedModel.title`), e.g. `Qwen3.8-Flash-Next IQ2_XS`\n(LS7, B22 replaced).\n",
+    )
+    architecture: str | None = Field(
+        None,
+        description='The architecture of the model it was made from, as the hub or\nthe source file read it (`qwen4exp`): kept for when the source\nmodel is no longer in the Library.\n',
+    )
+    quantization: str | None = Field(
+        None,
+        description="The engine's name for the size it was made from, e.g. `IQ2_XS`.",
+    )
+    contextLength: int | None = Field(
+        None,
+        description="The context, in tokens, it was prepared for: an engine that fixes\nthe context when it prepares (Strata's `--max-context`).\n",
+        ge=1,
+    )
+    mode: str | None = Field(
+        None,
+        description="How the engine runs it on the node that prepared it, in the\nengine's own words (Strata: *every expert in RAM*, *a RAM budget\nof its experts, the rest from the SSD*, *the low-RAM mode*).\n",
+    )
+    files: list[PreparedFile] | None = Field(
+        None,
+        description="Every file the model is made of beside its source model and\nthis provenance file, the entry first, as the engine's adapter\nread them off its entry file: what is the model's own on disk.\nThe source model's files are its own model's, not listed.\n",
+    )
+
+
+class EngineFit(BaseModel):
+    """
+    One engine's answer to *does it fit in this node's memory*, by that
+    engine's own fit model (LS6, Troy's L11). Shown with the engine's
+    name beside it; the library's detailed arithmetic for a library
+    model is `GET /v1/models/{id}/fit` with the same `fitModel`.
+
+    """
+
+    estimated: bool = Field(
+        ...,
+        description="False: *Fit not estimated*. The engine declares no fit model, its\ntable has no row for this model, or the model's size is not known\nyet. Never counts against the model.\n",
+    )
+    verdict: FitVerdict | None = Field(None, description='Present when `estimated`.')
+    model: FitModelKind | None = None
+    reason: str = Field(
+        ...,
+        description="The answer in words, in the engine's own terms: what it needs and\nwhat this node has, or why there is no estimate.\n",
+    )
+    requiredBytes: int | None = Field(
+        None,
+        description='`spill` and `reserved_share`: the weights, the KV cache at\n`contextLength` and the overhead allowance, on the cards.\n',
+        ge=0,
+    )
+    shareBytes: int | None = Field(
+        None,
+        description="`reserved_share`: what the engine takes, its share of the cards'\ntotal memory summed.\n",
+        ge=0,
+    )
+    ramBytes: int | None = Field(
+        None,
+        description="`engine_table`: the system memory the engine's own table asks for\n(Strata's setup's `ram_gb`, in its GB of 2^30 bytes).\n",
+        ge=0,
+    )
+    contextLength: int | None = Field(
+        None,
+        description="The context this answer is for. Absent where the engine's table does not depend on it.",
+        ge=1,
+    )
+    maxContextLength: int | None = Field(
+        None,
+        description='`spill`: the longest context that fits in free memory;\n`reserved_share`: the longest the KV cache in the share holds.\n',
+        ge=0,
+    )
+    approximate: bool | None = Field(
+        False,
+        description='The KV cache was a rough share of the weights (no layer\nmetadata), or the facts were a guess: as `Fit.basis` `estimate`.\n',
+    )
+
+
 class ConfigFieldStatus(BaseModel):
     """
     One sentence about what a field's value is doing on this machine
@@ -2172,6 +2887,16 @@ class ModelFile(BaseModel):
     path: str = Field(..., description='Absolute path.')
     role: ModelFileRole
     sizeBytes: int | None = Field(None, ge=0)
+
+
+class KeptModelFile(BaseModel):
+    """
+    A file a model is made of that Delete keeps for another model (LS8).
+    """
+
+    path: str
+    sizeBytes: int | None = Field(None, ge=0)
+    usedBy: list[ModelRef]
 
 
 class GgufDetail(BaseModel):
@@ -2254,6 +2979,105 @@ class SafetensorsDetail(BaseModel):
     configPath: str | None = Field(
         None,
         description='Absolute path to `config.json`, the file that made this a model.',
+    )
+
+
+class PreparedDetail(BaseModel):
+    """
+    A prepared model's provenance, as its file
+    (`PreparedProvenance`) says it, and what the library made of it.
+    Present iff `format` is `prepared` and the file could be read.
+
+    The library does not read the engine's own files
+    (experimental-engines.md: prepared files stay usable without the
+    library parsing them). What it knows of a prepared model (LS7,
+    B22 replaced: the Library imparts what is known and names what is
+    not) is what the engine's adapter read off those files when it
+    was prepared or added and the provenance file records (`title`,
+    `contextLength`, `mode`, `files`), measured on this host; what it
+    inherits from the model it was made from when the library lists
+    that (`LibraryModel.architecture`, `parameters`, `sizeLabel`);
+    and in `missing`, each fact it cannot give, with why. Fit is the
+    engine's own (LS6). `LibraryModel.files` lists the provenance
+    file (`index`), the entry file (`config`) and the files it
+    records, and `LibraryModel.sizeBytes` is `diskBytes`.
+
+    """
+
+    engine: EngineKind
+    entry: str = Field(
+        ..., description='The entry file as the provenance file writes it.'
+    )
+    entryPath: str | None = Field(
+        None,
+        description="`entry` resolved against the folder holding the provenance\nfile, on this library's host; the same as `entry` when that\nis absolute.\n",
+    )
+    entryFound: bool | None = Field(
+        None,
+        description="Whether this library's host sees the entry file. A relative\nentry that is not there makes the model `unreadable`. An\nabsolute entry not seen here is not an error: it is a path on\nthe node that runs the model (an engine's prepared files\nbelong on that node's own fast drive, which only its agent\nsees), and the agent checks it when the model starts, naming\nany missing file.\n",
+    )
+    recipe: str | None = Field(
+        None,
+        description='As `PreparedProvenance.recipe`; absent means prepared outside Eugene.',
+    )
+    recipeVersion: str | None = None
+    source: PreparedSource | None = None
+    sourceModelId: str | None = Field(
+        None,
+        description='The library model it was prepared from, when `source.path`\nnames one this library lists. Absent when it does not, or\nnames none.\n',
+    )
+    preparedAt: AwareDatetime | None = None
+    title: str | None = Field(None, description='From the provenance file (LS7).')
+    contextLength: int | None = Field(
+        None,
+        description='The context it was prepared for, from the provenance file (LS7).',
+        ge=1,
+    )
+    mode: str | None = Field(
+        None,
+        description="How the engine runs it, in the engine's words, from the provenance file (LS7).",
+    )
+    files: list[PreparedFile] | None = Field(
+        None,
+        description='The files it is made of beside its source model, each measured\non this host where the Library sees it (LS7).\n',
+    )
+    diskBytes: int | None = Field(
+        None,
+        description="What its own files take on disk, the shared ones counted too,\nmeasured on this host (LS7). Absent when they are not on the\nLibrary's machine.\n",
+        ge=0,
+    )
+    missing: list[PreparedFactMissing] | None = Field(
+        None,
+        description='Each fact the Library could not give, and why (LS7, Troy: the\nLibrary imparts what is known, and names what is not).\n',
+    )
+
+
+class PreparedModelRequest(BaseModel):
+    """
+    Adopt a model an engine has prepared: the library writes its
+    provenance file, `<name>.eugene-prepared.json`, into a Library
+    folder and lists it (library-sources-and-engines.md §4.5). Nothing
+    else is written, copied or moved; the engine's files stay where
+    they are.
+
+    """
+
+    name: str = Field(
+        ...,
+        description="The model's name: the provenance file is\n`<name>.eugene-prepared.json`, and like any model file's name\nit is what `Runtime.modelAlias` defaults to.\n",
+        pattern='^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$',
+    )
+    root: str | None = Field(
+        None,
+        description='Which Library folder (`modelRoots`) to write into. Must be one\nof them. Absent: the folder the entry file is in, when that\nis inside a Library folder, so the provenance sits beside what\nit describes; otherwise the first Library folder.\n',
+    )
+    subdirectory: str | None = Field(
+        None,
+        description='Relative destination under `root`. Path traversal is\nrejected; the result must stay inside the root.\n',
+    )
+    provenance: PreparedProvenance = Field(
+        ...,
+        description="What to write. `entry` is what the person gave: the library\nwrites it relative to the provenance file when it lies inside\nthat file's folder, so the two move together, and as given\notherwise. `files` come relative to the entry's folder, as the\nagent's `inspectPreparedModel` answers them, and are written\nrelative to the provenance file's folder (LS7).\n`formatVersion` is written as 1 and `preparedAt` as now when\nabsent.\n",
     )
 
 
@@ -2349,13 +3173,28 @@ class SkippedPath(BaseModel):
 
 class CatalogueSearchResult(BaseModel):
     """
-    One upstream repository. **No sizes and no fit verdict** — see
-    `searchCatalogue`: upstream's search response carries neither
-    and synthesizing them would cost a call per row.
+    One upstream repository. **No sizes and no fit verdict** from a
+    hub (see `searchCatalogueSources`): upstream's search response
+    carries neither and synthesizing them would cost a call per row.
 
     """
 
     repo: str = Field(..., description='Full repo id, e.g. `unsloth/Qwen3.8-27B-GGUF`.')
+    source: str | None = Field(
+        None,
+        description='The `CatalogueSource.id` this result came from (`POST`, LS4).\nAbsent on `GET`: the first enabled `hf_hub` source.\n',
+    )
+    hubSource: str | None = Field(
+        None,
+        description="The `hf_hub` source to ask about this repo (detail, card,\npreflight, download, as `source`): the result's own source for\na hub's result; the first enabled `hf_hub` source for an\nengine's list. Absent when no `hf_hub` source is enabled.\n",
+    )
+    engine: EngineKind | None = Field(
+        None, description="An `engine_list` result's engine."
+    )
+    supported: SupportedModel | None = Field(
+        None,
+        description="An `engine_list` result: the engine's entry, naming the one\nversion of `repo` it is (`supported.source.file`) at its\nrevision. `name` is its title and `facts` its exact facts.\n",
+    )
     owner: str | None = Field(
         None,
         description='The publisher. Prominent on purpose — "which quant publisher\ndo I trust" is how people navigate this catalogue, and it is\nthe fastest signal that separates an official release from a\nreupload.\n',
@@ -2364,6 +3203,10 @@ class CatalogueSearchResult(BaseModel):
     formats: list[ModelFormat] | None = Field(
         None,
         description='What this repo appears to serve, from its tags and library\nmetadata. Approximate at search time — a repo can hold both\nformats, and only the detail call reads the file list.\n',
+    )
+    facts: list[EligibilityCandidate] | None = Field(
+        None,
+        description="One per format in `formats`, for `POST /v1/eligibility`\n(LS2), always `approximate`: the format and MLX marker from\ntags, the architecture from the hub's repo-level GGUF\nmetadata. The row's dot is the best of them; the detail call\njudges each version.\n",
     )
     gated: GateKind | None = None
     private: bool | None = None
@@ -2419,6 +3262,10 @@ class Fit(BaseModel):
     """
 
     verdict: FitVerdict
+    model: FitModelKind | None = Field(
+        None,
+        description="The fit model this arithmetic is (LS6): `spill`, llama.cpp's,\nunless the caller asked for another (`fitModel`). Absent from a\nlibrary older than LS6, whose every fit was `spill`.\n",
+    )
     requiredBytes: int = Field(
         ..., description='`weightsBytes + kvCacheBytes + overheadBytes`.', ge=0
     )
@@ -2478,7 +3325,7 @@ class ModelFit(BaseModel):
     fit: Fit
     maxContextLength: int | None = Field(
         None,
-        description="The largest context that still `fits` in free VRAM,\ncomputed by solving the same arithmetic for context instead\nof asserting it. More useful than a yes/no at one context:\nit is the number that goes in a profile's `-c`, and it\nanswers the question a launch actually asks.\n",
+        description="The largest context that still `fits` in free VRAM,\ncomputed by solving the same arithmetic for context instead\nof asserting it. For `reserved_share` (LS6), the largest whose\nKV cache the engine's share holds beside the weights. More useful than a yes/no at one context:\nit is the number that goes in a profile's `-c`, and it\nanswers the question a launch actually asks.\n",
         ge=0,
     )
     modelContextLength: int | None = Field(
@@ -2571,6 +3418,60 @@ class ChatLogprobs(BaseModel):
 
     content: list[ChatTokenLogprob] | None = None
     refusal: list[ChatTokenLogprob] | None = None
+
+
+class EngineVerdict(BaseModel):
+    engine: EngineKind
+    verdict: EngineVerdictKind
+    available: bool
+    installable: bool | None = False
+    experimental: bool | None = False
+    reason: str = Field(
+        ..., description='The verdict in words, naming the term that decided it.'
+    )
+    preparation: ModelPreparation | None = None
+    preference: int | None = Field(
+        None, description='From the requirement that matched; absent on `no`.'
+    )
+    fit: EngineFit | None = Field(
+        None,
+        description="This engine's fit on the node, by its own fit model (LS6).\nPresent when the request carried `fit` and the verdict is not\n`no`.\n",
+    )
+
+
+class ModelEligibility(BaseModel):
+    modelId: str = Field(
+        ..., description="A library model's id, or an `EligibilityCandidate`'s `id`."
+    )
+    level: EligibilityLevel
+    approximate: bool | None = Field(
+        False,
+        description='The facts were a guess (`EligibilityCandidate.approximate`), or\na term could not be checked. Said beside the dot, never hidden.\n',
+    )
+    engines: list[EngineVerdict] = Field(
+        ...,
+        description='Every engine sent, best first: available before not, then\n`runs`, `may_run`, `after_preparation`, `no`, then\n`preference`. The first available `runs` or `may_run` is what\nRun would pick when the person has set no default.\n',
+    )
+
+
+class EligibilityList(BaseModel):
+    models: list[ModelEligibility]
+
+
+class EngineTableFit(BaseModel):
+    """
+    One row of an engine's own fit table, as its adapter applied it to one node.
+    """
+
+    file: str = Field(
+        ...,
+        description="The model's file as `ModelRequirement.files` names it: a GGUF's\nfirst shard, without its folder, compared ignoring case. A\nprepared model is matched by the file it was made from\n(`PreparedSource.file`).\n",
+        min_length=1,
+    )
+    supportedModel: str | None = Field(
+        None, description='The `SupportedModel.id` this row is for.'
+    )
+    fit: EngineFit
 
 
 class ConfigField(BaseModel):
@@ -2726,8 +3627,8 @@ class LibraryModel(BaseModel):
     """
     One launchable model on this host.
 
-    The format-independent facts are here; exactly one of `gguf` or
-    `safetensors` carries the rest. That split is not tidiness — a
+    The format-independent facts are here; exactly one of `gguf`,
+    `safetensors`, `kev` or `prepared` carries the rest. That split is not tidiness — a
     quant tier is a GGUF concept and an exact parameter count is a
     safetensors one, and flattening both into one object would
     produce a schema half of whose fields are null for any given
@@ -2741,7 +3642,7 @@ class LibraryModel(BaseModel):
     )
     path: str = Field(
         ...,
-        description="Absolute path, verbatim, in the operator's own layout — the\nmodel's real identity, reported in full because the `id` is\nnot human-readable and nothing here should be hidden behind\na handle.\n\nA `.gguf` file for GGUF (the **first** shard when split), a\ndirectory for safetensors. This is what goes on a runtime's\n`modelPath`.\n\n**A path on the host this library runs on** — inside its\ncontainer, if it runs in one. A node that runs the engine\nelsewhere reaches the same file through its agent's\n`pathMappings` (M11): the declaration keeps this spelling,\nand the node resolves its own at every spawn. So this string\nis both the model's identity install-wide and the left-hand\nside of any mapping that reaches it.\n",
+        description="Absolute path, verbatim, in the operator's own layout — the\nmodel's real identity, reported in full because the `id` is\nnot human-readable and nothing here should be hidden behind\na handle.\n\nA `.gguf` file for GGUF (the **first** shard when split), a\ndirectory for safetensors, the provenance file\n(`<name>.eugene-prepared.json`) for `prepared`. This is what\ngoes on a runtime's `modelPath`.\n\n**A path on the host this library runs on** — inside its\ncontainer, if it runs in one. A node that runs the engine\nelsewhere reaches the same file through its agent's\n`pathMappings` (M11): the declaration keeps this spelling,\nand the node resolves its own at every spawn. So this string\nis both the model's identity install-wide and the left-hand\nside of any mapping that reaches it.\n",
     )
     root: str | None = Field(
         None,
@@ -2750,7 +3651,7 @@ class LibraryModel(BaseModel):
     format: ModelFormat
     name: str = Field(
         ...,
-        description="The filename with its extension stripped, or the directory\nname for safetensors. **Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to — so\nplainly-named files mean the obvious name is already the\nright one.\n",
+        description="The filename with its extension stripped, the directory\nname for safetensors, or the provenance file's name without\n`.eugene-prepared.json` for `prepared`. **Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to — so\nplainly-named files mean the obvious name is already the\nright one.\n",
     )
     displayName: str | None = Field(
         None,
@@ -2759,7 +3660,7 @@ class LibraryModel(BaseModel):
     status: ModelStatus
     sizeBytes: int | None = Field(
         None,
-        description='Total size of every file belonging to this model — all\nshards, and the projector when there is one. The number\nthat answers "will this fit on the drive I am copying it\nto", which is why it is a sum rather than the weights file\nalone.\n',
+        description='Total size of every file belonging to this model — all\nshards, and the projector when there is one. The number\nthat answers "will this fit on the drive I am copying it\nto", which is why it is a sum rather than the weights file\nalone.\n\nAbsent for `prepared`: the engine\'s own files are not read,\nso their size is not known, and the provenance file\'s few\nbytes are not the model\'s size.\n',
         ge=0,
     )
     fileCount: int | None = Field(
@@ -2793,6 +3694,7 @@ class LibraryModel(BaseModel):
     gguf: GgufDetail | None = None
     safetensors: SafetensorsDetail | None = None
     kev: KevCheckpointDetail | None = None
+    prepared: PreparedDetail | None = None
     profileCount: int | None = Field(
         None,
         description='How many launch profiles are saved against this model. On\nthe list so the browser can badge a tuned model without\nfetching every profile collection.\n',
@@ -2812,6 +3714,34 @@ class LibraryModel(BaseModel):
     error: str | None = Field(
         None,
         description='Why this entry is `unreadable` — a header that would not\nparse, a permission error, a truncated file. Named rather\nthan dropped: a model the operator can see and we cannot\nexplain is the worst of the three states.\n',
+    )
+
+
+class ModelDeletion(BaseModel):
+    """
+    What deleting a model would do, read now (LS8).
+    """
+
+    modelId: str
+    files: list[ModelFile] = Field(
+        ..., description='Every file Delete removes, with its size.'
+    )
+    kept: list[KeptModelFile] = Field(
+        ...,
+        description='Files the model is made of that another listed model also\nnames, kept for it.\n',
+    )
+    bytesFreed: int = Field(..., description='The sizes of `files`, summed.', ge=0)
+    profiles: int = Field(..., description='How many saved profiles go with it.', ge=0)
+    preparedFrom: list[PreparedDependent] = Field(
+        ...,
+        description='Prepared models made from this one (their `sourceModelId`).\nAn engine reads the source while it runs them, so they stop\nworking without it; Delete takes them only when asked\n(`ModelDeleteRequest.alsoDelete`).\n',
+    )
+    refusal: str | None = Field(
+        None,
+        description='Why it cannot be deleted now, in a sentence; absent when it\ncan. A download into its files, or a run operation preparing\nor starting it.\n',
+    )
+    token: str = Field(
+        ..., description='Names this plan; `deleteModel` refuses another.'
     )
 
 
@@ -2949,6 +3879,10 @@ class CatalogueSearchPage(BaseModel):
         None,
         description='When this answer was fetched upstream. Present because\nresults are cached for a short window to stay inside the\n500-request/300-second API budget, and a client showing\npopularity numbers should know they are minutes old.\n',
     )
+    sources: list[CatalogueSourceStatus] | None = Field(
+        None,
+        description="What each source asked answered (`POST` only, LS4), in\n`catalogueSources` order. A source that failed says why here,\nwhile the others' results stand.\n",
+    )
 
 
 class CatalogueCandidate(BaseModel):
@@ -2994,6 +3928,10 @@ class CatalogueCandidate(BaseModel):
     gated: bool | None = Field(
         None,
         description="Convenience copy of the repo's gate, on the row the operator\nis about to click.\n",
+    )
+    facts: EligibilityCandidate | None = Field(
+        None,
+        description="This version's facts for `POST /v1/eligibility` (LS2): its\nformat; its architecture (the hub's read of the repo's GGUF,\nor the folder's own remote `config.json`); its quantization,\nfrom its name; and, for a folder, whether `config.json`\ncarries MLX's quantization block. A fact that could not be\nread is absent, which the judge says.\n",
     )
 
 
@@ -3050,6 +3988,10 @@ class StarterModel(BaseModel):
         ge=0,
     )
     alreadyOwned: AlreadyOwned | None = None
+    facts: EligibilityCandidate | None = Field(
+        None,
+        description="This entry's facts for `POST /v1/eligibility` (LS2), from what\nthe review recorded: a GGUF of `architecture`, at `label`.\nNo upstream call, like the rest of this answer.\n",
+    )
 
 
 class CataloguePreflight(BaseModel):
@@ -3118,6 +4060,10 @@ class Download(BaseModel):
     id: str
     state: DownloadState
     repo: str
+    source: str | None = Field(
+        None,
+        description='The `hf_hub` source it fetches from (LS4). Absent on a record\nfrom before LS4, or when none was named: the first enabled\n`hf_hub` source.\n',
+    )
     revision: str | None = None
     resolvedCommit: str | None = Field(
         None,
@@ -3135,10 +4081,6 @@ class Download(BaseModel):
         None, description='Recent rate, not an average over the whole job.', ge=0.0
     )
     etaSeconds: int | None = Field(None, ge=0)
-    runWhenReady: bool | None = Field(
-        None,
-        description='The operator asked for this model to be run when it lands.\nRecorded, never acted on here — see `DownloadSpec`. Cleared\nby `POST /v1/downloads/{id}/claim`, so a finished download\nwhose flag is still set is one nobody has picked up yet.\n',
-    )
     attempts: int | None = Field(
         None,
         description='How many times the transfer has been (re)started, including\nautomatic retries. Visible because a 40 GB fetch over a\ndomestic link will meet transient failures, and the\ndifference between a flaky connection and a dead one is\nthis number moving.\n',
@@ -3161,6 +4103,30 @@ class Download(BaseModel):
     )
     message: str | None = Field(
         None, description='What the current phase is doing, for the progress dialog.'
+    )
+
+
+class EngineFitModel(BaseModel):
+    """
+    How one engine uses memory, declared by its adapter beside `accepts`
+    (`EngineDescriptor.fit`; LS6, Troy's L11: data where it can be). The
+    library applies it (`POST /v1/eligibility` with `fit`,
+    `GET /v1/models/{id}/fit` with `fitModel`). An engine that declares
+    none has its fit *not estimated*, never another engine's number in
+    its place.
+
+    """
+
+    kind: FitModelKind
+    gpuMemoryUtilization: float | None = Field(
+        None,
+        description="`reserved_share`: the share of each card's total memory the\nengine takes when a launch sets none, its own default (vLLM's is\n0.92 on upstream main; it was 0.9 before).\n",
+        gt=0.0,
+        le=1.0,
+    )
+    table: list[EngineTableFit] | None = Field(
+        None,
+        description="`engine_table`: the engine's answer for each model it runs, on\nthe node that reported it.\n",
     )
 
 
@@ -3290,6 +4256,45 @@ class MessageContent1(
         ...,
         description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
         min_length=1,
+    )
+
+
+class EligibilityEngine(BaseModel):
+    """
+    One engine as a node reported it, sent to the library to be judged
+    against. The caller sends what it holds (the console the picked
+    node's `GET /v1/engines`, the agent its own) so the library needs
+    no call to any agent.
+
+    """
+
+    engine: EngineKind
+    available: bool = Field(..., description='Installed and usable on that node now.')
+    installable: bool | None = Field(
+        False,
+        description='Not available, but this node could have it: Eugene can install\nit here, or the agent wrote an install command for this\nhardware. False for an engine that cannot run on this hardware.\n',
+    )
+    experimental: bool | None = False
+    accepts: list[ModelRequirement]
+    fit: EngineFitModel | None = Field(
+        None,
+        description='How this engine uses memory, as the node reported it\n(`EngineDescriptor.fit`, LS6). Absent: the engine has no fit\nmodel, and its fit is *not estimated*.\n',
+    )
+
+
+class EligibilityRequest(BaseModel):
+    models: list[str] | None = Field(
+        None,
+        description='Library model ids to judge. Absent means every model, unless\n`candidates` are sent: then none.\n',
+    )
+    candidates: list[EligibilityCandidate] | None = Field(
+        None,
+        description='Models not in the library yet, judged by their facts (LS2).\nAnswered after `models`, in the order sent.\n',
+    )
+    engines: list[EligibilityEngine]
+    fit: FitQuestion | None = Field(
+        None,
+        description="Ask for each engine's fit too (LS6): every verdict but `no`\nthen carries its engine's `fit`, and a model that fits no engine\nthat would run it is `not_here`. Absent: no fit is computed, and\nthe level is about engines alone, as before LS6.\n",
     )
 
 
