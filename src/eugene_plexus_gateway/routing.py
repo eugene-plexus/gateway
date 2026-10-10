@@ -94,7 +94,14 @@ from ._http import internal_client
 from .affinity import HIT, MOVED, NEW, AffinityTable
 from .budget import Conversation, ConversationSizes, PoolLedger, TurnBudget
 from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS
-from .driver_client import BoundClient, DriverClient, HttpDriverClient, TieredClient, VideoJobs
+from .driver_client import (
+    CONNECT_TIMEOUT_SECONDS,
+    BoundClient,
+    DriverClient,
+    HttpDriverClient,
+    TieredClient,
+    VideoJobs,
+)
 from .driver_client import Key as DriverKey
 from .image_doors import ImageAsk, rules_out
 from .metrics import AttemptRow, CandidateRow
@@ -535,6 +542,40 @@ class _Unreachable:
     url: str
     error: str
     node: str | None = None
+
+
+def unreachable_reason(exc: Exception, *, url: str, timeout: float) -> str:
+    """Why a driver did not answer `/v1/info`, in words, never empty.
+
+    An httpx timeout's own text is empty, so a driver behind a firewall
+    that drops the connection was reported as `()` (2026-10-10: Strata's
+    driver on port 8093, which the node's firewall rule did not cover).
+    """
+    parsed = httpx.URL(url)
+    where = f"{parsed.host}:{parsed.port}" if parsed.port else parsed.host
+    if isinstance(exc, httpx.ConnectTimeout):
+        return (
+            f"no answer within {CONNECT_TIMEOUT_SECONDS:g} s connecting to {where}: the machine "
+            f"is off the network, or a firewall there is dropping connections to port "
+            f"{parsed.port}"
+        )
+    if isinstance(exc, httpx.ConnectError):
+        said = str(exc) or "the connection was refused"
+        return f"could not connect to {where} ({said}): nothing is listening there"
+    if isinstance(exc, httpx.TimeoutException):
+        return f"connected to {where}, then no answer within {timeout:g} s"
+    if isinstance(exc, httpx.HTTPStatusError):
+        response = exc.response
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        detail = body.get("detail") if isinstance(body, dict) else None
+        if isinstance(detail, dict):
+            detail = detail.get("detail") or detail.get("title")
+        return f"answered {response.status_code}: {detail or response.reason_phrase}"
+    said = str(exc)
+    return f"{type(exc).__name__}: {said}" if said else type(exc).__name__
 
 
 @dataclass(frozen=True)
@@ -1646,7 +1687,8 @@ class RoutingTable:
         try:
             info = await client.info()
         except (httpx.HTTPError, ValueError) as e:
-            return _Unreachable(name=name, url=url, error=str(e), node=node)
+            reason = unreachable_reason(e, url=url, timeout=self._request_timeout)
+            return _Unreachable(name=name, url=url, error=reason, node=node)
         # The reservation map is passed BY REFERENCE: every backend in
         # every snapshot reads the one the table owns, so a stop taken
         # after this refresh is visible to a backend built before it.
@@ -2624,6 +2666,13 @@ class RoutingTable:
                     # nobody, is the visible shape of a mis-wired install.
                     runtime=b.info.runtime,
                     version=b.info.version,
+                    # A driver that answers but could not build its engine
+                    # routes nothing; its own words say why (2026-10-10).
+                    error=(
+                        f"answers, but serves nothing: {b.info.degraded}"
+                        if b.info.degraded
+                        else None
+                    ),
                 )
             )
         out += [

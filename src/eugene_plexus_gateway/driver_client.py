@@ -327,6 +327,10 @@ class RoutingHooks(Protocol):
     ) -> None: ...
 
 
+#: How long the gateway waits to connect to a driver, whatever the request.
+CONNECT_TIMEOUT_SECONDS = 10.0
+
+
 class HttpDriverClient:
     """Real HTTP-backed client. Talks to an inference-driver over its OpenAPI."""
 
@@ -365,7 +369,7 @@ class HttpDriverClient:
         # inherited by the Windows logon task -- would swallow every hop.
         self._client = internal_client(
             base_url=self.base_url,
-            timeout=httpx.Timeout(timeout_seconds, connect=10.0),
+            timeout=httpx.Timeout(timeout_seconds, connect=CONNECT_TIMEOUT_SECONDS),
             auth=auth,
         )
 

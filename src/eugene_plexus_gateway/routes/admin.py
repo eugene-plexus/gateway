@@ -135,36 +135,11 @@ async def list_drivers(request: Request) -> DriversInfo:
             ).model_dump(exclude_none=True),
         )
 
+    # Every driver, whatever it answered, each unreachable or degraded one
+    # with its reason; none at all is an empty list. An all-unreachable
+    # topology was a 503 here, and the console lost every reason and every
+    # companion's runtime with it (2026-10-10).
     healths = table.as_driver_health()
-    if not healths:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=Problem(
-                type="https://github.com/eugene-plexus/gateway#no-drivers-in-topology",
-                title="No drivers in the topology",
-                status=503,
-                detail=(
-                    "The agent topology contains no inference-driver entries, "
-                    "so there is nothing to route to. Add one via the agent's "
-                    "POST /v1/components."
-                ),
-                component="gateway",
-            ).model_dump(exclude_none=True),
-        )
-
-    if not any(h.reachable for h in healths):
-        summary = "; ".join(f"{h.name}={h.url} ({h.error})" for h in healths)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=Problem(
-                type="https://github.com/eugene-plexus/gateway#drivers-unreachable",
-                title="No drivers reachable",
-                status=503,
-                detail=f"No driver in the topology is reachable. {summary}",
-                component="gateway",
-            ).model_dump(exclude_none=True),
-        )
-
     return DriversInfo(drivers=healths)
 
 

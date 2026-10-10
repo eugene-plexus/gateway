@@ -544,3 +544,49 @@ async def test_a_runtimes_shared_context_is_read_off_its_agent(route_http: Any) 
     assert backend.context_pool == 65536
     assert table.pick(table.resolve("qwen")).budget is not None
     await table.aclose()
+
+
+@pytest.mark.parametrize(
+    ("raised", "said"),
+    [
+        # An httpx timeout's text is empty: this was reported as "()".
+        (httpx.ConnectTimeout(""), "no answer within 10 s connecting to 192.168.16.75:8093"),
+        (httpx.ConnectTimeout(""), "a firewall there is dropping connections to port 8093"),
+        (httpx.ConnectError(""), "could not connect to 192.168.16.75:8093"),
+        (httpx.ReadTimeout(""), "connected to 192.168.16.75:8093, then no answer within 5 s"),
+        (httpx.RemoteProtocolError(""), "RemoteProtocolError"),
+    ],
+)
+async def test_an_unreachable_drivers_reason_is_never_empty(
+    route_http: Any, raised: Exception, said: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/components":
+            return httpx.Response(
+                200,
+                json=_components(
+                    {**_driver_entry("strata-driver", 8093), "url": "http://192.168.16.75:8093/"}
+                ),
+            )
+        raise raised
+
+    route_http(handler)
+    table = RoutingTable(agent_url="http://agent", request_timeout_seconds=5.0)
+    await table.refresh()
+    (health,) = table.as_driver_health()
+    assert health.reachable is False
+    assert said in (health.error or "")
+    await table.aclose()
+
+
+def test_a_refusal_is_said_in_the_drivers_own_words() -> None:
+    from eugene_plexus_gateway.routing import unreachable_reason
+
+    request = httpx.Request("GET", "http://192.168.16.75:8093/v1/info")
+    response = httpx.Response(
+        401, json={"detail": {"detail": "Provide a bearer token."}}, request=request
+    )
+    error = httpx.HTTPStatusError("401", request=request, response=response)
+    assert unreachable_reason(error, url="http://192.168.16.75:8093/", timeout=5) == (
+        "answered 401: Provide a bearer token."
+    )

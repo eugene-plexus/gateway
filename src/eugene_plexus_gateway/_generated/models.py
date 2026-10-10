@@ -3588,7 +3588,10 @@ class DriverHealth(BaseModel):
         description='The supervised engine runtime this driver follows, straight\noff its `/v1/info`. Absent for a backend that is not a\nruntime this install supervises.\n\nCarried up because it answers the one question this panel\ncould not previously answer: a driver that is reachable but\nserves nothing, next to a runtime that is `ready` and\nrouted to by nobody, is the visible shape of a\nmis-wired install.\n',
     )
     version: str | None = None
-    error: str | None = Field(None, description='Populated when `reachable: false`.')
+    error: str | None = Field(
+        None,
+        description='Why the gateway routes nothing to this driver, in words:\npopulated when `reachable: false` (never empty: a timeout\nsays so, with the address and port), and when the driver\nanswered but is degraded (its `/v1/info` `degraded`).\n',
+    )
 
 
 class InputAudio(BaseModel):

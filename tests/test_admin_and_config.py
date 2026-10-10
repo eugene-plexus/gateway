@@ -71,22 +71,40 @@ def test_admin_drivers_lists_unreachable_ones_too(
     assert "connection refused" in by_name["dead-box"]["error"]
 
 
-def test_admin_drivers_503_when_none_reachable(settings: Settings) -> None:
+def test_admin_drivers_lists_every_driver_when_none_is_reachable(settings: Settings) -> None:
+    """Each with its reason. This was a 503, and the console lost every
+    reason and every companion's runtime with it (2026-10-10)."""
     app = _app_with(settings, make_routing_table(unreachable={"dead-box": "connection refused"}))
     with TestClient(app) as c:
         response = c.get("/v1/admin/drivers")
-    assert response.status_code == 503
-    assert "No driver in the topology is reachable" in response.json()["detail"]["detail"]
+    assert response.status_code == 200
+    (dead,) = response.json()["drivers"]
+    assert dead["reachable"] is False and "connection refused" in dead["error"]
 
 
-def test_admin_drivers_503_when_topology_has_none(settings: Settings) -> None:
-    """Distinct message from "all unreachable": an empty topology is an
-    operator setup step, not a failure to diagnose."""
+def test_admin_drivers_is_an_empty_list_when_the_topology_has_none(settings: Settings) -> None:
+    """An empty topology is a setup step: the console says so in its empty
+    state, not as a failure to diagnose."""
     app = _app_with(settings, make_routing_table())
     with TestClient(app) as c:
         response = c.get("/v1/admin/drivers")
-    assert response.status_code == 503
-    assert "no inference-driver entries" in response.json()["detail"]["detail"].lower()
+    assert response.status_code == 200
+    assert response.json()["drivers"] == []
+
+
+def test_a_degraded_driver_is_reported_with_its_own_reason(settings: Settings) -> None:
+    """It answers, so it is reachable, but it routes nothing, and says why."""
+    broken = FakeDriverClient(
+        name="strata-driver",
+        model_id=None,
+        runtime="strata",
+        degraded="OpenAiCompatibleHttpEngine.from_config() missing 1 required argument",
+    )
+    app = _app_with(settings, make_routing_table(broken))
+    with TestClient(app) as c:
+        (driver,) = c.get("/v1/admin/drivers").json()["drivers"]
+    assert driver["reachable"] is True
+    assert driver["error"].startswith("answers, but serves nothing: OpenAiCompatibleHttpEngine")
 
 
 # --------------------------------------------------------------------------- #

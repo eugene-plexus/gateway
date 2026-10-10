@@ -3547,6 +3547,10 @@ class DriverInfo(BaseModel):
         None,
         description="The supervised engine runtime this driver is following, when\nit was configured with `runtimeName` rather than a literal\n`baseUrl`. Absent for a cloud provider, a CLI subscription,\nor any backend that is not a runtime this install\nsupervises.\n\nReported here despite the rule that a driver never says\nwhere it sits, because this is not the driver's own address —\nit is *what it serves*, which is exactly what `/v1/info` is\nfor. It lets the gateway and the UI show which engine\nprocess is behind a driver, so a model that is loaded but\nunroutable is diagnosable from the routing table instead of\nby reading two components' configs side by side.\n",
     )
+    degraded: str | None = Field(
+        None,
+        description="Set when the driver could not build its engine from its\nconfiguration and so serves nothing: why, in the driver's own\nwords (the same text as `/healthz`'s `adapter_error`). Absent\nwhen the engine is built. The gateway reports it as the\ndriver's `error`, so a driver that answers but routes nothing\nsays why on the Inference page (2026-10-10: every Strata\ndriver came up degraded and showed only *no model reported*).\n",
+    )
     version: str | None = Field(None, description='inference-driver semver.')
 
 

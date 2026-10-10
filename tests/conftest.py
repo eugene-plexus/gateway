@@ -70,8 +70,11 @@ class FakeDriverClient:
         decision_max_concurrent: int | None = None,
         models: list[str] | None = None,
         account: bool = False,
+        degraded: str | None = None,
     ) -> None:
         self.name = name
+        #: A driver that answers but could not build its engine (2026-10-10).
+        self.degraded = degraded
         #: Several models on one driver (P1). None is the single-model
         #: driver every test before P1 used, serving `model_id`.
         self.models = models
@@ -207,6 +210,7 @@ class FakeDriverClient:
             if self.account
             else None,
             runtime=self.runtime,
+            degraded=self.degraded,
             version="0.0.0-fake",
         )
 
