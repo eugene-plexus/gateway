@@ -1816,7 +1816,7 @@ class StreamOptions(BaseModel):
     include_usage: bool | None = None
     include_progress: bool | None = Field(
         None,
-        description="**An Eugene Plexus extension, not OpenAI's.** With streaming,\ntrue adds progress chunks saying what the backend is doing\nwhile it is not producing output: `choices: []` and an\n`x_eugene_plexus` carrying only `progress`. Local and cloud\nbackends alike report what they can observe -- llama.cpp how\nfar it has read the prompt, any HTTP backend that the service\nhas the request, Claude Code and Codex the tools they run.\nSee `StreamProgress`. A client that sets it must tolerate a\nchunk with no choices, as it already must for\n`include_usage`.\n\nA progress chunk is not output: failover to another backend\nis still possible after one, and a second backend's progress\nstarts again from its own beginning.\n",
+        description="**An Eugene Plexus extension, not OpenAI's.** With streaming,\ntrue adds progress chunks saying what the backend is doing\nwhile it is not producing output, and how far it has written\nwhile it is: `choices: []` and an `x_eugene_plexus` carrying\nonly `progress`. Local and cloud backends alike report what\nthey can observe -- llama.cpp how far it has read the prompt\nand how many tokens it has written, any HTTP backend that the\nservice has the request, Claude Code and Codex the tools they\nrun.\nSee `StreamProgress`. A client that sets it must tolerate a\nchunk with no choices, as it already must for\n`include_usage`.\n\nA progress chunk is not output: failover to another backend\nis still possible after one, and a second backend's progress\nstarts again from its own beginning.\n",
     )
 
 
@@ -2441,18 +2441,37 @@ class CompletionUsage(BaseModel):
     )
 
 
+class OutputCapSource(StrEnum):
+    """
+    Where an `OutputCap` came from. `request`: the caller's own
+    `max_tokens`. `profile`: the model's default Library profile
+    (Maximum output tokens). `install`: the gateway's
+    `defaultMaxTokens`.
+
+    """
+
+    request = 'request'
+    profile = 'profile'
+    install = 'install'
+
+
 class Stage(StrEnum):
     """
     `prompt`: reading the prompt, with the token counts below.
     `working`: the backend says it is working and not how far.
     `tool`: an agent backend is running one of its own tools,
     named in `tool`.
+    `generating`: writing, thinking included, with the backend's
+    own count so far in `generated_tokens`. Only from a backend
+    that counts as it writes (llama.cpp), at most every half
+    second.
 
     """
 
     prompt = 'prompt'
     working = 'working'
     tool = 'tool'
+    generating = 'generating'
 
 
 class Phase(StrEnum):
@@ -2480,17 +2499,19 @@ class Phase(StrEnum):
 
 class StreamProgress(BaseModel):
     """
-    What the backend is doing while it is not producing output, on a
-    progress chunk (`stream_options.include_progress`). The only
-    thing such a chunk carries: its `x_eugene_plexus` has this and
-    nothing else, and its `choices` is empty. It can arrive at any
-    point before the final chunk -- an agent backend runs a tool
-    between two bursts of thinking.
+    What the backend is doing while it is not producing output, or
+    how far it has written while it is, on a progress chunk
+    (`stream_options.include_progress`). The only thing such a chunk
+    carries: its `x_eugene_plexus` has this and nothing else, and its
+    `choices` is empty. It can arrive at any point before the final
+    chunk -- an agent backend runs a tool between two bursts of
+    thinking, and `generating` comes between output chunks.
 
     What each backend can report is in `inference-driver.yaml`'s
-    `StreamProgress`: llama.cpp's prompt reading, a hosted API
-    accepting the request and its keepalives, Claude Code's and
-    Codex's own tools. Nothing is estimated here.
+    `StreamProgress`: llama.cpp's prompt reading and its running count
+    of tokens written, a hosted API accepting the request and its
+    keepalives, Claude Code's and Codex's own tools. Nothing is
+    estimated here.
 
     **Why it exists (2026-09-27).** Until the first token a stream
     said nothing. On the processor a long prompt takes minutes to
@@ -2502,10 +2523,20 @@ class StreamProgress(BaseModel):
 
     stage: Stage = Field(
         ...,
-        description='`prompt`: reading the prompt, with the token counts below.\n`working`: the backend says it is working and not how far.\n`tool`: an agent backend is running one of its own tools,\nnamed in `tool`.\n',
+        description="`prompt`: reading the prompt, with the token counts below.\n`working`: the backend says it is working and not how far.\n`tool`: an agent backend is running one of its own tools,\nnamed in `tool`.\n`generating`: writing, thinking included, with the backend's\nown count so far in `generated_tokens`. Only from a backend\nthat counts as it writes (llama.cpp), at most every half\nsecond.\n",
     )
     tool: str | None = Field(
         None, description="On `tool`, the tool's name as the backend gives it."
+    )
+    generated_tokens: int | None = Field(
+        None,
+        description='On `generating`: tokens written so far, reasoning included, as\nthe backend counted them.\n',
+        ge=0,
+    )
+    tokens_per_second: float | None = Field(
+        None,
+        description="On `generating`: the backend's own writing speed so far, when\nit reports one.\n",
+        ge=0.0,
     )
     phase: Phase | None = Field(
         None,
@@ -4304,85 +4335,23 @@ class ResponseFormat(BaseModel):
     )
 
 
-class CompletionRoutingInfo(BaseModel):
+class OutputCap(BaseModel):
     """
-    Namespaced extension recording how this particular request was
-    served. Not part of OpenAI's schema, and ignored by clients that
-    do not know it.
+    The output cap the gateway sent to the backend that answered, and
+    where it came from. Absent when none was sent: the answer was then
+    bounded only by the model's context window, the request deadline
+    and the backend's own rules. On the chat door's final frame and on
+    its non-streamed response.
 
-    It exists because the failure mode of a routing layer is being
-    opaque: when one of several backends is slow or a cascade fired,
-    an operator needs to see which one answered without going to the
-    logs. `attempts` above 1 is the visible evidence that failover
-    did its job.
+    **Why (2026-10-10).** A Strata answer stopped mid-thought at 4,096
+    tokens, and Workbench told Troy to raise his chat's own setting.
+    The cap was his install's `defaultMaxTokens`, saved long before.
+    Whoever shows a length stop can now name the setting that made it.
 
     """
 
-    driver: str | None = Field(
-        None, description='Name of the inference-driver that served this request.'
-    )
-    runtime: str | None = Field(
-        None,
-        description='Name of the engine runtime behind that driver, when it is a\nlocal engine. Absent for hosted and CLI backends, which have\nno runtime of ours.\n',
-    )
-    backend: BackendKind | None = None
-    latency_ms: int | None = Field(
-        None, description='Gateway-side wall-clock time, including any failed attempts.'
-    )
-    attempts: int | None = Field(
-        None,
-        description='How many backends were tried. Greater than 1 means the\npriority-list cascade fired and an earlier backend failed.\n',
-        ge=1,
-    )
-    web_searches: int | None = Field(
-        None,
-        description='How many web searches this install ran for the request (P8).\nAbsent when none ran, and when the backend searched itself.\n',
-        ge=0,
-    )
-    search_suggestions: list[str] | None = Field(
-        None,
-        description="For each search this install ran whose provider's terms require\nsomething shown with its results (Google's Search Suggestions,\nHTML), that HTML, in the order the searches ran. Show it to the\nperson who asked, unmodified, beside the answer\n(docs/design/google-search-account.md, GS4). Absent when none\nhad any.\n",
-    )
-    tier: int | None = Field(
-        None,
-        description="Which tier of the slot answered, 1-based. Greater than 1\nmeans every backend in an earlier tier was ineligible or\nfailed — a cloud target answering for a local model, say.\n\n**Positional, counted over the slot's tiers rather than over\nthe ones that had anything in them**, which is the only\nreading that answers the question this field exists for:\n*did the primary serve this?* A primary whose companion\ndriver is down is a tier with no backends, and it still\noccupies its number. See `ModelRoutingInfo.tiers` for which\ntier can be absent and why.\n",
-        ge=1,
-    )
-    swapped_in: bool | None = Field(
-        None,
-        description='True when the gateway had to start a `startOnDemand`\nruntime to serve this request. The visible cost of idle\nunload, next to the request that paid it.\n',
-    )
-    waited_ms: int | None = Field(
-        None,
-        description='How long the request waited for a runtime to reach `ready`\nbefore being sent. Zero when nothing had to be woken.\n',
-        ge=0,
-    )
-    context_length: int | None = Field(
-        None,
-        description='The context window of the backend that actually answered, as\nthat backend resolved it. **Null** when it does not expose\none — a hosted provider, a CLI subscription, or a local\nengine that was not reachable to ask. Null and not absent:\nthis envelope serializes its unset fields, as `runtime` has\nsince M0.\n\nPer-request, and therefore not the same number as\n`x_eugene_plexus.context_length` on `GET /v1/models`: that\none is the smallest across every backend serving the name,\nbecause a request may land on any of them. This one is the\nwindow that applied to *this* request, which is what makes a\ntruncated answer explicable after the fact.\n',
-        ge=1,
-    )
-    prompt_truncated: bool | None = Field(
-        None,
-        description="**The backend silently dropped input.** True when the prompt\nwe sent was far larger than the token count the backend\nreported consuming — the signature of a server that fits an\nover-long prompt into the window by discarding the middle of\nthe conversation and answering anyway, with a 200 and no\nflag of its own.\n\nThis is the failure that makes a coding harness loop: it\nsends file contents, the model never receives them, and the\nconfident answer that comes back is about code nobody read.\nMeasured on this project's own hardware: 66,389 characters\nacross six messages came back as `prompt_tokens: 86`, HTTP\n200, nothing anywhere saying so.\n\nDetected, not predicted. It is computed from\n`usage.prompt_tokens` **after** the answer, by a ratio\nchosen to be far below any real tokenizer's — so it cannot\nfire on a merely token-dense prompt, and it needs no\ntokenizer of ours.\n\n**And by a second test where the window is known**\n(2026-10-03): `prompt_tokens` reached at least 90% of\n`context_length` while the prompt's characters, at four to a\ntoken, exceed the whole window. The ratio alone cannot see a\ncut that keeps a near-full window: Ollama's default context is\n4,096 tokens on a card under 23 GiB and it still keeps the\nnewest turns and drops the middle, so a prompt cut to 4k went\nunflagged below about 82,000 characters.\n\n**Three states, and the difference matters.** `null` means\nnot evaluated — the backend reported no usage, or the prompt\nwas too small for the test to mean anything — and must not\nbe read as reassurance. `false` means it was checked and the\ninput arrived. `true` means it did not. Null and not absent:\nthis envelope serializes its unset fields, as `runtime` has\nsince M0.\n\n**Why a flag and not an error.** The answer has already been\ngenerated, and on a streamed request it has already been\ndelivered — M10's rule is that a stream cannot be unsent.\nFailing one path and flagging the other would make the same\ncondition report two different ways, so both flag. A backend\nthat refuses instead of truncating needs none of this: its\nrefusal is exact and is passed straight through as a 400.\n",
-    )
-    progress: StreamProgress | None = None
-    cost_usd: float | None = Field(
-        None,
-        description="What the provider says it billed for this request, in US\ndollars. Only a video job carries it today: on the poll that\nfinds it `completed` (or `failed`), when the provider reports\none (OpenRouter's `usage.cost`). **Absent means not known,\nnever free.** Added 2026-10-08 (Workbench's video screen; the\ngateway's first money).\n",
-        ge=0.0,
-    )
-
-
-class EmbeddingResponse(BaseModel):
-    object: Object
-    data: list[EmbeddingData]
-    model: str = Field(
-        ...,
-        description='The model that actually produced these vectors. After a\nsame-model failover this still names that model -- by the\nrule above, it can never name a different one.\n',
-    )
-    usage: EmbeddingUsage | None = None
-    x_eugene_plexus: CompletionRoutingInfo | None = None
+    tokens: int = Field(..., description='The `max_tokens` sent.', ge=1)
+    source: OutputCapSource
 
 
 class RoutingTierView(BaseModel):
@@ -4618,16 +4587,6 @@ class SystemOneRequest(BaseModel):
         ..., description='What is being judged — text, or structured data.'
     )
     questions: dict[str, SystemOneQuestion]
-
-
-class SystemOneResponse(BaseModel):
-    model: str = Field(
-        ...,
-        description="The public alias that served the request — after a cascade\nit names what answered, exactly as the chat doors do. The\nbackend's own model revision is preserved on the driver's\n`reportedModel` for provenance and surfaced in\n`x_eugene_plexus`.\n",
-    )
-    answers: dict[str, SystemOneAnswer]
-    usage: SystemOneUsage | None = None
-    x_eugene_plexus: CompletionRoutingInfo | None = None
 
 
 class MetricsGroup(BaseModel):
@@ -5088,33 +5047,6 @@ class Model(BaseModel):
     x_eugene_plexus: ModelRoutingInfo | None = None
 
 
-class CompletionResponse(BaseModel):
-    id: str
-    object: Literal['text_completion']
-    created: int
-    model: str
-    choices: list[CompletionChoice]
-    usage: CompletionUsage | None = None
-    x_eugene_plexus: CompletionRoutingInfo | None = None
-
-
-class CompletionChunk(BaseModel):
-    """
-    One SSE `data:` frame. The frame with `finish_reason` carries
-    `x_eugene_plexus`, as chat's final frame does. With
-    `include_usage`, a last frame has `choices` empty and `usage`.
-
-    """
-
-    id: str
-    object: Literal['text_completion']
-    created: int
-    model: str
-    choices: list[CompletionChoice]
-    usage: CompletionUsage | None = None
-    x_eugene_plexus: CompletionRoutingInfo | None = None
-
-
 class ModerationParts(RootModel[list[ModerationInputPart]]):
     """
     One input of text and an image, with one result.
@@ -5125,43 +5057,6 @@ class ModerationParts(RootModel[list[ModerationInputPart]]):
         description='One input of text and an image, with one result.',
         min_length=1,
     )
-
-
-class ImagesResponse(BaseModel):
-    created: int
-    data: list[ImageObject]
-    output_format: str | None = Field(
-        None,
-        description="What the first image is, read from its bytes (P2-2): `png`,\n`jpeg`, `webp`, and `svg` from OpenRouter's vector models.\n",
-    )
-    size: str | None = None
-    quality: str | None = None
-    background: str | None = None
-    usage: ImagesUsage | None = None
-    x_eugene_plexus: CompletionRoutingInfo | None = None
-
-
-class VideoResource(BaseModel):
-    """
-    OpenAI's `VideoResource`, every field its schema requires. `id` is
-    the signed handle.
-
-    """
-
-    id: str
-    object: Literal['video']
-    model: str
-    status: VideoStatus
-    progress: int
-    created_at: int
-    completed_at: int | None
-    expires_at: int | None
-    prompt: str | None
-    size: str
-    seconds: str
-    remixed_from_video_id: str | None
-    error: VideoError | None
-    x_eugene_plexus: CompletionRoutingInfo | None = None
 
 
 class ChatCompletionChunkChoice(BaseModel):
@@ -5177,6 +5072,88 @@ class ChatCompletionChunkChoice(BaseModel):
     finish_reason: FinishReason1 | None = Field(
         None, description='Null until the terminal chunk.'
     )
+
+
+class CompletionRoutingInfo(BaseModel):
+    """
+    Namespaced extension recording how this particular request was
+    served. Not part of OpenAI's schema, and ignored by clients that
+    do not know it.
+
+    It exists because the failure mode of a routing layer is being
+    opaque: when one of several backends is slow or a cascade fired,
+    an operator needs to see which one answered without going to the
+    logs. `attempts` above 1 is the visible evidence that failover
+    did its job.
+
+    """
+
+    driver: str | None = Field(
+        None, description='Name of the inference-driver that served this request.'
+    )
+    runtime: str | None = Field(
+        None,
+        description='Name of the engine runtime behind that driver, when it is a\nlocal engine. Absent for hosted and CLI backends, which have\nno runtime of ours.\n',
+    )
+    backend: BackendKind | None = None
+    latency_ms: int | None = Field(
+        None, description='Gateway-side wall-clock time, including any failed attempts.'
+    )
+    attempts: int | None = Field(
+        None,
+        description='How many backends were tried. Greater than 1 means the\npriority-list cascade fired and an earlier backend failed.\n',
+        ge=1,
+    )
+    web_searches: int | None = Field(
+        None,
+        description='How many web searches this install ran for the request (P8).\nAbsent when none ran, and when the backend searched itself.\n',
+        ge=0,
+    )
+    search_suggestions: list[str] | None = Field(
+        None,
+        description="For each search this install ran whose provider's terms require\nsomething shown with its results (Google's Search Suggestions,\nHTML), that HTML, in the order the searches ran. Show it to the\nperson who asked, unmodified, beside the answer\n(docs/design/google-search-account.md, GS4). Absent when none\nhad any.\n",
+    )
+    tier: int | None = Field(
+        None,
+        description="Which tier of the slot answered, 1-based. Greater than 1\nmeans every backend in an earlier tier was ineligible or\nfailed — a cloud target answering for a local model, say.\n\n**Positional, counted over the slot's tiers rather than over\nthe ones that had anything in them**, which is the only\nreading that answers the question this field exists for:\n*did the primary serve this?* A primary whose companion\ndriver is down is a tier with no backends, and it still\noccupies its number. See `ModelRoutingInfo.tiers` for which\ntier can be absent and why.\n",
+        ge=1,
+    )
+    swapped_in: bool | None = Field(
+        None,
+        description='True when the gateway had to start a `startOnDemand`\nruntime to serve this request. The visible cost of idle\nunload, next to the request that paid it.\n',
+    )
+    waited_ms: int | None = Field(
+        None,
+        description='How long the request waited for a runtime to reach `ready`\nbefore being sent. Zero when nothing had to be woken.\n',
+        ge=0,
+    )
+    context_length: int | None = Field(
+        None,
+        description='The context window of the backend that actually answered, as\nthat backend resolved it. **Null** when it does not expose\none — a hosted provider, a CLI subscription, or a local\nengine that was not reachable to ask. Null and not absent:\nthis envelope serializes its unset fields, as `runtime` has\nsince M0.\n\nPer-request, and therefore not the same number as\n`x_eugene_plexus.context_length` on `GET /v1/models`: that\none is the smallest across every backend serving the name,\nbecause a request may land on any of them. This one is the\nwindow that applied to *this* request, which is what makes a\ntruncated answer explicable after the fact.\n',
+        ge=1,
+    )
+    prompt_truncated: bool | None = Field(
+        None,
+        description="**The backend silently dropped input.** True when the prompt\nwe sent was far larger than the token count the backend\nreported consuming — the signature of a server that fits an\nover-long prompt into the window by discarding the middle of\nthe conversation and answering anyway, with a 200 and no\nflag of its own.\n\nThis is the failure that makes a coding harness loop: it\nsends file contents, the model never receives them, and the\nconfident answer that comes back is about code nobody read.\nMeasured on this project's own hardware: 66,389 characters\nacross six messages came back as `prompt_tokens: 86`, HTTP\n200, nothing anywhere saying so.\n\nDetected, not predicted. It is computed from\n`usage.prompt_tokens` **after** the answer, by a ratio\nchosen to be far below any real tokenizer's — so it cannot\nfire on a merely token-dense prompt, and it needs no\ntokenizer of ours.\n\n**And by a second test where the window is known**\n(2026-10-03): `prompt_tokens` reached at least 90% of\n`context_length` while the prompt's characters, at four to a\ntoken, exceed the whole window. The ratio alone cannot see a\ncut that keeps a near-full window: Ollama's default context is\n4,096 tokens on a card under 23 GiB and it still keeps the\nnewest turns and drops the middle, so a prompt cut to 4k went\nunflagged below about 82,000 characters.\n\n**Three states, and the difference matters.** `null` means\nnot evaluated — the backend reported no usage, or the prompt\nwas too small for the test to mean anything — and must not\nbe read as reassurance. `false` means it was checked and the\ninput arrived. `true` means it did not. Null and not absent:\nthis envelope serializes its unset fields, as `runtime` has\nsince M0.\n\n**Why a flag and not an error.** The answer has already been\ngenerated, and on a streamed request it has already been\ndelivered — M10's rule is that a stream cannot be unsent.\nFailing one path and flagging the other would make the same\ncondition report two different ways, so both flag. A backend\nthat refuses instead of truncating needs none of this: its\nrefusal is exact and is passed straight through as a 400.\n",
+    )
+    progress: StreamProgress | None = None
+    output_cap: OutputCap | None = None
+    cost_usd: float | None = Field(
+        None,
+        description="What the provider says it billed for this request, in US\ndollars. Only a video job carries it today: on the poll that\nfinds it `completed` (or `failed`), when the provider reports\none (OpenRouter's `usage.cost`). **Absent means not known,\nnever free.** Added 2026-10-08 (Workbench's video screen; the\ngateway's first money).\n",
+        ge=0.0,
+    )
+
+
+class EmbeddingResponse(BaseModel):
+    object: Object
+    data: list[EmbeddingData]
+    model: str = Field(
+        ...,
+        description='The model that actually produced these vectors. After a\nsame-model failover this still names that model -- by the\nrule above, it can never name a different one.\n',
+    )
+    usage: EmbeddingUsage | None = None
+    x_eugene_plexus: CompletionRoutingInfo | None = None
 
 
 class RoutingSlotView(BaseModel):
@@ -5291,6 +5268,16 @@ class AnthropicCountTokensRequest(BaseModel):
     tool_choice: AnthropicToolChoice | None = None
 
 
+class SystemOneResponse(BaseModel):
+    model: str = Field(
+        ...,
+        description="The public alias that served the request — after a cascade\nit names what answered, exactly as the chat doors do. The\nbackend's own model revision is preserved on the driver's\n`reportedModel` for provenance and surfaced in\n`x_eugene_plexus`.\n",
+    )
+    answers: dict[str, SystemOneAnswer]
+    usage: SystemOneUsage | None = None
+    x_eugene_plexus: CompletionRoutingInfo | None = None
+
+
 class EngineFitModel(BaseModel):
     """
     How one engine uses memory, declared by its adapter beside `accepts`
@@ -5321,6 +5308,33 @@ class ModelList(BaseModel):
     x_eugene_plexus: ModelListInfo | None = None
 
 
+class CompletionResponse(BaseModel):
+    id: str
+    object: Literal['text_completion']
+    created: int
+    model: str
+    choices: list[CompletionChoice]
+    usage: CompletionUsage | None = None
+    x_eugene_plexus: CompletionRoutingInfo | None = None
+
+
+class CompletionChunk(BaseModel):
+    """
+    One SSE `data:` frame. The frame with `finish_reason` carries
+    `x_eugene_plexus`, as chat's final frame does. With
+    `include_usage`, a last frame has `choices` empty and `usage`.
+
+    """
+
+    id: str
+    object: Literal['text_completion']
+    created: int
+    model: str
+    choices: list[CompletionChoice]
+    usage: CompletionUsage | None = None
+    x_eugene_plexus: CompletionRoutingInfo | None = None
+
+
 class ModerationRequest(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -5332,6 +5346,43 @@ class ModerationRequest(BaseModel):
         ...,
         description="A string, an array of strings, or an array of parts. Every piece\nis a named schema: an inline array here was generated as `Input`\nand renamed the embeddings request's `Input` to `Input2`.\n",
     )
+
+
+class ImagesResponse(BaseModel):
+    created: int
+    data: list[ImageObject]
+    output_format: str | None = Field(
+        None,
+        description="What the first image is, read from its bytes (P2-2): `png`,\n`jpeg`, `webp`, and `svg` from OpenRouter's vector models.\n",
+    )
+    size: str | None = None
+    quality: str | None = None
+    background: str | None = None
+    usage: ImagesUsage | None = None
+    x_eugene_plexus: CompletionRoutingInfo | None = None
+
+
+class VideoResource(BaseModel):
+    """
+    OpenAI's `VideoResource`, every field its schema requires. `id` is
+    the signed handle.
+
+    """
+
+    id: str
+    object: Literal['video']
+    model: str
+    status: VideoStatus
+    progress: int
+    created_at: int
+    completed_at: int | None
+    expires_at: int | None
+    prompt: str | None
+    size: str
+    seconds: str
+    remixed_from_video_id: str | None
+    error: VideoError | None
+    x_eugene_plexus: CompletionRoutingInfo | None = None
 
 
 class ChatCompletionChunk(BaseModel):
@@ -5347,7 +5398,7 @@ class ChatCompletionChunk(BaseModel):
     usage: CompletionUsage | None = None
     x_eugene_plexus: CompletionRoutingInfo | None = Field(
         None,
-        description='Set on the **final frame only**, alongside `usage` — the\nsame place OpenAI puts its own end-of-stream extras.\nAbsent on every earlier frame, because the values are not\nknown until the completion is done. **One exception, asked\nfor:** with `stream_options.include_progress`, a progress\nchunk before the first token carries an `x_eugene_plexus`\nholding only `progress`, with `choices: []`.\n\nAdded at M8. Until then a streaming client could see no\nrouting information at all: the non-streaming response\ncarried this and the stream did not, so exactly the clients\nthat stream — the UI playground among them — were the ones\nthat could not tell which backend answered. Retained\nmetrics do not depend on this (they are recorded at the\nrouting hooks, which fire on both paths); this closes the\nmatching gap in what a caller can see.\n',
+        description='Set on the **final frame only**, alongside `usage` — the\nsame place OpenAI puts its own end-of-stream extras.\nAbsent on every earlier frame, because the values are not\nknown until the completion is done. **One exception, asked\nfor:** with `stream_options.include_progress`, a progress\nchunk before or between output chunks carries an\n`x_eugene_plexus` holding only `progress`, with\n`choices: []`.\n\nAdded at M8. Until then a streaming client could see no\nrouting information at all: the non-streaming response\ncarried this and the stream did not, so exactly the clients\nthat stream — the UI playground among them — were the ones\nthat could not tell which backend answered. Retained\nmetrics do not depend on this (they are recorded at the\nrouting hooks, which fire on both paths); this closes the\nmatching gap in what a caller can see.\n',
     )
 
 

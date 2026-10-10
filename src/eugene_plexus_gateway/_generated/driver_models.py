@@ -1971,12 +1971,17 @@ class Stage(StrEnum):
     `working`: the backend says it is working and not how far.
     `tool`: an agent backend is running one of its own tools,
     named in `tool`.
+    `generating`: writing, thinking included, with the backend's
+    own count of the tokens so far in `generatedTokens`. Sent
+    between output frames (2026-10-10, Troy: Workbench said
+    "Waiting for the model" through minutes of reasoning).
 
     """
 
     prompt = 'prompt'
     working = 'working'
     tool = 'tool'
+    generating = 'generating'
 
 
 class StreamProgress(BaseModel):
@@ -1996,6 +2001,14 @@ class StreamProgress(BaseModel):
       tools. Its thinking is `reasoning` output, not progress.
     - **Codex**: `working` at `turn.started`; `tool` when an item
       that runs something starts.
+    - **llama.cpp, while it writes**: `generating`, from its own
+      running count (`timings_per_token: true`, which puts
+      `timings.predicted_n` on every frame), at most every half
+      second. Measured on b10948: the count on the last frame equals
+      the usage's `completion_tokens`. No other backend reports a
+      running count today (Strata 0.1.39 says it only at the end),
+      so none sends `generating`: nothing here is estimated from the
+      text.
 
     **Why it exists (2026-09-27).** Before the first token a stream
     said nothing at all: measured on llama.cpp b11215 with a 7,795
@@ -2008,11 +2021,21 @@ class StreamProgress(BaseModel):
 
     stage: Stage = Field(
         ...,
-        description='`prompt`: reading the prompt, with the token counts below.\n`working`: the backend says it is working and not how far.\n`tool`: an agent backend is running one of its own tools,\nnamed in `tool`.\n',
+        description='`prompt`: reading the prompt, with the token counts below.\n`working`: the backend says it is working and not how far.\n`tool`: an agent backend is running one of its own tools,\nnamed in `tool`.\n`generating`: writing, thinking included, with the backend\'s\nown count of the tokens so far in `generatedTokens`. Sent\nbetween output frames (2026-10-10, Troy: Workbench said\n"Waiting for the model" through minutes of reasoning).\n',
     )
     tool: str | None = Field(
         None,
         description="On `tool`: the tool's name as the backend gives it (`Read`,\n`Bash`, `command`). Its arguments are not carried.\n",
+    )
+    generatedTokens: int | None = Field(
+        None,
+        description='On `generating`: tokens written so far, reasoning included, as\nthe backend counted them.\n',
+        ge=0,
+    )
+    tokensPerSecond: float | None = Field(
+        None,
+        description="On `generating`: the backend's own writing speed so far, when\nit reports one.\n",
+        ge=0.0,
     )
     promptTokens: int | None = Field(
         None,
@@ -3755,5 +3778,5 @@ class GenerateRequest(BaseModel):
     )
     reportProgress: bool | None = Field(
         False,
-        description="On `POST /v1/generate/stream` only: emit `event: progress`\nframes saying what the backend is doing when it is not yet,\nor not at the moment, producing output -- see\n`StreamProgress` for what each backend reports. Ignored by\n`POST /v1/generate`. Not an output setting: it changes what\nthe stream says about the work, never what the model says.\n\nllama.cpp's own `return_progress` flag is sent only once the\nbackend has answered as `llama-server` (its `/props`), since\na hosted API refuses a field it does not know.\n\n**The 200 commits at the first progress frame**, where it\notherwise commits at the first token, so a backend that\nfails partway through reading the prompt fails as an\n`event: error` frame instead of a status code. That is why\nit is asked for rather than sent by default.\n",
+        description="On `POST /v1/generate/stream` only: emit `event: progress`\nframes saying what the backend is doing when it is not yet,\nor not at the moment, producing output -- see\n`StreamProgress` for what each backend reports. Ignored by\n`POST /v1/generate`. Not an output setting: it changes what\nthe stream says about the work, never what the model says.\n\nllama.cpp's own `return_progress` and `timings_per_token`\nflags are sent only once the backend has answered as\n`llama-server` (its `/props`), since a hosted API refuses a\nfield it does not know.\n\n**The 200 commits at the first progress frame**, where it\notherwise commits at the first token, so a backend that\nfails partway through reading the prompt fails as an\n`event: error` frame instead of a status code. That is why\nit is asked for rather than sent by default.\n",
     )

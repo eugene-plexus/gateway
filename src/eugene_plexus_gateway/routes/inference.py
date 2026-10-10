@@ -27,7 +27,7 @@ import math
 import struct
 import time
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, replace
 from dataclasses import field as dc_field
 from datetime import UTC, datetime
@@ -120,6 +120,8 @@ from .._generated.models import (
     ModelListInfo,
     Object,
     Object1,
+    OutputCap,
+    OutputCapSource,
     PromptTokensDetails,
     ResponseFormat,
     Role1,
@@ -711,6 +713,9 @@ class _Serving:
     #: Why a search that would be removed rather than refused could not run
     #: (P8, the Responses door), for the door to say so.
     search_blocked: str | None = None
+    #: The output cap sent to whichever candidate answers, and where it
+    #: came from (2026-10-10), read once the client knows who answered.
+    output_cap: Callable[[Any], OutputCap | None] = lambda _client: None
 
 
 async def _prepare(
@@ -938,6 +943,11 @@ async def _prepare(
         )
     generate = _to_generate_request(body, store, install_max_tokens=install_max_tokens)
     generate.localOnly = admission.local_only()
+    # The cap each candidate is sent and where it came from, filled as
+    # each is prepared: a profile belongs to one candidate's model file, so
+    # a fallback can be capped differently from the primary.
+    base_cap = _output_cap(body, store, None, install_max_tokens=install_max_tokens)
+    caps: dict[tuple[str | None, str | None], OutputCap | None] = {}
     if completion is not None:
         # The chat body's one message was a stand-in; the driver is sent
         # the prompt itself, continued as written.
@@ -962,8 +972,12 @@ async def _prepare(
                 and body.temperature is not None
                 and body.top_p is not None
             ):
+                caps[(candidate.node, candidate.name)] = base_cap
                 return original
             defaults = await profiles.get(paths.get((candidate.node, candidate.name)))
+            caps[(candidate.node, candidate.name)] = _output_cap(
+                body, store, defaults, install_max_tokens=install_max_tokens
+            )
             # The profile's three defaults, copied onto the request this
             # candidate is being handed -- never a request rebuilt from the
             # caller's body. A rebuild threw away whatever was added since:
@@ -1015,8 +1029,13 @@ async def _prepare(
     routing_ms = int((time.perf_counter() - arrived) * 1000) - waited_ms
     swapped_in = bool(wake is not None and wake.ok)
 
+    def output_cap(answered: Any) -> OutputCap | None:
+        key = (getattr(answered, "served_by_node", None), getattr(answered, "served_by", None))
+        return caps.get(key, base_cap)
+
     started = time.perf_counter()
     return _Serving(
+        output_cap=output_cap,
         search_blocked=search_blocked,
         client=served,
         table=table,
@@ -1082,7 +1101,9 @@ async def create_chat_completion(request: Request) -> Any:
         # would be closed before the first attempt was made. The stream
         # records itself.
         return StreamingResponse(
-            _stream_completion(body, generate, client, table, started, rec=rec),
+            _stream_completion(
+                body, generate, client, table, started, rec=rec, output_cap=prepared.output_cap
+            ),
             media_type="text/event-stream",
         )
 
@@ -1139,7 +1160,14 @@ async def create_chat_completion(request: Request) -> Any:
             )
 
         result = _to_chat_completion(
-            body, response, client, table, started, waited_ms=waited_ms, swapped_in=swapped_in
+            body,
+            response,
+            client,
+            table,
+            started,
+            waited_ms=waited_ms,
+            swapped_in=swapped_in,
+            output_cap=prepared.output_cap(client),
         )
         _record(
             rec,
@@ -4122,6 +4150,7 @@ def _routing_info(
     waited_ms: int = 0,
     swapped_in: bool = False,
     prompt_truncated: bool | None = None,
+    output_cap: OutputCap | None = None,
 ) -> CompletionRoutingInfo:
     """Which backend actually served this, and whether failover fired.
 
@@ -4171,7 +4200,34 @@ def _routing_info(
         prompt_truncated=prompt_truncated,
         web_searches=_searches_run(client),
         search_suggestions=_search_suggestions(client),
+        output_cap=output_cap,
     )
+
+
+def _output_cap(
+    body: Any,
+    store: ConfigStore | None,
+    defaults: dict[str, Any] | None,
+    *,
+    install_max_tokens: bool = True,
+) -> OutputCap | None:
+    """The output cap `_to_generate_request` sends, and where it came from.
+
+    The same order: the caller's own, then the model's default profile, then
+    the install's `defaultMaxTokens`. None when none is sent. A length stop
+    can then name the setting that made it: Workbench told Troy to raise his
+    chat's own setting when the cap was the install's (2026-10-10).
+    """
+    if body.max_tokens is not None:
+        return OutputCap(tokens=body.max_tokens, source=OutputCapSource.request)
+    profiled = (defaults or {}).get("maxTokens")
+    if profiled is not None:
+        return OutputCap(tokens=profiled, source=OutputCapSource.profile)
+    if store is not None and install_max_tokens:
+        installed = store.get("defaultMaxTokens")
+        if installed is not None:
+            return OutputCap(tokens=installed, source=OutputCapSource.install)
+    return None
 
 
 def _search_suggestions(client: Any) -> list[str] | None:
@@ -4277,6 +4333,7 @@ def _to_chat_completion(
     *,
     waited_ms: int = 0,
     swapped_in: bool = False,
+    output_cap: OutputCap | None = None,
 ) -> ChatCompletionResponse:
     usage = _openai_usage(response.usage)
     window = _served_window(client, table, body.model)
@@ -4320,6 +4377,7 @@ def _to_chat_completion(
             waited_ms=waited_ms,
             swapped_in=swapped_in,
             prompt_truncated=truncated,
+            output_cap=output_cap,
         ),
     )
 
@@ -4332,6 +4390,7 @@ async def _stream_completion(
     started: float,
     *,
     rec: _Recording,
+    output_cap: Callable[[Any], OutputCap | None] = lambda _client: None,
 ) -> AsyncIterator[str]:
     """SSE framed exactly as OpenAI frames it, one frame per token.
 
@@ -4659,6 +4718,7 @@ async def _stream_completion(
                     waited_ms=rec.waited_ms,
                     swapped_in=rec.swapped_in,
                     prompt_truncated=truncated,
+                    output_cap=output_cap(client),
                 ),
             )
         )
@@ -4697,6 +4757,8 @@ def _progress_of(raw: dict[str, Any]) -> StreamProgress | None:
                 "cached_tokens": raw.get("cachedTokens"),
                 "processed_tokens": raw.get("processedTokens"),
                 "elapsed_ms": raw.get("elapsedMs"),
+                "generated_tokens": raw.get("generatedTokens"),
+                "tokens_per_second": raw.get("tokensPerSecond"),
             }
         )
     except ValueError:

@@ -263,3 +263,18 @@ def test_a_driver_that_sends_progress_unasked_is_not_passed_on(settings: Setting
         r = client.post("/v1/chat/completions", json=_chat())
     assert r.status_code == 200, r.text
     assert all(f["choices"] for f in _frames(r.text)), r.text
+
+
+def test_the_running_count_reaches_the_caller_in_its_own_words(settings: Settings) -> None:
+    # 2026-10-10: Workbench said "Waiting for the model" through minutes of
+    # reasoning. llama.cpp's running count now crosses the gateway, renamed
+    # to this document's snake_case and nothing else.
+    fake = _fake(progress=[{"stage": "generating", "generatedTokens": 12, "tokensPerSecond": 83.1}])
+    with _client(settings, fake) as client:
+        r = client.post(
+            "/v1/chat/completions", json=_chat(stream_options={"include_progress": True})
+        )
+    assert r.status_code == 200, r.text
+    assert [f["x_eugene_plexus"] for f in _frames(r.text) if not f["choices"]] == [
+        {"progress": {"stage": "generating", "generated_tokens": 12, "tokens_per_second": 83.1}}
+    ]
