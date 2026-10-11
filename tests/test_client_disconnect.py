@@ -24,7 +24,7 @@ import json
 from typing import Any
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from starlette.requests import Request
 
 from eugene_plexus_gateway._generated.models import EmbeddingRequest
@@ -144,7 +144,9 @@ async def test_a_closed_tab_cancels_the_embedding(app: FastAPI) -> None:
     app.state.routing = make_routing_table(driver)
 
     body = EmbeddingRequest(model="m", input="hi")
-    answer = await _drive(app, hang, lambda r: create_embedding(r, body))
+    # Called by hand, so it is handed what FastAPI would inject (MR0: the
+    # answer's headers are set on it).
+    answer = await _drive(app, hang, lambda r: create_embedding(r, body, Response()))
 
     assert hang.cancelled
     assert not hang.finished

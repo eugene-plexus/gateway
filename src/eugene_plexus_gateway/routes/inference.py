@@ -35,7 +35,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
@@ -1917,9 +1917,27 @@ async def no_stored_responses(rest: str) -> Any:
 # /v1/embeddings
 # --------------------------------------------------------------------------- #
 
+#: What an embeddings request may carry that this door accepts and does not
+#: act on (MR0), in the order they are named. The driver's `EmbedRequest` has
+#: no field for either, so neither reaches a backend, and this layer does not
+#: emulate `dimensions`: a truncated vector is a wrong answer that looks like
+#: a right one. Each one the caller sent is named on
+#: `x-eugene-plexus-ignored-settings`, as the other doors name theirs. Until
+#: MR0 the contract said `dimensions` was "passed through" and both were
+#: dropped without a word. When a driver can honour one, it leaves this list.
+_EMBEDDING_IGNORED = ("dimensions", "user")
+
+
+def _ignored_embedding_settings(body: EmbeddingRequest) -> list[str]:
+    """The settings this request carries that the answer does not honour.
+
+    A JSON `null` is "not sent", as on the Anthropic door: only a value is named.
+    """
+    return [name for name in _EMBEDDING_IGNORED if getattr(body, name, None) is not None]
+
 
 @router.post("/v1/embeddings", dependencies=_auth)
-async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
+async def create_embedding(request: Request, body: EmbeddingRequest, response: Response) -> Any:
     """Text in, vectors out.
 
     **The one place in this gateway where a slot does not cascade.**
@@ -1930,6 +1948,10 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
     caller's vector store with a 200 and no marker, and the damage
     outlives the request. Same trade as M10's commit point: give up a
     retry rather than return a wrong answer that looks right.
+
+    **`dimensions` and `user` are accepted and ignored, and the answer says
+    so** (MR0): `x-eugene-plexus-ignored-settings` names each one the request
+    carried. The vectors come back at the model's own width.
     """
     await admission.authorize(request, body.model)
     table = _routing(request)
@@ -2031,6 +2053,10 @@ async def create_embedding(request: Request, body: EmbeddingRequest) -> Any:
     context = admission.current.get()
     if context is not None:
         context.embedding_result = result
+    # On a served answer only: a refusal or a failure served nothing the
+    # caller could have been misled about.
+    if ignored := _ignored_embedding_settings(body):
+        response.headers["x-eugene-plexus-ignored-settings"] = ", ".join(ignored)
     fmt = getattr(body.encoding_format, "value", body.encoding_format) or "float"
     usage = None
     if result.usage is not None:

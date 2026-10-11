@@ -131,6 +131,116 @@ def test_an_empty_batch_is_refused_too(embed_client) -> None:  # type: ignore[no
 
 
 # --------------------------------------------------------------------- #
+# settings it accepts and does not honour (MR0)
+# --------------------------------------------------------------------- #
+#
+# Until MR0 the contract called `dimensions` "passed through" and `user`
+# "recorded", and the door dropped both without a word. A caller asking for
+# 256 dimensions got the model's full width, with a 200 and no sign that
+# anything had been ignored.
+
+IGNORED = "x-eugene-plexus-ignored-settings"
+
+
+def _embed(client, **extra):  # type: ignore[no-untyped-def]
+    return client.post("/v1/embeddings", json={"model": "nomic-embed-text", "input": "a", **extra})
+
+
+def test_dimensions_is_named_as_ignored(embed_client) -> None:  # type: ignore[no-untyped-def]
+    _, client = embed_client
+
+    response = _embed(client, dimensions=2)
+
+    assert response.status_code == 200, response.text
+    assert response.headers[IGNORED] == "dimensions"
+
+
+def test_user_is_named_as_ignored(embed_client) -> None:  # type: ignore[no-untyped-def]
+    _, client = embed_client
+
+    response = _embed(client, user="person-1")
+
+    assert response.status_code == 200, response.text
+    assert response.headers[IGNORED] == "user"
+
+
+def test_both_are_named_in_one_stable_order(embed_client) -> None:  # type: ignore[no-untyped-def]
+    """The order is the door's, not the request's: `user` is sent first here."""
+    _, client = embed_client
+
+    response = _embed(client, user="person-1", dimensions=2)
+
+    assert response.status_code == 200, response.text
+    assert response.headers[IGNORED] == "dimensions, user"
+
+
+def test_nothing_is_named_when_neither_is_sent(embed_client) -> None:  # type: ignore[no-untyped-def]
+    """A header that appeared on every answer would teach callers to ignore
+    it. `encoding_format` is honoured here, so it is never named either."""
+    _, client = embed_client
+
+    assert IGNORED not in _embed(client).headers
+    assert IGNORED not in _embed(client, encoding_format="base64").headers
+
+
+def test_a_null_is_not_a_setting(embed_client) -> None:  # type: ignore[no-untyped-def]
+    """As on the Anthropic door: only a value is named. An SDK that always
+    sends every field as `null` is not asking for anything."""
+    _, client = embed_client
+
+    response = _embed(client, dimensions=None, user=None)
+
+    assert response.status_code == 200, response.text
+    assert IGNORED not in response.headers
+
+
+def test_the_vectors_come_back_at_the_models_own_width(embed_client) -> None:  # type: ignore[no-untyped-def]
+    """**The header is only honest if nothing here quietly acts on the setting.**
+    This layer does not emulate `dimensions`: a truncated vector is a wrong
+    answer that looks like a right one. The fake driver's vectors are 4 wide."""
+    _, client = embed_client
+
+    floats = _embed(client, dimensions=2).json()["data"][0]["embedding"]
+
+    assert len(floats) == 4
+
+
+def test_the_header_rides_a_base64_answer_too(embed_client) -> None:  # type: ignore[no-untyped-def]
+    """The SDKs ask for base64 by default, so this is the answer most callers read."""
+    _, client = embed_client
+
+    response = _embed(client, dimensions=2, encoding_format="base64")
+
+    assert response.headers[IGNORED] == "dimensions"
+    assert len(base64.b64decode(response.json()["data"][0]["embedding"])) == 4 * 4
+
+
+def test_a_refused_or_failed_request_names_nothing(settings) -> None:  # type: ignore[no-untyped-def]
+    """The header describes an answer that was served. A request that got none
+    has nothing to be told about, and a client that retries sees it only on the
+    attempt that served."""
+    dead = _embedder("primary", "nomic-embed-text")
+    dead.embed_error = DriverError(
+        driver_name="primary",
+        driver_url="http://primary",
+        status_code=503,
+        problem=Problem(
+            type="about:blank", title="Not started", status=503, retryDisposition="safe"
+        ),
+        raw_body="down",
+    )
+    both = {"input": "a", "dimensions": 2, "user": "person-1"}
+    with TestClient(_app(dead, settings=settings)) as client:
+        refused = client.post("/v1/embeddings", json={"model": "no-such-model", **both})
+        failed = client.post("/v1/embeddings", json={"model": "nomic-embed-text", **both})
+
+    assert refused.status_code == 404
+    assert failed.status_code != 200
+    assert IGNORED not in refused.headers
+    assert IGNORED not in failed.headers
+
+
+# --------------------------------------------------------------------- #
 # THE RULE
 # --------------------------------------------------------------------- #
 
