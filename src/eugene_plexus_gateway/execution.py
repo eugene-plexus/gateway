@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sys
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Iterable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -24,11 +24,6 @@ class StreamPolicy:
     complete: Callable[[Any], bool] = lambda event: False
     usage: Callable[[Any], Any] = lambda event: None
     eof_is_success: bool = True
-    #: What an event says about the attempt itself, when it is not for the
-    #: caller at all (the driver's own headers, 2026-10-12): taken as that
-    #: attempt's and never yielded, so it commits nothing and no door ever sees
-    #: it. None for an event that is the caller's.
-    notes: Callable[[Any], tuple[str, ...] | None] = lambda event: None
 
 
 DEFAULT_STREAM_POLICY = StreamPolicy()
@@ -50,15 +45,6 @@ class Attempt:
         self.finished = False
         self.committed = False
         self.first_ms: int | None = None
-        #: What this attempt's driver said its backend was sent and does not
-        #: honour, in the driver's field names. Counted only if it serves.
-        self.ignored: tuple[str, ...] = ()
-
-    def note_ignored(self, names: Iterable[str]) -> None:
-        """The driver's own say, known the moment its response opened. Shown
-        as the attempt in flight's until it serves or fails."""
-        self.ignored = tuple(names)
-        self.owner._ignored_open = self.ignored
 
     def commit(self) -> None:
         if not self.committed:
@@ -71,10 +57,6 @@ class Attempt:
         self.owner.served_model = getattr(self.candidate, "public_model", None)
         self.owner.served_candidate = self.candidate
         self.owner.tier = self.tier
-        if self.ignored:
-            served = self.owner._ignored_served
-            served.extend(name for name in self.ignored if name not in served)
-        self.owner._ignored_open = ()
 
     def finish(
         self,
@@ -87,7 +69,6 @@ class Attempt:
         if self.finished:
             return
         self.finished = True
-        self.owner._ignored_open = ()
         from .driver_client import RepetitionStopped, retry_disposition
 
         self.owner._finish_circuit(
@@ -175,8 +156,6 @@ class Executor:
                     raise
             else:
                 usage = getattr(result, "usage", None)
-                if generation is not None:
-                    attempt.note_ignored(getattr(result, "ignored_settings", ()))
                 attempt.finish(served=True, usage=usage)
                 if generation is not None:
                     self.owner._served(usage, attempt.candidate, generation)
@@ -202,10 +181,6 @@ class Executor:
                     self.owner._enter(attempt.candidate)
                 events = call(attempt.candidate)
                 async for event in events:
-                    named = policy.notes(event)
-                    if named is not None:
-                        attempt.note_ignored(named)
-                        continue
                     if not policy.progress(event):
                         attempt.commit()
                         attempt.publish()

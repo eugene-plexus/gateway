@@ -1,25 +1,33 @@
-"""What the serving backend does not honour, said in a door's own words.
+"""What the chosen backend does not honour, said in a door's own words.
 
-A driver answers `POST /v1/generate` and `/v1/generate/stream` with
-`x-eugene-plexus-ignored-settings`: the request fields -- in its contract's
-spelling, `toolChoice` -- that its backend was sent and is known not to honour
-(`docs/design/tools-assumed.md`, 2026-10-12). Strata ignores `tool_choice`
-`required` and a named function, measured, so those are sent as it takes them
-and named rather than refused. A door says the same on its own header of that
-name, spelled the way its caller spelled the request, after the settings the
-door itself dropped, so one header lists everything this request was not given.
+A backend's driver lists, in its capabilities, the settings it is sent and is
+measured not to honour, by value (`capabilities.settingsNotHonoured`,
+`docs/design/tools-assumed.md`, 2026-10-12): Strata ignores `tool_choice`
+`required` and a named function, and `parallel_tool_calls: false`. A measured
+gap is sent and named, not refused. The list is static per backend, so it is
+read from the backend chosen for the first attempt **before anything is sent**,
+and a stream's head never waits for the backend to speak (an earlier version
+read a header off the driver's response instead, which held every stream's head
+until its first frame, and broke the Responses door's opening).
 
-Three things live here and nowhere else: reading the driver's header, the
-driver-to-door spelling, and the merge.
+A door names what the caller sent, with a value the list names, on its own
+`x-eugene-plexus-ignored-settings`, spelled the way its caller spelled the
+request, after the settings the door itself dropped, so one header lists
+everything this request was not given. **Only what the caller sent**: the
+gateway's own settings (a search loop's forced first turn) are not the
+caller's, and are never named.
+
+Three things live here and nowhere else: matching a listing against a request,
+the driver-to-door spelling, and the merge.
 """
 
 from __future__ import annotations
 
-import logging
 import re
 from collections.abc import Iterable, Mapping
+from typing import Any
 
-log = logging.getLogger(__name__)
+from ._generated.driver_models import GenerateRequest, NamedToolChoice, SettingNotHonoured
 
 HEADER = "x-eugene-plexus-ignored-settings"
 
@@ -45,6 +53,9 @@ WIRE_NAMES: dict[str, str] = {
 
 #: Where the Messages door's caller says it differently. Only what that door
 #: reads and sends on is here; everything else is the chat door's spelling.
+#: Anthropic's `tool_choice` carries the parallel switch inside it, with the
+#: opposite sense (`disable_parallel_tool_use: true` is `parallel_tool_calls:
+#: false`), so that is where a caller of this door looks for it.
 _MESSAGES: dict[str, str] = {
     "stop": "stop_sequences",
     "responseFormat": "output_config.format",
@@ -59,30 +70,7 @@ _RESPONSES: dict[str, str] = {
 
 _DOORS: dict[str, dict[str, str]] = {"chat": {}, "messages": _MESSAGES, "responses": _RESPONSES}
 
-#: What a request field's name can be. A driver's words go out on the caller's
-#: response header, so anything else is left off it: this is a field name or it
-#: is nothing, as the caller's own keys are never reflected raw either.
-_FIELD = re.compile(r"[A-Za-z][A-Za-z0-9_.]{0,63}")
 _CAMEL = re.compile(r"(?<=[a-z0-9])([A-Z])")
-
-
-def parse(value: str | None) -> tuple[str, ...]:
-    """The driver's header as its field names: each once, in the order named.
-
-    A driver is not trusted to send only names, so a token that is not one is
-    dropped (and noted at debug, as an unreadable progress frame is) rather
-    than passed on or allowed to fail an answer that was fine.
-    """
-    kept: dict[str, None] = {}
-    for token in (value or "").split(","):
-        name = token.strip()
-        if not name:
-            continue
-        if _FIELD.fullmatch(name):
-            kept.setdefault(name)
-        else:
-            log.debug("unreadable entry in a driver's %s: %r", HEADER, name[:40])
-    return tuple(kept)
 
 
 def spelled(name: str, door: str = "chat") -> str:
@@ -97,10 +85,58 @@ def spelled(name: str, door: str = "chat") -> str:
     )
 
 
-def merge(own: str | None, backend: Iterable[str], door: str = "chat") -> str | None:
+def sent(request: GenerateRequest, setting: str) -> str | bool | None:
+    """What the caller sent for `setting`, spelled as a listing's `values` spell it.
+
+    None when the caller did not send it (`callerSettings` is the caller's own
+    list: never a profile's or the install's default, and never what the
+    gateway's own search loop asks of a backend on a request it made itself) or
+    when its value is not one a listing can name. A tool choice is its mode:
+    `auto`, `none`, `required`, or `function` for a named function. A boolean is
+    itself, and `false` is a value: it is sent, and a backend may ignore it.
+    """
+    if setting not in (request.callerSettings or []):
+        return None
+    value: Any = getattr(request, setting, None)
+    if isinstance(value, NamedToolChoice):
+        return "function"
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return str(value)  # a `StrEnum` member (`ToolChoice`) as its plain value
+    return None
+
+
+def not_honoured(
+    listed: Iterable[SettingNotHonoured] | None, request: GenerateRequest
+) -> tuple[str, ...]:
+    """The driver's field names of what `request` carries and the backend does not honour.
+
+    A setting is named when the caller sent it **with a value the listing
+    names**: `tool_choice: required` is named for a backend that lists
+    `toolChoice` with `required`, and `tool_choice: auto` is not. Each once, in
+    the order the listing gives them. A listing that names nothing, or a
+    backend with no listing, names nothing: absent means everything carried is
+    honoured.
+
+    Only names this gateway built reach a header: a name is returned only if it
+    is in the request's own `callerSettings`, so a driver's words are matched
+    against what the caller sent and never passed on.
+    """
+    named: dict[str, None] = {}
+    for entry in listed or ():
+        value = sent(request, entry.setting)
+        # `false` is a value and a boolean is not a string, so `value in values`
+        # does not take `"false"` for it.
+        if value is not None and value in entry.values:
+            named.setdefault(entry.setting)
+    return tuple(named)
+
+
+def merge(own: str | None, names: Iterable[str], door: str = "chat") -> str | None:
     """A door's own header value with the backend's names added.
 
-    The door's own come first, then the backend's in the order its driver gave
+    The door's own come first, then the backend's in the order its listing gave
     them, each once however it was named: the door's `tool_choice` and the
     backend's `toolChoice` are one entry. None when there is nothing to name,
     so a header is never sent empty.
@@ -109,21 +145,21 @@ def merge(own: str | None, backend: Iterable[str], door: str = "chat") -> str | 
     for part in (own or "").split(","):
         if part.strip():
             named.setdefault(part.strip())
-    for name in backend:
+    for name in names:
         named.setdefault(spelled(name, door))
     return ", ".join(named) or None
 
 
 def added_to(
-    headers: Mapping[str, str], backend: Iterable[str], door: str = "chat"
+    headers: Mapping[str, str], names: Iterable[str], door: str = "chat"
 ) -> dict[str, str]:
     """`headers`, with the backend's names merged into its ignored-settings
     entry: added when the door had none, left alone when there is nothing to add."""
-    merged = merge(headers.get(HEADER), backend, door)
+    merged = merge(headers.get(HEADER), names, door)
     out = {name: value for name, value in headers.items() if name != HEADER}
     if merged is not None:
         out[HEADER] = merged
     return out
 
 
-__all__ = ["HEADER", "WIRE_NAMES", "added_to", "merge", "parse", "spelled"]
+__all__ = ["HEADER", "WIRE_NAMES", "added_to", "merge", "not_honoured", "sent", "spelled"]

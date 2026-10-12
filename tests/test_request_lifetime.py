@@ -43,19 +43,13 @@ def test_total_deadline_cancels_owned_work_releases_admission_and_never_replays(
     driver.stream = hanging_stream
     driver.supports_embeddings = True
     install_snapshot(app.state.routing, driver, fallback)
-    # 0.08 s raced the route's own preparation on a slow CI runner; 0.5 s does
-    # not, and the backend still hangs for 30. The same race reached the
-    # batch cases too (2026-10-02, /v1/embeddings on a runner: the deadline
-    # fired before the backend call began, so there was nothing yet to
-    # cancel), so every case gets the budget that leaves preparation out of
-    # it.
-    #
-    # **A stream whose backend never speaks is a stream that never started**
-    # (2026-10-12): its head waits for its first frame, so that it can carry
-    # what the serving backend does not honour, and its answer is the 504 a
-    # request that never started gets. Until then it was a 200 with the
-    # deadline as an error frame; `test_a_deadline_after_the_first_frame...`
-    # below keeps that case, which is still the stream's.
+    # A stream's deadline must fire after its headers are sent, or the answer
+    # is the 504 a stream that never started gets. 0.08 s raced the route's
+    # own preparation on a slow CI runner; 0.5 s does not, and the backend
+    # still hangs for 30. The same race reached the batch cases too
+    # (2026-10-02, /v1/embeddings on a runner: the deadline fired before the
+    # backend call began, so there was nothing yet to cancel), so every case
+    # gets the budget that leaves preparation out of it.
     budget = 0.5
     with TestClient(app) as client:
         original = app.state.config_store.get
@@ -70,57 +64,10 @@ def test_total_deadline_cancels_owned_work_releases_admission_and_never_replays(
         )
         assert time.perf_counter() - before < 2
         assert "total request deadline" in response.text, response.text
-        assert response.status_code == 504
+        assert response.status_code == (200 if extra.get("stream") else 504)
         assert cancelled and not fallback.calls
         assert authority.calls[-1]["action"] == "release"
         assert response.headers["x-request-id"]
-
-
-@pytest.mark.parametrize(
-    "path,extra",
-    [
-        ("/v1/chat/completions", {"stream": True}),
-        ("/v1/messages", {"max_tokens": 10, "stream": True}),
-    ],
-)
-def test_a_deadline_after_the_first_frame_is_an_error_in_the_stream_not_a_status(
-    setup, path, extra
-):
-    """The head went out with the first frame, so a deadline that fires after
-    it can only end the stream the way the client can still read: an error
-    frame in a 200. The other half of the test above."""
-    from eugene_plexus_gateway.driver_client import StreamEvent
-
-    app, authority, driver, fallback, headers, _ = setup
-    authority.allowed = None
-    cancelled = []
-
-    async def speaks_then_hangs(request):
-        yield StreamEvent(text="Hello")
-        try:
-            await asyncio.sleep(30)
-        finally:
-            cancelled.append(True)
-        yield StreamEvent(text="never")
-
-    driver.stream = speaks_then_hangs
-    install_snapshot(app.state.routing, driver, fallback)
-    # The budget has to outlast the route's own preparation and the first
-    # frame, which is what makes this a stream that started: a second, where
-    # the test above takes half of one, and the backend still hangs for 30.
-    with TestClient(app) as client:
-        original = app.state.config_store.get
-        app.state.config_store.get = lambda key: (
-            1.0 if key == "requestTimeoutSeconds" else original(key)
-        )
-        before = time.perf_counter()
-        response = client.post(path, json=body(**extra), headers=headers)
-        assert time.perf_counter() - before < 3
-        assert response.status_code == 200
-        assert "Hello" in response.text
-        assert "total request deadline" in response.text, response.text
-        assert cancelled and not fallback.calls
-        assert authority.calls[-1]["action"] == "release"
 
 
 def test_policy_and_request_id_survive_profile_default_replacement(setup):

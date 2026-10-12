@@ -93,7 +93,7 @@ from ._generated.models import (
 from ._http import internal_client
 from .affinity import HIT, MOVED, NEW, AffinityTable
 from .budget import Conversation, ConversationSizes, PoolLedger, TurnBudget
-from .capabilities import calls_tools
+from .capabilities import calls_tools, chats, said_tools
 from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from .driver_client import (
     CONNECT_TIMEOUT_SECONDS,
@@ -2142,6 +2142,9 @@ class RoutingTable:
             return None
         client = TieredClient(name=resolution.model, tiers=tiers, hooks=self)
         client.affinity = outcome
+        # The first attempt goes to the first backend picked, in the order the
+        # balancer left them: what it does not honour is read from this entry.
+        client.first_model = picked[0].model
         client.budget = self._budget_for(resolution, picked, affinity, outcome)
         if affinity is not None:
             seen = self._sizes.get(resolution.model, affinity)
@@ -2819,13 +2822,22 @@ def _reaches_search(backends: list[_Backend]) -> bool:
     `webSearchOptions` searches itself, and one that calls tools can be
     offered the gateway's own search. **Any** of them is enough, because a
     searched request is routed only to those -- unlike `tools`, where the
-    weakest backend decides. A backend whose driver does not say whether it
-    calls tools is taken to (`calls_tools`); native search stays as it was,
-    which is a model's own listing and nothing assumed.
+    weakest backend decides.
+
+    **A chat backend whose driver does not say whether it calls tools is taken
+    to** (2026-10-12, `docs/design/tools-assumed.md`), so the gateway's own
+    search is offered to a model nobody has measured, and a driver that reports
+    no capabilities at all is not a no. Said first, ahead of the listing's own
+    word, which is what is read for the rest: native search stays a model's own
+    listing and nothing assumed.
     """
+    if any(said_tools(b.model) is None and chats(b.model) for b in backends):
+        return True
     for b in backends:
-        settings = set(b.caps.supportedSettings or []) if b.caps is not None else set()
-        if "webSearchOptions" in settings or calls_tools(b.model):
+        caps = b.caps
+        if caps is None:
+            continue
+        if "webSearchOptions" in set(caps.supportedSettings or []) or caps.toolCalling is True:
             return True
     return False
 

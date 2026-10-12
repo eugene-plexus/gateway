@@ -19,7 +19,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import door_paths
 from ._generated.client_key_models import ClientAdmissionResult
-from .capabilities import calls_tools
+from .capabilities import TOOL_SETTINGS, calls_tools, chats, said_tools, tools_refused
 from .ignored_settings import WIRE_NAMES
 from .metrics import AttemptRow, RequestRow
 
@@ -218,6 +218,39 @@ def local_only() -> bool:
 
 
 async def permitted(resolution: Any, requirements: Any = None) -> Any:
+    """The backends of `resolution` this request may go to, confirmed afresh.
+
+    A request that carries settings or tools is checked against each backend's
+    own listing, read again now rather than trusted from the last refresh. A
+    backend that cannot take what was sent is left out, and when none can, the
+    request is refused saying which setting nobody takes. What a listing owes a
+    request (2026-10-12, `docs/design/tools-assumed.md`):
+
+    - **A model that does not chat is not asked about tools.** A request that
+      carries tools is a chat request's, and a model that names its surfaces and
+      leaves chat out (an embedding, rerank or speech model) is refused by the
+      door, by name, as the wrong one (`_wrong_surface`: "serves embeddings and
+      not chat"). It is kept here for that when nothing in the slot chats, and
+      left out, uncounted, when something does.
+    - **`tools` are assumed**: only a driver's `toolCalling: false` turns a chat
+      backend away, and its list of settings, which may be none at all, does not
+      decide them. When every chat backend turned away was turned away for that,
+      the refusal says so, in the driver's words (`tools_refused`).
+    - **`toolChoice` and `parallelToolCalls`, sent with tools, are admitted for a
+      backend whose driver says nothing of tool calling**: its capabilities are
+      not reported at all, or carry no `toolCalling`. Whatever its
+      `supportedSettings` holds, because a driver that reports nothing is not a
+      no. A backend that does say keeps the rule that its list names the
+      settings it takes.
+    - **Every other setting keeps the existing rule, for every backend**: the
+      listing must name it, and a backend whose capabilities are not reported
+      takes none. Unknown is yes for tools and the settings that ride with them,
+      and nowhere else.
+
+    A backend turned away for its tools does not count toward what "some backend
+    takes", so a refusal for another setting names that setting, not one a
+    backend that cannot serve the request anyway happens to list.
+    """
     context = current.get()
     allowed = context.allowed_models if context else None
     resolution = resolution.restricted(allowed)
@@ -229,15 +262,20 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
     # No prompt accompanies this probe. Reconfirm before wake/selection, then
     # carry localOnly to the driver to close the probe-to-execution race.
     semaphore = asyncio.Semaphore(8)
-    # Every setting some reachable backend confirms, so a refusal can name
-    # the one nobody does rather than "the required settings".
+    # Every setting some backend that can serve this request confirms, so a
+    # refusal can name the one nobody does rather than "the required settings".
     confirmed_anywhere: set[str] = set()
-    # Backends turned away because their driver says it does not call tools:
-    # when that is every one turned away, the refusal says so (2026-10-12).
+    # Backends turned away because their driver says tools cannot be carried to
+    # them: when that is every chat backend turned away, the refusal says so
+    # (2026-10-12), in the driver's words and not as the model failing.
     told_no_tools = 0
+    # Backends left out for not being chat models, which says nothing of tools:
+    # they are not counted among those a tools refusal is about.
+    set_aside = 0
+    something_chats = any(chats(b.model) for b in resolution.backends())
 
     async def confirm(backend: Any) -> Any:
-        nonlocal told_no_tools
+        nonlocal told_no_tools, set_aside
         try:
             model = backend.model.id if backend.model is not None else None
             async with semaphore, asyncio.timeout(4):
@@ -250,9 +288,14 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
             entry = next((m for m in info.models or [] if m.id == model), None)
             if entry is None:
                 return None  # the model left the driver since the last refresh
+            confirmed = replace(backend, info=info.model_copy(update={"models": None}), model=entry)
+            if tools and not chats(entry):
+                if something_chats:
+                    set_aside += 1
+                    return None
+                return confirmed  # the door refuses it by name, and that is the answer
             caps = entry.capabilities
-            if caps is not None:
-                confirmed_anywhere.update(caps.supportedSettings or [])
+            listed = set(caps.supportedSettings or []) if caps is not None else set()
             # Tools are assumed and turned off only on evidence (2026-10-12): a
             # backend whose driver says nothing of tool calling takes them, so
             # its list of settings, which may be none at all, does not decide
@@ -261,12 +304,19 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
             if tools and not carries:
                 told_no_tools += 1
                 return None
+            wanted = settings - {"tools"} if carries else set(settings)
+            taken = set(listed)
             if tools:
-                confirmed_anywhere.add("tools")
-            wanted = settings - {"tools"} if carries else settings
-            if wanted and (caps is None or not wanted.issubset(set(caps.supportedSettings or []))):
+                taken.add("tools")
+                if said_tools(entry) is None:
+                    # Nothing reported: the settings that come with tools are
+                    # not refused for a list the driver may not have written.
+                    wanted -= TOOL_SETTINGS
+                    taken |= settings & TOOL_SETTINGS
+            confirmed_anywhere.update(taken)
+            if wanted and not wanted <= listed:
                 return None
-            return replace(backend, info=info.model_copy(update={"models": None}), model=entry)
+            return confirmed
         except Exception:
             return None
 
@@ -279,13 +329,11 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
     result = replace(resolution, tiers=tiers).restricted(allowed, local_only=local_only())
     if not result.has_backends():
         if not local_only():
-            if tools and turned_away and told_no_tools == turned_away:
+            chat_turned_away = turned_away - set_aside
+            if tools and told_no_tools and told_no_tools == chat_turned_away:
                 raise AdmissionFailure(
                     400,
-                    "Every backend serving this model reports that it does not call tools "
-                    "(capabilities.toolCalling: false), so the request was refused rather than "
-                    "answered without them. GET /v1/models reports "
-                    "x_eugene_plexus.tool_calling per model. Nothing was forwarded or woken.",
+                    tools_refused(resolution.model, told_no_tools),
                     param="tools",
                 )
             missing = sorted(settings - confirmed_anywhere)

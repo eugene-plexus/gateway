@@ -4108,7 +4108,7 @@ class ModelRoutingInfo(BaseModel):
     )
     tool_calling: bool | None = Field(
         None,
-        description='Whether a request for this model may carry `tools`.\n\n**True only when every backend serving it can**, by the same\nreasoning as `context_length` above: a request may land on\nany of them, so the honest answer is the weakest one. A\nharness can read this and pick a model rather than discover\nthe limit as a 400 halfway through a task.\n\nA backend whose driver does not say counts as one that can\n(2026-10-12, `docs/design/tools-assumed.md`): tools are\nassumed, and turned off only on evidence the driver\nreports (`capabilities.toolCalling: false`).\n',
+        description="Whether a request for this model may carry `tools`.\n\n**True only when every backend serving it can**, by the same\nreasoning as `context_length` above: a request may land on\nany of them, so the honest answer is the weakest one. A\nharness can read this and pick a model rather than discover\nthe limit as a 400 halfway through a task.\n\nA chat model's backend whose driver does not say counts as\none that can (2026-10-12, `docs/design/tools-assumed.md`):\ntools are assumed, and turned off only on evidence the\ndriver reports (`capabilities.toolCalling: false`). A model\nthat does not chat (embeddings, rerank, speech) is not one\nthat calls tools, and a request sending it tools is refused\nfor what it is, in the door's words for a model on the wrong\ndoor. The tools that come with a request that carries tools\n(`tool_choice`, `parallel_tool_calls`) are admitted for such a\nbackend whatever its `supportedSettings` says, since a driver\nthat reports nothing is not a no.\n",
     )
     web_search: bool | None = Field(
         None,

@@ -27,7 +27,7 @@ import math
 import struct
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, replace
 from dataclasses import field as dc_field
 from datetime import UTC, datetime
@@ -146,7 +146,7 @@ from .._generated.models import (
 )
 from .._generated.models import Phase as StreamPhase
 from .._generated.models import Stage as StreamStage
-from ..capabilities import calls_tools
+from ..capabilities import calls_tools, tools_refused
 from ..config import ConfigStore
 from ..dependencies import require_authorized
 from ..disconnect import ClientGone, serve_while_connected
@@ -159,7 +159,6 @@ from ..driver_client import (
     capacity_refused,
 )
 from ..images import attachment_kinds, max_images
-from ..late_head import LateHeadStreamingResponse
 from ..lifecycle import LifecycleManager, WakeResult
 from ..metrics import AttemptRow, CandidateRow, MetricsStore, RequestRow, ToolExecutionRow
 from ..routing import Resolution, RoutingTable, collect_attempts, current_attempts, takes
@@ -322,19 +321,6 @@ def _record(
             context.recorded = True
     except Exception:
         log.debug("could not record request metrics", exc_info=True)
-
-
-def _ignored_headers(client: Any, own: Mapping[str, str], door: str) -> dict[str, str]:
-    """`own`, with what the backend that served was sent and does not honour
-    added to its `x-eugene-plexus-ignored-settings`, in `door`'s spelling.
-
-    Read off the client when called: after the answer for a whole response,
-    and after a stream's first frame for a streamed one (`LateHeadStreamingResponse`),
-    because that is when the serving attempt is known. A backend that failed
-    before it served said nothing that counts. The driver's field names, here
-    `toolChoice`, become the caller's (`ignored_settings.spelled`).
-    """
-    return ignored_settings.added_to(own, getattr(client, "ignored_settings", None) or (), door)
 
 
 def _tool_rows(searched: server_tools.SearchingClient | None) -> list[ToolExecutionRow]:
@@ -531,12 +517,14 @@ def _any_backend_carries_tools(resolution: Resolution) -> bool:
     **Only a driver's `toolCalling: false` is a reason to refuse**
     (2026-10-12): a backend that says nothing is taken to call tools
     (`calls_tools`), so a model on an engine nobody has measured is asked,
-    not refused for it.
+    not refused for it. A model that does not chat is not one that calls
+    tools, and is refused as the wrong door before this is asked
+    (`_wrong_surface`).
     """
     return any(calls_tools(b.model) for b in resolution.backends())
 
 
-def _tools_unsupported(model: str) -> _Failure:
+def _tools_unsupported(model: str, backends: int = 1) -> _Failure:
     """400, in OpenAI's envelope so a harness's SDK raises properly.
 
     The alternative -- dropping `tools` and answering -- is the failure
@@ -549,11 +537,7 @@ def _tools_unsupported(model: str) -> _Failure:
     """
     return _Failure(
         code=400,
-        message=(
-            f"Every backend serving {model!r} reports that it does not call tools, so the "
-            "request was refused rather than answered without them. "
-            "GET /v1/models reports x_eugene_plexus.tool_calling per model."
-        ),
+        message=tools_refused(model, backends),
         error_type="invalid_request_error",
         param="tools",
     )
@@ -744,6 +728,13 @@ class _Serving:
     #: The output cap sent to whichever candidate answers, and where it
     #: came from (2026-10-10), read once the client knows who answered.
     output_cap: Callable[[Any], OutputCap | None] = lambda _client: None
+    #: What the backend chosen for the first attempt does not honour, of what
+    #: the caller sent (2026-10-12): its driver's field names, matched by value
+    #: against its listing's `settingsNotHonoured` before anything is sent
+    #: (`ignored_settings.not_honoured`). Each door says it on its own
+    #: `x-eugene-plexus-ignored-settings`, in its own words, on both response
+    #: modes, so a stream's head never waits for the backend to speak.
+    not_honoured: tuple[str, ...] = ()
 
 
 async def _prepare(
@@ -915,7 +906,7 @@ async def _prepare(
     # three backends would otherwise work twice and fail once, which is
     # the worst possible way to learn about it.
     if body.tools and not _any_backend_carries_tools(resolution):
-        return _tools_unsupported(body.model)
+        return _tools_unsupported(body.model, len(resolution.backends()))
 
     # Nothing eligible: first make sure that is still true — the snapshot
     # can be a refresh interval behind the agent about readiness, and the
@@ -1062,8 +1053,12 @@ async def _prepare(
         return caps.get(key, base_cap)
 
     started = time.perf_counter()
+    first = getattr(client, "first_model", None)
     return _Serving(
         output_cap=output_cap,
+        not_honoured=ignored_settings.not_honoured(
+            getattr(getattr(first, "capabilities", None), "settingsNotHonoured", None), generate
+        ),
         search_blocked=search_blocked,
         client=served,
         table=table,
@@ -1122,22 +1117,21 @@ async def create_chat_completion(request: Request) -> Any:
     waited_ms = prepared.waited_ms
     swapped_in = prepared.swapped_in
     store = _store(request)
+    # What the backend chosen for the first attempt does not honour, of what
+    # this caller sent, known before anything is sent (`_Serving.not_honoured`).
+    headers = ignored_settings.added_to({}, prepared.not_honoured, "chat")
 
     if body.stream:
         # The generator runs AFTER this function returns, so its
         # collection scope has to live inside it — a `with` block here
         # would be closed before the first attempt was made. The stream
         # records itself.
-        #
-        # **The head waits for the stream's first frame**, because that is when
-        # the serving backend's own `x-eugene-plexus-ignored-settings` is
-        # known (2026-10-12).
-        return LateHeadStreamingResponse(
+        return StreamingResponse(
             _stream_completion(
                 body, generate, client, table, started, rec=rec, output_cap=prepared.output_cap
             ),
             media_type="text/event-stream",
-            late=lambda: _ignored_headers(client, {}, "chat"),
+            headers=headers,
         )
 
     with collect_attempts() as tries:
@@ -1212,9 +1206,7 @@ async def create_chat_completion(request: Request) -> Any:
             backend_ms=response.latencyMs,
             client=client,
         )
-        return JSONResponse(
-            content=_completion_body(result), headers=_ignored_headers(client, {}, "chat")
-        )
+        return JSONResponse(content=_completion_body(result), headers=headers)
 
 
 # --------------------------------------------------------------------------- #
@@ -1447,17 +1439,20 @@ async def create_anthropic_message(request: Request) -> Any:
     prepared = await _prepare(request, body, surface="chat", instead="/v1/embeddings", search=plan)
     if isinstance(prepared, _Failure):
         return prepared.as_anthropic()
+    # The hints this door dropped come first, then what the backend chosen for
+    # the first attempt does not honour of what the caller sent, in this door's
+    # words (`tool_choice`, `tool_choice.disable_parallel_tool_use`).
+    headers = ignored_settings.added_to(headers, prepared.not_honoured, "messages")
 
     if body.stream:
         # The generator runs AFTER this function returns, so the
         # attempt-collection scope has to live inside it.
-        return LateHeadStreamingResponse(
+        return StreamingResponse(
             _stream_anthropic(
                 body, prepared, model=body.model, display=anthropic.thinking_display(raw)
             ),
             media_type="text/event-stream",
             headers=headers,
-            late=lambda: _ignored_headers(prepared.client, headers, "messages"),
         )
 
     store = _store(request)
@@ -1502,24 +1497,20 @@ async def create_anthropic_message(request: Request) -> Any:
                 transcript=searched.transcript if searched is not None else None,
                 web_searches=_searches_run(prepared.client) or 0,
             ),
-            headers=_ignored_headers(
-                prepared.client,
-                {
-                    **headers,
-                    **anthropic.envelope_headers(
-                        _routing_info(
-                            prepared.client,
-                            prepared.table,
-                            body.model,
-                            prepared.started,
-                            waited_ms=prepared.waited_ms,
-                            swapped_in=prepared.swapped_in,
-                            prompt_truncated=truncated,
-                        )
-                    ),
-                },
-                "messages",
-            ),
+            headers={
+                **headers,
+                **anthropic.envelope_headers(
+                    _routing_info(
+                        prepared.client,
+                        prepared.table,
+                        body.model,
+                        prepared.started,
+                        waited_ms=prepared.waited_ms,
+                        swapped_in=prepared.swapped_in,
+                        prompt_truncated=truncated,
+                    )
+                ),
+            },
         )
 
 
@@ -1616,7 +1607,7 @@ async def _counted(request: Request, body: ChatCompletionRequest) -> _Count:
     if not surfaces and (reported := resolution.reported_surfaces()):
         return _Count(failure=_no_door_yet(body.model, reported, wanted="chat"))
     if body.tools and not _any_backend_carries_tools(resolution):
-        return _Count(failure=_tools_unsupported(body.model))
+        return _Count(failure=_tools_unsupported(body.model, len(resolution.backends())))
     kinds = attachment_kinds(body.messages)
     if "image" in kinds:
         return _Count(
@@ -1673,16 +1664,6 @@ async def _stream_responses(
     drops a stream that is silent for five minutes -- before its first
     event too -- and starts the whole request again, which on a slow
     prefill is a loop that never finishes (record §5).
-
-    **It opens when the backend has first been heard from, or after one
-    keepalive interval, whichever comes first** (2026-10-12), rather than
-    before the backend is asked. The head goes out with the first frame
-    (`LateHeadStreamingResponse`) so that it can carry what the serving
-    backend says it does not honour, and that is known only once its response
-    has opened. A backend that opens inside ten seconds, which every warm
-    local engine does, is named on the head. One still prefilling is not
-    waited for past the first keepalive, because Codex must not sit silent,
-    and what it was sent and does not honour is then not yet known to say.
     """
     translator = responses.StreamTranslator(
         response_id,
@@ -1691,27 +1672,16 @@ async def _stream_responses(
         include_reasoning=translated.include_reasoning,
         namespaces=translated.namespaces,
     )
-    opened = False
-
-    def opening() -> list[str]:
-        nonlocal opened
-        if opened:
-            return []
-        opened = True
-        return translator.start()
-
+    for chunk in translator.start():
+        yield chunk
     with collect_attempts() as tries:
         response: GenerateResponse | None = None
         try:
             async for event in responses.with_keepalive(
                 prepared.client.stream(prepared.generate), responses.KEEPALIVE_SECONDS
             ):
-                fresh = opening()
-                for chunk in fresh:
-                    yield chunk
                 if event is None:
-                    if not fresh:
-                        yield translator.keepalive()
+                    yield translator.keepalive()
                     continue
                 if event.done:
                     # Captured, NOT broken out of -- see `_stream_completion`.
@@ -1740,8 +1710,6 @@ async def _stream_responses(
             log.warning("responses stream for %r failed: %s", body.model, e)
             _record(prepared.rec, body, tries)
             failure = _serve_failure(e, body, store)
-            for chunk in opening():
-                yield chunk
             for chunk in translator.failed(
                 failure.message,
                 code=responses.stream_error_code(failure.code, failure.message, failure.error_type),
@@ -1755,8 +1723,6 @@ async def _stream_responses(
             # by another backend.
             log.warning("driver stream for %r ended without a done event", body.model)
             _record(prepared.rec, body, tries)
-            for chunk in opening():
-                yield chunk
             for chunk in translator.failed(
                 "The backend stopped before it finished. What arrived above is partial.",
                 code="server_error",
@@ -1877,13 +1843,15 @@ async def create_response(request: Request) -> Any:
     elif translated.search is not None:
         translated.run_search()
     response_id = responses.new_id(admission.request_id())
+    # The hints this door dropped come first, then what the backend chosen for
+    # the first attempt does not honour of what the caller sent.
+    headers = ignored_settings.added_to(translated.headers(), prepared.not_honoured, "responses")
 
     if body.stream:
-        return LateHeadStreamingResponse(
+        return StreamingResponse(
             _stream_responses(body, prepared, translated, response_id, store),
             media_type="text/event-stream",
-            headers=translated.headers(),
-            late=lambda: _ignored_headers(prepared.client, translated.headers(), "responses"),
+            headers=headers,
         )
 
     created_at = int(time.time())
@@ -1948,24 +1916,20 @@ async def create_response(request: Request) -> Any:
                 usage=response.usage,
                 incomplete_details=details,
             ),
-            headers=_ignored_headers(
-                prepared.client,
-                {
-                    **translated.headers(),
-                    **anthropic.envelope_headers(
-                        _routing_info(
-                            prepared.client,
-                            prepared.table,
-                            body.model,
-                            prepared.started,
-                            waited_ms=prepared.waited_ms,
-                            swapped_in=prepared.swapped_in,
-                            prompt_truncated=truncated,
-                        )
-                    ),
-                },
-                "responses",
-            ),
+            headers={
+                **headers,
+                **anthropic.envelope_headers(
+                    _routing_info(
+                        prepared.client,
+                        prepared.table,
+                        body.model,
+                        prepared.started,
+                        waited_ms=prepared.waited_ms,
+                        swapped_in=prepared.swapped_in,
+                        prompt_truncated=truncated,
+                    )
+                ),
+            },
         )
 
 

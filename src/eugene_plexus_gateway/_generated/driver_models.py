@@ -2160,6 +2160,19 @@ class RerankedPassage(BaseModel):
     rawScore: float = Field(..., description="The backend's own number, unchanged.")
 
 
+class SettingNotHonoured(BaseModel):
+    """
+    One request field, in this contract's spelling, and the values of
+    it the backend is sent and does not honour. For `toolChoice` the
+    values are its modes: `auto`, `none`, `required`, and `function`
+    for a named function. A boolean setting lists `true` or `false`.
+
+    """
+
+    setting: str = Field(..., min_length=1)
+    values: list[str | bool] = Field(..., min_length=1)
+
+
 class RerankScale(StrEnum):
     """
     What a backend's rerank scores are. `probability`: already 0 to 1
@@ -3511,6 +3524,10 @@ class Capabilities(BaseModel):
         None,
         description='Explicit callerSettings this active adapter can carry without\ndropping them. This does not promise the provider accepts every\npossible value. Absent means unknown; ineligible for requests\nrequiring explicit settings. The driver still validates before\nexecution, including after a configuration change.\n',
     )
+    settingsNotHonoured: list[SettingNotHonoured] | None = Field(
+        None,
+        description="Settings this backend is sent and is measured not to honour,\nby value (2026-10-12, `docs/design/tools-assumed.md`). A\nmeasured gap is named, not refused, so these are in\n`supportedSettings` too. Static per backend, so the gateway\nnames them on its own `x-eugene-plexus-ignored-settings`\nbefore a stream opens, without waiting for this driver's\nper-request header. Absent or empty: everything carried is\nhonoured. Strata lists `toolChoice` with `required` and\n`function` (it honours `auto`; `none` this driver honours by\nsending no tools) and `parallelToolCalls` with `false`.\n",
+    )
     streaming: bool | None = Field(
         None, description='Whether `/v1/generate/stream` emits true incremental tokens.'
     )
@@ -3540,7 +3557,7 @@ class Capabilities(BaseModel):
     )
     toolCalling: bool | None = Field(
         None,
-        description='Whether this driver can carry `tools` to its backend and\nreport `toolCalls` back.\n\nThe gateway reads it to answer a question a harness\ncannot otherwise ask: a plain answer where a tool call\nwas expected looks identical whether the model declined\nor the backend never saw the tools. A driver that says\n`false` here is failed at the front door with a reason\ninstead.\n\n**True unless there is evidence** (Troy, 2026-10-12;\n`docs/design/tools-assumed.md`): a chat model on any engine\nis taken to use tools. `false` only when the backend refused\na request for its tools, in its own words (kept for the\nengine\'s life; llama-server\'s "tools param requires --jinja\nflag", Ollama\'s "does not support tools"), when a provider\'s\nown listing says so, or when this driver has no way to carry\ntools to the engine (a CLI subscription). Never because a\nconfiguration is untested: until 2026-10-12 Strata was\nreported `false` for that reason alone, and measured, it\ncalls tools correctly.\n',
+        description='Whether this driver can carry `tools` to its backend and\nreport `toolCalls` back.\n\nThe gateway reads it to answer a question a harness\ncannot otherwise ask: a plain answer where a tool call\nwas expected looks identical whether the model declined\nor the backend never saw the tools. A driver that says\n`false` here is failed at the front door with a reason\ninstead.\n\n**True unless there is evidence** (Troy, 2026-10-12;\n`docs/design/tools-assumed.md`): a chat model on any engine\nis taken to use tools. `false` only when:\n* the backend refused a request for its tools, in its own\n  words. The words matched are measured ones only:\n  llama-server\'s "tools param requires --jinja flag" (a 500\n  from a `--no-jinja` engine, b10948). While `false` for that,\n  the driver asks the backend again every 10 minutes with the\n  smallest request carrying a tool, and an answer clears it,\n  so a backend fixed in place gets its tools back without the\n  driver restarting;\n* a provider\'s own listing says so (a listing that says\n  nothing is not a no);\n* this driver has no way to carry tools to the engine (a CLI\n  subscription), which is this driver\'s limit, not the\n  model\'s.\n\nNever because a configuration is untested: until 2026-10-12\nStrata was reported `false` for that reason alone, and\nmeasured, it calls tools correctly.\n',
     )
     maxContextTokens: int | None = Field(
         None,
