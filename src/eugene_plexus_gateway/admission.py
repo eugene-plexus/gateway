@@ -9,7 +9,7 @@ import time
 import uuid
 from collections.abc import Sequence
 from contextvars import ContextVar
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -21,16 +21,28 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from . import door_paths
 from ._generated.client_key_models import ClientAdmissionResult
 from .capabilities import TOOL_SETTINGS, calls_tools, chats, said_tools, tools_refused
+from .driver_client import CREDENTIAL_REFUSED_NEXT_STEP
 from .ignored_settings import WIRE_NAMES
+from .ignored_settings import carried as carried_words
 from .metrics import AttemptRow, RequestRow
 
 
 class AdmissionFailure(Exception):
     def __init__(
-        self, status: int, message: str, retry: str | None = None, param: str | None = None
+        self,
+        status: int,
+        message: str,
+        retry: str | None = None,
+        param: str | None = None,
+        kind: str | None = None,
     ):
         self.status, self.message, self.retry = status, message, retry
         self.param = param
+        #: The error `type` the caller reads, when it is not the one the status says
+        #: (a driver's refusal of the gateway's credential is `upstream_auth_error`, as
+        #: the front door's own 502 for it is). Not on the Anthropic doors, whose error
+        #: types are a closed set.
+        self.kind = kind
         super().__init__(message)
 
 
@@ -221,6 +233,44 @@ def local_only() -> bool:
 #: How long one backend's listing is given to answer the re-check in `permitted`.
 CONFIRM_TIMEOUT_SECONDS = 4.0
 
+#: How many characters of one driver's cause a refusal keeps.
+MAX_CAUSE_CHARS = 240
+
+#: What to look at when a driver does not answer GET /v1/info as an inference driver
+#: does (a 404, any other 4xx, a body that is not a listing). Observed, not guessed:
+#: the address is where the agent said the driver is.
+NOT_A_DRIVER_NEXT_STEP = (
+    "Check that the address above is an inference driver of this install, at a version "
+    "this gateway reads."
+)
+
+#: Statuses of a 4xx that are the driver asking to be asked again.
+_RETRYABLE_4XX = frozenset({408, 429})
+
+#: Transport failures that a restart or a dropped connection leaves: a deadline, a
+#: refused or reset connection, a driver that hung up. A proxy or a protocol that
+#: cannot be spoken is the install's, and a retry does not change it.
+_TRANSIENT_TRANSPORT = (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)
+
+
+@dataclass(frozen=True)
+class Unconfirmed:
+    """One driver whose listing could not confirm a request, and what was observed.
+
+    `text` names the driver and the cause in plain words. `transient` is whether
+    waiting could change it: a deadline, a connection that was refused or dropped,
+    a 5xx, a driver whose engine has not loaded yet. A driver that refuses the
+    gateway's own credential, does not answer GET /v1/info as an inference driver
+    does or answers it with something that is not a listing is not changed by a
+    retry, and `remedy` says what to look at: **only such a cause has one**. `kind`
+    is the error type a refusal made only of such causes carries.
+    """
+
+    text: str
+    transient: bool = True
+    remedy: str | None = None
+    kind: str = "upstream_error"
+
 
 def _who(backend: Any) -> str:
     """The driver a candidate is, as a person can find it: its name, the node when
@@ -229,27 +279,87 @@ def _who(backend: Any) -> str:
     return f"driver {backend.name!r}{node} ({backend.url})"
 
 
-def unread_because(backend: Any, exc: Exception) -> str:
-    """What was observed when `backend`'s `/v1/info` could not be read, in words.
+def _plain(text: str, limit: int = MAX_CAUSE_CHARS) -> str:
+    """`text` on one line and at most `limit` characters, cut at a word boundary
+    and ended with an ellipsis when it was cut.
+
+    A malformed listing's validation error is many lines, and a long answer from a
+    driver would otherwise bury the rest of the refusal. A cut never splits a
+    word (unless one word is the whole of it).
+    """
+    flat = " ".join(text.split())
+    if len(flat) <= limit:
+        return flat
+    room = limit - len("...")
+    cut = flat[:room]
+    if flat[room] != " ":
+        # The cut falls inside a word: keep the words before it.
+        cut = cut.rpartition(" ")[0] or cut
+    return cut.rstrip() + "..."
+
+
+def _changed(backend: Any, what: str) -> Unconfirmed:
+    """A driver that answered, but not as it did at the last refresh: a state a
+    retry may find changed again (its engine was loading, it was reconfigured)."""
+    return Unconfirmed(f"{_who(backend)}: {_plain(what)}")
+
+
+def unread_because(backend: Any, exc: Exception) -> Unconfirmed:
+    """What was observed when `backend`'s `/v1/info` could not be read, in words,
+    and whether a retry could change it.
 
     The driver and the cause, never empty: our own deadline as such, and every
     other failure as the routing table words an unreachable driver
     (`routing.unreachable_reason`: nothing listening, a firewall dropping the
-    connection, an answer that was not a 2xx). Whitespace is collapsed and the
-    length kept, because a malformed listing's validation error is many lines.
+    connection, an answer that was not a 2xx), classed by what it is.
+
+    - **Transient**: a deadline, a connection refused, reset or timed out, a 5xx,
+      a 408 or 429.
+    - **A driver refusing the gateway's credential (401, 403)**: the install's
+      fault and not the request's, and a retry does not mend it.
+    - **A driver that is not answering as one** (a 404 or any other 4xx, a body that
+      is not JSON or not a listing): the address is not an inference driver this
+      gateway can read.
+    - **Anything else** is not claimed to be transient: said as what it is.
+
+    Whitespace is collapsed and the length kept (`_plain`), because a malformed
+    listing's validation error is many lines.
     """
     from .routing import unreachable_reason
 
+    who = _who(backend)
     if isinstance(exc, TimeoutError):
-        cause = f"no answer to GET /v1/info within {CONFIRM_TIMEOUT_SECONDS:g} s"
-    else:
-        cause = unreachable_reason(exc, url=backend.url, timeout=CONFIRM_TIMEOUT_SECONDS)
-    return f"{_who(backend)}: {' '.join(cause.split())[:240]}"
+        return Unconfirmed(f"{who}: no answer to GET /v1/info within {CONFIRM_TIMEOUT_SECONDS:g} s")
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        answered = unreachable_reason(exc, url=backend.url, timeout=CONFIRM_TIMEOUT_SECONDS)
+        if status in (401, 403):
+            cause = f"refused the gateway's credential ({answered})"
+            return Unconfirmed(
+                f"{who}: {_plain(cause)}",
+                transient=False,
+                remedy=CREDENTIAL_REFUSED_NEXT_STEP,
+                kind="upstream_auth_error",
+            )
+        if status >= 500 or status in _RETRYABLE_4XX:
+            return Unconfirmed(f"{who}: {_plain(answered)}")
+        cause = f"does not serve GET /v1/info ({answered})"
+        return Unconfirmed(
+            f"{who}: {_plain(cause)}", transient=False, remedy=NOT_A_DRIVER_NEXT_STEP
+        )
+    if isinstance(exc, ValueError):
+        # An answer that was not JSON, or JSON that was not a driver's listing.
+        cause = f"answered GET /v1/info with something that is not a driver listing ({exc})"
+        return Unconfirmed(
+            f"{who}: {_plain(cause)}", transient=False, remedy=NOT_A_DRIVER_NEXT_STEP
+        )
+    cause = unreachable_reason(exc, url=backend.url, timeout=CONFIRM_TIMEOUT_SECONDS)
+    return Unconfirmed(f"{who}: {_plain(cause)}", transient=isinstance(exc, _TRANSIENT_TRANSPORT))
 
 
-def unconfirmed_refusal(model: str, carried: Sequence[str], observed: Sequence[str]) -> str:
+def unconfirmed_refusal(model: str, carried: Sequence[str], observed: Sequence[Unconfirmed]) -> str:
     """The refusal of a request none of whose backends could be checked against its
-    listing: a 503 that says what was observed, not a 400 that blames the request.
+    listing, saying what was observed and not blaming the request.
 
     **The request is not what failed.** A driver that does not answer (a timeout,
     a restart) was left out without a word, and when it was the only one that could
@@ -257,11 +367,37 @@ def unconfirmed_refusal(model: str, carried: Sequence[str], observed: Sequence[s
     it", a 400 that a client such as Codex does not retry, for what the next try
     would have got through. One sentence for every way a backend could not be
     confirmed, so the causes are worded in one place.
+
+    "Try again in a few seconds" is said only when some cause can pass: for a
+    driver that refuses the gateway's credential, or is not an inference driver,
+    waiting changes nothing and the sentence says what to look at instead.
     """
+    causes = "; ".join(o.text for o in observed)
+    retry = ": try again in a few seconds." if any(o.transient for o in observed) else "."
+    # Once each, however many drivers say the same: only a cause waiting cannot clear has one.
+    remedies = dict.fromkeys(o.remedy for o in observed if o.remedy)
     return (
         f"Could not confirm that a backend serving {model!r} takes what this request "
-        f"carries ({', '.join(carried)}): {'; '.join(observed)}. This is not a refusal of "
-        "the request: try again in a few seconds. Nothing was forwarded or woken."
+        f"carries ({', '.join(carried)}): {causes}. This is not a refusal of the request{retry}"
+        + "".join(f" {remedy}" for remedy in remedies)
+        + " Nothing was forwarded or woken."
+    )
+
+
+def unconfirmed_failure(
+    model: str, carried: Sequence[str], observed: Sequence[Unconfirmed]
+) -> AdmissionFailure:
+    """The failure for `unconfirmed_refusal`: a 503 with a `Retry-After` when waiting
+    could clear any of the causes, and otherwise a 502 with no retry advice and no
+    `Retry-After`, the treatment the front door gives a driver that refuses its
+    credential (`_driver_failure_status`): the request was fine and the install is not.
+    """
+    message = unconfirmed_refusal(model, carried, observed)
+    if any(o.transient for o in observed):
+        return AdmissionFailure(503, message, "5")
+    refused = any(o.kind == "upstream_auth_error" for o in observed)
+    return AdmissionFailure(
+        502, message, kind="upstream_auth_error" if refused else "upstream_error"
     )
 
 
@@ -290,6 +426,12 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
       `supportedSettings` holds, because a driver that reports nothing is not a
       no. A backend that does say keeps the rule that its list names the
       settings it takes.
+    - **A request that carries no tools is not refused for `toolChoice` or
+      `parallelToolCalls` by a backend whose tool calling is off** (its driver's
+      listing says so, or it learned so from its backend). Without tools those
+      settings say nothing, and the driver drops them with a warning, as it does
+      for a listed no-tools model. A request that does carry tools is turned away
+      by that backend, above.
     - **Every other setting keeps the existing rule, for every backend**: the
       listing must name it, and a backend whose capabilities are not reported
       takes none. Unknown is yes for tools and the settings that ride with them,
@@ -300,14 +442,17 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
     backend that cannot serve the request anyway happens to list.
 
     **A backend that could not be confirmed is not a backend that refused.** Its
-    listing may not be readable (a timeout, a driver restarting), or may answer
-    differently from the table (the model is gone from it, or it follows another
-    runtime): it is left out like any other, but when nothing is left, **no
-    refusal blames the request for what the listing did not say** ("takes tools,
-    remove it" is a 400, which a client such as Codex does not retry, for a
-    state the next try may not meet). It is a retryable 503 that names each
-    driver and what was observed (`unconfirmed_refusal`). Not for a key that
-    requires local-only inference, whose refusal is the policy's and stays 403.
+    listing may not be readable (a timeout, a driver restarting, a driver that
+    refuses the gateway's credential or is not an inference driver), or may
+    answer differently from the table (the model is gone from it, or it follows
+    another runtime): it is left out like any other, but when nothing is left,
+    **no refusal blames the request for what the listing did not say** ("takes
+    tools, remove it" is a 400, which a client such as Codex does not retry, for a
+    state the next try may not meet). It names each driver and what was observed
+    (`unconfirmed_refusal`), as a retryable 503 when waiting could clear any of the
+    causes, and as a 502 with no retry advice when none can (`unconfirmed_failure`).
+    For a key that requires local-only inference the refusal is the policy's and
+    stays a 403, with the causes appended.
     """
     context = current.get()
     allowed = context.allowed_models if context else None
@@ -334,7 +479,7 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
     # Drivers whose listing could not confirm the request, by `(node, name)`: what
     # was observed, in words. Such a backend is left out, but its silence is not
     # its answer, so when nothing is left the refusal says so (`unconfirmed_refusal`).
-    unconfirmed: dict[tuple[str | None, str], str] = {}
+    unconfirmed: dict[tuple[str | None, str], Unconfirmed] = {}
 
     async def confirm(backend: Any) -> Any:
         nonlocal told_no_tools, set_aside
@@ -356,17 +501,21 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
                 was = f"runtime {backend.info.runtime!r}" if backend.info.runtime else "no runtime"
                 unconfirmed.setdefault(
                     driver,
-                    f"{_who(backend)}: it now follows {now}, not {was} as at the last refresh",
+                    _changed(backend, f"it now follows {now}, not {was} as at the last refresh"),
                 )
                 return None
             entry = next((m for m in info.models or [] if m.id == model), None)
             if entry is None:
                 # The model left the driver since the last refresh.
-                unconfirmed.setdefault(
-                    driver,
-                    f"{_who(backend)}: it answered GET /v1/info without {model!r}, which it "
-                    "listed at the last refresh",
+                gone = (
+                    f"it answered GET /v1/info without {model!r}, which it listed at the "
+                    "last refresh"
                 )
+                if info.degraded:
+                    # A driver that could not build its engine says why, in its own
+                    # words, and "the model is gone" is only half of that.
+                    gone += f"; the driver says it serves nothing: {info.degraded}"
+                unconfirmed.setdefault(driver, _changed(backend, gone))
                 return None
             confirmed = replace(backend, info=info.model_copy(update={"models": None}), model=entry)
             if tools and not chats(entry):
@@ -393,6 +542,14 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
                     # not refused for a list the driver may not have written.
                     wanted -= TOOL_SETTINGS
                     taken |= settings & TOOL_SETTINGS
+            elif not carries:
+                # A model whose tool calling is off (listed, or learned from its
+                # backend) and a request that carries no tools: `tool_choice` and
+                # `parallel_tool_calls` say nothing, so they are not refused for a
+                # list that omits them. The driver drops them with a warning. Taken
+                # as admitted, so a refusal for another setting does not name them.
+                wanted -= TOOL_SETTINGS
+                taken |= settings & TOOL_SETTINGS
             confirmed_anywhere.update(taken)
             if wanted and not wanted <= listed:
                 return None
@@ -410,13 +567,12 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
     if not result.has_backends():
         if not local_only():
             if unconfirmed:
-                carried = (["tools"] if tools else []) + sorted(
-                    WIRE_NAMES.get(m, m) for m in settings - {"tools"}
-                )
-                raise AdmissionFailure(
-                    503,
-                    unconfirmed_refusal(resolution.model, carried, list(unconfirmed.values())),
-                    "5",
+                # What the caller sent: every setting it named, `tools` too when it
+                # sent the key (an empty list is still something it said).
+                raise unconfirmed_failure(
+                    resolution.model,
+                    carried_words(settings | ({"tools"} if tools else set())),
+                    list(unconfirmed.values()),
                 )
             chat_turned_away = turned_away - set_aside
             if tools and told_no_tools and told_no_tools == chat_turned_away:
@@ -443,10 +599,19 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
                 "together (tool_calling / supportedSettings). Nothing was forwarded or woken.",
                 param="tools" if tools else None,
             )
+        # The policy's refusal, so its status; a driver that could not be read is
+        # not why a key may not use it, but it is why nothing could confirm local
+        # execution, so what was observed is said after it.
+        unread = (
+            f" Could not confirm: {'; '.join(o.text for o in unconfirmed.values())}."
+            if unconfirmed
+            else ""
+        )
         raise AdmissionFailure(
             403,
             "This key requires local-only inference, but no permitted backend "
-            "confirms local execution and policy enforcement. Nothing was forwarded or woken.",
+            f"confirms local execution and policy enforcement.{unread} "
+            "Nothing was forwarded or woken.",
         )
     return result
 
@@ -486,6 +651,11 @@ CLIENT_ADMISSION_PATHS = frozenset(
         "/v1/systemone",
         # Slice 4, 2026-09-23: Codex CLI's only door.
         "/v1/responses",
+        # Its count: a check and not an admission, as `count_tokens` is -- see the
+        # route. It went without a row for a while, so a key's scope, its local-only
+        # rule and its attribution applied to nothing here, and a refusal admission
+        # raised was an unhandled exception (a 500).
+        "/v1/responses/input_tokens",
         # P3a, 2026-09-28. Shipped without this row for one commit, and a
         # scoped key could speak through any model it was not allowed:
         # the rule above, broken exactly as it describes.
@@ -567,6 +737,8 @@ class ClientAdmissionMiddleware:
                 if exc.status == 400
                 else "api_error"
             )
+            if exc.kind is not None and not anthropic:
+                kind = exc.kind
             error: dict[str, Any] = {"error": {"type": kind, "message": exc.message}}
             if exc.param is not None:
                 error["error"]["param"] = exc.param

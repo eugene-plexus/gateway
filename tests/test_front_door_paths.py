@@ -11,6 +11,7 @@ the per-door test was written after the fact. This one reads the routes.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Iterator
 
 from fastapi.routing import APIRoute
@@ -31,6 +32,15 @@ def _routes(routes: list) -> Iterator[APIRoute]:
             yield from _routes(route.original_router.routes)
 
 
+def _handler_source(route: APIRoute) -> str:
+    """The text of a route's handler, or nothing when it has none to read (a callable
+    object, a builtin): such a handler does not call the credential checks by name."""
+    try:
+        return inspect.getsource(route.endpoint)
+    except (OSError, TypeError):
+        return ""
+
+
 def _client_key_routes(settings: Settings) -> list[APIRoute]:
     app = create_app(settings=settings)
     found = [
@@ -49,6 +59,35 @@ def test_every_route_taking_a_client_key_is_under_client_admission(settings: Set
         r.path for r in _client_key_routes(settings) if r.path not in CLIENT_ADMISSION_PATHS
     )
     assert not missing, f"accepts a client key with no client admission: {missing}"
+
+
+def test_every_door_that_authorizes_in_its_own_body_is_under_client_admission(
+    settings: Settings,
+) -> None:
+    """The walk above sees a route that declares `require_authorized`. The Anthropic and
+    Responses doors check the credential in their own bodies (their refusals are not
+    FastAPI's envelope), so it cannot see them, and `/v1/responses/input_tokens` was
+    added beside them with no row: a key that may not use a model was counted on it,
+    and a refusal admission raised was an unhandled exception. Read from what each
+    route's handler calls."""
+    app = create_app(settings=settings)
+    in_body = [
+        r
+        for r in _routes(app.routes)
+        if any(
+            call in _handler_source(r) for call in ("anthropic.authorize(", "responses.authorize(")
+        )
+    ]
+    # The walk itself must find the doors it exists for, or every assertion below
+    # holds of nothing.
+    assert {
+        "/v1/messages",
+        "/v1/messages/count_tokens",
+        "/v1/responses",
+        "/v1/responses/input_tokens",
+    } <= {r.path for r in in_body}
+    missing = sorted(r.path for r in in_body if r.path not in CLIENT_ADMISSION_PATHS)
+    assert not missing, f"checks a client key in its own body, with no client admission: {missing}"
 
 
 def test_every_body_taking_route_with_a_client_key_is_bounded(settings: Settings) -> None:

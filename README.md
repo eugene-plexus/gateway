@@ -76,10 +76,12 @@ The status codes distinguish the cases that differ operationally, because "it di
 | ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
 | 404  | Nothing serves the requested model at all                                                                                                                 | No — fix the topology |
 | 400  | A backend rejected the request (4xx). Does **not** cascade: the next backend would reject it identically, and cascading past it would bury the real error | No — fix the request  |
-| 503  | A driver serves the model but isn't ready (usually an engine still loading its weights), or its listing could not be read to confirm it takes the request | Yes                   |
-| 502  | The cascade ran and every eligible backend failed                                                                                                         | Maybe                 |
+| 503  | A driver serves the model but isn't ready (usually an engine still loading its weights), or its listing could not be read to confirm it takes the request, for a reason waiting can clear (a timeout, a refused connection, a 5xx) | Yes                   |
+| 502  | The cascade ran and every eligible backend failed; or a driver's listing could not be read and waiting does not change it (the driver refuses the gateway's credential, or is not an inference driver), named by what was observed | Maybe — not for a refused credential |
 
 Transport errors, timeouts and 5xx cascade to the next backend; 4xx fails hard.
+
+`POST /v1/messages/count_tokens` and `POST /v1/responses/input_tokens` are a key check and never an admission, and a count the gateway cannot give is a **400** with the cause, never a 5xx: Claude Code's `/context` retries a 5xx before it counts by sending the request.
 
 ## Safe mode
 

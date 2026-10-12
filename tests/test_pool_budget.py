@@ -11,6 +11,7 @@ turns from 44 to 0 (`specs/docs/acceptance/cache-aware-balancing-measurement.md`
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -293,3 +294,145 @@ async def test_first_counts_only_the_replica_a_conversation_holds_as_admit_does(
     new = table.pick(table.resolve(LOCAL), affinity="k:another")
     chosen = new.budget.first(_turn(), _front_tier(new))
     assert chosen is not None and chosen.name != turn.served_by, "a new one may go to the other"
+
+
+# --- the read looks where the walk does ------------------------------------------
+#
+# `model_asked_first` is a copy of what `_admit` and `Executor.attempts` do, so each
+# thing it copies has a test that fails when the copy is wrong: which tier it reads,
+# that it reads only the front one, that it changes nothing, and how it sizes a turn.
+
+SLOT = "slotty"
+
+
+def _slot_table(front: str, *, wait: float = 0.05):  # type: ignore[no-untyped-def]
+    """A slot of two targets: the first is `front`, and the second is the two pooled
+    replicas. `asleep`: its runtime is stopped, so its tier is empty (an empty tier
+    stays in the list). `cooling`: it is eligible, and a test opens its circuit."""
+    ahead = FakeDriverClient(
+        name="ahead-driver",
+        base_url="http://z",
+        model_id="ahead-model",
+        runtime="rt-ahead" if front == "asleep" else None,
+    )
+    a = FakeDriverClient(
+        name="llama-a-driver", base_url="http://a", model_id=LOCAL, runtime="llama-a"
+    )
+    b = FakeDriverClient(
+        name="llama-b-driver", base_url="http://b", model_id=LOCAL, runtime="llama-b"
+    )
+    for fake in (a, b):
+        fake.usage = Usage(promptTokens=40, completionTokens=4, totalTokens=44)
+    runtimes = [
+        *([runtime_facts("rt-ahead", status="stopped")] if front == "asleep" else []),
+        runtime_facts("llama-a", parallel_slots=4, context_pool=POOL),
+        runtime_facts("llama-b", parallel_slots=4, context_pool=POOL),
+    ]
+    table = make_routing_table(
+        ahead,
+        a,
+        b,
+        runtimes=runtimes,
+        strategy="conversation",
+        slots=[{"model": SLOT, "targets": ["ahead-model", LOCAL]}],
+        room_wait_seconds=wait,
+    )
+    return table, {fake.name: fake for fake in (ahead, a, b)}
+
+
+def _pool(candidate):  # type: ignore[no-untyped-def]
+    """The ledger key of the runtime a replica of `_table` sits on."""
+    return A if candidate.name == "llama-a-driver" else B
+
+
+async def test_an_empty_first_tier_is_passed_over_by_the_read_and_by_admit_alike():
+    """A slot whose first target is asleep has an empty first tier, and the first tier
+    that holds anything is the second: the read must look there, for the replica with
+    room, and `_admit` must put that one in front and reserve its room. A `_front`
+    that always said tier 0 would read an empty tier (and name the tier's usual
+    first) and have `_admit` order and reserve nothing."""
+    table, _fakes = _slot_table("asleep")
+    client = table.pick(table.resolve(SLOT), affinity="k:new")
+    assert client._tiers[0] == [] and len(client._tiers[1]) == 2, "the slot's first tier is empty"
+    assert client._front() == 1
+    usual_first, roomy = client._tiers[1]
+    table._ledger.take(_pool(usual_first), 9_000)
+
+    named = client.model_asked_first(_turn())
+    assert named is client.entries[roomy], "the replica with room, in the second tier"
+
+    await client._admit(_turn())
+    assert client._tiers[1][0] is roomy and client._tiers[0] == []
+    assert table._ledger.in_flight(_pool(roomy)) == client.budget.tokens > 0
+    client.budget.close()
+
+
+async def test_the_budget_is_read_for_the_front_tier_and_no_other():
+    """`_admit` orders the front tier and leaves the others in the balancer's order,
+    so when the front tier's only backend is cooling the walk goes to the next tier's
+    usual first, whoever has room there. A read that looked at room in every tier
+    would name the replica `_admit` never moves up. Checked against the real attempt."""
+    table, fakes = _slot_table("cooling")
+    client = table.pick(table.resolve(SLOT), affinity="k:new")
+    (ahead,) = client._tiers[0]
+    ahead.circuit.failures, ahead.circuit.until = 1, time.perf_counter() + 60
+    usual_first, roomy = client._tiers[1]
+    table._ledger.take(_pool(usual_first), 9_000)
+
+    named = client.model_asked_first(_turn())
+    assert named is client.entries[usual_first], "the second tier is in its usual order"
+
+    await client.generate(_turn())
+    assert fakes[usual_first.name].calls and not fakes[roomy.name].calls, "and the attempt agrees"
+
+
+def test_reading_who_is_asked_first_leaves_the_tiers_as_they_were():
+    """A read reorders a copy: the client's own tiers are what `Executor.attempts`
+    walks next, so a read that moved the replica with room up in them would have
+    changed the order the attempt goes in."""
+    table, _a, _b = _table(wait=0.05)
+    client = table.pick(table.resolve(LOCAL), affinity="k:new")
+    usual_first, roomy = client._tiers[0]
+    table._ledger.take(_pool(usual_first), 9_000)
+    before = [list(tier) for tier in client._tiers]
+
+    named = client.model_asked_first(_turn())
+    assert named is client.entries[roomy], "the read moved the replica with room up"
+    assert client._tiers == before and client._tiers[0] == [usual_first, roomy]
+
+
+async def test_first_sizes_a_turn_with_its_max_tokens_as_admit_does():
+    """A small prompt with a big `max_tokens` is a turn that does not fit beside what
+    is already in the pool, and the same prompt with a small one does: the size that
+    decides who has room includes the answer the turn may write (Claude Code sends
+    32,000). A `first` that sized the prompt alone would name the full replica."""
+    table, _a, _b = _table(wait=0.05)
+    client = table.pick(table.resolve(LOCAL), affinity="k:new")
+    tier = _front_tier(client)
+    usual_first, other = tier
+    table._ledger.take(_pool(usual_first), 5_000)
+    small, large = _turn(max_tokens=1_000), _turn(max_tokens=6_000)
+
+    assert client.budget.first(small, tier) is usual_first, "its answer fits beside what is there"
+    assert client.budget.first(large, tier) is other, "its answer does not: max_tokens decides"
+    ordered = await client.budget.admit(large, tier)
+    assert ordered[0] is other, "and admit says the same"
+    client.budget.close()
+
+
+async def test_admit_keeps_how_big_the_turn_was_for_the_conversations_next_estimate():
+    """The size a turn is estimated from next time is the characters the engine was
+    given and the tokens it counted, so a turn's characters are kept when it is
+    admitted and again when it is served."""
+    table, _a, _b = _table(wait=0.05)
+    client = table.pick(table.resolve(LOCAL), affinity="k:size")
+    turn = _turn("fix the bug and then the test")
+    await client.budget.admit(turn, _front_tier(client))
+    assert client.budget.chars == request_chars(turn) > 0
+    client.budget.close()
+
+    served = _turn("and what about the docs")
+    await table.pick(table.resolve(LOCAL), affinity="k:served").generate(served)
+    seen = table._sizes.get(LOCAL, "k:served")
+    assert seen is not None and seen.prompt_tokens == 40
+    assert seen.chars == request_chars(served) > 0

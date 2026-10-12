@@ -60,6 +60,7 @@ from .._generated.driver_models import AudioOutputFormat as DriverAudioOutputFor
 from .._generated.driver_models import (
     AudioOutputRequest,
     CompletionPrompt,
+    DriverModel,
     EmbedRequest,
     GenerateRequest,
     GenerateResponse,
@@ -151,6 +152,7 @@ from ..config import ConfigStore
 from ..dependencies import require_authorized
 from ..disconnect import ClientGone, serve_while_connected
 from ..driver_client import (
+    CREDENTIAL_REFUSED_NEXT_STEP,
     DriverClient,
     DriverError,
     RepetitionStopped,
@@ -732,11 +734,44 @@ class _Serving:
     #: caller sent (2026-10-12): its driver's field names, matched by value
     #: against its listing's `settingsNotHonoured` before anything is sent
     #: (`ignored_settings.not_honoured`). Each door says it on its own
-    #: `x-eugene-plexus-ignored-settings`, in its own words, on both response
-    #: modes, so a stream's head never waits for the backend to speak. **Fixed
-    #: when the head is built**: a failover after it cannot change it
-    #: (`TieredClient.model_asked_first`).
+    #: `x-eugene-plexus-ignored-settings`, in its own words, so a stream's head
+    #: never waits for the backend to speak. **Fixed when the head is built**:
+    #: a failover after it cannot change it (`TieredClient.model_asked_first`).
+    #: **That is a stream's header, and only a stream's**: a whole answer has no
+    #: head to send early, so it is named after the call from the backend that
+    #: served it (`not_honoured_by_answer`).
     not_honoured: tuple[str, ...] = ()
+
+    def not_honoured_by_answer(self) -> tuple[str, ...]:
+        """What the backend that ANSWERED does not honour, of what the caller sent.
+
+        **For a whole answer**, built after the call. The first attempt's read
+        (`not_honoured`) is what a stream's head must say, being on the wire before
+        any backend has been asked; a whole answer's header can wait for the call,
+        and a failover in it moves the answer to another backend, whose listing
+        is the one that says what was ignored: Strata answering after a backend
+        that honours `required` failed was named from the failed backend's
+        listing, and said nothing. Read from the candidate that served it
+        (`TieredClient.served_candidate`, which the search loop's wrapper passes
+        on), by the entry it was picked as (`entries`). A candidate with no entry
+        has no listing, so nothing is named; the first attempt's names are used
+        only when nobody is known to have answered.
+        """
+        answered = getattr(self.client, "served_candidate", None)
+        if answered is None:
+            return self.not_honoured
+        return _not_honoured_by(getattr(self.client, "entries", {}).get(answered), self.generate)
+
+
+def _not_honoured_by(entry: DriverModel | None, generate: GenerateRequest) -> tuple[str, ...]:
+    """What `generate` carries and the backend listed as `entry` does not honour.
+
+    The driver's own field names (`ignored_settings.not_honoured`): nothing for an
+    entry that is missing, has no capabilities or lists nothing.
+    """
+    return ignored_settings.not_honoured(
+        getattr(getattr(entry, "capabilities", None), "settingsNotHonoured", None), generate
+    )
 
 
 async def _prepare(
@@ -1061,9 +1096,7 @@ async def _prepare(
     first = client.model_asked_first(generate) if isinstance(client, TieredClient) else None
     return _Serving(
         output_cap=output_cap,
-        not_honoured=ignored_settings.not_honoured(
-            getattr(getattr(first, "capabilities", None), "settingsNotHonoured", None), generate
-        ),
+        not_honoured=_not_honoured_by(first, generate),
         search_blocked=search_blocked,
         client=served,
         table=table,
@@ -1122,9 +1155,6 @@ async def create_chat_completion(request: Request) -> Any:
     waited_ms = prepared.waited_ms
     swapped_in = prepared.swapped_in
     store = _store(request)
-    # What the backend chosen for the first attempt does not honour, of what
-    # this caller sent, known before anything is sent (`_Serving.not_honoured`).
-    headers = ignored_settings.added_to({}, prepared.not_honoured, "chat")
 
     if body.stream:
         # The generator runs AFTER this function returns, so its
@@ -1136,7 +1166,10 @@ async def create_chat_completion(request: Request) -> Any:
                 body, generate, client, table, started, rec=rec, output_cap=prepared.output_cap
             ),
             media_type="text/event-stream",
-            headers=headers,
+            # What the backend the first attempt goes to does not honour, of what
+            # this caller sent: the head is on the wire before any backend has
+            # been asked (`_Serving.not_honoured`).
+            headers=ignored_settings.added_to({}, prepared.not_honoured, "chat"),
         )
 
     with collect_attempts() as tries:
@@ -1211,7 +1244,12 @@ async def create_chat_completion(request: Request) -> Any:
             backend_ms=response.latencyMs,
             client=client,
         )
-        return JSONResponse(content=_completion_body(result), headers=headers)
+        # A whole answer is named after the call, from the backend that served it:
+        # a failover in it moves the answer to another listing.
+        return JSONResponse(
+            content=_completion_body(result),
+            headers=ignored_settings.added_to({}, prepared.not_honoured_by_answer(), "chat"),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1444,10 +1482,12 @@ async def create_anthropic_message(request: Request) -> Any:
     prepared = await _prepare(request, body, surface="chat", instead="/v1/embeddings", search=plan)
     if isinstance(prepared, _Failure):
         return prepared.as_anthropic()
-    # The hints this door dropped come first, then what the backend chosen for
-    # the first attempt does not honour of what the caller sent, in this door's
-    # words (`tool_choice`, `tool_choice.disable_parallel_tool_use`).
-    headers = ignored_settings.added_to(headers, prepared.not_honoured, "messages")
+    # The hints this door dropped come first, then what the backend that serves
+    # does not honour of what the caller sent, in this door's words (`tool_choice`,
+    # `tool_choice.disable_parallel_tool_use`). A stream's head goes out before any
+    # backend is asked, so it is the first attempt's backend; a whole answer is
+    # named after the call, from the backend that served it.
+    own = headers
 
     if body.stream:
         # The generator runs AFTER this function returns, so the
@@ -1457,7 +1497,7 @@ async def create_anthropic_message(request: Request) -> Any:
                 body, prepared, model=body.model, display=anthropic.thinking_display(raw)
             ),
             media_type="text/event-stream",
-            headers=headers,
+            headers=ignored_settings.added_to(own, prepared.not_honoured, "messages"),
         )
 
     store = _store(request)
@@ -1503,7 +1543,7 @@ async def create_anthropic_message(request: Request) -> Any:
                 web_searches=_searches_run(prepared.client) or 0,
             ),
             headers={
-                **headers,
+                **ignored_settings.added_to(own, prepared.not_honoured_by_answer(), "messages"),
                 **anthropic.envelope_headers(
                     _routing_info(
                         prepared.client,
@@ -1594,8 +1634,29 @@ async def _counted(request: Request, body: ChatCompletionRequest) -> _Count:
     Shared by `/v1/messages/count_tokens` and `/v1/responses/input_tokens`
     (P2c), which differ only in how they say the answer. **A key check,
     not an admission**: nothing is generated, woken or recorded.
+
+    **A count is a 400 and never a 5xx** (`_cannot_count`: Claude Code's
+    `/context` retries a 5xx before it falls back to counting by sending the
+    request). Admission re-reads the listing of a request that carries tools or
+    settings, and when it cannot confirm one it answers a 503 (a driver that is
+    restarting, a deadline) or a 502 (a driver that refuses the gateway's
+    credential, or is not an inference driver): on the doors that generate that
+    is right, and here it is a count that cannot be given, with the same cause in
+    the same words. Both looks at admission are covered, the second being the one
+    after a refresh. A refusal of the request itself (a 400, a key's 403) is
+    still that.
     """
     await admission.authorize(request, None)
+    try:
+        return await _count_with_a_backend(request, body)
+    except admission.AdmissionFailure as failure:
+        if failure.status < 500:
+            raise
+        # Its own full stop is not said twice: `_cannot_count` ends the reason with one.
+        return _Count(reason=failure.message.rstrip("."))
+
+
+async def _count_with_a_backend(request: Request, body: ChatCompletionRequest) -> _Count:
     table = _routing(request)
     if table is None:
         return _Count(reason="the gateway is starting or in safe mode")
@@ -1848,15 +1909,17 @@ async def create_response(request: Request) -> Any:
     elif translated.search is not None:
         translated.run_search()
     response_id = responses.new_id(admission.request_id())
-    # The hints this door dropped come first, then what the backend chosen for
-    # the first attempt does not honour of what the caller sent.
-    headers = ignored_settings.added_to(translated.headers(), prepared.not_honoured, "responses")
+    # The hints this door dropped come first, then what the backend that serves does
+    # not honour of what the caller sent: the first attempt's backend on a stream
+    # (its head is on the wire before any is asked), the one that served on a whole
+    # answer (named after the call).
+    own = translated.headers()
 
     if body.stream:
         return StreamingResponse(
             _stream_responses(body, prepared, translated, response_id, store),
             media_type="text/event-stream",
-            headers=headers,
+            headers=ignored_settings.added_to(own, prepared.not_honoured, "responses"),
         )
 
     created_at = int(time.time())
@@ -1922,7 +1985,7 @@ async def create_response(request: Request) -> Any:
                 incomplete_details=details,
             ),
             headers={
-                **headers,
+                **ignored_settings.added_to(own, prepared.not_honoured_by_answer(), "responses"),
                 **anthropic.envelope_headers(
                     _routing_info(
                         prepared.client,
@@ -5185,9 +5248,7 @@ def _driver_failure_status(e: DriverError) -> _Failure:
             message=(
                 f"The driver {e.driver_name!r} at {e.driver_url} refused the gateway's "
                 f"credential (HTTP {upstream}): {detail} Nothing is wrong with this "
-                f"request. The gateway holds a `service:gateway` token minted by its own "
-                f"node's agent; re-check that driver's auth keys, or restart it so it "
-                f"picks up the install's current signing key."
+                f"request. {CREDENTIAL_REFUSED_NEXT_STEP}"
             ),
             error_type="upstream_auth_error",
         )

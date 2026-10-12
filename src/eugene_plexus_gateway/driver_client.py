@@ -980,6 +980,17 @@ def _is_cascade_eligible(exc: Exception) -> bool:
     return retry_disposition(exc) == "safe"
 
 
+#: What to do about a driver that refused the gateway's OWN credential (a 401 or
+#: 403): a rotated signing key on one node is the shape it takes. One sentence for
+#: the front door's 502 (`routes.inference._driver_failure_status`) and for
+#: admission's, when the listing it re-reads is refused (`admission.unread_because`),
+#: so the two cannot drift.
+CREDENTIAL_REFUSED_NEXT_STEP = (
+    "The gateway holds a `service:gateway` token minted by its own node's agent; re-check "
+    "that driver's auth keys, or restart it so it picks up the install's current signing key."
+)
+
+
 def capacity_refused(exc: BaseException) -> bool:
     """The driver's `#backend-capacity`: the engine's shared KV pool was
     full of other requests' prompts (CB3). Load, not a broken backend, so
@@ -1148,17 +1159,25 @@ class TieredClient:
         head never waits for a backend (an earlier version read a header off the
         driver's response instead, which held every head until the first frame).
 
-        **A failover after the head is sent cannot change the header.** The head
-        is on the wire before any backend has been asked, so it names the first
-        attempt's backend, and an attempt that then fails over to another is not
-        re-said: that would need the head held until the first had failed. What
-        can still move between this read and the attempt is a circuit another
-        request trips or the room it takes (and, at the margin of "fits", the
-        tool a server-run search loop adds to its first turn, which the size read
-        here does not count); the header then names the backend that was first in
-        line when the head was built. A turn that must wait for room goes where
-        room opens first, which is not known before it waits, so it is read as the
-        tier's usual first, which is also where it goes when the wait runs out.
+        **A failover after the head is sent cannot change a stream's header.** The
+        head is on the wire before any backend has been asked, so it names the
+        first attempt's backend, and an attempt that then fails over to another is
+        not re-said: that would need the head held until the first had failed.
+        **A whole answer is not named from this read**: it has no head to send
+        early, so the door names it after the call, from the backend that served
+        it (`served_candidate`, `_Serving.not_honoured_by_answer`).
+
+        What can still move between this read and the attempt is a circuit another
+        request trips, the recovery probe another request takes (a circuit past its
+        cooldown hands out one: three concurrent requests over one half-open circuit
+        all read the probe backend as first, and only one of them gets it, the
+        others skip it), or the room another request takes (and, at the margin of
+        "fits", the tool a server-run search loop adds to its first turn, which the
+        size read here does not count); a stream's header then names the backend
+        that was first in line when the head was built. A turn that must wait for
+        room goes where room opens first, which is not known before it waits, so
+        it is read as the tier's usual first, which is also where it goes when the
+        wait runs out.
 
         None when nothing would be asked (every circuit is cooling), or when that
         candidate has no entry here: nothing is named then.

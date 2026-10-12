@@ -4,14 +4,15 @@ A backend's driver lists, in its capabilities, the settings it is sent and is
 measured not to honour, by value (`capabilities.settingsNotHonoured`,
 `docs/design/tools-assumed.md`, 2026-10-12): Strata ignores `tool_choice`
 `required` and a named function, and `parallel_tool_calls: false`. A measured
-gap is sent and named, not refused. The list is static per backend, so it is
-read from the backend the first attempt goes to **before anything is sent**
-(`TieredClient.model_asked_first`: not always the balancer's first pick), and a
-stream's head never waits for the backend to speak (an earlier version read a
-header off the driver's response instead, which held every stream's head until
-its first frame, and broke the Responses door's opening). **That header is not
-read by any module here**, and a failover after the head is sent cannot change
-what the head says.
+gap is sent and named, not refused. The list is static per backend, so a stream
+reads it from the backend the first attempt goes to **before anything is sent**
+(`TieredClient.model_asked_first`: not always the balancer's first pick), and
+its head never waits for the backend to speak (an earlier version read a header
+off the driver's response instead, which held every stream's head until its
+first frame, and broke the Responses door's opening). **That header is not read
+by any module here.** A failover after the head is sent cannot change what a
+stream's head says; **a whole answer has no head to send early**, so it is named
+after the call from the backend that served it (`_Serving.not_honoured_by_answer`).
 
 A door names what the caller sent, with a value the list names, on its own
 `x-eugene-plexus-ignored-settings`, spelled the way its caller spelled the
@@ -21,7 +22,8 @@ gateway's own settings (a search loop's forced first turn) are not the
 caller's, and are never named.
 
 Three things live here and nowhere else: matching a listing against a request,
-the driver-to-door spelling, and the merge.
+the driver-to-door spelling (of one field, and of a whole request's list of them),
+and the merge.
 """
 
 from __future__ import annotations
@@ -86,6 +88,28 @@ def spelled(name: str, door: str = "chat") -> str:
     return (
         _DOORS.get(door, {}).get(name) or WIRE_NAMES.get(name) or _CAMEL.sub(r"_\1", name).lower()
     )
+
+
+#: The settings said first when a request's are listed: the tools, how they are
+#: chosen, whether they are called in parallel. The rest follow alphabetically.
+_TOOLS_FIRST = ("tools", "toolChoice", "parallelToolCalls")
+
+
+def carried(settings: Iterable[str]) -> list[str]:
+    """What a request carries, in its caller's words, in an order a person reads.
+
+    `settings` are the driver's field names (`GenerateRequest.callerSettings`): each
+    is said the way the chat door spells it (`WIRE_NAMES`), the tools first and the
+    settings that ride with them next, the others alphabetically, so the same
+    request is worded the same way every time (`callerSettings` is a set to the
+    code that reads it). Every setting the caller sent is named, `tools` included
+    whenever the caller sent the key, with a list or not: an empty one is still
+    something the caller said.
+    """
+    sent_names = set(settings)
+    first = [WIRE_NAMES.get(name, name) for name in _TOOLS_FIRST if name in sent_names]
+    rest = sorted(WIRE_NAMES.get(name, name) for name in sent_names.difference(_TOOLS_FIRST))
+    return [*first, *rest]
 
 
 def sent(request: GenerateRequest, setting: str) -> str | bool | None:
@@ -178,4 +202,13 @@ def added_to(
     return out
 
 
-__all__ = ["HEADER", "WIRE_NAMES", "added_to", "merge", "not_honoured", "sent", "spelled"]
+__all__ = [
+    "HEADER",
+    "WIRE_NAMES",
+    "added_to",
+    "carried",
+    "merge",
+    "not_honoured",
+    "sent",
+    "spelled",
+]
