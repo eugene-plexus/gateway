@@ -93,6 +93,7 @@ from ._generated.models import (
 from ._http import internal_client
 from .affinity import HIT, MOVED, NEW, AffinityTable
 from .budget import Conversation, ConversationSizes, PoolLedger, TurnBudget
+from .capabilities import calls_tools
 from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS
 from .driver_client import (
     CONNECT_TIMEOUT_SECONDS,
@@ -2818,13 +2819,13 @@ def _reaches_search(backends: list[_Backend]) -> bool:
     `webSearchOptions` searches itself, and one that calls tools can be
     offered the gateway's own search. **Any** of them is enough, because a
     searched request is routed only to those -- unlike `tools`, where the
-    weakest backend decides.
+    weakest backend decides. A backend whose driver does not say whether it
+    calls tools is taken to (`calls_tools`); native search stays as it was,
+    which is a model's own listing and nothing assumed.
     """
     for b in backends:
-        caps = b.caps
-        if caps is None:
-            continue
-        if "webSearchOptions" in set(caps.supportedSettings or []) or caps.toolCalling is True:
+        settings = set(b.caps.supportedSettings or []) if b.caps is not None else set()
+        if "webSearchOptions" in settings or calls_tools(b.model):
             return True
     return False
 
@@ -2841,10 +2842,14 @@ def _all_carry_tools(backends: list[_Backend]) -> bool:
 
     False for a model with no backends at all -- nothing serves it, so
     nothing about it can be promised.
+
+    A backend whose driver does not say counts as one that can
+    (`calls_tools`, 2026-10-12): only a driver's `toolCalling: false` takes a
+    model out of this.
     """
     if not backends:
         return False
-    return all(b.caps is not None and bool(b.caps.toolCalling) for b in backends)
+    return all(calls_tools(b.model) for b in backends)
 
 
 def _smallest_context(backends: list[_Backend]) -> int | None:

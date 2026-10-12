@@ -4108,11 +4108,11 @@ class ModelRoutingInfo(BaseModel):
     )
     tool_calling: bool | None = Field(
         None,
-        description='Whether a request for this model may carry `tools`.\n\n**True only when every backend serving it can**, by the same\nreasoning as `context_length` above: a request may land on\nany of them, so the honest answer is the weakest one. A\nharness can read this and pick a model rather than discover\nthe limit as a 400 halfway through a task.\n',
+        description='Whether a request for this model may carry `tools`.\n\n**True only when every backend serving it can**, by the same\nreasoning as `context_length` above: a request may land on\nany of them, so the honest answer is the weakest one. A\nharness can read this and pick a model rather than discover\nthe limit as a 400 halfway through a task.\n\nA backend whose driver does not say counts as one that can\n(2026-10-12, `docs/design/tools-assumed.md`): tools are\nassumed, and turned off only on evidence the driver\nreports (`capabilities.toolCalling: false`).\n',
     )
     web_search: bool | None = Field(
         None,
-        description="Whether a web search can reach this model: at least one\nbackend serving it searches itself (its model lists\n`webSearchOptions`) or calls tools, so the gateway can run the\nsearch for it. Says nothing about the caller's key or whether\nthe install has a search account; that is\n`ModelList.x_eugene_plexus.web_search`. Added 2026-10-01 (C3).\n",
+        description="Whether a web search can reach this model: at least one\nbackend serving it searches itself (its model lists\n`webSearchOptions`) or calls tools, so the gateway can run the\nsearch for it. Says nothing about the caller's key or whether\nthe install has a search account; that is\n`ModelList.x_eugene_plexus.web_search`. Added 2026-10-01 (C3).\nA backend whose driver does not say whether it calls tools\ncounts as one that does (2026-10-12).\n",
     )
     tiers: list[list[str]] | None = Field(
         None,

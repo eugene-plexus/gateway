@@ -32,6 +32,7 @@ from eugene_plexus_gateway._generated.driver_models import (
     GenerateResponse,
     Problem,
     ToolCall,
+    ToolChoice,
     Usage,
 )
 from eugene_plexus_gateway._generated.driver_models import (
@@ -39,7 +40,7 @@ from eugene_plexus_gateway._generated.driver_models import (
 )
 from eugene_plexus_gateway.app import create_app
 from eugene_plexus_gateway.auth_state import AuthState, load_auth_state
-from eugene_plexus_gateway.driver_client import DriverError, StreamEvent
+from eugene_plexus_gateway.driver_client import DriverAnswer, DriverError, StreamEvent
 from eugene_plexus_gateway.routing import (
     RoutingTable,
     _Backend,
@@ -64,7 +65,9 @@ class FakeDriverClient:
         max_context_tokens: int | None = None,
         runtime: str | None = None,
         node: str | None = None,
-        supports_tools: bool = False,
+        supports_tools: bool | None = False,
+        capabilities_reported: bool = True,
+        ignored: list[str] | None = None,
         supports_embeddings: bool = False,
         supports_decisions: bool = False,
         decision_max_concurrent: int | None = None,
@@ -93,6 +96,14 @@ class FakeDriverClient:
         since R1.6 -- a driver is joined only to a runtime on its OWN
         node, because two replicas of one model share a runtime name."""
         self.supports_tools = supports_tools
+        """What the listing says of tool calling. `None` is a driver that does not
+        say (an older one), which the gateway takes as a yes (2026-10-12)."""
+        self.capabilities_reported = capabilities_reported
+        """False lists every model with no capabilities at all."""
+        self.ignored: list[str] = list(ignored or [])
+        """The driver's `x-eugene-plexus-ignored-settings`: the request fields,
+        in the driver's spelling, its backend does not honour. As a real driver
+        says it, a field is named only on a request that carries it."""
         self.supports_embeddings = supports_embeddings
         self.supports_decisions = supports_decisions
         self.decision_max_concurrent = decision_max_concurrent
@@ -199,7 +210,11 @@ class FakeDriverClient:
         )
         ids = self.models if self.models is not None else ([self.model_id] if self.model_id else [])
         served = [
-            DriverModel(id=i, surfaces=list(surfaces), capabilities=capabilities.model_copy())
+            DriverModel(
+                id=i,
+                surfaces=list(surfaces),
+                capabilities=capabilities.model_copy() if self.capabilities_reported else None,
+            )
             for i in ids
         ]
         return DriverInfo(
@@ -223,6 +238,22 @@ class FakeDriverClient:
             described.models = [m for m in described.models if m.id == model]
         return described
 
+    def named(self, request: GenerateRequest) -> tuple[str, ...]:
+        """What this driver's response headers name on `request`: its ignored
+        fields that the request carries, as the contract words it.
+
+        A tool choice is carried when it asks for something: `auto` is what an
+        engine does anyway and `none` is honoured by sending no tools, so
+        neither is ever sent and ignored (Strata, measured 2026-10-12)."""
+
+        def carries(name: str) -> bool:
+            value = getattr(request, name, None)
+            if name == "toolChoice":
+                return value is not None and value not in (ToolChoice.auto, ToolChoice.none)
+            return value is not None
+
+        return tuple(n for n in self.ignored if carries(n))
+
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
         self.calls.append(request)
         if self.generate_hook is not None:
@@ -230,7 +261,7 @@ class FakeDriverClient:
         if self.generate_error is not None:
             raise self.generate_error
         if self.tool_calls is not None:
-            return GenerateResponse(
+            return DriverAnswer(
                 content=None,
                 toolCalls=self.tool_calls,
                 finishReason=FinishReason.tool_calls,
@@ -238,9 +269,10 @@ class FakeDriverClient:
                 modelId=request.model or self.model_id,
                 usage=self.usage,
                 latencyMs=1,
+                ignored_settings=self.named(request),
             )
         text = self.responses.pop(0) if self.responses else f"<{self.name} default response>"
-        return GenerateResponse(
+        return DriverAnswer(
             content=text,
             reasoning=self.reasoning,
             finishReason=self.finish_reason,
@@ -249,6 +281,7 @@ class FakeDriverClient:
             modelId=request.model or self.model_id,
             usage=self.usage,
             latencyMs=1,
+            ignored_settings=self.named(request),
         )
 
     async def count_tokens(self, request: GenerateRequest) -> int:
@@ -367,6 +400,10 @@ class FakeDriverClient:
         self.calls.append(request)
         if self.generate_error is not None:
             raise self.generate_error
+        if named := self.named(request):
+            # The driver's response headers: said as its stream opens, before
+            # any frame, as `HttpDriverClient.stream` says them.
+            yield StreamEvent(ignored=named)
         if request.reportProgress:
             for payload in self.progress:
                 yield StreamEvent(progress=payload)

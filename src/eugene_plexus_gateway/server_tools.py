@@ -72,6 +72,7 @@ from ._generated.driver_models import (
 )
 from ._generated.driver_models import WebSearchOptions as DriverWebSearchOptions
 from ._generated.tool_driver_models import WebSearchRequest
+from .capabilities import calls_tools
 from .chat_contract import _field_name
 from .driver_client import DriverClient, DriverError, StreamEvent
 from .image_doors import ImageAsk, format_name, to_driver
@@ -426,9 +427,11 @@ def searchable(
 
     A backend whose model lists `webSearchOptions` is sent the request
     natively -- forwarded, not run twice. Any other must call tools, since
-    this install's search is offered to the model as one. The rest cannot
-    take part and are left out of every tier (empty tiers keep their
-    numbers, as everywhere else).
+    this install's search is offered to the model as one, and is taken to
+    unless its driver says it does not (`calls_tools`, 2026-10-12: tools are
+    assumed, and a backend nobody has measured is not left out for that). The
+    rest cannot take part and are left out of every tier (empty tiers keep
+    their numbers, as everywhere else).
 
     `native_ok=False` when the loop must run whatever the backend can do
     alone -- an `image_generation` call (P8e) is answered only here -- so
@@ -445,7 +448,7 @@ def searchable(
             if native_ok and "webSearchOptions" in settings:
                 native.add((backend.node, backend.name, backend.public_id or None))
                 kept.append(backend)
-            elif caps is not None and getattr(caps, "toolCalling", None) is True:
+            elif calls_tools(model):
                 kept.append(backend)
         tiers.append(replace(tier, backends=kept))
     return replace(resolution, tiers=tiers), native

@@ -25,8 +25,9 @@ from typing import Any, Protocol
 from urllib.parse import quote
 
 import httpx
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
+from . import ignored_settings
 from ._generated.driver_models import (
     DecisionRequest,
     DecisionResponse,
@@ -177,6 +178,27 @@ class StreamEvent:
     """An image the gateway itself is making for this answer (P8e), as a
     `server_tools.SearchUpdate` over an `ImageExecution`. Only on the
     Responses door, the one door whose API defines `image_generation`."""
+    ignored: tuple[str, ...] | None = None
+    """What the driver's response headers said its backend was sent and does
+    not honour (2026-10-12): its `x-eugene-plexus-ignored-settings`, as the
+    driver's own field names. **Not output and not for a door**: the first
+    event of an attempt's stream when the header named anything, before any
+    frame, and `Executor.stream` takes it as that attempt's own and never
+    passes it on -- so it neither commits a stream nor reaches a translator.
+    None on every other event."""
+
+
+class DriverAnswer(GenerateResponse):
+    """A `GenerateResponse` with what only its HTTP response said.
+
+    `ignored_settings` is the driver's own `x-eugene-plexus-ignored-settings`:
+    the request fields, in its contract's spelling, that the backend was sent
+    and does not honour. It rides beside the body and never in it, so it is not
+    part of what the answer dumps to; `Executor.whole` reads it off the answer
+    of the attempt that served.
+    """
+
+    ignored_settings: tuple[str, ...] = Field(default=(), exclude=True)
 
 
 def _problem_from_bytes(raw: bytes) -> Problem | None:
@@ -390,7 +412,7 @@ class HttpDriverClient:
         body = response.json()
         return DriverInfo.model_validate(body)
 
-    async def generate(self, request: GenerateRequest) -> GenerateResponse:
+    async def generate(self, request: GenerateRequest) -> DriverAnswer:
         payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
         response = await self._client.post(
             "/v1/generate",
@@ -406,9 +428,13 @@ class HttpDriverClient:
                 raw_body=response.text,
             )
         try:
-            return GenerateResponse.model_validate(response.json())
+            answer = DriverAnswer.model_validate(response.json())
         except ValueError as exc:
             raise self._invalid_reply() from exc
+        answer.ignored_settings = ignored_settings.parse(
+            response.headers.get(ignored_settings.HEADER)
+        )
+        return answer
 
     async def embed(self, request: EmbedRequest) -> EmbedResponse:
         payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
@@ -738,6 +764,12 @@ class HttpDriverClient:
                     problem=_problem_from_bytes(body),
                     raw_body=body.decode("utf-8", "replace"),
                 )
+            # Known before the first frame, so said before it: the attempt
+            # that opens a stream and then fails still has its own say, and
+            # only the one that serves has it counted (`Executor.stream`).
+            named = ignored_settings.parse(response.headers.get(ignored_settings.HEADER))
+            if named:
+                yield StreamEvent(ignored=named)
             event_name: str | None = None
             async for line in response.aiter_lines():
                 if not line.strip():
@@ -1077,10 +1109,28 @@ class TieredClient:
         #: The candidate that answered the last call, for `pin`.
         self.served_candidate: DriverClient | None = None
         self.tier = 0
+        #: What the attempts that served said their backends were sent and do
+        #: not honour (2026-10-12), as drivers spell it, each once in the order
+        #: first named. Across calls, because the search loop's turns are one
+        #: answer, and of served attempts only: a backend that failed before
+        #: it served has nothing to say about this one.
+        self._ignored_served: list[str] = []
+        #: The same for the attempt in flight, once its stream has opened and
+        #: until it serves or fails. A stream's head can go out on progress,
+        #: before any attempt has served.
+        self._ignored_open: tuple[str, ...] = ()
 
     @property
     def candidates(self) -> list[DriverClient]:
         return [c for tier in self._tiers for c in tier]
+
+    @property
+    def ignored_settings(self) -> list[str]:
+        """What the backend serving this request was sent and does not honour,
+        in its driver's field names: the doors' `x-eugene-plexus-ignored-settings`
+        says it in their own (`ignored_settings.merge`). Empty before anything
+        has said, and for a driver that does not say."""
+        return list(dict.fromkeys([*self._ignored_served, *self._ignored_open]))
 
     def pin(self) -> None:
         """Send every later call to the backend that answered, and only to it.
@@ -1325,6 +1375,7 @@ class TieredClient:
             complete=lambda event: bool(event.done),
             usage=lambda event: event.result.usage if event.result is not None else None,
             eof_is_success=False,
+            notes=lambda event: event.ignored,
         )
         stream = Executor(self).stream("stream", call, policy=policy, generation=request)
         try:

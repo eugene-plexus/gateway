@@ -3540,7 +3540,7 @@ class Capabilities(BaseModel):
     )
     toolCalling: bool | None = Field(
         None,
-        description='Whether this driver can carry `tools` to its backend and\nreport `toolCalls` back.\n\nThe gateway reads it to answer a question a harness\ncannot otherwise ask: a plain answer where a tool call\nwas expected looks identical whether the model declined\nor the backend never saw the tools. A driver that says\n`false` here is failed at the front door with a reason\ninstead.\n',
+        description='Whether this driver can carry `tools` to its backend and\nreport `toolCalls` back.\n\nThe gateway reads it to answer a question a harness\ncannot otherwise ask: a plain answer where a tool call\nwas expected looks identical whether the model declined\nor the backend never saw the tools. A driver that says\n`false` here is failed at the front door with a reason\ninstead.\n\n**True unless there is evidence** (Troy, 2026-10-12;\n`docs/design/tools-assumed.md`): a chat model on any engine\nis taken to use tools. `false` only when the backend refused\na request for its tools, in its own words (kept for the\nengine\'s life; llama-server\'s "tools param requires --jinja\nflag", Ollama\'s "does not support tools"), when a provider\'s\nown listing says so, or when this driver has no way to carry\ntools to the engine (a CLI subscription). Never because a\nconfiguration is untested: until 2026-10-12 Strata was\nreported `false` for that reason alone, and measured, it\ncalls tools correctly.\n',
     )
     maxContextTokens: int | None = Field(
         None,

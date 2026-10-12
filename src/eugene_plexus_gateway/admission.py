@@ -19,6 +19,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import door_paths
 from ._generated.client_key_models import ClientAdmissionResult
+from .capabilities import calls_tools
+from .ignored_settings import WIRE_NAMES
 from .metrics import AttemptRow, RequestRow
 
 
@@ -215,24 +217,6 @@ def local_only() -> bool:
     return context.local_only if context else False
 
 
-#: A driver setting's name as the chat door spells it, for a refusal. The
-#: rest are spelt the same on both sides.
-_WIRE_NAMES = {
-    "maxTokens": "max_tokens",
-    "topP": "top_p",
-    "toolChoice": "tool_choice",
-    "responseFormat": "response_format",
-    "topK": "top_k",
-    "minP": "min_p",
-    "frequencyPenalty": "frequency_penalty",
-    "presencePenalty": "presence_penalty",
-    "parallelToolCalls": "parallel_tool_calls",
-    "logitBias": "logit_bias",
-    "reasoningEffort": "reasoning_effort",
-    "webSearchOptions": "web_search_options",
-}
-
-
 async def permitted(resolution: Any, requirements: Any = None) -> Any:
     context = current.get()
     allowed = context.allowed_models if context else None
@@ -248,8 +232,12 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
     # Every setting some reachable backend confirms, so a refusal can name
     # the one nobody does rather than "the required settings".
     confirmed_anywhere: set[str] = set()
+    # Backends turned away because their driver says it does not call tools:
+    # when that is every one turned away, the refusal says so (2026-10-12).
+    told_no_tools = 0
 
     async def confirm(backend: Any) -> Any:
+        nonlocal told_no_tools
         try:
             model = backend.model.id if backend.model is not None else None
             async with semaphore, asyncio.timeout(4):
@@ -265,28 +253,46 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
             caps = entry.capabilities
             if caps is not None:
                 confirmed_anywhere.update(caps.supportedSettings or [])
-            if settings and (
-                caps is None or not settings.issubset(set(caps.supportedSettings or []))
-            ):
+            # Tools are assumed and turned off only on evidence (2026-10-12): a
+            # backend whose driver says nothing of tool calling takes them, so
+            # its list of settings, which may be none at all, does not decide
+            # `tools`. Only `toolCalling: false` does.
+            carries = calls_tools(entry)
+            if tools and not carries:
+                told_no_tools += 1
                 return None
-            if tools and (caps is None or caps.toolCalling is not True):
+            if tools:
+                confirmed_anywhere.add("tools")
+            wanted = settings - {"tools"} if carries else settings
+            if wanted and (caps is None or not wanted.issubset(set(caps.supportedSettings or []))):
                 return None
             return replace(backend, info=info.model_copy(update={"models": None}), model=entry)
         except Exception:
             return None
 
     tiers = []
+    turned_away = 0
     for tier in resolution.tiers:
         checked = await asyncio.gather(*(confirm(b) for b in tier.backends))
+        turned_away += sum(1 for b in checked if b is None)
         tiers.append(replace(tier, backends=[b for b in checked if b is not None]))
     result = replace(resolution, tiers=tiers).restricted(allowed, local_only=local_only())
     if not result.has_backends():
         if not local_only():
+            if tools and turned_away and told_no_tools == turned_away:
+                raise AdmissionFailure(
+                    400,
+                    "Every backend serving this model reports that it does not call tools "
+                    "(capabilities.toolCalling: false), so the request was refused rather than "
+                    "answered without them. GET /v1/models reports "
+                    "x_eugene_plexus.tool_calling per model. Nothing was forwarded or woken.",
+                    param="tools",
+                )
             missing = sorted(settings - confirmed_anywhere)
             if missing:
                 # Named in the caller's words (2026-09-28): "the required
                 # settings" sent a caller to guess which of theirs it was.
-                wire = [_WIRE_NAMES.get(m, m) for m in missing]
+                wire = [WIRE_NAMES.get(m, m) for m in missing]
                 raise AdmissionFailure(
                     400,
                     f"No permitted backend serving this model takes {', '.join(wire)}. Remove "
