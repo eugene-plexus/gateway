@@ -1698,11 +1698,15 @@ class ModelCapabilities(BaseModel):
 
     chat: bool | None = Field(
         None,
-        description='Text generation — the default assumption for a causal model.\nFalse for an embedding model.\n',
+        description='Text generation — the default assumption for a causal model.\nFalse for an embedding model and for a reranker.\n',
     )
     embedding: bool | None = Field(
         None,
-        description='The model is a dedicated embedding model (a pooling type in\nits metadata, or non-causal attention). Load-bearing rather\nthan informational: llama-server\'s own help says\n`--embedding` is "for use only with dedicated embedding\nmodels", and launching one of these as a chat model does not\nfail — it starts, serves, and returns nonsense.\n',
+        description='The model is a dedicated embedding model (a pooling type in\nits metadata, or non-causal attention): a *search model*, in\nthe console\'s words. Load-bearing rather than informational:\nllama-server\'s own help says `--embedding` is "for use only\nwith dedicated embedding models", and launching one of these\nas a chat model does not fail — it starts, and answers\nneither embeddings (a 501) nor chat (a 500, or text that\nmeans nothing), measured on b11552. The agent starts one\ncorrectly by itself: `RuntimeMode`.\n\nFalse for a reranker, whose metadata carries a pooling type\ntoo: that one is `rerank`.\n',
+    )
+    rerank: bool | None = Field(
+        None,
+        description='The model is a reranker: it scores how well a passage answers\na question instead of turning text into a vector (a pooling\ntype of 4, `rank`, or classifier output labels in its\nmetadata). The console says "sort results". It needs\n`--reranking` the way an embedder needs `--embeddings`, and\nthe agent starts one that way by itself (`RuntimeMode`).\n\n**The metadata can miss one.** A cross-encoder converted\nwithout either key (the gpustack bge-reranker-v2-m3 file is\none: a non-causal `bert` with a classifier head and neither\nkey) reads as `embedding`, and `ModelProfileSpec.mode` is\nhow a person says otherwise.\n',
     )
     vision: bool | None = Field(
         None,
@@ -1872,6 +1876,25 @@ class RecommendedSampling(BaseModel):
     temperature: float | None = None
     topK: int | None = None
     topP: float | None = None
+
+
+class ProfileMode(StrEnum):
+    """
+    What to start a model as: the agent's `RuntimeMode`, with the same
+    four values and the same meanings, copied onto
+    `RuntimeSpec.mode` like every other launch field. A profile that
+    does not say is `auto`, which leaves
+    the agent to read the file's header, which is what
+    `ModelCapabilities.embedding` and `ModelCapabilities.rerank`
+    predict; the other three are the person's override. This
+    component never acts on it: it holds no engine knowledge.
+
+    """
+
+    auto = 'auto'
+    chat = 'chat'
+    embedding = 'embedding'
+    reranking = 'reranking'
 
 
 class ProfileBuiltAccuracy(StrEnum):
@@ -3146,6 +3169,10 @@ class ModelProfile(BaseModel):
     temperature: float | None = Field(None, ge=0.0, le=2.0)
     topP: float | None = Field(None, ge=0.0, le=1.0)
     engine: EngineKind
+    mode: ProfileMode | None = Field(
+        None,
+        description='What to start the model as, as saved (`ModelProfileSpec.mode`).',
+    )
     flags: dict[str, Any] | None = None
     extraArgs: list[str] | None = None
     env: dict[str, str] | None = None
@@ -3790,6 +3817,10 @@ class ModelProfileSpec(BaseModel):
     engine: EngineKind = Field(
         ...,
         description='Which engine these flags are written for. Flags are not\nportable between engines, so a profile is only ever offered\nfor the engine it names — and a model whose format no\ninstalled engine can load has nowhere to use one at all. The\nengine side of that answer is\n`EngineDescriptor.modelFormats` on the agent.\n',
+    )
+    mode: ProfileMode | None = Field(
+        None,
+        description="What to start the model as: `auto` (absent means the same) lets\nthe agent read the file's header, which\n`capabilities.embedding` and `capabilities.rerank` on the model\npredict; `chat`, `embedding` and `reranking` are the person's\noverride for a file whose header misleads. Copied onto\n`RuntimeSpec.mode` verbatim, and spelled the same on purpose.\nOnly a llama.cpp profile acts on the last two.\n",
     )
     flags: dict[str, Any] | None = Field(
         None,

@@ -2143,6 +2143,36 @@ class EmbedResponse(BaseModel):
     requestId: str | None = None
 
 
+class Document(RootModel[str]):
+    root: str = Field(..., max_length=1048576)
+
+
+class RerankedPassage(BaseModel):
+    index: int = Field(
+        ..., description="Position of the passage in the request's `documents`.", ge=0
+    )
+    score: float = Field(
+        ...,
+        description="How well the passage answers the question, 0 to 1: the\nbackend's own number for a `probability` backend, its logistic\nfor a `logit` one.\n",
+        ge=0.0,
+        le=1.0,
+    )
+    rawScore: float = Field(..., description="The backend's own number, unchanged.")
+
+
+class RerankScale(StrEnum):
+    """
+    What a backend's rerank scores are. `probability`: already 0 to 1
+    (Qwen3-Reranker, which scores "yes" against "no"), passed through.
+    `logit`: unbounded (bge-reranker-v2-m3, a one-label classifier),
+    mapped through `1 / (1 + e^-x)`, which keeps their order.
+
+    """
+
+    probability = 'probability'
+    logit = 'logit'
+
+
 class Type1(StrEnum):
     noul = 'noul'
     choice = 'choice'
@@ -3033,6 +3063,57 @@ class EmbedRequest(BaseModel):
     )
 
 
+class RerankPassagesRequest(BaseModel):
+    """
+    A question and the passages to score against it (MR6). The
+    gateway has already turned Jina's, Cohere's and TEI's shapes into
+    this one, and objects into their text.
+
+    """
+
+    model: str | None = Field(
+        None,
+        description="Which of this driver's models the request is for: an `id` from\n`DriverInfo.models`, **unprefixed** — the gateway strips the\n`<driver name>/` it added. Optional so a caller from before P1\nstill works against a single-model driver, which serves its one\nmodel when this is absent. An account driver refuses a request\nwithout it (400, `#model-required`), and every driver refuses a\nmodel it does not list (404, `#model-not-served`) before calling\nits backend.\n",
+        min_length=1,
+    )
+    localOnly: bool | None = Field(
+        False,
+        description='Internal policy; require a local active engine before forwarding any input.',
+    )
+    query: str = Field(..., max_length=1048576, min_length=1)
+    documents: list[Document] = Field(
+        ...,
+        description="The passages, as text. A result's `index` is a position in this\nlist, which is the only way a caller matches a score to its\npassage. At most 1,000 (Cohere's limit).\n",
+        max_length=1000,
+        min_length=1,
+    )
+    topN: int | None = Field(
+        None,
+        description='How many of the best to return. Absent, or more than there are:\nall of them.\n',
+        ge=1,
+    )
+    requestId: str | None = Field(
+        None,
+        description='Correlation id, echoed back. Same role as on `GenerateRequest`.',
+    )
+
+
+class RerankPassagesResponse(BaseModel):
+    results: list[RerankedPassage] = Field(
+        ...,
+        description='Best first: by `score`, highest first, and by `index` where two\nare equal. `topN` long when it was given and smaller than the\nnumber of passages.\n',
+    )
+    scale: RerankScale
+    modelId: str | None = Field(
+        None,
+        description='The model that scored these, as the public identifier, the way\n`EmbedResponse.modelId` is.\n',
+    )
+    backend: BackendKind | None = None
+    usage: Usage | None = None
+    latencyMs: int | None = Field(None, ge=0)
+    requestId: str | None = None
+
+
 class DecisionRequest(BaseModel):
     """
     One state, several named typed questions, answered together.
@@ -3518,7 +3599,7 @@ class DriverModel(BaseModel):
     )
     surfaces: list[str] = Field(
         ...,
-        description='Which requests this model answers. The values so far:\n\n* `chat` (`/v1/generate`), `embeddings` (`/v1/embed`),\n  `decisions` (`/v1/decide`), `speech` (`/v1/speak`, P3a),\n  `transcription` (`/v1/transcribe`, P3b), `translation`\n  (`/v1/transcribe` with `translate`, P3-4), `image`\n  (`/v1/image`, P4), `video` (`/v1/video`, P5),\n  `moderation` (`/v1/moderate`, P6) and `completion`\n  (`/v1/generate` with `completion`, P6), which have doors;\n* `rerank`, which names a door Eugene has not built yet.\n\n`completion` is reported for a local `llama-server`, a vLLM,\nand an Ollama account\'s models with its `completion`\ncapability: engines that continue raw text (P6-4). An account\nover a hosted API does not report it: OpenRouter\'s completions\nanswer the prompt as a chat turn (measured).\n\nAn OpenRouter model whose output is image and text (Gemini\'s\nimage models) serves `image` beside `chat`: its images route\nanswers them too (measured).\n\nA single-model `llama-server` whose projector hears\n(`/props` `modalities.audio`) serves `transcription` beside\n`chat`: its `/v1/audio/transcriptions` answers only then\n(measured).\n\nOpenAI\'s `whisper-*` models serve `translation` beside\n`transcription`; nothing else here translates (measured).\nElevenLabs\' `scribe_*` models serve `transcription`, listed\nonly while the key may use speech-to-text (P3-1, as P3-2\nrequires `models_read` for its speech models).\n\nA driver reports those anyway, so a model\'s id does not\nchange on the day its door arrives, and the gateway lists a\nmodel on `GET /v1/models` only once a door serves one of its\nsurfaces (P1-4).\n\n**Strings, not an enum, on purpose.** A newer driver\nreporting a surface an older gateway has never heard of must\nnot fail that gateway\'s validation of the whole `/v1/info`,\nwhich would make every model on the driver unreachable over\none unknown word. A reader ignores a surface it does not\nknow. Empty only for a model whose kind neither the backend\nnor the driver could decide, which serves nothing.\n\n**Replaces `capabilities.embeddings` and\n`capabilities.chatCapable`**, which said the same thing once\nfor the whole driver. Where they came from still holds for a\nsingle-model driver: `embeddings` is **a property of the\nrunning backend, not of the model**, and not readable from\nanything (`llama-server`\'s `/props` carries no pooling\nfield, and an Ollama runner started for chat refuses with\n*"This server does not support embeddings"*), so it is\ndetermined by trying once and cached for the driver\'s\nlifetime. A System One backend serves `decisions` alone. An\naccount takes each model\'s surfaces from its catalogue.\n',
+        description='Which requests this model answers. The values so far:\n\n* `chat` (`/v1/generate`), `embeddings` (`/v1/embed`),\n  `decisions` (`/v1/decide`), `speech` (`/v1/speak`, P3a),\n  `transcription` (`/v1/transcribe`, P3b), `translation`\n  (`/v1/transcribe` with `translate`, P3-4), `image`\n  (`/v1/image`, P4), `video` (`/v1/video`, P5),\n  `moderation` (`/v1/moderate`, P6), `completion`\n  (`/v1/generate` with `completion`, P6) and `rerank`\n  (`/v1/rerank`, MR6), which have doors.\n\n`rerank` is reported for a backend that answers a rerank: a\n`llama-server` started with `--reranking`, found by asking it\n(`/v1/rerank`). An account does not report it, whatever its\ncatalogue says, because no account engine sorts yet: a model\nan account lists only for reranking serves nothing here, as it\ndid before the door. Until 2026-10-12 this named `rerank` as a\ndoor Eugene had not built.\n\n`completion` is reported for a local `llama-server`, a vLLM,\nand an Ollama account\'s models with its `completion`\ncapability: engines that continue raw text (P6-4). An account\nover a hosted API does not report it: OpenRouter\'s completions\nanswer the prompt as a chat turn (measured).\n\nAn OpenRouter model whose output is image and text (Gemini\'s\nimage models) serves `image` beside `chat`: its images route\nanswers them too (measured).\n\nA single-model `llama-server` whose projector hears\n(`/props` `modalities.audio`) serves `transcription` beside\n`chat`: its `/v1/audio/transcriptions` answers only then\n(measured).\n\nOpenAI\'s `whisper-*` models serve `translation` beside\n`transcription`; nothing else here translates (measured).\nElevenLabs\' `scribe_*` models serve `transcription`, listed\nonly while the key may use speech-to-text (P3-1, as P3-2\nrequires `models_read` for its speech models).\n\nA driver reports those anyway, so a model\'s id does not\nchange on the day its door arrives, and the gateway lists a\nmodel on `GET /v1/models` only once a door serves one of its\nsurfaces (P1-4).\n\n**Strings, not an enum, on purpose.** A newer driver\nreporting a surface an older gateway has never heard of must\nnot fail that gateway\'s validation of the whole `/v1/info`,\nwhich would make every model on the driver unreachable over\none unknown word. A reader ignores a surface it does not\nknow. Empty only for a model whose kind neither the backend\nnor the driver could decide, which serves nothing.\n\n**Replaces `capabilities.embeddings` and\n`capabilities.chatCapable`**, which said the same thing once\nfor the whole driver. Where they came from still holds for a\nsingle-model driver: `embeddings` is **a property of the\nrunning backend, not of the model**, and not readable from\nanything (`llama-server`\'s `/props` carries no pooling\nfield, and an Ollama runner started for chat refuses with\n*"This server does not support embeddings"*), so it is\ndetermined by trying once and cached for the driver\'s\nlifetime. A System One backend serves `decisions` alone. An\naccount takes each model\'s surfaces from its catalogue.\n',
     )
     inputModalities: list[str] | None = Field(
         None,

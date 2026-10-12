@@ -338,6 +338,8 @@ CLIENT_ADMISSION_PATHS = frozenset(
         # rather than an admission -- see the route.
         "/v1/messages/count_tokens",
         "/v1/embeddings",
+        # MR6: with its row from the first commit, as the rule above asks.
+        "/v1/rerank",
         "/v1/systemone",
         # Slice 4, 2026-09-23: Codex CLI's only door.
         "/v1/responses",

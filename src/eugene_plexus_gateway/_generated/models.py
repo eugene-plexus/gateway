@@ -1720,6 +1720,7 @@ class Surface(StrEnum):
     video = 'video'
     moderation = 'moderation'
     completion = 'completion'
+    rerank = 'rerank'
 
 
 class VideoPriceUnit(StrEnum):
@@ -2595,11 +2596,11 @@ class EmbeddingRequest(BaseModel):
     )
     user: str | None = Field(
         None,
-        description='Opaque end-user id, as OpenAI defines it. Recorded, not routed on.',
+        description='Opaque end-user id, as OpenAI defines it. **Accepted and\nignored**: it is not sent to any backend, not recorded and not\nrouted on. A request that carries one is answered with\n`x-eugene-plexus-ignored-settings: user` (`dimensions, user`\nwhen both are sent). Before 2026-10-11 this said "recorded".\n',
     )
     dimensions: int | None = Field(
         None,
-        description='Passed through to the backend unchanged. Most local backends\nignore it; this layer does not emulate truncation, because a\nsilently-truncated vector is a wrong answer that looks like\na right one.\n',
+        description="**Accepted and ignored.** The vectors come back at the\nmodel's own width, whatever is asked here. No backend is sent\nthis field (the driver's `EmbedRequest` has none), and this\nlayer does not emulate truncation, because a silently\ntruncated vector is a wrong answer that looks like a right\none. A request that carries one is answered with\n`x-eugene-plexus-ignored-settings: dimensions` (`dimensions,\nuser` when both are sent). Before 2026-10-11 this said it was\npassed through to the backend unchanged; it never was.\n",
         ge=1,
     )
 
@@ -2633,6 +2634,38 @@ class EmbeddingUsage(BaseModel):
 
     prompt_tokens: int | None = Field(None, ge=0)
     total_tokens: int | None = Field(None, ge=0)
+
+
+class RerankDocument(BaseModel):
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    text: str = Field(
+        ...,
+        description='The passage. Other fields are kept by the caller, not read here.',
+    )
+
+
+class Object2(StrEnum):
+    list = 'list'
+
+
+class RerankResultDocument(BaseModel):
+    text: str = Field(
+        ..., description='The passage, when `return_documents` or `return_text` asked.'
+    )
+
+
+class TeiRerankResult(BaseModel):
+    index: int = Field(
+        ..., description="Position of the passage in the request's `texts`.", ge=0
+    )
+    score: float = Field(
+        ..., description="0 to 1, or the engine's own number with `raw_scores`."
+    )
+    text: str | None = Field(
+        None, description='The passage, when `return_text` or `return_documents` asked.'
+    )
 
 
 class Billing(StrEnum):
@@ -3181,7 +3214,7 @@ class ResponsesTool(BaseModel):
     strict: bool | None = None
 
 
-class Object2(StrEnum):
+class Object3(StrEnum):
     response = 'response'
 
 
@@ -3968,7 +4001,7 @@ class ModelRoutingInfo(BaseModel):
     )
     surfaces: list[Surface] | None = Field(
         None,
-        description="Which surfaces this model can be sent to. `decisions` means\n`POST /v1/systemone`; a decision-only model lists nothing\nelse, and a chat request naming it is refused with the\ndoor's name. `speech` means `POST /v1/audio/speech` (P3a),\n`transcription` `POST /v1/audio/transcriptions` (P3b),\n`translation` `POST /v1/audio/translations` (P3-4), `image`\n`POST /v1/images/generations` and `/edits` (P4), `video`\n`POST /v1/videos` (P5), `moderation` `POST /v1/moderations`\n(P6), `completion` `POST /v1/completions` (P6).\n\nOpenAI's own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Measured, not assumed, and the two are not always\ndisjoint**: an Ollama runner started for chat refuses to\nembed, `nomic-embed-text` refuses to chat -- but\n`llama-server` given `--embedding` still serves chat\nperfectly well. Hence a list.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n",
+        description='Which surfaces this model can be sent to. `decisions` means\n`POST /v1/systemone`; a decision-only model lists nothing\nelse, and a chat request naming it is refused with the\ndoor\'s name. `speech` means `POST /v1/audio/speech` (P3a),\n`transcription` `POST /v1/audio/transcriptions` (P3b),\n`translation` `POST /v1/audio/translations` (P3-4), `image`\n`POST /v1/images/generations` and `/edits` (P4), `video`\n`POST /v1/videos` (P5), `moderation` `POST /v1/moderations`\n(P6), `completion` `POST /v1/completions` (P6), `rerank`\n`POST /v1/rerank` (MR6).\n\nOpenAI\'s own `/v1/models` does not say, which is why every\nRAG front-end makes you pick an embedding model from a\ndropdown of everything and discover your mistake as an\nerror. This install knows, because the driver determines it\nfrom the backend, so it says.\n\n**Embeddings and chat are disjoint on every engine measured.**\nAn Ollama runner started for chat refuses to embed and\n`nomic-embed-text` refuses to chat. A `llama-server` started\nwith `--embedding` answers `/v1/chat/completions` and\n`/v1/completions` with a 500, and one started without it\nanswers `/v1/embeddings` with a 501 naming the flag (builds\nb10948 and b11552, measured 2026-10-11). So a single-model\ndriver reports `embeddings` or `chat`, never both. Until\n2026-10-11 this text said `llama-server --embedding` "still\nserves chat perfectly well". That was recorded on 2026-09-12\nand had stopped reproducing by 2026-09-16 (b10948). The\nsurfaces are a list for other reasons: a chat model also\ncarries `completion` where a local engine continues raw text\nand `transcription` where its projector hears, and an\naccount\'s image-and-text model carries `image` beside `chat`.\n\n**Eugene starts a llama.cpp model as an embedder when the file\nis one (MR3, 2026-10-11).** The agent\'s adapter reads the\nGGUF header, or takes the runtime\'s `mode`\n(`RuntimeSpec.mode`), and adds `--embeddings` itself, so an\nembedding model started from the Library is listed here as\n`embeddings` and not `chat`. Until then this text said that\nnothing did: the adapter passed the model, host, port and\nalias, the profile\'s curated flags and its extra arguments,\nand an embedding model answered neither surface (501 on\n`/v1/embeddings`, 500 on chat, both measured on b10948 and\nb11552) and was listed here as `chat`.\n\n**A reranker is listed as `rerank` (MR6, 2026-10-12)**, and\nnothing else: its driver asks it to rerank before it asks\nanything else, and a reranker answers neither chat nor\nembeddings. Until then there was no `rerank` surface or door,\nand a reranker was listed as `chat`.\n\nEmpty means nothing serving this model would admit to either\nsurface, which is a backend that could not be reached rather\nthan a model that does nothing.\n',
     )
     image_input: bool | None = Field(
         None,
@@ -4354,6 +4387,87 @@ class OutputCap(BaseModel):
     source: OutputCapSource
 
 
+class RerankRequest(BaseModel):
+    """
+    Jina's and Cohere's rerank body (`documents`), or TEI's (`texts`):
+    exactly one of the two (MR6). Fields this door does not know are
+    ignored, as other OpenAI-shaped bodies' are.
+
+    """
+
+    model: str | None = Field(
+        None,
+        description='A model whose `x_eugene_plexus.surfaces` include `rerank`.\nLeft out: the one such model this key may use (see the\noperation).\n',
+    )
+    query: str = Field(
+        ..., description='The question the passages are scored against.', min_length=1
+    )
+    documents: list[str | RerankDocument] | None = Field(
+        None,
+        description='The passages (Jina, Cohere): strings, or objects whose `text`\nis the passage. Answered as `RerankResponse`.\n',
+        max_length=1000,
+    )
+    texts: list[str] | None = Field(
+        None,
+        description='The passages (TEI). Answered as `TeiRerankResponse`.',
+        max_length=1000,
+    )
+    top_n: int | None = Field(
+        None,
+        description='How many of the best to return. Left out, or more than there\nare: all of them, which is what Open WebUI asks for.\n',
+        ge=1,
+    )
+    return_documents: bool | None = Field(
+        False,
+        description="Put each passage on its result (`document.text`, or `text` in\nTEI's shape). Cohere's default, false; Jina's is true, so a\nJina client that wants the text asks.\n",
+    )
+    return_text: bool | None = Field(
+        False, description="TEI's name for `return_documents`; either one asks."
+    )
+    raw_scores: bool | None = Field(
+        False,
+        description="TEI's: the engine's own numbers, unchanged, instead of 0 to 1.\nHonoured in either shape.\n",
+    )
+    truncate: bool | None = Field(
+        None,
+        description="TEI's. **Accepted and ignored**, and named in `x-eugene-plexus-ignored-settings`.",
+    )
+    truncation_direction: str | None = Field(
+        None, description="TEI's. **Accepted and ignored**, and named."
+    )
+    max_chunks_per_doc: int | None = Field(
+        None, description="Cohere's. **Accepted and ignored**, and named."
+    )
+    max_tokens_per_doc: int | None = Field(
+        None, description="Cohere's. **Accepted and ignored**, and named."
+    )
+    rank_fields: list[str] | None = Field(
+        None,
+        description="Cohere's. **Accepted and ignored**, and named: an object's\n`text` is the passage.\n",
+    )
+
+
+class RerankResult(BaseModel):
+    index: int = Field(
+        ..., description="Position of the passage in the request's `documents`.", ge=0
+    )
+    relevance_score: float = Field(
+        ...,
+        description="0 to 1, higher answers the question better; the engine's own\nnumber with `raw_scores`.\n",
+    )
+    document: RerankResultDocument | None = None
+
+
+class TeiRerankResponse(RootModel[list[TeiRerankResult]]):
+    """
+    TEI's answer, one entry a passage, best first.
+    """
+
+    root: list[TeiRerankResult] = Field(
+        ..., description="TEI's answer, one entry a passage, best first."
+    )
+
+
 class RoutingTierView(BaseModel):
     target: str = Field(
         ..., description='The model id this tier is the replica set of.'
@@ -4541,7 +4655,7 @@ class ResponsesResponse(BaseModel):
         extra='allow',
     )
     id: str
-    object: Object2
+    object: Object3
     created_at: int
     status: Status1 = Field(
         ...,
@@ -5151,6 +5265,23 @@ class EmbeddingResponse(BaseModel):
     model: str = Field(
         ...,
         description='The model that actually produced these vectors. After a\nsame-model failover this still names that model -- by the\nrule above, it can never name a different one.\n',
+    )
+    usage: EmbeddingUsage | None = None
+    x_eugene_plexus: CompletionRoutingInfo | None = None
+
+
+class RerankResponse(BaseModel):
+    id: str | None = Field(
+        None, description="This answer's own id, as Cohere's carry one."
+    )
+    object: Object2
+    model: str = Field(
+        ...,
+        description='The model that scored these. After a same-model failover it\nstill names that model; by the rule above it can never name a\ndifferent one.\n',
+    )
+    results: list[RerankResult] = Field(
+        ...,
+        description='Best first, by `relevance_score` and then by `index`; `top_n`\nlong when it was given and smaller than the number of passages.\n',
     )
     usage: EmbeddingUsage | None = None
     x_eugene_plexus: CompletionRoutingInfo | None = None

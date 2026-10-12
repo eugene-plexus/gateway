@@ -445,6 +445,13 @@ class _Backend:
         return "embeddings" in self.surfaces
 
     @property
+    def reranks(self) -> bool:
+        """Whether this model serves the rerank surface (MR6): a result
+        sorter, which scores passages against a question. Its driver asks it to
+        rerank before it asks anything else, so it serves nothing but this."""
+        return "rerank" in self.surfaces
+
+    @property
     def speaks(self) -> bool:
         """Whether this model serves the speech surface (P3a)."""
         return "speech" in self.surfaces
@@ -690,6 +697,7 @@ class Resolution:
             + (["video"] if any(b.makes_videos for b in backends) else [])
             + (["moderation"] if any(b.moderates for b in backends) else [])
             + (["completion"] if any(b.completes for b in backends) else [])
+            + (["rerank"] if any(b.reranks for b in backends) else [])
         )
 
     def reported_surfaces(self) -> list[str]:
@@ -715,9 +723,9 @@ class Resolution:
 
         For a model requested by its own name that is the model; for a
         slot alias (`vectors -> [a, b]`) it is `a`. The doors that must
-        never cross models -- embeddings, speech, decisions -- choose
-        from this and nothing else, so a first model that is down is
-        down rather than replaced by `b`.
+        never cross models -- embeddings, speech, decisions, rerank --
+        choose from this and nothing else, so a first model that is down
+        is down rather than replaced by `b`.
 
         Matching the request's own name instead answered every alias
         with a 503, since no backend's public id is the alias: speech
@@ -2197,6 +2205,24 @@ class RoutingTable:
         its first target.
         """
         eligible = [b for b in resolution.first_model() if b.embeds]
+        if not eligible:
+            return None
+        ordered = [b.client for b in self._order(resolution.model, eligible)]
+        return TieredClient(name=resolution.model, tiers=[ordered], hooks=self)
+
+    def pick_rerank(self, resolution: Resolution) -> TieredClient | None:
+        """`pick_embedding`'s single-model tier, for a result sorter (MR6).
+
+        **One model: the slot's first.** Two sorters' scores are not on one
+        scale (measured: Qwen3-Reranker answers probabilities,
+        bge-reranker-v2-m3 logits from 8.19 to -11.04), so a caller sorting by
+        them would mix scales behind a 200. The returned client holds a single
+        tier of the slot's first model's replicas that report the rerank
+        surface, which balance and fail over like any replicas; there is no
+        second tier for a cascade to walk into. A first model that is down is
+        down, not replaced by the slot's next target.
+        """
+        eligible = [b for b in resolution.first_model() if b.reranks]
         if not eligible:
             return None
         ordered = [b.client for b in self._order(resolution.model, eligible)]

@@ -18,7 +18,13 @@ from eugene_plexus_gateway import body_limit
 
 from .conftest import FakeDriverClient
 
-OPENAI_SHAPED = ["/v1/chat/completions", "/v1/embeddings", "/v1/systemone", "/v1/audio/speech"]
+OPENAI_SHAPED = [
+    "/v1/chat/completions",
+    "/v1/embeddings",
+    "/v1/rerank",
+    "/v1/systemone",
+    "/v1/audio/speech",
+]
 BOUNDED = [*OPENAI_SHAPED, "/v1/messages"]
 
 

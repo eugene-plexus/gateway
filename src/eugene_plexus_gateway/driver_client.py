@@ -41,6 +41,8 @@ from ._generated.driver_models import (
     ModerateRequest,
     ModerateResponse,
     Problem,
+    RerankPassagesRequest,
+    RerankPassagesResponse,
     RetryDisposition,
     SpeakRequest,
     TokenCount,
@@ -245,6 +247,7 @@ class DriverClient(Protocol):
     async def info(self, *, models: bool = True, model: str | None = None) -> DriverInfo: ...
     async def generate(self, request: GenerateRequest) -> GenerateResponse: ...
     async def embed(self, request: EmbedRequest) -> EmbedResponse: ...
+    async def rerank(self, request: RerankPassagesRequest) -> RerankPassagesResponse: ...
 
     async def decide(self, request: DecisionRequest) -> DecisionResponse: ...
     async def transcribe(self, request: TranscribeRequest) -> TranscribeResponse: ...
@@ -426,6 +429,34 @@ class HttpDriverClient:
             return EmbedResponse.model_validate(response.json())
         except ValueError as exc:
             raise self._invalid_reply() from exc
+
+    async def rerank(self, request: RerankPassagesRequest) -> RerankPassagesResponse:
+        """The driver's `/v1/rerank` (MR6): a question and passages in, each
+        passage scored and the best first."""
+        payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
+        response = await self._client.post(
+            "/v1/rerank",
+            json=payload,
+            headers={"X-Request-ID": str(request.requestId)} if request.requestId else None,
+        )
+        if response.status_code >= 400:
+            raise DriverError(
+                driver_name=self.name,
+                driver_url=self.base_url,
+                status_code=response.status_code,
+                problem=_problem_from_response(response),
+                raw_body=response.text,
+            )
+        try:
+            answer = RerankPassagesResponse.model_validate(response.json())
+        except ValueError as exc:
+            raise self._invalid_reply() from exc
+        # A score for a passage nobody sent is outside the contract. Refused
+        # here, as an invalid reply, so the attempt is recorded as the failure
+        # it was and the door never indexes its own passages with it.
+        if any(r.index >= len(request.documents) for r in answer.results):
+            raise self._invalid_reply()
+        return answer
 
     async def decide(self, request: DecisionRequest) -> DecisionResponse:
         payload = request.model_dump(mode="json", by_alias=True, exclude_none=True)
@@ -829,6 +860,7 @@ class BoundClient:
             ImageRequest,
             VideoRequest,
             ModerateRequest,
+            RerankPassagesRequest,
         )
     ](self, request: R) -> R:
         return request.model_copy(update={"model": self.model})
@@ -854,6 +886,11 @@ class BoundClient:
 
     async def embed(self, request: EmbedRequest) -> EmbedResponse:
         result = await self._inner.embed(self._bind(request))
+        result.modelId = self._publish(result.modelId)
+        return result
+
+    async def rerank(self, request: RerankPassagesRequest) -> RerankPassagesResponse:
+        result = await self._inner.rerank(self._bind(request))
         result.modelId = self._publish(result.modelId)
         return result
 
@@ -1167,6 +1204,12 @@ class TieredClient:
     async def embed(self, request: EmbedRequest) -> EmbedResponse:
         # pick_embedding supplies only replicas of this model.
         return await Executor(self).whole("embed", lambda candidate: candidate.embed(request))
+
+    async def rerank(self, request: RerankPassagesRequest) -> RerankPassagesResponse:
+        # pick_rerank supplies only replicas of this model: two sorters' scores
+        # are not on one scale, so a cascade to another model would be a 200
+        # that mixes them.
+        return await Executor(self).whole("rerank", lambda candidate: candidate.rerank(request))
 
     async def _over_tiers[T](self, label: str, call: Callable[[Any], Awaitable[T]]) -> T:
         return await Executor(self).whole(label, call)

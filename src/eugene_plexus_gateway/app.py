@@ -266,6 +266,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "/v1/chat/completions",
             "/v1/messages",
             "/v1/embeddings",
+            # MR6: a question and up to 1,000 passages, read and parsed whole.
+            "/v1/rerank",
             "/v1/systemone",
             "/v1/responses",
             "/v1/audio/speech",

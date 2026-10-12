@@ -49,6 +49,7 @@ from .. import (
     image_doors,
     moderation_door,
     repetition,
+    rerank_door,
     responses,
     server_tools,
     system_placement,
@@ -66,6 +67,8 @@ from .._generated.driver_models import (
     ImageResponse,
     Message,
     ModerateRequest,
+    RerankPassagesRequest,
+    RerankPassagesResponse,
     Role,
     SpeakRequest,
     TranscribeAudio,
@@ -79,6 +82,7 @@ from .._generated.driver_models import (
 from .._generated.driver_models import (
     DecisionRequest as DriverDecisionRequest,
 )
+from .._generated.driver_models import Document as DriverRerankDocument
 from .._generated.driver_models import NamedToolChoice as DriverNamedToolChoice
 from .._generated.driver_models import Prediction as DriverPrediction
 from .._generated.driver_models import PromptCacheRetention as DriverPromptCacheRetention
@@ -90,6 +94,7 @@ from .._generated.driver_models import Text as DriverModerationText
 from .._generated.driver_models import TimestampGranularity as DriverTimestampGranularity
 from .._generated.driver_models import Tool as DriverTool
 from .._generated.driver_models import ToolChoice as DriverToolChoice
+from .._generated.driver_models import Usage as DriverUsage
 from .._generated.driver_models import Verbosity as DriverVerbosity
 from .._generated.driver_models import WebSearchOptions as DriverWebSearchOptions
 from .._generated.models import (
@@ -220,7 +225,8 @@ def _record(
     | chat_contract.TranscriptionAsk
     | image_doors.ImageAsk
     | video_doors.VideoAsk
-    | moderation_door.ModerationAsk,
+    | moderation_door.ModerationAsk
+    | rerank_door.RerankAsk,
     tries: list[AttemptRow],
     *,
     served_model: str | None = None,
@@ -563,6 +569,7 @@ _DOORS = {
     "video": "/v1/videos",
     "moderation": "/v1/moderations",
     "completion": "/v1/completions",
+    "rerank": "/v1/rerank",
 }
 
 
@@ -2349,14 +2356,16 @@ async def _stream_text_completion(
 # --------------------------------------------------------------------------- #
 
 
-async def _moderation_model(request: Request, table: RoutingTable) -> str | _Failure:
-    """The model a request that left `model` out is for (P6-1): the one
-    model with the moderation surface this key may use, or a 400 naming
-    the choices. The OpenAI SDK leaves it out, and OpenAI then uses
-    `omni-moderation-latest`; here that is whichever one the install has."""
+async def _models_serving(request: Request, table: RoutingTable, surface: str) -> list[str]:
+    """Every model with this surface that this key may use: what a request
+    that left `model` out is choosing among (moderation, P6-1; rerank, MR6).
+
+    One function for both, so the two doors cannot disagree about which models
+    count. The key's allowlist and local-only policy narrow the list exactly as
+    they narrow `GET /v1/models`, which is where this reads it from."""
     await admission.authorize(request)
     context = admission.current.get()
-    choices = [
+    return [
         m.id
         for m in table.as_model_list(
             context.allowed_models if context else None, local_only=admission.local_only()
@@ -2365,8 +2374,16 @@ async def _moderation_model(request: Request, table: RoutingTable) -> str | _Fai
         # otherwise make every install with a moderation slot "several".
         if table.serves(m.id)
         and m.x_eugene_plexus is not None
-        and "moderation" in [getattr(s, "value", s) for s in m.x_eugene_plexus.surfaces or []]
+        and surface in [getattr(s, "value", s) for s in m.x_eugene_plexus.surfaces or []]
     ]
+
+
+async def _moderation_model(request: Request, table: RoutingTable) -> str | _Failure:
+    """The model a request that left `model` out is for (P6-1): the one
+    model with the moderation surface this key may use, or a 400 naming
+    the choices. The OpenAI SDK leaves it out, and OpenAI then uses
+    `omni-moderation-latest`; here that is whichever one the install has."""
+    choices = await _models_serving(request, table, "moderation")
     if len(choices) == 1:
         return choices[0]
     return _Failure(
@@ -2502,6 +2519,238 @@ async def create_moderation(request: Request) -> Any:
             "model": getattr(client, "served_model", None) or model,
             "results": result.results,
         }
+    )
+
+
+# --------------------------------------------------------------------------- #
+# /v1/rerank
+# --------------------------------------------------------------------------- #
+
+
+async def _rerank_model(request: Request, table: RoutingTable) -> str | _Failure:
+    """The model a request that left `model` out is for (MR6): the one model
+    with the rerank surface this key may use, as TEI's clients expect (they
+    send none, and a result sorter is something a person sets up once).
+
+    None is a 404 that says no result sorter is served to this key; several is
+    a 400 naming them, as moderation's is (P6-1)."""
+    choices = await _models_serving(request, table, "rerank")
+    if len(choices) == 1:
+        return choices[0]
+    if not choices:
+        return _Failure(
+            code=404,
+            message=(
+                "model: left out, and no result sorter (a model that serves rerank) is served "
+                "to this key. Start or install one, or use a key that may use one: "
+                "GET /v1/models reports x_eugene_plexus.surfaces per model."
+            ),
+            error_type="model_not_found",
+            param="model",
+        )
+    return _Failure(
+        code=400,
+        message=(
+            "model: required here, since this key may use several result sorters: "
+            + ", ".join(choices)
+            + "."
+        ),
+        error_type="invalid_request_error",
+        param="model",
+    )
+
+
+def _ignored_header(ask: rerank_door.RerankAsk) -> dict[str, str]:
+    """`x-eugene-plexus-ignored-settings`, naming what this request carried and
+    the answer does not honour; absent when it carried none."""
+    return {"x-eugene-plexus-ignored-settings": ", ".join(ask.ignored)} if ask.ignored else {}
+
+
+@router.post("/v1/rerank", dependencies=_auth)
+async def create_rerank(request: Request) -> Any:
+    """Passages sorted by how well they answer a question (MR6, 2026-10-12):
+    Jina's, Cohere's and TEI's bodies, one door.
+
+    **Same model only**, as embeddings: `pick_rerank` hands back replicas of the
+    slot's first model and nothing else. Two sorters' scores are not on one
+    scale, so a `modelSlots` fallback to a different target is not run: a caller
+    sorting by them would be mixing scales behind a 200.
+
+    **The answer follows the request's shape.** `documents` is answered as
+    `RerankResponse`; `texts`, TEI's, as the bare array TEI answers. What
+    `llama-server` does not do is done here: it answers `return_documents` with
+    no documents and refuses objects (measured on b10948 and b11552), so the
+    driver is sent text and the passage is put back from the request.
+
+    **An empty list is answered with no results and reaches no model**, once
+    the model it names has resolved: an unknown model is still a 404, and a
+    model that is not a sorter is still a 400.
+
+    **Nothing here wakes a runtime**, as for embeddings: start-on-demand is
+    chat-path lifecycle.
+    """
+    try:
+        raw = await request.json()
+    except ValueError:
+        return _error(
+            code=400,
+            message="body: must be JSON.",
+            error_type="invalid_request_error",
+            param="body",
+        )
+    try:
+        ask = rerank_door.parse(raw)
+    except rerank_door.Refusal as exc:
+        return _error(
+            code=400, message=exc.message, error_type="invalid_request_error", param=exc.field
+        )
+    table = _routing(request)
+    if table is None:
+        return _error(
+            code=503,
+            message="The gateway is starting up or in safe mode; no routing table exists yet.",
+            error_type="service_unavailable",
+        )
+    if ask.model is None:
+        chosen = await _rerank_model(request, table)
+        if isinstance(chosen, _Failure):
+            return chosen.as_openai()
+        ask = replace(ask, model=chosen)
+    model = ask.model or ""
+    await admission.authorize(request, model)
+    resolution = await admission.permitted(table.resolve(model))
+    if not resolution.has_backends():
+        return _no_such_model(model, table).as_openai()
+    surfaces = resolution.surfaces()
+    if surfaces and "rerank" not in surfaces:
+        return _wrong_surface(
+            model, surfaces, wanted="rerank", instead="/v1/chat/completions"
+        ).as_openai()
+    if not surfaces and (reported := resolution.reported_surfaces()):
+        return _no_door_yet(model, reported, wanted="rerank").as_openai()
+
+    if not ask.passages:
+        # Nothing to score, so nothing is sent and no row is made: the
+        # middleware's fallback would record it as an error (no backend
+        # served it), and a sort that took no time would pull this model's
+        # latency down. The answer names the model that would have scored.
+        if (context := admission.current.get()) is not None:
+            context.recorded = True
+        named = resolution.tiers[0].target if resolution.tiers else model
+        return JSONResponse(
+            content=[] if ask.shape == "texts" else rerank_door.envelope([], model=named),
+            headers=_ignored_header(ask),
+        )
+
+    client = table.pick_rerank(resolution)
+    if client is None and await table.refresh_if_stale():
+        resolution = await admission.permitted(table.resolve(model))
+        client = table.pick_rerank(resolution)
+    if client is None:
+        # No wake, as for embeddings.
+        return _not_ready(resolution, None).as_openai()
+    if isinstance(client, TieredClient):
+        client.authorize_attempt = admission.before_attempt
+
+    rec = _Recording(metrics=_metrics(request), started=time.perf_counter())
+    with collect_attempts() as tries:
+
+        def record(answered: RerankPassagesResponse | None = None) -> None:
+            said = answered.usage if answered is not None else None
+            # A sort reads tokens and writes none: the row says 0 completion
+            # tokens, as the embeddings row does, so it is not counted as a
+            # request whose usage is incomplete.
+            usage = (
+                DriverUsage(
+                    promptTokens=said.promptTokens,
+                    completionTokens=0,
+                    totalTokens=said.totalTokens,
+                )
+                if said is not None
+                else None
+            )
+            _record(
+                rec,
+                ask,
+                tries,
+                served_model=getattr(client, "served_model", None)
+                if answered is not None
+                else None,
+                tier=getattr(client, "tier", 1) if answered is not None else None,
+                usage=usage,
+                backend_ms=answered.latencyMs if answered is not None else None,
+                door="rerank",
+            )
+
+        try:
+            result = await serve_while_connected(
+                request,
+                client.rerank(
+                    RerankPassagesRequest(
+                        query=ask.query,
+                        documents=[DriverRerankDocument(p) for p in ask.passages],
+                        # Never more than there are: "all of them" is what a
+                        # larger number means, and no backend need be asked.
+                        topN=None if ask.top_n is None else min(ask.top_n, len(ask.passages)),
+                        localOnly=admission.local_only(),
+                        requestId=str(admission.request_id()) if admission.request_id() else None,
+                    )
+                ),
+                what="a rerank",
+            )
+        except ClientGone:
+            record()
+            return _error(
+                code=499,
+                message="The client disconnected; the backend call was cancelled.",
+                error_type="client_disconnected",
+            )
+        except DriverError as e:
+            record()
+            return _driver_failure(e).as_openai()
+        except httpx.TimeoutException as e:
+            record()
+            return _error(
+                code=504,
+                message=(
+                    f"No backend serving {model!r} answered within the gateway's "
+                    f"requestTimeoutSeconds ({_timeout_seconds(_store(request)):g}s). It was not "
+                    f"retried on a replica, because a replica would take the same time on the "
+                    f"same input. ({type(e).__name__})"
+                ),
+                error_type="timeout",
+            )
+        except httpx.HTTPError as e:
+            record()
+            return _error(
+                code=502,
+                message=(
+                    f"A backend serving {model!r} failed ({type(e).__name__}). "
+                    "The cascade never reached a different model: two sorters' scores are not "
+                    "comparable."
+                ),
+                error_type="upstream_error",
+            )
+        record(result)
+
+    scored = rerank_door.results(ask, result.results)
+    routing = _routing_info(client, table, model, rec.started)
+    headers = _ignored_header(ask)
+    if ask.shape == "texts":
+        # TEI's answer is a bare array, with nowhere to say what served it, so
+        # that rides the headers, as it does on the doors whose body cannot
+        # carry it (U4).
+        return JSONResponse(
+            content=scored, headers={**headers, **anthropic.envelope_headers(routing)}
+        )
+    return JSONResponse(
+        content=rerank_door.envelope(
+            scored,
+            model=result.modelId or getattr(client, "served_model", None) or model,
+            usage=rerank_door.usage_of(result.usage),
+            routing=routing.model_dump(mode="json", exclude_none=True),
+        ),
+        headers=headers,
     )
 
 

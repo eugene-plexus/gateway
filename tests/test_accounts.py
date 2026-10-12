@@ -117,11 +117,46 @@ def test_the_same_account_name_on_two_machines_is_one_account(settings: Any) -> 
 # --------------------------------------------------------------------------- #
 
 
+#: A surface no door here serves and none of this build's contract names: what a
+#: newer driver may report (`DriverModel.surfaces` is strings, not an enum, so
+#: that one unknown word cannot unroute a driver's other models).
+UNKNOWN_SURFACE = "a-surface-from-a-newer-driver"
+
+
 def test_a_model_with_no_door_yet_is_not_listed(settings: Any) -> None:
-    """P1-4: an account's rerank model is on the driver's list and not on
-    `/v1/models` until a rerank door exists. This used a speech model until
-    P3a gave speech its door, an image model until P4 and a video model until
-    P5 (2026-09-28)."""
+    """P1-4: a model whose only surface has no door here is on the driver's
+    list and not on `/v1/models`. This used a speech model until P3a gave
+    speech its door, an image model until P4, a video model until P5 and a
+    rerank model until MR6 (2026-10-12). Every surface the contract names has a
+    door now, so what is left is a word a newer driver reports."""
+    app = create_app(settings=settings)
+
+    class _WithNewSurface(FakeDriverClient):
+        def describe(self):  # type: ignore[no-untyped-def]
+            info = super().describe()
+            assert info.models is not None
+            info.models[1].surfaces = [UNKNOWN_SURFACE]
+            return info
+
+    account = _WithNewSurface(
+        name="openrouter",
+        models=["mistralai/mistral-nemo", "acme/newer-model"],
+        account=True,
+    )
+    app.state.routing = make_routing_table(account)
+    with TestClient(app) as client:
+        ids = [m["id"] for m in client.get("/v1/models").json()["data"]]
+        refused = client.post("/v1/chat/completions", json=_chat("openrouter/acme/newer-model"))
+    assert ids == ["openrouter/mistralai/mistral-nemo"]
+    assert refused.status_code == 400
+    assert UNKNOWN_SURFACE in refused.json()["error"]["message"]
+    assert not account.calls
+
+
+def test_a_rerank_model_is_listed_as_rerank_and_never_as_chat(settings: Any) -> None:
+    """MR6: the case the test above held until the door existed. A model that
+    reports `rerank` is on `/v1/models` with that surface and no other, and the
+    chat door sends a caller who names it to `/v1/rerank`."""
     app = create_app(settings=settings)
 
     class _WithRerank(FakeDriverClient):
@@ -138,10 +173,17 @@ def test_a_model_with_no_door_yet_is_not_listed(settings: Any) -> None:
     )
     app.state.routing = make_routing_table(account)
     with TestClient(app) as client:
-        ids = [m["id"] for m in client.get("/v1/models").json()["data"]]
+        listed = {m["id"]: m for m in client.get("/v1/models").json()["data"]}
         refused = client.post("/v1/chat/completions", json=_chat("openrouter/cohere/rerank-v3.5"))
-    assert ids == ["openrouter/mistralai/mistral-nemo"]
-    assert refused.status_code >= 400
+    assert sorted(listed) == [
+        "openrouter/cohere/rerank-v3.5",
+        "openrouter/mistralai/mistral-nemo",
+    ]
+    assert listed["openrouter/cohere/rerank-v3.5"]["x_eugene_plexus"]["surfaces"] == ["rerank"]
+    assert listed["openrouter/mistralai/mistral-nemo"]["x_eugene_plexus"]["surfaces"] == ["chat"]
+    assert refused.status_code == 400
+    assert "serves rerank and not chat" in refused.json()["error"]["message"]
+    assert "/v1/rerank" in refused.json()["error"]["message"]
     assert not account.calls
 
 
@@ -246,11 +288,14 @@ async def test_a_refresh_prefixes_an_accounts_models(route_http: Any) -> None:  
         "version": "0.2.0",
         "models": [
             {"id": "mistralai/mistral-nemo", "surfaces": ["chat"]},
-            # A rerank model: no door yet (a speech model until P3a, an image
-            # model until P4, a video model until P5).
+            # A rerank model: listed since MR6 (it had no door until then, as a
+            # speech model had none until P3a, an image model until P4 and a
+            # video model until P5).
             {"id": "cohere/rerank-v3.5", "surfaces": ["rerank"]},
+            # What has no door now: a surface this build has never heard of.
+            {"id": "acme/newer-model", "surfaces": [UNKNOWN_SURFACE]},
         ],
-        "catalogue": {"source": "openrouter", "total": 2, "exposed": 2},
+        "catalogue": {"source": "openrouter", "total": 3, "exposed": 3},
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -262,10 +307,14 @@ async def test_a_refresh_prefixes_an_accounts_models(route_http: Any) -> None:  
     table = RoutingTable(agent_url="http://agent")
     await table.refresh()
     assert table.known_models() == [
+        "openrouter/acme/newer-model",
         "openrouter/cohere/rerank-v3.5",
         "openrouter/mistralai/mistral-nemo",
     ]
-    assert [m.id for m in table.as_model_list()] == ["openrouter/mistralai/mistral-nemo"]
+    assert [m.id for m in table.as_model_list()] == [
+        "openrouter/cohere/rerank-v3.5",
+        "openrouter/mistralai/mistral-nemo",
+    ]
     await table.aclose()
 
 

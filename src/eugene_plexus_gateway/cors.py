@@ -82,6 +82,8 @@ FRONT_DOOR_PATHS: frozenset[str] = frozenset(
         "/v1/models",
         "/v1/chat/completions",
         "/v1/embeddings",
+        # MR6: a document search that sorts its results in a page.
+        "/v1/rerank",
         "/v1/messages",
         "/v1/responses",
         # P3a: a page that reads text aloud is the plainest browser client.

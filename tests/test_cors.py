@@ -62,7 +62,9 @@ def _preflight(client: TestClient, path: str, **extra: str) -> Any:
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("path", ["/v1/models", "/v1/chat/completions", "/v1/embeddings"])
+@pytest.mark.parametrize(
+    "path", ["/v1/models", "/v1/chat/completions", "/v1/embeddings", "/v1/rerank"]
+)
 def test_a_preflight_on_the_front_door_is_answered_before_auth(
     cors_client: TestClient, path: str
 ) -> None:
