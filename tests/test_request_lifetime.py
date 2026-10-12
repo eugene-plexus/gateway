@@ -105,14 +105,17 @@ def test_a_deadline_after_the_first_frame_is_an_error_in_the_stream_not_a_status
 
     driver.stream = speaks_then_hangs
     install_snapshot(app.state.routing, driver, fallback)
+    # The budget has to outlast the route's own preparation and the first
+    # frame, which is what makes this a stream that started: a second, where
+    # the test above takes half of one, and the backend still hangs for 30.
     with TestClient(app) as client:
         original = app.state.config_store.get
         app.state.config_store.get = lambda key: (
-            0.5 if key == "requestTimeoutSeconds" else original(key)
+            1.0 if key == "requestTimeoutSeconds" else original(key)
         )
         before = time.perf_counter()
         response = client.post(path, json=body(**extra), headers=headers)
-        assert time.perf_counter() - before < 2
+        assert time.perf_counter() - before < 3
         assert response.status_code == 200
         assert "Hello" in response.text
         assert "total request deadline" in response.text, response.text

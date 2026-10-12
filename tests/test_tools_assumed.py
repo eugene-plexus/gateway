@@ -426,6 +426,19 @@ def test_a_chat_stream_that_reports_progress_is_named_from_its_first_frame(
     assert first["choices"] == [] and first["x_eugene_plexus"]["progress"]["stage"] == "prompt"
 
 
+def test_a_browser_can_read_the_header_on_a_stream(settings: Settings) -> None:
+    """Workbench is a page on another origin: the header must be on the head
+    the browser reads and in the list of headers its script may read."""
+    body = _chat(tools=[WEATHER], stream=True, **FORCED["chat"])
+    with TestClient(_app(settings, _backend(ignored=["toolChoice"]))) as client:
+        r = client.post(
+            "/v1/chat/completions", json=body, headers={"origin": "http://192.168.16.75:8079"}
+        )
+    assert r.headers[HEADER] == "tool_choice"
+    assert r.headers["access-control-allow-origin"] == "*"
+    assert HEADER in r.headers["access-control-expose-headers"].lower().split(", ")
+
+
 def test_the_chat_door_which_named_nothing_before_names_it_alone(settings: Settings) -> None:
     with TestClient(_app(settings, _backend(ignored=["toolChoice"]))) as client:
         whole = _post(client, "chat", **FORCED["chat"])

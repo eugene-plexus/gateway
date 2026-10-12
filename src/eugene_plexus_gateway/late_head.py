@@ -13,11 +13,14 @@ generators open have to be entered and left in one context.
 
 **What it costs and what it does not.** The head now comes with the first
 frame, so a client that waited for the head before reading waits for the first
-frame instead. A client's read timeout covers both, and nothing is sent in the
-body before that frame on the doors that use this, so the stream itself is
-unchanged. A generator that fails before its first frame fails before the head,
-as a failed request, and a client that leaves while it waits cancels it as it
-cancels one that is streaming.
+frame instead. A client's read timeout covers both. The chat and Messages doors
+sent nothing before their first backend frame, so for them the stream is what it
+was and only the head has moved (measured over real sockets: the first byte
+arrives when it did). The Responses door says it is working while it waits, so
+it opens at its first backend frame or one keepalive interval in, whichever is
+first (`_stream_responses`). A generator that fails before its first frame
+fails before the head, as a failed request, and a client that leaves while it
+waits cancels it as it cancels one that is streaming.
 """
 
 from __future__ import annotations
