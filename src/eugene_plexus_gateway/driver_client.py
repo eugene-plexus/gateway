@@ -1061,14 +1061,12 @@ class TieredClient:
         #: last prompt is kept for the budget's next estimate, and a hit is
         #: told from an eviction by it (CB5). Set by `RoutingTable.pick`.
         self.conversation: Conversation | None = None
-        #: The model entry of the backend `RoutingTable.pick` put first, which
-        #: is the one a request is sent to first. What its driver says it does
-        #: not honour (`capabilities.settingsNotHonoured`) is therefore known
-        #: before anything is sent, and the doors name it on a stream's head
-        #: without waiting for a backend to speak (`ignored_settings`). A
-        #: failover to another backend is not re-said: the list is static per
-        #: backend and read once. Set by `RoutingTable.pick`.
-        self.first_model: DriverModel | None = None
+        #: The model entry each candidate was picked as, by candidate: what its
+        #: driver lists of what it does not honour (`capabilities.settingsNotHonoured`)
+        #: is static per backend, so it is known before anything is sent and a
+        #: stream's head names it without waiting for a backend to speak
+        #: (`model_asked_first`, `ignored_settings`). Set by `RoutingTable.pick`.
+        self.entries: dict[DriverClient, DriverModel | None] = {}
         #: `TieredClient` is passed where a `DriverClient` is expected,
         #: so it carries the protocol's `node` too. It is a slot over
         #: several machines' backends and has no one node of its own;
@@ -1124,14 +1122,55 @@ class TieredClient:
         assert last_exc is not None  # candidates is non-empty (checked in __init__)
         raise last_exc
 
+    def _front(self) -> int | None:
+        """The tier a request is tried in first: the first that holds anything."""
+        return next((index for index, tier in enumerate(self._tiers) if tier), None)
+
     async def _admit(self, request: GenerateRequest) -> None:
         """CB3: wait for room in a shared pool, and try first where there is."""
         if self.budget is None:
             return
-        for index, tier in enumerate(self._tiers):
-            if tier:
-                self._tiers[index] = await self.budget.admit(request, tier)
-                return
+        index = self._front()
+        if index is not None:
+            self._tiers[index] = await self.budget.admit(request, self._tiers[index])
+
+    def model_asked_first(self, request: GenerateRequest) -> DriverModel | None:
+        """The model entry of the backend this request's first attempt goes to.
+
+        What the doors read to name, before anything is sent, what that backend
+        does not honour (`capabilities.settingsNotHonoured`, static per backend).
+        **The backend actually asked first**, which is not always the balancer's
+        pick: `_admit` moves a replica with room in a shared pool to the front of
+        the first tier, and `Executor.attempts` skips a candidate whose circuit
+        would refuse an attempt. This reads that walk ahead by the same rules
+        (`TurnBudget.first`, `Executor.first_to_try`) and **only reads**: it
+        reserves no room, takes no circuit and waits for nothing, so a stream's
+        head never waits for a backend (an earlier version read a header off the
+        driver's response instead, which held every head until the first frame).
+
+        **A failover after the head is sent cannot change the header.** The head
+        is on the wire before any backend has been asked, so it names the first
+        attempt's backend, and an attempt that then fails over to another is not
+        re-said: that would need the head held until the first had failed. What
+        can still move between this read and the attempt is a circuit another
+        request trips or the room it takes (and, at the margin of "fits", the
+        tool a server-run search loop adds to its first turn, which the size read
+        here does not count); the header then names the backend that was first in
+        line when the head was built. A turn that must wait for room goes where
+        room opens first, which is not known before it waits, so it is read as the
+        tier's usual first, which is also where it goes when the wait runs out.
+
+        None when nothing would be asked (every circuit is cooling), or when that
+        candidate has no entry here: nothing is named then.
+        """
+        tiers = [list(tier) for tier in self._tiers]
+        index = self._front()
+        if self.budget is not None and index is not None:
+            ahead = self.budget.first(request, tiers[index])
+            if ahead is not None:
+                tiers[index] = [ahead, *(c for c in tiers[index] if c is not ahead)]
+        first = Executor.first_to_try(tiers)
+        return self.entries.get(first) if first is not None else None
 
     def _enter(self, candidate: DriverClient) -> None:
         if self.budget is not None:

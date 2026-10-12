@@ -728,12 +728,14 @@ class _Serving:
     #: The output cap sent to whichever candidate answers, and where it
     #: came from (2026-10-10), read once the client knows who answered.
     output_cap: Callable[[Any], OutputCap | None] = lambda _client: None
-    #: What the backend chosen for the first attempt does not honour, of what
-    #: the caller sent (2026-10-12): its driver's field names, matched by value
+    #: What the backend the first attempt goes to does not honour, of what the
+    #: caller sent (2026-10-12): its driver's field names, matched by value
     #: against its listing's `settingsNotHonoured` before anything is sent
     #: (`ignored_settings.not_honoured`). Each door says it on its own
     #: `x-eugene-plexus-ignored-settings`, in its own words, on both response
-    #: modes, so a stream's head never waits for the backend to speak.
+    #: modes, so a stream's head never waits for the backend to speak. **Fixed
+    #: when the head is built**: a failover after it cannot change it
+    #: (`TieredClient.model_asked_first`).
     not_honoured: tuple[str, ...] = ()
 
 
@@ -1053,7 +1055,10 @@ async def _prepare(
         return caps.get(key, base_cap)
 
     started = time.perf_counter()
-    first = getattr(client, "first_model", None)
+    # The model entry of the backend the first ATTEMPT goes to, read now, before
+    # anything is sent: not the balancer's first pick, which an open circuit or a
+    # replica with room can set aside (`TieredClient.model_asked_first`).
+    first = client.model_asked_first(generate) if isinstance(client, TieredClient) else None
     return _Serving(
         output_cap=output_cap,
         not_honoured=ignored_settings.not_honoured(

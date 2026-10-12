@@ -231,11 +231,44 @@ class TurnBudget:
         self._ledger.take(pool[0], self.tokens)
         self._lease = (id(candidate), pool[0])
 
+    def _sized(self, request: Any) -> tuple[int, int, int]:
+        """`(chars, prompt, tokens)` of one turn, as the estimate reads it."""
+        chars = request_chars(request)
+        seen = self._sizes.get(self._target, self._conversation) if self._conversation else None
+        prompt, tokens = estimate(chars, getattr(request, "maxTokens", None), seen)
+        return chars, prompt, tokens
+
+    def _with_room(self, waiting_on: Sequence[Any], prompt: int, tokens: int) -> Any | None:
+        """The first of `waiting_on` a turn this size fits on now, if any.
+
+        The one place that decides who has room, so what `admit` does and what
+        `first` says it would do cannot differ.
+        """
+        for candidate in waiting_on:
+            pool = self._pool_of(candidate)
+            if pool is None or self._ledger.fits(pool[0], pool[1], tokens, prompt):
+                return candidate
+        return None
+
+    def first(self, request: Any, tier: Sequence[Any]) -> Any | None:
+        """The backend `admit` would put first this instant, or None.
+
+        **A read**: nothing is reserved and nothing waits, so a stream's head can
+        ask it before anything is sent. None when nothing has room now, which is
+        when `admit` waits, and who gets room first is not known until it has: the
+        tier's usual order is then the best answer, and where the turn goes when
+        the wait runs out.
+        """
+        if not tier:
+            return None
+        _chars, prompt, tokens = self._sized(request)
+        # Only the conversation's own replica counts while it holds it, as in `admit`.
+        waiting_on = tier[:1] if self._held else tier
+        return self._with_room(waiting_on, prompt, tokens)
+
     async def admit(self, request: Any, tier: Sequence[Any]) -> list[Any]:
         """Wait for room, and answer the tier with the backend to try first."""
-        self._chars = request_chars(request)
-        seen = self._sizes.get(self._target, self._conversation) if self._conversation else None
-        self.prompt, self.tokens = estimate(self._chars, getattr(request, "maxTokens", None), seen)
+        self._chars, self.prompt, self.tokens = self._sized(request)
         ordered = list(tier)
         if not ordered:
             return ordered
@@ -244,12 +277,11 @@ class TurnBudget:
         started = time.perf_counter()
         deadline = started + max(0.0, float(self._wait_seconds()))
         while True:
-            for candidate in waiting_on:
-                pool = self._pool_of(candidate)
-                if pool is None or self._ledger.fits(pool[0], pool[1], self.tokens, self.prompt):
-                    self._reserve(candidate)
-                    self.waited_ms = int((time.perf_counter() - started) * 1000)
-                    return [candidate, *(c for c in ordered if c is not candidate)]
+            candidate = self._with_room(waiting_on, self.prompt, self.tokens)
+            if candidate is not None:
+                self._reserve(candidate)
+                self.waited_ms = int((time.perf_counter() - started) * 1000)
+                return [candidate, *(c for c in ordered if c is not candidate)]
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
                 # Waited long enough: the usual order, and the engine decides.

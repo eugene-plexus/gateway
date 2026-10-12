@@ -2142,9 +2142,11 @@ class RoutingTable:
             return None
         client = TieredClient(name=resolution.model, tiers=tiers, hooks=self)
         client.affinity = outcome
-        # The first attempt goes to the first backend picked, in the order the
-        # balancer left them: what it does not honour is read from this entry.
-        client.first_model = picked[0].model
+        # Each candidate's model entry, for what its listing says it does not
+        # honour. The doors read it for the backend the first ATTEMPT goes to
+        # (`TieredClient.model_asked_first`), which the balancer's first pick is
+        # not always: a circuit may be open, and a replica with room is moved up.
+        client.entries = {b.client: b.model for b in picked}
         client.budget = self._budget_for(resolution, picked, affinity, outcome)
         if affinity is not None:
             seen = self._sizes.get(resolution.model, affinity)

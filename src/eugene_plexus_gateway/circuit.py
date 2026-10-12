@@ -14,13 +14,20 @@ class Circuit:
     epoch: int = 0
     _owner: int | None = None
 
+    def available(self) -> bool:
+        """Whether `acquire` would say yes right now. **A read: it takes nothing**,
+        and in particular not the one recovery probe a cooled-down circuit hands
+        out, so a caller that only wants to know which backend an attempt would go
+        to (`TieredClient.model_asked_first`) cannot use up the attempt it is
+        asking about."""
+        return self.failures == 0 or not (self.probing or time.perf_counter() < self.until)
+
     def acquire(self) -> bool:
-        if self.failures == 0:
-            return True
-        if self.probing or time.perf_counter() < self.until:
+        if not self.available():
             return False
-        self.probing = True
-        self._owner = self.epoch
+        if self.failures:
+            self.probing = True
+            self._owner = self.epoch
         return True
 
     def finish(

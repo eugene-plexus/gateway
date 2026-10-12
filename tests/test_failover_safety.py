@@ -105,6 +105,26 @@ async def test_cooldown_skips_primary_and_recovers_with_two_probes(monkeypatch, 
     assert first.circuit.failures == 0
 
 
+def test_available_reads_the_circuit_and_takes_no_probe(monkeypatch):
+    """`acquire` hands out the one recovery probe of a circuit whose cooldown is
+    over; `available` says whether it would, and takes nothing. That is what lets
+    the head of a response ask which backend an attempt goes to without using up
+    the attempt (`TieredClient.model_asked_first`)."""
+    from eugene_plexus_gateway import circuit as module
+
+    now = [100.0]
+    monkeypatch.setattr(module.time, "perf_counter", lambda: now[0])
+    healthy, cooling = Circuit(), Circuit(failures=1, until=130.0)
+    assert healthy.available() and not cooling.available()
+    assert not healthy.probing and not cooling.probing
+    now[0] = 130.0
+    assert cooling.available() and cooling.available()
+    assert not cooling.probing, "a read takes no probe"
+    assert cooling.acquire() and cooling.probing
+    assert not cooling.available() and not cooling.acquire(), "the probe is taken"
+    assert healthy.acquire() and not healthy.probing, "a healthy one needs no probe"
+
+
 @pytest.mark.parametrize(
     "fragment",
     [

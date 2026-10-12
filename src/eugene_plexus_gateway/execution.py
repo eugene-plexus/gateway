@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sys
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -105,6 +105,22 @@ class Executor:
     def __init__(self, owner: TieredClient) -> None:
         self.owner = owner
         self.last_error: Exception | None = None
+
+    @staticmethod
+    def first_to_try(tiers: Sequence[Sequence[DriverClient]]) -> DriverClient | None:
+        """The candidate `attempts` would go to first over `tiers`, or None.
+
+        The same walk, in the same order, skipping what it skips: a candidate
+        whose circuit would refuse an attempt now (`Circuit.available`, which
+        `acquire` is built on). **A read**: no circuit is taken, so it can be
+        asked before anything is sent without using up the attempt it asks about.
+        """
+        for candidates in tiers:
+            for candidate in candidates:
+                circuit = getattr(candidate, "circuit", None)
+                if circuit is None or circuit.available():
+                    return candidate
+        return None
 
     async def attempts(self) -> AsyncIterator[Attempt]:
         from .driver_client import _cooling_error

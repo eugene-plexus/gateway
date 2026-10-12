@@ -28,6 +28,7 @@ a component test is not a wiring test.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import threading
 import time
@@ -63,7 +64,7 @@ from eugene_plexus_gateway.driver_client import StreamEvent
 from eugene_plexus_gateway.routes import inference
 from eugene_plexus_gateway.settings import Settings
 
-from .conftest import FakeDriverClient, make_routing_table
+from .conftest import FakeDriverClient, make_routing_table, runtime_facts
 from .test_anthropic_messages import body as claude_code_body
 from .test_responses import codex_request
 from .test_server_tools import (
@@ -265,6 +266,36 @@ def test_a_backend_with_no_listing_names_nothing() -> None:
     assert ignored_settings.not_honoured([], request) == ()
 
 
+def test_none_sends_no_tools_so_no_parallel_switch_is_named_for_an_unreading_backend() -> None:
+    """`tool_choice: none` to Strata: its driver sends no tools and no
+    `parallel_tool_calls` with them, so nothing is ignored, though `false` is in
+    its listing. Named for any other tool choice, and when sent alone."""
+    both = {"parallelToolCalls": False, "callerSettings": ["toolChoice", "parallelToolCalls"]}
+    assert ignored_settings.not_honoured(STRATA, _req(toolChoice=ToolChoice.none, **both)) == ()
+    assert ignored_settings.not_honoured(STRATA, _req(toolChoice=ToolChoice.auto, **both)) == (
+        "parallelToolCalls",
+    )
+    assert ignored_settings.not_honoured(STRATA, _req(toolChoice=ToolChoice.required, **both)) == (
+        "toolChoice",
+        "parallelToolCalls",
+    )
+    # The parallel switch alone is still named: the choice is not `none`.
+    alone = _req(parallelToolCalls=False, callerSettings=["parallelToolCalls"])
+    assert ignored_settings.not_honoured(STRATA, alone) == ("parallelToolCalls",)
+
+
+def test_none_names_the_parallel_switch_for_a_backend_that_does_read_tool_choice() -> None:
+    """The rule is the driver's: a backend that lists no `toolChoice` is sent `none`
+    as `none` (and the switch with it), so its listing of the switch stands."""
+    reads = _listing(parallelToolCalls=[False])
+    request = _req(
+        toolChoice=ToolChoice.none,
+        parallelToolCalls=False,
+        callerSettings=["toolChoice", "parallelToolCalls"],
+    )
+    assert ignored_settings.not_honoured(reads, request) == ("parallelToolCalls",)
+
+
 # --------------------------------------------------------------------------- #
 # The mapping, the order, the dedupe
 # --------------------------------------------------------------------------- #
@@ -330,12 +361,6 @@ def test_a_doors_own_header_is_kept_when_the_backend_has_nothing_to_add() -> Non
 
 def test_the_backend_alone_makes_the_header() -> None:
     assert ignored_settings.added_to({}, ["toolChoice"], "chat") == {HEADER: "tool_choice"}
-
-
-def test_the_driver_per_request_header_is_not_read_by_this_module() -> None:
-    """The gateway names from the listing. Reading a header off each response is
-    what held every stream's head, and nothing here parses one."""
-    assert not hasattr(ignored_settings, "parse")
 
 
 # --------------------------------------------------------------------------- #
@@ -421,6 +446,14 @@ NAMED_ON = {
             {"tool_choice": "required", "parallel_tool_calls": False},
             ["tool_choice", "parallel_tool_calls"],
         ),
+        # `none` is honoured by sending no tools, and no parallel switch with them:
+        # nothing is left on the request for the backend to ignore.
+        ("none with parallel false", {"tool_choice": "none", "parallel_tool_calls": False}, []),
+        (
+            "auto with parallel false",
+            {"tool_choice": "auto", "parallel_tool_calls": False},
+            ["parallel_tool_calls"],
+        ),
         ("neither", {}, []),
     ],
     "messages": [
@@ -447,6 +480,11 @@ NAMED_ON = {
             {"tool_choice": {"type": "any", "disable_parallel_tool_use": True}},
             ["tool_choice", "tool_choice.disable_parallel_tool_use"],
         ),
+        (
+            "none with parallel disabled",
+            {"tool_choice": {"type": "none", "disable_parallel_tool_use": True}},
+            [],
+        ),
         ("neither", {}, []),
     ],
     "responses": [
@@ -464,6 +502,12 @@ NAMED_ON = {
             "both",
             {"tool_choice": "required", "parallel_tool_calls": False},
             ["tool_choice", "parallel_tool_calls"],
+        ),
+        ("none with parallel false", {"tool_choice": "none", "parallel_tool_calls": False}, []),
+        (
+            "auto with parallel false",
+            {"tool_choice": "auto", "parallel_tool_calls": False},
+            ["parallel_tool_calls"],
         ),
         ("neither", {}, []),
     ],
@@ -585,8 +629,121 @@ def test_a_backend_that_does_not_carry_the_parallel_switch_is_still_refused_for_
 
 
 # --------------------------------------------------------------------------- #
-# Read from the backend chosen for the first attempt
+# Read from the backend the first attempt goes to
 # --------------------------------------------------------------------------- #
+
+#: Two runtimes sharing nothing, each with a pool of its own to budget (CB3).
+POOLED = [runtime_facts("rt-a", context_pool=10_000), runtime_facts("rt-b", context_pool=10_000)]
+
+#: Which backend is the balancer's first pick, and which the one asked: round robin
+#: from a fresh table starts at the first name, and `a-` sorts before `b-`.
+PICKED_ASKED = [
+    pytest.param(STRATA_GAPS, {}, False, id="the balancers pick lists gaps"),
+    pytest.param({}, STRATA_GAPS, True, id="the backend asked lists gaps"),
+]
+
+
+def _cool(table: Any, name: str) -> None:
+    """Open one driver's circuit, as a failure a moment ago leaves it."""
+    for backend in table.resolve(MODEL).backends():
+        if backend.name == name:
+            backend.client.circuit.failures = 1
+            backend.client.circuit.until = time.perf_counter() + 60
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["whole", "streamed"])
+@pytest.mark.parametrize("door", ["chat", "messages", "responses"])
+@pytest.mark.parametrize(("picked_lists", "asked_lists", "named"), PICKED_ASKED)
+def test_the_header_names_the_backend_asked_when_the_balancers_pick_has_an_open_circuit(
+    settings: Settings,
+    door: str,
+    streamed: bool,
+    picked_lists: dict[str, list[str | bool]],
+    asked_lists: dict[str, list[str | bool]],
+    named: bool,
+) -> None:
+    """`Executor.attempts` skips a candidate whose circuit is open, so the balancer's
+    first pick is not where the request goes first. The head names what the backend
+    the request actually goes to first does not honour, whichever of the two lists
+    a gap: reading the pick would have said the cooling one's."""
+    picked = _backend("a-picked", model_id=MODEL, not_honoured=picked_lists)
+    asked = _backend("b-asked", model_id=MODEL, not_honoured=asked_lists)
+    app = _app(settings, picked, asked, strategy="round_robin", affinity=False)
+    _cool(app.state.routing, "a-picked")
+    with TestClient(app) as client:
+        r = _post(client, door, stream=streamed, **FORCED[door])
+    assert r.status_code == 200, r.text
+    assert asked.calls and not picked.calls, "the cooling backend was not asked"
+    assert ("tool_choice" in _header(r)) is named
+
+
+def test_a_backend_whose_cooldown_is_over_is_asked_as_the_probe_and_is_the_one_named(
+    settings: Settings,
+) -> None:
+    """The read ahead takes no probe. A circuit past its cooldown hands out one
+    recovery probe, to whichever attempt asks first: if the head's read took it,
+    the attempt would find it taken, skip this backend and go to the other, and the
+    header would name a backend that was never asked."""
+    probing = _backend("a-probe", model_id=MODEL)
+    other = _backend("b-other", model_id=MODEL, not_honoured={})
+    app = _app(settings, probing, other, strategy="round_robin", affinity=False)
+    for backend in app.state.routing.resolve(MODEL).backends():
+        if backend.name == "a-probe":
+            backend.client.circuit.failures = 1  # it failed, and the cooldown has passed
+            backend.client.circuit.until = 0.0
+    with TestClient(app) as client:
+        r = _post(client, "chat", **FORCED["chat"])
+    assert r.status_code == 200, r.text
+    assert probing.calls and not other.calls, "the probe went to the backend that was read"
+    assert _header(r) == ["tool_choice"]
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["whole", "streamed"])
+@pytest.mark.parametrize("door", ["chat", "messages", "responses"])
+@pytest.mark.parametrize(("full_lists", "roomy_lists", "named"), PICKED_ASKED)
+def test_the_header_names_the_replica_with_room_when_the_pool_moves_it_to_the_front(
+    settings: Settings,
+    door: str,
+    streamed: bool,
+    full_lists: dict[str, list[str | bool]],
+    roomy_lists: dict[str, list[str | bool]],
+    named: bool,
+) -> None:
+    """`TieredClient._admit` tries first where there is room in a shared pool: a
+    replica whose pool is full of other turns' prompts is not asked first, though
+    the balancer picked it. The head names the replica that has room."""
+    full = _backend("a-full", model_id=MODEL, runtime="rt-a", not_honoured=full_lists)
+    roomy = _backend("b-roomy", model_id=MODEL, runtime="rt-b", not_honoured=roomy_lists)
+    app = _app(settings, full, roomy, runtimes=POOLED, strategy="round_robin", affinity=False)
+    app.state.routing._ledger.take((None, "rt-a"), 9_500)
+    with TestClient(app) as client:
+        r = _post(client, door, stream=streamed, **FORCED[door])
+    assert r.status_code == 200, r.text
+    assert roomy.calls and not full.calls, "the replica with room was moved to the front"
+    assert ("tool_choice" in _header(r)) is named
+
+
+def test_reading_the_backend_asked_first_reserves_nothing_and_takes_no_probe() -> None:
+    """A read: asked any number of times, before anything is sent, it leaves the
+    pools' ledger as it was and the circuit's probe where it was."""
+    a = _backend("a", model_id=MODEL, runtime="rt-a")
+    b = _backend("b", model_id=MODEL, runtime="rt-b", not_honoured={})
+    table = make_routing_table(a, b, runtimes=POOLED, strategy="round_robin", affinity=False)
+    for backend in table.resolve(MODEL).backends():
+        if backend.name == "a":
+            backend.client.circuit.failures = 1
+            backend.client.circuit.until = 0.0
+    client = table.pick(table.resolve(MODEL))
+    assert client is not None and client.budget is not None
+    for _ in range(3):
+        entry = client.model_asked_first(_req(maxTokens=100))
+        assert entry is not None and entry.capabilities is not None
+        assert entry.capabilities.settingsNotHonoured, "a is first, and is the probe"
+    assert table._ledger.in_flight((None, "rt-a")) == 0
+    assert table._ledger.in_flight((None, "rt-b")) == 0
+    assert client.budget._lease is None
+    circuits = [backend.client.circuit for backend in table.resolve(MODEL).backends()]
+    assert not any(circuit.probing for circuit in circuits)
 
 
 def test_the_backend_chosen_first_is_the_one_named(settings: Settings) -> None:
@@ -613,18 +770,24 @@ def test_the_backend_chosen_first_is_the_one_named(settings: Settings) -> None:
 def test_a_failover_is_not_re_said_the_first_attempts_backend_is_the_one_named(
     settings: Settings, door: str, streamed: bool
 ) -> None:
-    """The contract: read from the backend chosen for the first attempt, before
-    anything is sent. The first tier is down; the second serves, and the header,
-    which was decided before either was asked, is the first's."""
+    """**A failover after the head is sent cannot change the header.** It is read
+    from the backend the first attempt goes to, before anything is sent. The first
+    tier is down, and fails only now, after the head; the second serves, and the
+    header, which was on the wire before either was asked, is the first's.
+
+    The first tier is healthy for the request that sets the door's own names (a
+    failure of its would open its circuit, and the next request would go past it
+    to the second: that is `test_the_header_names_the_backend_asked...`)."""
     dead = _backend("dead", model_id="dead-model")
-    dead.generate_error = httpx.ConnectError("refused")
     alive = _backend("alive", model_id="alive-model", not_honoured={})
     slots = [{"model": MODEL, "targets": ["dead-model", "alive-model"]}]
     with TestClient(_app(settings, dead, alive, slots=slots)) as client:
         own = _header(_post(client, door, stream=streamed))
+        tried = len(dead.calls)
+        dead.generate_error = httpx.ConnectError("refused")
         r = _post(client, door, stream=streamed, **FORCED[door])
     assert r.status_code == 200, r.text
-    assert dead.calls and alive.calls, "the first was tried and the second served"
+    assert len(dead.calls) == tried + 1 and len(alive.calls) == 1, "tried, failed, then served"
     assert _header(r) == [*own, "tool_choice"]
 
 
@@ -701,6 +864,28 @@ def test_a_stream_opens_before_its_backends_first_frame_and_the_head_carries_the
     if door == "responses":
         assert token - timeline.first(b"response.created") >= 0.4
         assert token - timeline.first(b"response.in_progress") >= 0.4
+
+
+@pytest.mark.parametrize("door", ["chat", "messages", "responses"])
+def test_a_stream_whose_turn_waits_for_room_in_a_pool_still_opens_at_once(
+    settings: Settings, door: str
+) -> None:
+    """The wait for room in a shared pool (CB3) is after the head, as it always
+    was. Reading which backend is asked first asks the budget who has room now and
+    never waits for room, so a turn that must wait for it (its only replica's pool
+    is full) has its head out, with the header on it, long before it is let in."""
+    fake = _backend(runtime="rt-a")
+    fake.responses = ["pelican"]
+    app = _app(settings, fake, runtimes=POOLED[:1], room_wait_seconds=0.6)
+    app.state.routing._ledger.take((None, "rt-a"), 9_500)
+    timeline = Timeline(app)
+    with TestClient(timeline) as client:
+        r = _post(client, door, stream=True, **FORCED[door])
+    assert r.status_code == 200 and "pelican" in r.text
+    opened, headers = timeline.head()
+    token = timeline.first(b"pelican")
+    assert token - opened >= 0.5, f"the head came {token - opened:.2f}s before the first token"
+    assert headers[HEADER].split(", ")[-1] == "tool_choice"
 
 
 def test_the_responses_stream_says_it_is_working_while_the_backend_prefills(
@@ -928,6 +1113,80 @@ def test_codex_through_the_wire_is_answered_and_names_the_parallel_switch(
     assert "parallel_tool_calls" in _header(r) and "tool_choice" not in _header(r)
 
 
+@pytest.fixture
+def header_lookups(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every lookup, by anything in this process, of the driver's per-request
+    header on headers that carry the stand-in driver's value for it (the key as
+    looked up, lower-cased). Spies on the four ways `httpx.Headers` gives one
+    header up; reading by key is how a module would read it, and `dict(...)` or a
+    copy does it through `__getitem__` too."""
+    looked: list[str] = []
+    driver_says = _Install.per_request.encode()
+
+    def watch(method: Any) -> Any:
+        @functools.wraps(method)
+        def spy(self: httpx.Headers, key: str, *args: Any, **kwargs: Any) -> Any:
+            if str(key).lower() == HEADER and driver_says in (
+                value for name, value in self.raw if name.lower() == HEADER.encode()
+            ):
+                looked.append(str(key).lower())
+            return method(self, key, *args, **kwargs)
+
+        return spy
+
+    for name in ("get", "get_list", "__getitem__", "__contains__"):
+        monkeypatch.setattr(httpx.Headers, name, watch(getattr(httpx.Headers, name)))
+    return looked
+
+
+def test_the_spy_sees_a_lookup_of_the_drivers_header_and_only_that(
+    header_lookups: list[str],
+) -> None:
+    """A check that cannot fail checks nothing. A lookup of the header on headers
+    carrying the driver's value is recorded, however it is spelled or asked; the
+    same header with another value (the gateway's own, which callers read) and
+    other headers of the driver's answer are not."""
+    driver = httpx.Response(200, headers={HEADER: _Install.per_request, "retry-after": "5"})
+    driver.headers.get("retry-after")
+    assert header_lookups == []
+    gateway = httpx.Response(200, headers={HEADER: "tool_choice"})
+    assert gateway.headers[HEADER] == "tool_choice" and HEADER in gateway.headers
+    assert header_lookups == []
+    for ask in (
+        lambda: driver.headers.get(HEADER.title()),
+        lambda: driver.headers[HEADER],
+        lambda: HEADER in driver.headers,
+        lambda: driver.headers.get_list(HEADER),
+        lambda: dict(driver.headers),
+    ):
+        header_lookups.clear()
+        ask()
+        assert set(header_lookups) == {HEADER}, "a lookup the spy cannot see would pass any test"
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["whole", "streamed"])
+@pytest.mark.parametrize("door", ["chat", "messages", "responses"])
+def test_no_module_reads_the_header_the_driver_answers_with(
+    header_lookups: list[str],
+    wired: TestClient,
+    stand_in: tuple[str, list[dict[str, Any]]],
+    door: str,
+    streamed: bool,
+) -> None:
+    """The driver also says `x-eugene-plexus-ignored-settings` on every answer, for
+    direct callers, and the gateway names from the listing instead. A module that
+    read it, to name from it, to log it or to hold a head for it (as round one did,
+    and held every stream's head), would look it up on the driver's answer. Nothing
+    does, on any door, whole or streamed, through the real client over a real
+    socket; and what the driver said never reaches the caller."""
+    r = _post(wired, door, stream=streamed, **FORCED[door])
+    assert r.status_code == 200, r.text
+    assert WIRE_TOKEN in r.text
+    assert stand_in[1], "the driver was asked, and answered with its header"
+    assert header_lookups == []
+    assert _Install.per_request not in r.headers.get(HEADER, "")
+
+
 # --------------------------------------------------------------------------- #
 # Unknown counts as yes, in each place; only `false` is evidence
 # --------------------------------------------------------------------------- #
@@ -1079,6 +1338,27 @@ def test_every_other_setting_keeps_the_rule_for_a_backend_that_does_not_say(
     assert "top_k" in r.json()["error"]["message"]
     assert r.json()["error"]["message"].startswith(
         "No permitted backend serving this model takes top_k."
+    )
+    assert fake.calls == []
+
+
+@pytest.mark.parametrize("knobs", UNSAID)
+def test_a_refusal_for_another_setting_does_not_also_name_the_tool_settings_it_admitted(
+    settings: Settings, knobs: dict[str, Any]
+) -> None:
+    """`tool_choice` and `parallel_tool_calls` are admitted for a backend that says
+    nothing of tool calling, whatever its list holds: they are settings it takes.
+    When the request is refused for `top_k`, which its list lacks, the refusal
+    names `top_k` and only that: the others were never the problem, and "remove
+    them" would send the caller off to take out what was fine."""
+    fake = _short(FakeDriverClient(name="custom", model_id=MODEL, **knobs), "maxTokens")
+    with TestClient(_app(settings, fake)) as client:
+        r = _tools_post(client, tool_choice="required", parallel_tool_calls=False, top_k=5)
+    error = r.json()["error"]
+    assert r.status_code == 400
+    assert error["param"] == "top_k"
+    assert error["message"].startswith(
+        "No permitted backend serving this model takes top_k. Remove it or choose"
     )
     assert fake.calls == []
 
@@ -1247,6 +1527,167 @@ def test_the_front_doors_own_refusal_is_the_same_sentence_for_the_same_reason(
 
 
 # --------------------------------------------------------------------------- #
+# A listing that cannot be confirmed is not a refusal of the request
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("door", ["chat", "messages", "responses"])
+def test_a_driver_whose_listing_cannot_be_read_is_a_retryable_503_that_names_it(
+    settings: Settings, door: str
+) -> None:
+    """Admission re-reads the listing of a request that carries tools. A driver
+    that does not answer (down, restarting) was left out without a word, and the
+    request was then refused as if it were at fault: a 400, "takes tools, remove
+    it", which a client such as Codex does not retry. It is a 503 with a
+    `Retry-After`, naming the driver and what was observed."""
+    fake = _backend("strata-box")
+    fake.info_error = httpx.ConnectError("All connection attempts failed")
+    with TestClient(_app(settings, fake)) as client:
+        r = _post(client, door)
+    assert r.status_code == 503, r.text
+    assert r.headers["Retry-After"] == "5"
+    message = r.json()["error"]["message"]
+    assert "driver 'strata-box' (http://fake-driver)" in message
+    assert "could not connect to fake-driver" in message
+    assert "All connection attempts failed" in message
+    assert "tools" in message, "what could not be confirmed is named"
+    assert "not a refusal of the request" in message and "try again" in message
+    assert "Remove" not in message and "No permitted backend" not in message
+    assert fake.calls == []
+
+
+def test_a_driver_that_does_not_answer_in_time_is_named_with_the_deadline(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(admission, "CONFIRM_TIMEOUT_SECONDS", 0.05)
+    fake = _backend("slow-box")
+
+    async def never(*, models: bool = True, model: str | None = None) -> Any:
+        await asyncio.sleep(30)
+
+    fake.info = never  # type: ignore[method-assign]
+    with TestClient(_app(settings, fake)) as client:
+        r = _tools_post(client)
+    assert r.status_code == 503, r.text
+    assert "driver 'slow-box'" in r.json()["error"]["message"]
+    assert "no answer to GET /v1/info within 0.05 s" in r.json()["error"]["message"]
+    assert fake.calls == []
+
+
+def test_a_driver_that_answers_an_error_is_named_with_its_answer(settings: Settings) -> None:
+    fake = _backend("restarting")
+    request = httpx.Request("GET", "http://fake-driver/v1/info")
+    fake.info_error = httpx.HTTPStatusError(
+        "boom", request=request, response=httpx.Response(503, request=request)
+    )
+    with TestClient(_app(settings, fake)) as client:
+        r = _tools_post(client)
+    assert r.status_code == 503
+    assert "driver 'restarting'" in r.json()["error"]["message"]
+    assert "answered 503" in r.json()["error"]["message"]
+
+
+def test_a_driver_that_could_not_be_read_is_not_counted_as_one_that_said_no(
+    settings: Settings,
+) -> None:
+    """One driver cannot be read and the other says it carries no tools. Nothing
+    is known of the first, so "every driver serving it reports that tools cannot
+    be carried to it" would be false, and "takes tools, remove it" worse."""
+    unread = FakeDriverClient(name="a-unread", model_id=MODEL, supports_tools=True)
+    unread.info_error = httpx.ConnectError("refused")
+    no = FakeDriverClient(name="b-no", model_id=MODEL, supports_tools=False)
+    with TestClient(_app(settings, unread, no)) as client:
+        r = _tools_post(client)
+    message = r.json()["error"]["message"]
+    assert r.status_code == 503, r.text
+    assert "'a-unread'" in message and "b-no" not in message
+    assert "cannot be carried" not in message and "Remove" not in message
+
+
+def test_an_account_whose_listing_cannot_be_read_is_named_once(settings: Settings) -> None:
+    """Candidates are per model: an account serving two of a slot's targets is one
+    driver, and is said once."""
+    account = FakeDriverClient(name="openrouter", models=["m1", "m2"], account=True)
+    account.info_error = httpx.ConnectError("refused")
+    slots = [{"model": MODEL, "targets": ["openrouter/m1", "openrouter/m2"]}]
+    with TestClient(_app(settings, account, slots=slots)) as client:
+        r = _tools_post(client)
+    assert r.status_code == 503, r.text
+    assert r.json()["error"]["message"].count("driver 'openrouter'") == 1
+
+
+def test_a_driver_that_could_not_be_read_is_left_out_when_another_can_serve(
+    settings: Settings,
+) -> None:
+    unread = FakeDriverClient(name="a-unread", model_id=MODEL, supports_tools=True)
+    unread.info_error = httpx.ConnectError("refused")
+    fine = FakeDriverClient(name="b-fine", model_id=MODEL, supports_tools=True)
+    fine.responses = ["from b"]
+    with TestClient(_app(settings, unread, fine)) as client:
+        r = _tools_post(client)
+    assert r.status_code == 200, r.text
+    assert r.json()["choices"][0]["message"]["content"] == "from b"
+    assert unread.calls == []
+
+
+def test_a_driver_that_answers_without_the_model_is_named_and_not_blamed_on_the_request(
+    settings: Settings,
+) -> None:
+    """A restarted driver's list is empty until its engine loads: the model it
+    listed at the last refresh is not there now. Said as that, a retryable 503."""
+    fake = _backend("restarted")
+    app = _app(settings, fake)
+    fake.model_id = None  # its list is empty from here
+    with TestClient(app) as client:
+        r = _tools_post(client)
+    assert r.status_code == 503, r.text
+    message = r.json()["error"]["message"]
+    assert "driver 'restarted'" in message
+    assert (
+        f"answered GET /v1/info without {MODEL!r}, which it listed at the last refresh" in message
+    )
+    assert fake.calls == []
+
+
+def test_a_driver_that_now_follows_another_runtime_is_named_and_not_blamed_on_the_request(
+    settings: Settings,
+) -> None:
+    fake = _backend("moved")
+    app = _app(settings, fake)
+    fake.runtime = "rt-new"  # reconfigured since the last refresh
+    with TestClient(app) as client:
+        r = _tools_post(client)
+    assert r.status_code == 503, r.text
+    message = r.json()["error"]["message"]
+    assert "driver 'moved'" in message
+    assert "now follows runtime 'rt-new', not no runtime as at the last refresh" in message
+    assert fake.calls == []
+
+
+def test_a_driver_that_answers_and_does_not_take_the_setting_is_still_the_400(
+    settings: Settings,
+) -> None:
+    """The positive control for the rule above: a listing that WAS read, and says
+    the backend does not take what was sent, is the request's refusal, as ever."""
+    fake = _short(FakeDriverClient(name="said", model_id=MODEL, supports_tools=True), "maxTokens")
+    with TestClient(_app(settings, fake)) as client:
+        r = _tools_post(client, top_k=5)
+    assert r.status_code == 400
+    assert r.json()["error"]["param"] == "top_k"
+
+
+def test_the_message_names_what_the_request_carries_in_the_callers_words() -> None:
+    said = admission.unconfirmed_refusal(
+        "qwen", ["tools", "tool_choice"], ["driver 'a' (http://a): no answer"]
+    )
+    assert said == (
+        "Could not confirm that a backend serving 'qwen' takes what this request carries "
+        "(tools, tool_choice): driver 'a' (http://a): no answer. This is not a refusal of the "
+        "request: try again in a few seconds. Nothing was forwarded or woken."
+    )
+
+
+# --------------------------------------------------------------------------- #
 # A model that does not chat is sent to its own door
 # --------------------------------------------------------------------------- #
 
@@ -1352,6 +1793,28 @@ def test_searchable_leaves_out_a_backend_that_says_it_does_not_call_tools() -> N
         [],
         set(),
     )
+
+
+@pytest.mark.parametrize(
+    ("chat_says", "listed"),
+    [(False, False), (None, True)],
+    ids=["the chat model says no tools", "the chat model says nothing"],
+)
+def test_a_silent_model_that_does_not_chat_does_not_make_a_search_reach_the_slot(
+    settings: Settings, chat_says: bool | None, listed: bool
+) -> None:
+    """`web_search` on `GET /v1/models` is about the chat models of a slot. A model
+    that does not chat and says nothing of tools (an embedding model here) is not
+    a chat model that is taken to call tools, so it does not make a search reach a
+    slot whose chat model says it takes none; and the chat model's own silence
+    still does."""
+    chatty = FakeDriverClient(name="chatty", model_id="chatty", supports_tools=chat_says)
+    embed = FakeDriverClient(
+        name="embed", model_id="nomic", supports_embeddings=True, capabilities_reported=False
+    )
+    slots = [{"model": MODEL, "targets": ["chatty", "nomic"]}]
+    with TestClient(_app(settings, chatty, embed, slots=slots)) as client:
+        assert _models(client)[MODEL]["web_search"] is listed
 
 
 def test_searchable_leaves_out_a_model_that_does_not_chat_when_nothing_said_it_does() -> None:

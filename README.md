@@ -76,7 +76,7 @@ The status codes distinguish the cases that differ operationally, because "it di
 | ---- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- |
 | 404  | Nothing serves the requested model at all                                                                                                                 | No — fix the topology |
 | 400  | A backend rejected the request (4xx). Does **not** cascade: the next backend would reject it identically, and cascading past it would bury the real error | No — fix the request  |
-| 503  | A driver serves the model but isn't ready — usually an engine still loading its weights                                                                   | Yes                   |
+| 503  | A driver serves the model but isn't ready (usually an engine still loading its weights), or its listing could not be read to confirm it takes the request | Yes                   |
 | 502  | The cascade ran and every eligible backend failed                                                                                                         | Maybe                 |
 
 Transport errors, timeouts and 5xx cascade to the next backend; 4xx fails hard.

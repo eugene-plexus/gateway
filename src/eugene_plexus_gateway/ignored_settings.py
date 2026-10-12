@@ -5,10 +5,13 @@ measured not to honour, by value (`capabilities.settingsNotHonoured`,
 `docs/design/tools-assumed.md`, 2026-10-12): Strata ignores `tool_choice`
 `required` and a named function, and `parallel_tool_calls: false`. A measured
 gap is sent and named, not refused. The list is static per backend, so it is
-read from the backend chosen for the first attempt **before anything is sent**,
-and a stream's head never waits for the backend to speak (an earlier version
-read a header off the driver's response instead, which held every stream's head
-until its first frame, and broke the Responses door's opening).
+read from the backend the first attempt goes to **before anything is sent**
+(`TieredClient.model_asked_first`: not always the balancer's first pick), and a
+stream's head never waits for the backend to speak (an earlier version read a
+header off the driver's response instead, which held every stream's head until
+its first frame, and broke the Responses door's opening). **That header is not
+read by any module here**, and a failover after the head is sent cannot change
+what the head says.
 
 A door names what the caller sent, with a value the list names, on its own
 `x-eugene-plexus-ignored-settings`, spelled the way its caller spelled the
@@ -122,9 +125,22 @@ def not_honoured(
     Only names this gateway built reach a header: a name is returned only if it
     is in the request's own `callerSettings`, so a driver's words are matched
     against what the caller sent and never passed on.
+
+    **`tool_choice: none` to a backend that never reads `tool_choice` does not
+    name `parallel_tool_calls`.** Such a backend lists `toolChoice` and cannot be
+    told `none`, so its driver honours it as it can, by sending no tools and none
+    of what rides with them (`inference-driver`'s `_payload_for`; the driver's
+    own header leaves it out the same way). Nothing is left on the request for
+    the backend to ignore, though `parallel_tool_calls: false` is in its listing.
     """
+    entries = list(listed or ())
+    # A listing names `toolChoice` exactly for a backend that never reads it.
+    unread = any(entry.setting == "toolChoice" for entry in entries)
+    tools_unsent = unread and sent(request, "toolChoice") == "none"
     named: dict[str, None] = {}
-    for entry in listed or ():
+    for entry in entries:
+        if tools_unsent and entry.setting == "parallelToolCalls":
+            continue
         value = sent(request, entry.setting)
         # `false` is a value and a boolean is not a string, so `value in values`
         # does not take `"false"` for it.

@@ -7,6 +7,7 @@ import contextlib
 import json
 import time
 import uuid
+from collections.abc import Sequence
 from contextvars import ContextVar
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -217,6 +218,53 @@ def local_only() -> bool:
     return context.local_only if context else False
 
 
+#: How long one backend's listing is given to answer the re-check in `permitted`.
+CONFIRM_TIMEOUT_SECONDS = 4.0
+
+
+def _who(backend: Any) -> str:
+    """The driver a candidate is, as a person can find it: its name, the node when
+    it has one (two machines run one name), and where it listens."""
+    node = f" on node {backend.node!r}" if backend.node else ""
+    return f"driver {backend.name!r}{node} ({backend.url})"
+
+
+def unread_because(backend: Any, exc: Exception) -> str:
+    """What was observed when `backend`'s `/v1/info` could not be read, in words.
+
+    The driver and the cause, never empty: our own deadline as such, and every
+    other failure as the routing table words an unreachable driver
+    (`routing.unreachable_reason`: nothing listening, a firewall dropping the
+    connection, an answer that was not a 2xx). Whitespace is collapsed and the
+    length kept, because a malformed listing's validation error is many lines.
+    """
+    from .routing import unreachable_reason
+
+    if isinstance(exc, TimeoutError):
+        cause = f"no answer to GET /v1/info within {CONFIRM_TIMEOUT_SECONDS:g} s"
+    else:
+        cause = unreachable_reason(exc, url=backend.url, timeout=CONFIRM_TIMEOUT_SECONDS)
+    return f"{_who(backend)}: {' '.join(cause.split())[:240]}"
+
+
+def unconfirmed_refusal(model: str, carried: Sequence[str], observed: Sequence[str]) -> str:
+    """The refusal of a request none of whose backends could be checked against its
+    listing: a 503 that says what was observed, not a 400 that blames the request.
+
+    **The request is not what failed.** A driver that does not answer (a timeout,
+    a restart) was left out without a word, and when it was the only one that could
+    have served, the refusal read as the request's own fault: "takes tools, remove
+    it", a 400 that a client such as Codex does not retry, for what the next try
+    would have got through. One sentence for every way a backend could not be
+    confirmed, so the causes are worded in one place.
+    """
+    return (
+        f"Could not confirm that a backend serving {model!r} takes what this request "
+        f"carries ({', '.join(carried)}): {'; '.join(observed)}. This is not a refusal of "
+        "the request: try again in a few seconds. Nothing was forwarded or woken."
+    )
+
+
 async def permitted(resolution: Any, requirements: Any = None) -> Any:
     """The backends of `resolution` this request may go to, confirmed afresh.
 
@@ -250,6 +298,16 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
     A backend turned away for its tools does not count toward what "some backend
     takes", so a refusal for another setting names that setting, not one a
     backend that cannot serve the request anyway happens to list.
+
+    **A backend that could not be confirmed is not a backend that refused.** Its
+    listing may not be readable (a timeout, a driver restarting), or may answer
+    differently from the table (the model is gone from it, or it follows another
+    runtime): it is left out like any other, but when nothing is left, **no
+    refusal blames the request for what the listing did not say** ("takes tools,
+    remove it" is a 400, which a client such as Codex does not retry, for a
+    state the next try may not meet). It is a retryable 503 that names each
+    driver and what was observed (`unconfirmed_refusal`). Not for a key that
+    requires local-only inference, whose refusal is the policy's and stays 403.
     """
     context = current.get()
     allowed = context.allowed_models if context else None
@@ -273,21 +331,43 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
     # they are not counted among those a tools refusal is about.
     set_aside = 0
     something_chats = any(chats(b.model) for b in resolution.backends())
+    # Drivers whose listing could not confirm the request, by `(node, name)`: what
+    # was observed, in words. Such a backend is left out, but its silence is not
+    # its answer, so when nothing is left the refusal says so (`unconfirmed_refusal`).
+    unconfirmed: dict[tuple[str | None, str], str] = {}
 
     async def confirm(backend: Any) -> Any:
         nonlocal told_no_tools, set_aside
         try:
             model = backend.model.id if backend.model is not None else None
-            async with semaphore, asyncio.timeout(4):
-                # This candidate's entry alone (P1): an account would
-                # otherwise re-read every model it lists, on every request
-                # that carries a setting.
-                info = await backend.client.info(model=model)
+            driver = (backend.node, backend.name)
+            try:
+                async with semaphore, asyncio.timeout(CONFIRM_TIMEOUT_SECONDS):
+                    # This candidate's entry alone (P1): an account would
+                    # otherwise re-read every model it lists, on every request
+                    # that carries a setting.
+                    info = await backend.client.info(model=model)
+            except Exception as exc:
+                unconfirmed.setdefault(driver, unread_because(backend, exc))
+                return None
             if info.runtime != backend.info.runtime:
-                return None  # cached runtime facts must not wake a replacement
+                # Cached runtime facts must not wake a replacement.
+                now = f"runtime {info.runtime!r}" if info.runtime else "no runtime"
+                was = f"runtime {backend.info.runtime!r}" if backend.info.runtime else "no runtime"
+                unconfirmed.setdefault(
+                    driver,
+                    f"{_who(backend)}: it now follows {now}, not {was} as at the last refresh",
+                )
+                return None
             entry = next((m for m in info.models or [] if m.id == model), None)
             if entry is None:
-                return None  # the model left the driver since the last refresh
+                # The model left the driver since the last refresh.
+                unconfirmed.setdefault(
+                    driver,
+                    f"{_who(backend)}: it answered GET /v1/info without {model!r}, which it "
+                    "listed at the last refresh",
+                )
+                return None
             confirmed = replace(backend, info=info.model_copy(update={"models": None}), model=entry)
             if tools and not chats(entry):
                 if something_chats:
@@ -329,6 +409,15 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
     result = replace(resolution, tiers=tiers).restricted(allowed, local_only=local_only())
     if not result.has_backends():
         if not local_only():
+            if unconfirmed:
+                carried = (["tools"] if tools else []) + sorted(
+                    WIRE_NAMES.get(m, m) for m in settings - {"tools"}
+                )
+                raise AdmissionFailure(
+                    503,
+                    unconfirmed_refusal(resolution.model, carried, list(unconfirmed.values())),
+                    "5",
+                )
             chat_turned_away = turned_away - set_aside
             if tools and told_no_tools and told_no_tools == chat_turned_away:
                 raise AdmissionFailure(

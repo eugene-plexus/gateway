@@ -236,3 +236,60 @@ async def test_a_cascaded_attempt_holds_room_only_where_it_went():
     gate.set()
     await task
     assert seen == {"a": 0, "b": client.budget.tokens}
+
+
+# --- read ahead: who would be first ---------------------------------------------
+#
+# A response's head names what the backend its first attempt goes to does not
+# honour, before anything is sent (`TieredClient.model_asked_first`), so it asks
+# the budget who `admit` would put first without waiting or reserving.
+
+
+def _front_tier(client):  # type: ignore[no-untyped-def]
+    return client._tiers[client._front()]
+
+
+async def test_first_names_who_admit_would_put_first_and_changes_nothing():
+    table, _a, _b = _table(wait=0.05)
+    table._ledger.take(A, 9_000)
+    client = table.pick(table.resolve(LOCAL), affinity="k:new")
+    tier = _front_tier(client)
+    chosen = client.budget.first(_turn(), tier)
+    assert chosen is not None and chosen.name == "llama-b-driver", "the replica with room"
+    assert table._ledger.in_flight(A) == 9_000 and table._ledger.in_flight(B) == 0
+    ordered = await client.budget.admit(_turn(), tier)
+    assert ordered[0] is chosen, "and admit puts that one in front"
+    client.budget.close()
+
+
+async def test_first_names_nobody_when_nothing_has_room_and_admit_waits_then_keeps_the_order():
+    table, _a, _b = _table(wait=0.05)
+    table._ledger.take(A, 9_500)
+    table._ledger.take(B, 9_500)
+    client = table.pick(table.resolve(LOCAL), affinity="k:new")
+    tier = _front_tier(client)
+    assert client.budget.first(_turn(), tier) is None
+    assert await client.budget.admit(_turn(), tier) == tier
+    assert client.budget.waited_ms >= 40
+
+
+async def test_first_counts_only_the_replica_a_conversation_holds_as_admit_does():
+    """Going elsewhere would read the conversation's whole history again, so while
+    it holds its replica only that one counts: a full home is a wait, not another
+    replica. `first` has to keep the rule `admit` keeps, or a head would name a
+    backend the turn never goes to."""
+    table, _a, _b = _table(wait=0.05)
+    turn, task = _send(table, "k:s", _turn())
+    await task
+    home = A if turn.served_by == "llama-a-driver" else B
+    table._ledger.take(home, 9_000)  # home is full; the other replica is empty
+
+    held = table.pick(table.resolve(LOCAL), affinity="k:s")
+    tier = _front_tier(held)
+    assert tier[0].name == turn.served_by, "the conversation is placed on its replica"
+    assert held.budget.first(_turn("and more"), tier) is None
+    assert await held.budget.admit(_turn("and more"), tier) == tier
+
+    new = table.pick(table.resolve(LOCAL), affinity="k:another")
+    chosen = new.budget.first(_turn(), _front_tier(new))
+    assert chosen is not None and chosen.name != turn.served_by, "a new one may go to the other"
