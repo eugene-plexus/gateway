@@ -19,7 +19,7 @@ import asyncio
 import contextlib
 import json
 import logging
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import quote
@@ -376,6 +376,15 @@ class HttpDriverClient:
             timeout=httpx.Timeout(timeout_seconds, connect=CONNECT_TIMEOUT_SECONDS),
             auth=auth,
         )
+        self._auth = auth
+
+    def credential_refusal(self) -> str | None:
+        """Why this driver was sent no credential, when it was sent none: this node's agent
+        would not mint the gateway a token for the driver's machine (`outbound.py`), so the
+        driver's 401 is the gateway's doing and not the driver refusing a credential.
+        None when the credential that went out is the one the driver answered."""
+        ask = getattr(self._auth, "refusal", None)
+        return ask() if callable(ask) else None
 
     async def info(self, *, models: bool = True, model: str | None = None) -> DriverInfo:
         """The driver's `/v1/info`. `models=False` leaves an account's list
@@ -959,6 +968,11 @@ class BoundClient:
             if closer is not None:
                 await closer()
 
+    def credential_refusal(self) -> str | None:
+        """The inner client's: why the driver behind this model was sent no credential."""
+        ask = getattr(self._inner, "credential_refusal", None)
+        return ask() if callable(ask) else None
+
     async def aclose(self) -> None:
         """Nothing: the inner client is the routing table's to close."""
 
@@ -980,15 +994,29 @@ def _is_cascade_eligible(exc: Exception) -> bool:
     return retry_disposition(exc) == "safe"
 
 
-#: What to do about a driver that refused the gateway's OWN credential (a 401 or
-#: 403): a rotated signing key on one node is the shape it takes. One sentence for
-#: the front door's 502 (`routes.inference._driver_failure_status`) and for
-#: admission's, when the listing it re-reads is refused (`admission.unread_because`),
-#: so the two cannot drift.
-CREDENTIAL_REFUSED_NEXT_STEP = (
-    "The gateway holds a `service:gateway` token minted by its own node's agent; re-check "
-    "that driver's auth keys, or restart it so it picks up the install's current signing key."
-)
+def each_named(drivers: Sequence[str]) -> str:
+    """Drivers, each as a person can find it (`admission._who`), in one phrase: `A`,
+    `A and B`, `A, B and C`."""
+    if len(drivers) <= 1:
+        return "".join(drivers)
+    return f"{', '.join(drivers[:-1])} and {drivers[-1]}"
+
+
+def credential_refused_next_step(drivers: Sequence[str]) -> str:
+    """What to do about drivers that refused the gateway's OWN credential (a 401 or 403): a
+    rotated signing key on one node is the shape it takes. One sentence for the front
+    door's 502 (`routes.inference._driver_failure_status`) and for admission's, when the
+    listing it re-reads is refused (`admission.unread_because`), so the two cannot drift.
+
+    **It names each driver it is for**, which a refusal that names several needs to say
+    which one each remedy is about: "that driver's auth keys" did not.
+    """
+    many = len(drivers) > 1
+    return (
+        "The gateway holds a `service:gateway` token minted by its own node's agent; re-check "
+        f"the auth keys of {each_named(drivers)}, or restart {'each' if many else 'it'} so it "
+        "picks up the install's current signing key."
+    )
 
 
 def capacity_refused(exc: BaseException) -> bool:

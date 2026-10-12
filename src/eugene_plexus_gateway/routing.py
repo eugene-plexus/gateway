@@ -107,7 +107,7 @@ from .driver_client import Key as DriverKey
 from .image_doors import ImageAsk, rules_out
 from .metrics import AttemptRow, CandidateRow
 from .model_patterns import permits
-from .outbound import RECIPIENT_CONTROL, Outbound
+from .outbound import RECIPIENT_CONTROL, Outbound, token_refused_words
 from .tool_client import ToolDriverClient, ToolDriverInfo
 
 # Deadline for one topology read (an agent's `/v1/components`, a control
@@ -1041,7 +1041,7 @@ class RoutingTable:
             refused = self._outbound.refusal(recipient) if self._outbound is not None else None
             if response.status_code == 401 and refused:
                 # The far side saw no token; the reason is on this machine.
-                said += f" (this node's agent would not give the gateway a token for it: {refused})"
+                said += f" ({token_refused_words(refused)})"
             return None, said
         try:
             return response.json(), None

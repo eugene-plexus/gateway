@@ -63,7 +63,16 @@ def _preflight(client: TestClient, path: str, **extra: str) -> Any:
 
 
 @pytest.mark.parametrize(
-    "path", ["/v1/models", "/v1/chat/completions", "/v1/embeddings", "/v1/rerank"]
+    "path",
+    [
+        "/v1/models",
+        "/v1/chat/completions",
+        "/v1/embeddings",
+        "/v1/rerank",
+        # A count has its parent door's treatment: the same client calls both.
+        "/v1/messages/count_tokens",
+        "/v1/responses/input_tokens",
+    ],
 )
 def test_a_preflight_on_the_front_door_is_answered_before_auth(
     cors_client: TestClient, path: str
@@ -104,6 +113,17 @@ def test_a_real_response_carries_the_header(cors_client: TestClient) -> None:
         "x-eugene-plexus-tier",
     } <= exposed
     assert "x-eugene-plexus-ignored-settings" in exposed
+
+
+@pytest.mark.parametrize(
+    ("path", "status"), [("/v1/messages/count_tokens", 403), ("/v1/responses/input_tokens", 401)]
+)
+def test_a_count_refusal_carries_the_header_for_the_browser_to_read(
+    cors_client: TestClient, path: str, status: int
+) -> None:
+    r = cors_client.post(path, json={}, headers={"origin": ORIGIN})
+    assert r.status_code == status, r.text
+    assert r.headers["access-control-allow-origin"] == "*"
 
 
 def test_a_request_with_no_origin_is_untouched(cors_client: TestClient) -> None:

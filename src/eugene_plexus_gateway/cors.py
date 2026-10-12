@@ -86,6 +86,10 @@ FRONT_DOOR_PATHS: frozenset[str] = frozenset(
         "/v1/rerank",
         "/v1/messages",
         "/v1/responses",
+        # A count has its parent door's treatment: the same client calls both, and
+        # Anthropic's browser path announces itself on a count as on a message.
+        "/v1/messages/count_tokens",
+        "/v1/responses/input_tokens",
         # P3a: a page that reads text aloud is the plainest browser client.
         "/v1/audio/speech",
         # P3b, and the one that refuses, so a browser reads why.

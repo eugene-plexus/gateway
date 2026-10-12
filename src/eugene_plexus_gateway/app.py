@@ -265,11 +265,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         paths={
             "/v1/chat/completions",
             "/v1/messages",
+            # The counts check a client key in their own bodies and read a whole JSON body
+            # like their parents do. Left out, a key holder could post unbounded JSON to
+            # them (`tests/test_front_door_paths.py` finds such doors from their handlers).
+            "/v1/messages/count_tokens",
             "/v1/embeddings",
             # MR6: a question and up to 1,000 passages, read and parsed whole.
             "/v1/rerank",
             "/v1/systemone",
             "/v1/responses",
+            "/v1/responses/input_tokens",
             "/v1/audio/speech",
             # P4: a generation is a small JSON body; variations only refuse.
             "/v1/images/generations",

@@ -139,6 +139,34 @@ def test_a_backend_that_cannot_count_is_a_400_with_its_reason(settings: Settings
     assert not driver.calls
 
 
+def test_a_backends_own_reason_is_not_followed_by_a_second_nothing_was_sent(
+    settings: Settings,
+) -> None:
+    """The driver's 501 ends "Nothing was sent to the model.", and the count's own words
+    said it again after it, with a second full stop: "..model.. Nothing was sent..." """
+    driver = counting(count=None)
+    with serve(settings, driver) as client:
+        r = client.post(PATH, json=captured())
+    message = r.json()["error"]["message"]
+    assert ".." not in message
+    assert message.count("Nothing was sent to the model") == 1
+    assert message.endswith("A client can count by sending the request instead.")
+
+
+def test_a_count_carries_the_cap_only_when_the_caller_sent_one(settings: Settings) -> None:
+    """The translation supplies a `max_tokens` a count never has, for the shared
+    translation to apply unchanged; it is not the caller's, so it does not reach the
+    backend as one (a backend whose list names no `maxTokens`, or a driver that refuses
+    an explicit cap, would turn the count away for it)."""
+    driver = counting()
+    with serve(settings, driver) as client:
+        assert client.post(PATH, json=captured()).status_code == 200
+        assert client.post(PATH, json=captured(max_tokens=5)).status_code == 200
+    plain, capped = driver.count_calls
+    assert "maxTokens" not in (plain.callerSettings or [])
+    assert "maxTokens" in (capped.callerSettings or []) and capped.maxTokens == 5
+
+
 def test_a_replica_that_can_count_answers_for_one_that_cannot(settings: Settings) -> None:
     first = counting("a", count=None, base_url="http://a")
     second = counting("b", count=77, base_url="http://b")

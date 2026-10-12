@@ -1038,11 +1038,18 @@ def translate_count_request(
     """A `count_tokens` body, translated exactly as a message is.
 
     It has no `max_tokens` -- Anthropic's count endpoint takes none and
-    Claude Code sends none (captured) -- so one is supplied, and the shared
-    translation, every refusal in it included, applies unchanged. Nothing
-    is generated, so the number is never used for anything.
+    Claude Code sends none (captured) -- so one is supplied for the shared
+    translation, every refusal in it included, to apply unchanged. Nothing
+    is generated, so the number is never used for anything, **and it is taken
+    off again before the request is used**: left on, it was a setting the caller
+    sent (`callerSettings`), which every backend had to list for the count to be
+    answered, and which a refusal named though the count sent none. A cap the
+    caller did send stays.
     """
-    return translate_request({"max_tokens": 1, **raw}, max_images=max_images)
+    translated = translate_request({"max_tokens": 1, **raw}, max_images=max_images)
+    if "max_tokens" not in raw:
+        translated = translated.model_copy(update={"max_tokens": None})
+    return translated
 
 
 # --------------------------------------------------------------------------- #

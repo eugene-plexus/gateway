@@ -24,6 +24,7 @@ import base64
 import json
 import logging
 import math
+import re
 import struct
 import time
 import uuid
@@ -152,13 +153,13 @@ from ..config import ConfigStore
 from ..dependencies import require_authorized
 from ..disconnect import ClientGone, serve_while_connected
 from ..driver_client import (
-    CREDENTIAL_REFUSED_NEXT_STEP,
     DriverClient,
     DriverError,
     RepetitionStopped,
     TieredClient,
     VideoJobs,
     capacity_refused,
+    credential_refused_next_step,
 )
 from ..images import attachment_kinds, max_images
 from ..lifecycle import LifecycleManager, WakeResult
@@ -1559,18 +1560,54 @@ async def create_anthropic_message(request: Request) -> Any:
         )
 
 
-def _cannot_count(model: str, reason: str) -> JSONResponse:
+#: A reason that already says nothing was sent: an admission refusal ends "Nothing was
+#: forwarded or woken.", and a driver that cannot count says "Nothing was sent to the model."
+_SAYS_NOTHING_WAS_SENT = re.compile(r"Nothing was (?:forwarded or woken|sent to the model)\.?$")
+
+
+def _count_of(model: str | None) -> str:
+    """` for 'model'`, or nothing: a refusal before the model is known (a key that cannot
+    be checked) names no model."""
+    return f" for {model!r}" if model is not None else ""
+
+
+def _cannot_count(model: str | None, reason: str) -> JSONResponse:
     """A count this door will not give, as the 400 Claude Code falls back on.
 
     **A 400 and never a 5xx, measured**: `/context` tries a 4xx count
     once and then counts by sending the request itself, and retries a
     5xx first -- so every "cannot count", a backend that is down
-    included, is the status that costs the client one attempt.
+    included, is the status that costs the client one attempt. That holds for
+    a key that cannot be checked as well: the authority that does not answer
+    the key check, and the agent that cannot give the key policy, are a count
+    that cannot be given, with the same cause in the same words (a key the
+    authority refuses is still that refusal).
     """
+    # The reason ends in one full stop of its own however its source ended it (a driver's
+    # detail often ends in one, and `..` read as a mistake). Said once: a reason that already
+    # says nothing was forwarded, woken or sent (an admission refusal, a driver that cannot
+    # count) is not followed by the same again.
+    said = admission.as_sentence(reason)
+    tail = (
+        "A client can count by sending the request instead."
+        if _SAYS_NOTHING_WAS_SENT.search(said)
+        else "Nothing was sent to the model; a client can count by sending the request instead."
+    )
     return anthropic.error_response(
         400,
-        f"Cannot count tokens for {model!r} without generating: {reason}. Nothing was "
-        "sent to the model; a client can count by sending the request instead.",
+        f"Cannot count tokens{_count_of(model)} without generating: {said} {tail}",
+    )
+
+
+def _cannot_count_in_openai_words(model: str | None, reason: str) -> JSONResponse:
+    """The same count refused in OpenAI's envelope (`/v1/responses/input_tokens`)."""
+    said = admission.as_sentence(reason)
+    if not _SAYS_NOTHING_WAS_SENT.search(said):
+        said += " Nothing was sent to the model."
+    return responses.error_response(
+        400,
+        f"Cannot count tokens{_count_of(model)} without generating: {said}",
+        param="model" if model is not None else None,
     )
 
 
@@ -1593,6 +1630,10 @@ async def count_anthropic_message_tokens(request: Request) -> Any:
     try:
         await anthropic.authorize(request)
     except anthropic.Refusal as refusal:
+        if refusal.status >= 500:
+            # The key policy cannot be read: a count that cannot be given, and not a 503
+            # that `/context` would retry (a key refused is still that refusal).
+            return _cannot_count(None, refusal.message)
         return refusal.response()
     try:
         raw = await request.json()
@@ -1640,20 +1681,22 @@ async def _counted(request: Request, body: ChatCompletionRequest) -> _Count:
     request). Admission re-reads the listing of a request that carries tools or
     settings, and when it cannot confirm one it answers a 503 (a driver that is
     restarting, a deadline) or a 502 (a driver that refuses the gateway's
-    credential, or is not an inference driver): on the doors that generate that
-    is right, and here it is a count that cannot be given, with the same cause in
-    the same words. Both looks at admission are covered, the second being the one
-    after a refresh. A refusal of the request itself (a 400, a key's 403) is
-    still that.
+    credential, is not an inference driver or could not build its engine): on the
+    doors that generate that is right, and here it is a count that cannot be
+    given, with the same cause in the same words. Both looks at admission are
+    covered, the second being the one after a refresh, and so is the key check
+    that comes before them: an authority that answers a 5xx to it, or does not
+    answer, is a count that cannot be given and not a 503. A refusal of the
+    request itself (a 400, a key's 401 or 403) is still that, and nothing is
+    counted on any of them.
     """
-    await admission.authorize(request, None)
     try:
+        await admission.authorize(request, None)
         return await _count_with_a_backend(request, body)
     except admission.AdmissionFailure as failure:
         if failure.status < 500:
             raise
-        # Its own full stop is not said twice: `_cannot_count` ends the reason with one.
-        return _Count(reason=failure.message.rstrip("."))
+        return _Count(reason=failure.message)
 
 
 async def _count_with_a_backend(request: Request, body: ChatCompletionRequest) -> _Count:
@@ -1827,6 +1870,10 @@ async def count_response_input_tokens(request: Request) -> Any:
     try:
         await responses.authorize(request)
     except responses.Refusal as refusal:
+        if refusal.status >= 500:
+            # The key policy cannot be read: a count that cannot be given, as on the
+            # Messages door's count.
+            return _cannot_count_in_openai_words(None, refusal.message)
         return refusal.response()
     try:
         raw = await request.json()
@@ -1850,12 +1897,7 @@ async def count_response_input_tokens(request: Request) -> Any:
             400, f"The backend rejected this request: {counted.rejected}", param="input"
         )
     if counted.reason is not None:
-        return responses.error_response(
-            400,
-            f"Cannot count tokens for {body.model!r} without generating: {counted.reason}. "
-            "Nothing was sent to the model.",
-            param="model",
-        )
+        return _cannot_count_in_openai_words(body.model, counted.reason)
     return JSONResponse(content={"object": "response.input_tokens", "input_tokens": counted.tokens})
 
 
@@ -5248,7 +5290,7 @@ def _driver_failure_status(e: DriverError) -> _Failure:
             message=(
                 f"The driver {e.driver_name!r} at {e.driver_url} refused the gateway's "
                 f"credential (HTTP {upstream}): {detail} Nothing is wrong with this "
-                f"request. {CREDENTIAL_REFUSED_NEXT_STEP}"
+                f"request. {credential_refused_next_step([f'driver {e.driver_name!r}'])}"
             ),
             error_type="upstream_auth_error",
         )

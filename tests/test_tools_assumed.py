@@ -58,6 +58,7 @@ from eugene_plexus_gateway._generated.driver_models import (
     GenerateRequest,
     Message,
     NamedToolChoice,
+    Problem,
     Role,
     SettingNotHonoured,
     Tool,
@@ -65,7 +66,11 @@ from eugene_plexus_gateway._generated.driver_models import (
 )
 from eugene_plexus_gateway.app import create_app
 from eugene_plexus_gateway.capabilities import calls_tools, chats, said_tools, tools_refused
-from eugene_plexus_gateway.driver_client import DriverError, StreamEvent
+from eugene_plexus_gateway.driver_client import (
+    DriverError,
+    StreamEvent,
+    credential_refused_next_step,
+)
 from eugene_plexus_gateway.routes import inference
 from eugene_plexus_gateway.settings import Settings
 from tests.test_admission import Authority
@@ -115,6 +120,19 @@ def _listing(**gaps: list[str | bool]) -> list[SettingNotHonoured]:
 
 
 STRATA = _listing(**STRATA_GAPS)
+
+#: What the driver lists for an OpenRouter model whose own listing leaves `tool_choice` out
+#: (the eight `amazon/nova-*`, `stepfun/step-5-preview`, `cohere/command-a-plus` and
+#: `thinkingmachines/inkling-*` of the public list of 2026-10-12) while it asks OpenRouter
+#: only for providers that take every parameter it sends: neither tool setting is
+#: delivered, `none` included, and the tools stay on the request, because a strict upstream
+#: (Bedrock's Converse, behind `amazon/nova-*`) refuses a history that carries tool calls
+#: or results without the tool definitions.
+NOVA_GAPS: dict[str, list[str | bool]] = {
+    "toolChoice": ["none", "required", "function"],
+    "parallelToolCalls": [False],
+}
+NOVA = _listing(**NOVA_GAPS)
 NAMED = NamedToolChoice(type="function", function=Function(name="get_weather"))
 TOOL = Tool(type="function", function=FunctionDefinition(name="get_weather"))
 #: A request carrying tools, a choice and the parallel switch, all the caller's.
@@ -302,6 +320,50 @@ def test_none_names_the_parallel_switch_for_a_backend_that_does_read_tool_choice
     assert ignored_settings.not_honoured(reads, request) == ("parallelToolCalls",)
 
 
+def test_none_names_the_parallel_switch_too_when_the_gap_names_none() -> None:
+    """The driver keeps the tools for a model whose `toolChoice` gap names `none` (an
+    OpenRouter listing without `tool_choice`: a strict upstream refuses a history that
+    carries tool calls without their definitions) and withholds both settings. Nothing
+    is left unsent by `none` there, so `tool_choice: none` with `parallel_tool_calls:
+    false` names both. Only a gap that leaves `none` out is honoured by sending no tools,
+    and names neither the parallel switch nor `none`."""
+    both = {"parallelToolCalls": False, "callerSettings": ["toolChoice", "parallelToolCalls"]}
+    assert ignored_settings.not_honoured(NOVA, _req(toolChoice=ToolChoice.none, **both)) == (
+        "toolChoice",
+        "parallelToolCalls",
+    )
+    # `none` alone is named too (the gap names it), and nothing rides with it.
+    alone = _req(toolChoice=ToolChoice.none, callerSettings=["toolChoice"])
+    assert ignored_settings.not_honoured(NOVA, alone) == ("toolChoice",)
+    # Every other choice is named as for any listing.
+    assert ignored_settings.not_honoured(NOVA, _req(toolChoice=ToolChoice.auto, **both)) == (
+        "parallelToolCalls",
+    )
+    assert ignored_settings.not_honoured(NOVA, _req(toolChoice=ToolChoice.required, **both)) == (
+        "toolChoice",
+        "parallelToolCalls",
+    )
+    # And the Strata-shaped gap, whose `none` is honoured, still names neither.
+    assert ignored_settings.not_honoured(STRATA, _req(toolChoice=ToolChoice.none, **both)) == ()
+
+
+def test_none_is_given_as_no_tools_when_some_gap_does_not_name_it() -> None:
+    """The driver's rule (`_none_is_given_as_no_tools`) is that any `toolChoice` gap that
+    leaves `none` out makes `none` an instruction to send no tools, and the switch goes
+    with them. One gap that names `none` does not change that."""
+    mixed = (
+        _listing(toolChoice=["none", "required"])
+        + _listing(toolChoice=["required"])
+        + _listing(parallelToolCalls=[False])
+    )
+    request = _req(
+        toolChoice=ToolChoice.none,
+        parallelToolCalls=False,
+        callerSettings=["toolChoice", "parallelToolCalls"],
+    )
+    assert ignored_settings.not_honoured(mixed, request) == ("toolChoice",)
+
+
 # --------------------------------------------------------------------------- #
 # The mapping, the order, the dedupe
 # --------------------------------------------------------------------------- #
@@ -342,9 +404,12 @@ def test_a_field_is_spelled_the_way_the_door_s_caller_spells_it(
 
 def test_the_chat_table_is_the_one_admission_words_its_refusals_from() -> None:
     """One table, not two: admission names the setting a backend lacks in the
-    caller's words from the same place."""
-    assert not hasattr(admission, "_WIRE_NAMES")
-    assert admission.WIRE_NAMES is ignored_settings.WIRE_NAMES
+    caller's words from the same place as the header and the list of what a request
+    carries do, and keeps no copy of it."""
+    assert not hasattr(admission, "_WIRE_NAMES") and not hasattr(admission, "WIRE_NAMES")
+    assert admission.worded is ignored_settings.worded
+    for name, wire in ignored_settings.WIRE_NAMES.items():
+        assert ignored_settings.worded(name) == ignored_settings.spelled(name) == wire
 
 
 def test_the_doors_own_come_first_then_the_backends_each_once() -> None:
@@ -540,6 +605,67 @@ def test_a_door_names_what_the_caller_sent_and_the_backend_does_not_honour(
     assert r.status_code == 200, r.text
     assert _header(r) == own + named
     # Answered, not refused: both requests reached the backend, as sent.
+    assert len(fake.calls) == 2
+
+
+#: The same for a backend whose gap names `none` (`NOVA_GAPS`), where `tool_choice: none`
+#: leaves the tools on the request and neither setting is delivered: both are named.
+NAMED_ON_NOVA = {
+    "chat": [
+        ("none", {"tool_choice": "none"}, ["tool_choice"]),
+        (
+            "none with parallel false",
+            {"tool_choice": "none", "parallel_tool_calls": False},
+            ["tool_choice", "parallel_tool_calls"],
+        ),
+        ("auto", {"tool_choice": "auto"}, []),
+        (
+            "auto with parallel false",
+            {"tool_choice": "auto", "parallel_tool_calls": False},
+            ["parallel_tool_calls"],
+        ),
+    ],
+    "messages": [
+        ("none", {"tool_choice": {"type": "none"}}, ["tool_choice"]),
+        (
+            "none with parallel disabled",
+            {"tool_choice": {"type": "none", "disable_parallel_tool_use": True}},
+            ["tool_choice", "tool_choice.disable_parallel_tool_use"],
+        ),
+        ("auto", {"tool_choice": {"type": "auto"}}, []),
+    ],
+    "responses": [
+        ("none", {"tool_choice": "none"}, ["tool_choice"]),
+        (
+            "none with parallel false",
+            {"tool_choice": "none", "parallel_tool_calls": False},
+            ["tool_choice", "parallel_tool_calls"],
+        ),
+        ("auto", {"tool_choice": "auto"}, []),
+    ],
+}
+NOVA_CASES = [
+    pytest.param(door, extra, named, id=f"{door}: {label}")
+    for door, cases in NAMED_ON_NOVA.items()
+    for label, extra, named in cases
+]
+
+
+@pytest.mark.parametrize("streamed", [False, True], ids=["whole", "streamed"])
+@pytest.mark.parametrize(("door", "extra", "named"), NOVA_CASES)
+def test_a_door_names_both_settings_for_a_backend_whose_gap_names_none(
+    settings: Settings, door: str, extra: dict[str, Any], named: list[str], streamed: bool
+) -> None:
+    """`tool_choice: none` with the parallel switch off, to a model such as
+    `amazon/nova-lite-v1`: the tools stay on the request and neither setting is
+    delivered, so the header names both. It left out the switch, on the premise that
+    `none` sends no tools, for every backend that lists `toolChoice`."""
+    fake = _backend("nova", not_honoured=NOVA_GAPS)
+    with TestClient(_app(settings, fake)) as client:
+        own = _header(_post(client, door, stream=streamed))
+        r = _post(client, door, stream=streamed, **extra)
+    assert r.status_code == 200, r.text
+    assert _header(r) == own + named
     assert len(fake.calls) == 2
 
 
@@ -1858,6 +1984,56 @@ def test_a_driver_that_answers_an_error_is_named_with_its_answer(settings: Setti
     assert "answered 503" in r.json()["error"]["message"]
 
 
+def test_a_detail_that_ends_in_a_full_stop_does_not_make_two(settings: Settings) -> None:
+    """The refusal ends a cause with its own full stop, and a driver's own detail often
+    ends in one: "loading.. This is not a refusal"."""
+    fake = _backend("restarting")
+    fake.info_error = _answered(503, "The engine is still loading.")
+    with TestClient(_app(settings, fake)) as client:
+        r = _tools_post(client)
+    message = r.json()["error"]["message"]
+    assert r.status_code == 503, r.text
+    assert (
+        "answered 503: The engine is still loading. This is not a refusal of the request: "
+        "try again in a few seconds. Nothing was forwarded or woken."
+    ) in message
+    assert ".." not in message
+
+
+def test_two_details_that_end_in_a_full_stop_are_joined_without_one(settings: Settings) -> None:
+    fakes = [_backend(f"driver-{i}", base_url=f"http://box-{i}") for i in "ab"]
+    fakes[0].info_error = _answered(503, "Still loading.")
+    fakes[1].info_error = _answered(503, "Also loading.")
+    with TestClient(_app(settings, *fakes)) as client:
+        r = _tools_post(client)
+    message = r.json()["error"]["message"]
+    assert (
+        "answered 503: Still loading; driver 'driver-b' (http://box-b): answered 503: Also loading. This"
+        in message
+    )
+    assert ".." not in message and ".;" not in message
+
+
+def test_a_local_only_key_403_ends_a_detail_with_one_full_stop(keyed_count: Any) -> None:
+    from tests.test_local_only import describe_as
+
+    app, authority, allowed, _, headers = keyed_count
+    authority.local_only = True
+    describe_as(allowed, "local")
+    allowed.info_error = _answered(503, "Still loading.")
+    with TestClient(app) as client:
+        r = client.post(
+            "/v1/chat/completions", json=_chat(model="allowed", tools=[WEATHER]), headers=headers
+        )
+    message = r.json()["error"]["message"]
+    assert r.status_code == 403, r.text
+    assert (
+        "Could not confirm: driver 'allowed-driver' (http://fake-driver): answered 503: Still loading. Nothing"
+        in message
+    )
+    assert ".." not in message
+
+
 def test_a_driver_that_could_not_be_read_is_not_counted_as_one_that_said_no(
     settings: Settings,
 ) -> None:
@@ -1983,13 +2159,21 @@ WAITING_CLEARS = [
     ),
 ]
 
+#: What a cause waiting cannot clear tells a person to look at, as the cases below read it:
+#: each names its driver (`strata-box`, at the fake's address) and never "that driver" or
+#: "the address above", which several drivers named in one refusal make ambiguous.
+CHECK_CREDENTIAL = "re-check the auth keys of driver 'strata-box' (http://fake-driver)"
+CHECK_ADDRESS = (
+    "Make sure driver 'strata-box' (http://fake-driver) is an inference driver of this install"
+)
+
 #: Causes it cannot, how each is said, what to look at, and the error type: a 502.
 WAITING_DOES_NOT_CLEAR = (
     [
         pytest.param(
             _answered(status, "bad token"),
             f"refused the gateway's credential (answered {status}: bad token)",
-            admission.CREDENTIAL_REFUSED_NEXT_STEP,
+            CHECK_CREDENTIAL,
             "upstream_auth_error",
             id=f"a {status}",
         )
@@ -1999,7 +2183,7 @@ WAITING_DOES_NOT_CLEAR = (
         pytest.param(
             _answered(status, "nope"),
             f"does not serve GET /v1/info (answered {status}: nope)",
-            admission.NOT_A_DRIVER_NEXT_STEP,
+            CHECK_ADDRESS,
             "upstream_error",
             id=f"a {status}",
         )
@@ -2010,14 +2194,14 @@ WAITING_DOES_NOT_CLEAR = (
             _not_json(),
             "answered GET /v1/info with something that is not a driver listing "
             "(Expecting value: line 1 column 1 (char 0))",
-            admission.NOT_A_DRIVER_NEXT_STEP,
+            CHECK_ADDRESS,
             "upstream_error",
             id="not JSON",
         ),
         pytest.param(
             _not_a_listing(),
             "answered GET /v1/info with something that is not a driver listing (",
-            admission.NOT_A_DRIVER_NEXT_STEP,
+            CHECK_ADDRESS,
             "upstream_error",
             id="not a listing",
         ),
@@ -2048,6 +2232,33 @@ def test_a_cause_that_passes_is_a_503_with_a_retry_after(
     assert fake.calls == []
 
 
+@pytest.mark.parametrize("door", ["chat", "messages", "responses"])
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_refusal_to_a_request_the_gateway_sent_no_token_is_a_503_naming_the_agents_reason(
+    settings: Settings, door: str, status: int
+) -> None:
+    """The driver's 401 or 403 is the gateway's doing when this node's agent would not give it
+    a token for the driver's machine (`outbound.Outbound.refusal`): not the driver refusing a
+    credential, and the agent is asked again within seconds. A 503 to try again, saying why no
+    token was sent, on every door."""
+    fake = _backend("far-box")
+    fake.info_error = _answered(status, "Missing token")
+    fake.credential_refusal = lambda: "403: this node holds no gateway grant"  # type: ignore[attr-defined]
+    with TestClient(_app(settings, fake)) as client:
+        r = _post(client, door)
+    assert r.status_code == 503, r.text
+    assert r.headers["Retry-After"] == "5"
+    message = r.json()["error"]["message"]
+    assert (
+        f"driver 'far-box' (http://fake-driver): answered {status}: Missing token (this node's "
+        "agent would not give the gateway a token for it: 403: this node holds no gateway grant)"
+    ) in message
+    assert "refused the gateway's credential" not in message
+    assert "try again in a few seconds" in message
+    assert "service:gateway" not in message and "that driver" not in message
+    assert fake.calls == []
+
+
 @pytest.mark.parametrize(("error", "shown", "step", "kind"), WAITING_DOES_NOT_CLEAR)
 def test_a_cause_waiting_cannot_clear_is_a_502_naming_it_with_no_retry_advice(
     settings: Settings, error: Exception, shown: str, step: str | None, kind: str
@@ -2071,6 +2282,7 @@ def test_a_cause_waiting_cannot_clear_is_a_502_naming_it_with_no_retry_advice(
     assert "This is not a refusal of the request" in message
     if step is not None:
         assert step in message
+    assert "that driver" not in message and "the address above" not in message
     assert "Remove" not in message and "No permitted backend" not in message
     assert fake.calls == []
 
@@ -2111,10 +2323,15 @@ def test_a_driver_that_will_answer_among_drivers_that_will_not_makes_it_a_retry(
     assert "driver 'a-loading'" in message and "could not connect" in message
     assert "driver 'b-refused'" in message and "refused the gateway's credential" in message
     assert "try again in a few seconds" in message
-    assert message.count(admission.CREDENTIAL_REFUSED_NEXT_STEP) == 1
+    assert message.count("re-check the auth keys of") == 1
+    assert "auth keys of driver 'b-refused' (http://fake-driver)" in message
 
 
-def test_two_drivers_that_refuse_say_what_to_look_at_once(settings: Settings) -> None:
+def test_two_drivers_that_refuse_say_what_to_look_at_once_naming_both(
+    settings: Settings,
+) -> None:
+    """One sentence however many drivers say the same, and it names each of them: "that
+    driver" would not say which of two was meant."""
     fakes = [_backend(f"driver-{i}", base_url=f"http://box-{i}") for i in "ab"]
     for fake in fakes:
         fake.info_error = _answered(403, "bad token")
@@ -2123,7 +2340,47 @@ def test_two_drivers_that_refuse_say_what_to_look_at_once(settings: Settings) ->
     assert r.status_code == 502
     message = r.json()["error"]["message"]
     assert "driver 'driver-a'" in message and "driver 'driver-b'" in message
-    assert message.count(admission.CREDENTIAL_REFUSED_NEXT_STEP) == 1
+    assert message.count("service:gateway") == 1
+    assert (
+        "re-check the auth keys of driver 'driver-a' (http://box-a) and driver 'driver-b' "
+        "(http://box-b)"
+    ) in message
+    assert "that driver" not in message
+
+
+@pytest.mark.parametrize(
+    ("error", "named"),
+    [
+        pytest.param(_answered(403, "bad token"), CHECK_CREDENTIAL, id="a credential refused"),
+        pytest.param(_answered(404, "nope"), CHECK_ADDRESS, id="not an inference driver"),
+    ],
+)
+def test_each_remedy_names_its_driver(settings: Settings, error: Exception, named: str) -> None:
+    """Not "the address above" or "that driver": a refusal that names several drivers says
+    which one each remedy is for, and says it the same way when there is only one."""
+    fake = _backend("strata-box")
+    fake.info_error = error
+    with TestClient(_app(settings, fake)) as client:
+        r = _tools_post(client)
+    message = r.json()["error"]["message"]
+    assert named in message
+    assert "that driver" not in message and "the address above" not in message
+
+
+def test_two_drivers_that_are_not_inference_drivers_are_checked_in_one_sentence(
+    settings: Settings,
+) -> None:
+    fakes = [_backend(f"driver-{i}", base_url=f"http://box-{i}") for i in "ab"]
+    for fake in fakes:
+        fake.info_error = _answered(404, "nope")
+    with TestClient(_app(settings, *fakes)) as client:
+        r = _tools_post(client)
+    message = r.json()["error"]["message"]
+    assert message.count("at a version this gateway reads") == 1
+    assert (
+        "Make sure each of driver 'driver-a' (http://box-a) and driver 'driver-b' "
+        "(http://box-b) is an inference driver of this install"
+    ) in message
 
 
 # --------------------------------------------------------------------------- #
@@ -2160,6 +2417,59 @@ def test_what_a_request_carries_is_said_in_the_callers_words_in_a_readable_order
     assert ignored_settings.carried([]) == []
 
 
+def test_what_a_request_carries_is_said_in_the_words_of_the_door_it_came_by() -> None:
+    """The tools first and the settings that ride with them next, as ever, in each door's
+    own spelling: the Messages caller's parallel switch is
+    `tool_choice.disable_parallel_tool_use`, its stop is `stop_sequences`, and the
+    Responses caller's cap is `max_output_tokens`. What no table has a word for is as it
+    came, never a guess."""
+    names = ["stop", "parallelToolCalls", "maxTokens", "toolChoice", "tools", "mirostatTau"]
+    assert ignored_settings.carried(names, "chat") == [
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "max_tokens",
+        "mirostatTau",
+        "stop",
+    ]
+    assert ignored_settings.carried(names, "messages") == [
+        "tools",
+        "tool_choice",
+        "tool_choice.disable_parallel_tool_use",
+        "max_tokens",
+        "mirostatTau",
+        "stop_sequences",
+    ]
+    assert ignored_settings.carried(names, "responses") == [
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "max_output_tokens",
+        "mirostatTau",
+        "stop",
+    ]
+    # No door named is the chat door's, and so is a door nobody has heard of.
+    assert ignored_settings.carried(names) == ignored_settings.carried(names, "chat")
+    assert ignored_settings.carried(names, "nonesuch") == ignored_settings.carried(names, "chat")
+
+
+@pytest.mark.parametrize(
+    ("path", "door"),
+    [
+        ("/v1/chat/completions", "chat"),
+        ("/v1/messages", "messages"),
+        ("/v1/messages/count_tokens", "messages"),
+        ("/v1/responses", "responses"),
+        ("/v1/responses/input_tokens", "responses"),
+        ("/v1/embeddings", "chat"),
+        ("/v1/completions", "chat"),
+        ("", "chat"),
+    ],
+)
+def test_a_path_is_the_door_whose_words_a_refusal_uses(path: str, door: str) -> None:
+    assert ignored_settings.door_of(path) == door
+
+
 def test_a_refusal_names_every_setting_the_caller_sent_in_its_words(settings: Settings) -> None:
     """tool_choice, parallel_tool_calls and top_k, with the tools: said as the caller
     wrote them and not as the driver does, in the order above."""
@@ -2178,9 +2488,12 @@ def test_a_refusal_names_every_setting_the_caller_sent_in_its_words(settings: Se
 
 
 @pytest.mark.parametrize("door", ["messages", "responses"])
-def test_the_other_doors_say_what_they_carry_in_the_same_words_and_order(
+def test_the_other_doors_say_what_they_carry_in_the_words_of_their_own_caller(
     settings: Settings, door: str
 ) -> None:
+    """A Messages caller wrote `disable_parallel_tool_use` where it meant the parallel
+    switch off, and says so in the header the same door answers with: the refusal says it
+    that way too, in the same order."""
     fake = _backend("strata-box")
     fake.info_error = httpx.ConnectError("refused")
     extra = {
@@ -2191,8 +2504,38 @@ def test_the_other_doors_say_what_they_carry_in_the_same_words_and_order(
         r = _post(client, door, **extra)
     assert r.status_code == 503, r.text
     carried = _carried(r.json()["error"]["message"])
-    assert carried[:3] == ["tools", "tool_choice", "parallel_tool_calls"]
+    assert (
+        carried[:3]
+        == {
+            "messages": ["tools", "tool_choice", "tool_choice.disable_parallel_tool_use"],
+            "responses": ["tools", "tool_choice", "parallel_tool_calls"],
+        }[door]
+    )
     assert "toolChoice" not in carried and "parallelToolCalls" not in carried
+    if door == "messages":
+        assert "parallel_tool_calls" not in carried
+
+
+def test_a_setting_nobody_takes_is_named_in_the_words_of_the_door_it_came_by(
+    settings: Settings,
+) -> None:
+    """The refusal of a setting no backend lists is worded from the same table: a Messages
+    caller is told about `tool_choice.disable_parallel_tool_use`, not about a field the
+    door has no such name for."""
+    fake = _backend("strata-box", not_honoured={})
+    fake.supported_settings = [s for s in fake.supported_settings if s != "parallelToolCalls"]
+    with TestClient(_app(settings, fake)) as client:
+        r = _post(
+            client, "messages", tool_choice={"type": "any", "disable_parallel_tool_use": True}
+        )
+    error = r.json()["error"]
+    assert r.status_code == 400, r.text
+    assert error["message"].startswith(
+        "No permitted backend serving this model takes tool_choice.disable_parallel_tool_use. "
+        "Remove it"
+    )
+    assert error["param"] == "tool_choice.disable_parallel_tool_use"
+    assert fake.calls == []
 
 
 def test_tools_sent_empty_are_still_said_to_be_carried(settings: Settings) -> None:
@@ -2210,21 +2553,64 @@ def test_tools_sent_empty_are_still_said_to_be_carried(settings: Settings) -> No
     assert _carried(message) == ["tools"]
 
 
-def test_a_driver_that_answers_without_the_model_says_why_when_it_says_so(
+DEGRADED = "could not build its engine: the model file is missing"
+
+
+@pytest.mark.parametrize("door", ["chat", "messages", "responses"])
+@pytest.mark.parametrize(
+    "listed", [False, True], ids=["a listing with nothing", "the model listed"]
+)
+def test_a_driver_that_says_it_serves_nothing_is_a_502_with_no_retry_advice(
+    settings: Settings, door: str, listed: bool
+) -> None:
+    """A driver that could not build its engine from its configuration reports why in its
+    own words (`DriverInfo.degraded`) and stays that way until the configuration is fixed
+    and it is restarted: waiting changes nothing. A 502 with no `Retry-After` and no "try
+    again", naming the driver and what to look at. (A real one lists nothing; one that
+    lists the model as well still says it serves nothing.)"""
+    fake = _backend("restarted", degraded=DEGRADED)
+    app = _app(settings, fake)
+    if not listed:
+        fake.model_id = None
+    with TestClient(app) as client:
+        r = _post(client, door)
+    assert r.status_code == 502, r.text
+    assert "Retry-After" not in r.headers
+    body = r.json()
+    message = body["error"]["message"]
+    assert (
+        f"driver 'restarted' (http://fake-driver): it says it serves nothing: {DEGRADED}" in message
+    )
+    assert (
+        "Look at the health and configuration of driver 'restarted' (http://fake-driver)" in message
+    )
+    assert "try again" not in message.lower() and "few seconds" not in message
+    assert "This is not a refusal of the request" in message
+    assert "Remove" not in message and "No permitted backend" not in message
+    assert body["error"]["type"] == ("api_error" if door == "messages" else "upstream_error")
+    assert fake.calls == []
+
+
+def test_a_driver_that_serves_nothing_among_drivers_one_of_which_will_answer_is_a_retry(
     settings: Settings,
 ) -> None:
-    """A driver that could not build its engine reports why in its own words
-    (`DriverInfo.degraded`), and "the model is gone" is only half of that."""
-    fake = _backend("restarted", degraded="could not build its engine: the model file is missing")
-    app = _app(settings, fake)
-    fake.model_id = None
+    """The request is served by the one that comes back, so waiting helps, and the driver
+    that cannot build its engine is named with what to look at all the same."""
+    loading = _backend("a-loading")
+    loading.info_error = httpx.ConnectError("refused")
+    broken = _backend("b-broken", degraded=DEGRADED)
+    app = _app(settings, loading, broken)
+    broken.model_id = None
     with TestClient(app) as client:
         r = _tools_post(client)
-    assert r.status_code == 503, r.text
+    assert r.status_code == 503 and r.headers["Retry-After"] == "5"
+    message = r.json()["error"]["message"]
+    assert "driver 'a-loading'" in message and "could not connect" in message
     assert (
-        f"answered GET /v1/info without {MODEL!r}, which it listed at the last refresh; "
-        "the driver says it serves nothing: could not build its engine: the model file is missing"
-    ) in r.json()["error"]["message"]
+        f"driver 'b-broken' (http://fake-driver): it says it serves nothing: {DEGRADED}" in message
+    )
+    assert "try again in a few seconds" in message
+    assert "Look at the health and configuration of driver 'b-broken'" in message
 
 
 def test_what_a_degraded_driver_says_is_capped_like_any_other_cause(settings: Settings) -> None:
@@ -2236,8 +2622,9 @@ def test_what_a_degraded_driver_says_is_capped_like_any_other_cause(settings: Se
         r = _tools_post(client)
     message = r.json()["error"]["message"]
     cause = message.split("driver 'restarted' (http://fake-driver): ", 1)[1].split(
-        ". This is not a refusal", 1
+        " This is not a refusal", 1
     )[0]
+    assert cause.startswith("it says it serves nothing: not built because")
     assert len(cause) <= admission.MAX_CAUSE_CHARS and cause.endswith("because...")
     assert "\n" not in message and "  " not in message
 
@@ -2297,6 +2684,130 @@ def test_a_long_answer_is_one_line_cut_at_a_word_with_an_ellipsis() -> None:
         f"answered GET /v1/info with something that is not a driver listing ({cause})".split()
     )
     assert flat.startswith(kept) and flat[len(kept)] == " ", "the cut falls between two words"
+
+
+#: An over-long, many-lined detail, in the place each branch of `unread_because` puts the
+#: driver's own words.
+LONG_DETAIL = "one  two\n\tthree " + "word " * 100 + "\n   last words here"
+
+#: Every way a cause is worded, with the whole of it before the cap.
+CAPPED = [
+    pytest.param(
+        _answered(401, LONG_DETAIL),
+        f"refused the gateway's credential (answered 401: {LONG_DETAIL})",
+        id="a credential refused: 401",
+    ),
+    pytest.param(
+        _answered(403, LONG_DETAIL),
+        f"refused the gateway's credential (answered 403: {LONG_DETAIL})",
+        id="a credential refused: 403",
+    ),
+    pytest.param(_answered(503, LONG_DETAIL), f"answered 503: {LONG_DETAIL}", id="a 5xx"),
+    pytest.param(_answered(429, LONG_DETAIL), f"answered 429: {LONG_DETAIL}", id="a 429"),
+    pytest.param(
+        _answered(404, LONG_DETAIL),
+        f"does not serve GET /v1/info (answered 404: {LONG_DETAIL})",
+        id="a 4xx",
+    ),
+    pytest.param(
+        ValueError(LONG_DETAIL),
+        f"answered GET /v1/info with something that is not a driver listing ({LONG_DETAIL})",
+        id="not a listing",
+    ),
+    pytest.param(
+        httpx.ConnectError(LONG_DETAIL),
+        f"could not connect to a ({LONG_DETAIL}): nothing is listening there",
+        id="a ConnectError text",
+    ),
+    pytest.param(
+        RuntimeError(LONG_DETAIL), f"RuntimeError: {LONG_DETAIL}", id="an unclassified exception"
+    ),
+]
+
+
+@pytest.mark.parametrize(("error", "whole"), CAPPED)
+def test_every_way_a_cause_is_worded_is_one_line_cut_at_a_word_with_an_ellipsis(
+    error: Exception, whole: str
+) -> None:
+    """The cap is applied to every cause, not to the one that was tried: each branch
+    of `unread_because` that words a driver's own answer collapses its whitespace, keeps
+    the cap and ends a cut in an ellipsis, between two words."""
+    backend = SimpleNamespace(name="a", node=None, url="http://a")
+    said = admission.unread_because(backend, error).text
+    head = "driver 'a' (http://a): "
+    assert said.startswith(head)
+    body = said[len(head) :]
+    assert "\n" not in said and "\t" not in said and "  " not in said
+    assert len(body) <= admission.MAX_CAUSE_CHARS
+    assert body.endswith("...")
+    kept = body[: -len("...")]
+    flat = " ".join(whole.split())
+    assert len(flat) > admission.MAX_CAUSE_CHARS, "the case is long enough to be cut"
+    assert flat.startswith(kept) and flat[len(kept)] == " ", "the cut falls between two words"
+
+
+def test_a_runtime_changed_to_a_long_name_is_capped_too(settings: Settings) -> None:
+    """The other causes a listing gives (`_changed`): its own words, here a runtime's name,
+    are as long as an operator made them."""
+    fake = _backend("moved")
+    app = _app(settings, fake)
+    fake.runtime = "my  runtime " * 60
+    with TestClient(app) as client:
+        r = _tools_post(client)
+    message = r.json()["error"]["message"]
+    cause = message.split("driver 'moved' (http://fake-driver): ", 1)[1].split(" This is not", 1)[0]
+    assert cause.startswith("it now follows runtime 'my runtime my runtime")
+    assert len(cause) <= admission.MAX_CAUSE_CHARS and cause.endswith("...")
+    assert "  " not in message
+
+
+@pytest.mark.parametrize(
+    ("text", "ended"),
+    [
+        ("a cause", "a cause."),
+        ("a cause.", "a cause."),
+        ("a cause...", "a cause..."),
+        ("a cause.  ", "a cause."),
+        ("", "."),
+    ],
+)
+def test_a_sentence_is_ended_with_one_full_stop_and_never_two(text: str, ended: str) -> None:
+    assert admission.as_sentence(text) == ended
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_refusal_to_a_request_that_went_out_with_no_token_says_each_part_whole(
+    status: int,
+) -> None:
+    """What the driver answered and why nothing was sent are each capped on their own: a
+    long answer must not cut off the reason, which is what to act on, and an answer
+    that is long to begin with is cut like any other. A 401 or a 403."""
+    reason = "403: this node holds no gateway grant"
+    backend = SimpleNamespace(
+        name="a",
+        node="far",
+        url="http://a",
+        client=SimpleNamespace(credential_refusal=lambda: reason),
+    )
+    said = admission.unread_because(backend, _answered(status, LONG_DETAIL))
+    assert said.transient and said.remedy is None and said.kind == "upstream_error"
+    head = "driver 'a' on node 'far' (http://a): "
+    assert said.text.startswith(head)
+    detail, parenthesis = said.text[len(head) :].split(" (this node's agent", 1)
+    assert detail.endswith("...") and len(detail) <= admission.MAX_CAUSE_CHARS
+    assert detail.startswith(f"answered {status}: one two three word word")
+    assert parenthesis == f" would not give the gateway a token for it: {reason})"
+    assert "\n" not in said.text and "  " not in said.text
+    # The same answer when the gateway did send a credential is the driver's refusal of it.
+    sent = SimpleNamespace(
+        name="a",
+        node="far",
+        url="http://a",
+        client=SimpleNamespace(credential_refusal=lambda: None),
+    )
+    refused = admission.unread_because(sent, _answered(status, "bad token"))
+    assert not refused.transient and refused.kind == "upstream_auth_error"
+    assert f"refused the gateway's credential (answered {status}: bad token)" in refused.text
 
 
 @pytest.mark.parametrize(
@@ -2380,22 +2891,92 @@ def test_a_local_only_keys_403_with_nothing_unreadable_says_no_more_than_it_did(
 
 
 # --------------------------------------------------------------------------- #
-# Without tools, the tool settings say nothing
+# A model whose tools are off is admitted the tool settings its driver lists
 # --------------------------------------------------------------------------- #
+
+#: What the real drivers answer a `tool_choice` or a `parallel_tool_calls` with when their
+#: engine cannot take tools at all (the Claude Code and Codex CLI subscriptions, OpenAI's
+#: Responses-only models), probed against the real driver apps in the round-four review:
+#: an HTTP 400, which does not cascade.
+CANNOT_HONOR = (
+    "tool_choice: this engine cannot honor this explicit setting; remove it or select a "
+    "backend that supports it."
+)
+
+#: What says nothing on a request without tools, and Codex sends on every request.
+TOOL_SETTINGS_ALONE = [
+    pytest.param({"tool_choice": "auto"}, id="tool_choice"),
+    pytest.param({"parallel_tool_calls": False}, id="parallel_tool_calls"),
+    pytest.param({"tool_choice": "auto", "parallel_tool_calls": False}, id="both"),
+]
+
+
+def _cannot_take_tools(name: str = "cli") -> FakeDriverClient:
+    """A model whose tool calling is off from the start, as the driver of an engine that
+    cannot take tools says it (`toolCalling: false`, no tool setting listed), and whose
+    driver refuses the settings itself, with the 400 above, when it is sent one."""
+    fake = FakeDriverClient(name=name, model_id="cli-model", supports_tools=False)
+    fake.supported_settings = ["maxTokens"]
+    fake.generate_error = DriverError(
+        driver_name=name,
+        driver_url="http://fake-driver",
+        status_code=400,
+        problem=Problem(type="about:blank", title="Bad request", status=400, detail=CANNOT_HONOR),
+        raw_body="",
+    )
+    return fake
+
+
+@pytest.mark.parametrize("extra", TOOL_SETTINGS_ALONE)
+def test_a_slot_whose_first_model_cannot_take_the_tool_settings_is_served_by_the_next(
+    settings: Settings, extra: dict[str, Any]
+) -> None:
+    """Round four admitted `tool_choice` and `parallel_tool_calls` on a request with no
+    tools to every model whose tool calling is off, on the premise that its driver drops
+    them. The drivers of an engine that cannot take tools refuse them, with a 400 that
+    does not cascade, so a slot [subscription model, local model] that the local model
+    served became a hard 400 from the first target. Admission keeps its rule, a setting
+    is admitted where the driver lists it, and this driver lists none: the first target
+    is turned away before it is asked, and the second serves."""
+    cli = _cannot_take_tools()
+    local = FakeDriverClient(name="local", model_id="local-model", supports_tools=True)
+    local.responses = ["from local"]
+    slots = [{"model": "slot", "targets": ["cli-model", "local-model"]}]
+    with TestClient(_app(settings, cli, local, slots=slots)) as client:
+        r = client.post("/v1/chat/completions", json=_chat(model="slot", **extra))
+    assert r.status_code == 200, r.text
+    assert r.json()["choices"][0]["message"]["content"] == "from local"
+    assert cli.calls == [], "turned away by what its listing says, and never asked"
+    assert len(local.calls) == 1 and not local.calls[0].tools
+
+
+@pytest.mark.parametrize("extra", TOOL_SETTINGS_ALONE)
+def test_a_model_that_cannot_take_the_tool_settings_is_refused_them_by_name_when_it_is_alone(
+    settings: Settings, extra: dict[str, Any]
+) -> None:
+    """The admission 400 it always was: the setting is named in the caller's words, and
+    the driver, whose own refusal is the same 400, is not asked."""
+    cli = _cannot_take_tools()
+    with TestClient(_app(settings, cli)) as client:
+        r = client.post("/v1/chat/completions", json=_chat(model="cli-model", **extra))
+    error = r.json()["error"]
+    assert r.status_code == 400, r.text
+    assert error["message"].startswith("No permitted backend serving this model takes ")
+    assert all(setting in error["message"] for setting in extra)
+    assert "cannot honor" not in error["message"], "admission answered, not the driver"
+    assert cli.calls == []
 
 
 @pytest.mark.parametrize("off", ["listed", "learned"])
-def test_a_request_with_no_tools_is_not_refused_the_tool_settings_by_a_model_with_tools_off(
+def test_a_model_whose_tools_are_off_is_admitted_the_tool_settings_its_driver_lists(
     settings: Settings, off: str
 ) -> None:
-    """Codex sends `tool_choice` and `parallel_tool_calls` on every request. A model
-    whose tool calling is off (its listing says so from the start, or its driver
-    learned it from the backend since the table was built) and a list of settings
-    that leaves them out: without tools they say nothing, and the driver drops them
-    with a warning. Refused, a caller could not chat with it at all."""
-    fake = _short(
-        FakeDriverClient(name="cli", model_id=MODEL, supports_tools=off != "listed"), "maxTokens"
-    )
+    """The positive control, and what this project's own driver reports for a model whose
+    tools are off (it lists the two settings, and drops them from a request that carries
+    no tools): from the start (`listed`), or after the driver learned from its backend
+    that tools are refused (`learned`, where the list still has them). Codex sends both
+    on every request, so refusing them would leave it unable to chat with the model."""
+    fake = FakeDriverClient(name="cli", model_id=MODEL, supports_tools=off != "listed")
     app = _app(settings, fake)
     if off == "learned":
         fake.supports_tools = False  # said by the driver after the table was built
@@ -2409,9 +2990,11 @@ def test_a_request_with_no_tools_is_not_refused_the_tool_settings_by_a_model_wit
     assert not sent.tools
 
 
-def test_the_same_model_is_still_refused_tools_in_the_drivers_words(settings: Settings) -> None:
-    """The exemption is for a request that carries no tools. One that does is turned
-    away, as it always was, whatever settings come with it."""
+def test_a_model_whose_tools_are_off_is_still_refused_tools_in_the_drivers_words(
+    settings: Settings,
+) -> None:
+    """A request that carries tools is turned away by a model whose tool calling is off,
+    whatever settings come with it: the refusal is the tools one, not a list of settings."""
     fake = _short(FakeDriverClient(name="cli", model_id=MODEL, supports_tools=False), "maxTokens")
     with TestClient(_app(settings, fake)) as client:
         r = _tools_post(client, tool_choice="auto", parallel_tool_calls=False)
@@ -2420,30 +3003,34 @@ def test_the_same_model_is_still_refused_tools_in_the_drivers_words(settings: Se
     assert fake.calls == []
 
 
-def test_the_exemption_does_not_name_the_tool_settings_in_a_refusal_for_another(
+def test_an_empty_tools_key_is_still_refused_for_tools_by_a_model_without_them(
     settings: Settings,
 ) -> None:
-    """`top_k` is the trouble, and it is the only thing named: the tool settings were
-    admitted, so "remove them" would send the caller to take out what was fine."""
-    fake = _short(FakeDriverClient(name="cli", model_id=MODEL, supports_tools=False), "maxTokens")
+    """`tools: []` is the key with nothing in it, and a caller that sends it said something
+    (`callerSettings` lists it). The model's tools are off, so its list leaves `tools`
+    out, while the two settings its driver does list are fine: the refusal names `tools`
+    and only it."""
+    fake = FakeDriverClient(name="cli", model_id=MODEL, supports_tools=False)
+    fake.supported_settings = [s for s in fake.supported_settings if s != "tools"]
     with TestClient(_app(settings, fake)) as client:
         r = client.post(
             "/v1/chat/completions",
-            json=_chat(tool_choice="auto", parallel_tool_calls=False, top_k=5),
+            json=_chat(tools=[], tool_choice="auto", parallel_tool_calls=False),
         )
     error = r.json()["error"]
-    assert r.status_code == 400 and error["param"] == "top_k"
+    assert r.status_code == 400 and error["param"] == "tools", r.text
     assert error["message"].startswith(
-        "No permitted backend serving this model takes top_k. Remove it"
+        "No permitted backend serving this model takes tools. Remove it or choose"
     )
+    assert fake.calls == []
 
 
 @pytest.mark.parametrize("setting", ["tool_choice", "parallel_tool_calls"])
-def test_a_model_that_calls_tools_and_does_not_list_the_setting_is_still_refused_it(
+def test_a_model_that_calls_tools_and_does_not_list_the_setting_is_refused_it(
     settings: Settings, setting: str
 ) -> None:
-    """The exemption is for a model whose tool calling is OFF. One whose driver says
-    it calls tools and lists what it takes keeps the rule that its list is the list."""
+    """One whose driver says it calls tools and lists what it takes: its list is the
+    list, with tools or without them."""
     fake = _short(FakeDriverClient(name="said", model_id=MODEL, supports_tools=True), "maxTokens")
     extra = {"tool_choice": "auto"} if setting == "tool_choice" else {"parallel_tool_calls": False}
     with TestClient(_app(settings, fake)) as client:
@@ -2463,7 +3050,9 @@ def test_the_credential_refusal_is_the_front_doors_sentence() -> None:
         )
     )
     assert failure.code == 502 and failure.error_type == "upstream_auth_error"
-    assert failure.message.endswith(admission.CREDENTIAL_REFUSED_NEXT_STEP)
+    assert failure.message.endswith(credential_refused_next_step(["driver 'd'"]))
+    assert "re-check the auth keys of driver 'd'," in failure.message
+    assert "that driver" not in failure.message
 
 
 def test_the_message_names_what_the_request_carries_in_the_callers_words() -> None:
@@ -2486,18 +3075,31 @@ def test_a_cause_waiting_cannot_clear_says_what_to_look_at_and_not_to_try_again(
     refused = admission.Unconfirmed(
         "driver 'a' (http://a): refused the gateway's credential (answered 403: no)",
         transient=False,
-        remedy=admission.CREDENTIAL_REFUSED_NEXT_STEP,
+        remedy=credential_refused_next_step,
         kind="upstream_auth_error",
+        driver="driver 'a' (http://a)",
     )
-    other = replace(refused, text="driver 'b' (http://b): refused the gateway's credential")
+    other = replace(
+        refused,
+        text="driver 'b' (http://b): refused the gateway's credential",
+        driver="driver 'b' (http://b)",
+    )
     said = admission.unconfirmed_refusal("qwen", ["tools"], [refused, other])
     assert said == (
         "Could not confirm that a backend serving 'qwen' takes what this request carries "
         "(tools): driver 'a' (http://a): refused the gateway's credential (answered 403: no); "
         "driver 'b' (http://b): refused the gateway's credential. This is not a refusal of the "
-        f"request. {admission.CREDENTIAL_REFUSED_NEXT_STEP} Nothing was forwarded or woken."
+        "request. The gateway holds a `service:gateway` token minted by its own node's agent; "
+        "re-check the auth keys of driver 'a' (http://a) and driver 'b' (http://b), or restart "
+        "each so it picks up the install's current signing key. Nothing was forwarded or woken."
     )
     assert "try again" not in said
+    # And with one driver: the same sentence, in the singular.
+    alone = admission.unconfirmed_refusal("qwen", ["tools"], [refused])
+    assert alone.endswith(
+        "re-check the auth keys of driver 'a' (http://a), or restart it so it picks up the "
+        "install's current signing key. Nothing was forwarded or woken."
+    )
 
 
 def test_a_cause_that_passes_among_causes_that_do_not_keeps_the_retry_advice() -> None:
@@ -2507,11 +3109,13 @@ def test_a_cause_that_passes_among_causes_that_do_not_keeps_the_retry_advice() -
     wrong = admission.Unconfirmed(
         "driver 'b' (http://b): does not serve GET /v1/info (answered 404: nope)",
         transient=False,
-        remedy=admission.NOT_A_DRIVER_NEXT_STEP,
+        remedy=admission.not_an_inference_driver,
+        driver="driver 'b' (http://b)",
     )
     said = admission.unconfirmed_refusal("qwen", ["tools"], [loading, wrong])
     assert "try again in a few seconds" in said
-    assert said.count(admission.NOT_A_DRIVER_NEXT_STEP) == 1
+    assert said.count("is an inference driver of this install") == 1
+    assert "Make sure driver 'b' (http://b) is an inference driver" in said
     assert admission.unconfirmed_failure("qwen", ["tools"], [loading, wrong]).status == 503
 
 
@@ -2620,6 +3224,299 @@ def test_a_count_still_refuses_for_the_request_with_the_400_it_always_did(
         r = client.post(path, json=body())
     assert r.status_code == 400, r.text
     assert tools_refused(MODEL, 1) in r.json()["error"]["message"]
+
+
+def _without_a_cap(body: dict[str, Any]) -> dict[str, Any]:
+    """A count body as `/context` sends it: Anthropic's endpoint takes no `max_tokens`,
+    and Codex's no `max_output_tokens`."""
+    return {k: v for k, v in body.items() if k not in ("max_tokens", "max_output_tokens")}
+
+
+@pytest.mark.parametrize(("path", "body"), COUNT_DOORS)
+def test_a_count_names_no_max_tokens_it_was_not_sent(
+    settings: Settings, path: str, body: Any
+) -> None:
+    """The Messages door translates a count body as a message, and a message needs a
+    `max_tokens` that a count never has, so one is supplied
+    (`anthropic.translate_count_request`). It was then the caller's: named among what the
+    request carries, though the count sent none."""
+    fake = _backend("strata-box")
+    fake.info_error = httpx.ConnectError("refused")
+    with TestClient(_app(settings, fake)) as client:
+        r = client.post(path, json=_without_a_cap(body()))
+    assert r.status_code == 400, r.text
+    carried = _carried(r.json()["error"]["message"])
+    assert "tools" in carried
+    assert not {"max_tokens", "max_output_tokens"} & set(carried), carried
+
+
+def test_a_count_that_was_sent_a_max_tokens_names_it(settings: Settings) -> None:
+    """The positive control: what the caller did send is carried and named, as ever."""
+    fake = _backend("strata-box")
+    fake.info_error = httpx.ConnectError("refused")
+    with TestClient(_app(settings, fake)) as client:
+        r = client.post(
+            "/v1/messages/count_tokens", json={**_without_a_cap(_messages()), "max_tokens": 7}
+        )
+    assert r.status_code == 400, r.text
+    assert "max_tokens" in _carried(r.json()["error"]["message"])
+
+
+@pytest.mark.parametrize(("path", "body"), COUNT_DOORS)
+def test_a_count_is_not_turned_away_for_a_max_tokens_the_caller_never_sent(
+    settings: Settings, path: str, body: Any
+) -> None:
+    """A backend whose list names no `maxTokens` counts a prompt that sent none. The
+    supplied placeholder made it a setting every backend had to list, so such a count
+    was refused for it, and a driver that refuses an explicit cap (an agentic CLI) would
+    have refused it too."""
+    fake = _short(FakeDriverClient(name="no-cap", model_id=MODEL, supports_tools=True), "stop")
+    fake.prompt_tokens = 42
+    plain = {
+        "/v1/messages/count_tokens": {
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        "/v1/responses/input_tokens": {"model": MODEL, "input": "hi"},
+    }[path]
+    with TestClient(_app(settings, fake)) as client:
+        r = client.post(path, json=plain)
+    assert r.status_code == 200, r.text
+    assert not fake.count_calls[0].callerSettings, "nothing here was the caller's to ask"
+
+
+@pytest.mark.parametrize(("path", "body"), COUNT_DOORS)
+def test_the_count_400_says_nothing_was_sent_once(settings: Settings, path: str, body: Any) -> None:
+    """The refusal ends "Nothing was forwarded or woken.", and the count's own words added
+    "Nothing was sent to the model" after it: one sentence, whichever door says it."""
+    fake = _backend("strata-box")
+    fake.info_error = httpx.ConnectError("refused")
+    with TestClient(_app(settings, fake)) as client:
+        r = client.post(path, json=body())
+    assert r.status_code == 400, r.text
+    message = r.json()["error"]["message"]
+    assert message.count("Nothing was forwarded or woken") == 1
+    assert "Nothing was sent to the model" not in message
+    assert message.count("Cannot count tokens") == 1
+
+
+@pytest.mark.parametrize(
+    ("reason", "says_it_already"),
+    [
+        ("a backend could not be reached", False),
+        ("Could not confirm it. Nothing was forwarded or woken.", True),
+        ("Cannot count exactly: no template. Nothing was sent to the model.", True),
+        ("Cannot count exactly: no template. Nothing was sent to the model", True),
+        # Said in the middle of a reason is not the sentence that ends it.
+        ("Nothing was forwarded or woken, it says, and then it stopped", False),
+    ],
+)
+def test_a_reason_that_already_says_nothing_was_sent_is_not_followed_by_it_again(
+    reason: str, says_it_already: bool
+) -> None:
+    """Both doors' counts: the reason's own sentence is the one, when it ends with it, and
+    the count's own words add it when the reason does not. Never twice, never `..`."""
+    anthropic_says = json.loads(inference._cannot_count("m", reason).body)["error"]["message"]
+    openai_says = json.loads(inference._cannot_count_in_openai_words("m", reason).body)["error"][
+        "message"
+    ]
+    head = "Cannot count tokens for 'm' without generating: "
+    for message in (anthropic_says, openai_says):
+        assert message.startswith(head) and ".." not in message
+    sentence = admission.as_sentence(reason)
+    if says_it_already:
+        assert (
+            anthropic_says == f"{head}{sentence} A client can count by sending the request instead."
+        )
+        assert openai_says == f"{head}{sentence}"
+        for message in (anthropic_says, openai_says):
+            assert (
+                message.count("Nothing was forwarded or woken")
+                + message.count("Nothing was sent to the model")
+                == 1
+            )
+    else:
+        assert anthropic_says == (
+            f"{head}{sentence} Nothing was sent to the model; a client can count by sending "
+            "the request instead."
+        )
+        assert openai_says == f"{head}{sentence} Nothing was sent to the model."
+
+
+def test_a_count_before_the_model_is_known_names_no_model() -> None:
+    message = json.loads(inference._cannot_count(None, "The key could not be checked.").body)
+    assert message["error"]["message"] == (
+        "Cannot count tokens without generating: The key could not be checked. Nothing was "
+        "sent to the model; a client can count by sending the request instead."
+    )
+    named = json.loads(inference._cannot_count("qwen", "The key could not be checked.").body)
+    assert named["error"]["message"].startswith("Cannot count tokens for 'qwen' without generating")
+    openai = json.loads(inference._cannot_count_in_openai_words(None, "No key.").body)
+    assert openai["error"]["param"] is None
+    assert (
+        json.loads(inference._cannot_count_in_openai_words("qwen", "No key.").body)["error"][
+            "param"
+        ]
+        == "model"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# A count is a 400 when the key authority cannot check the key
+# --------------------------------------------------------------------------- #
+
+
+class CheckFails(Authority):
+    """An admission authority that cannot answer a key CHECK, which is what a count makes:
+    it answers `check_status`, or does not answer at all when that is None (a refused
+    connection). The policy read, an acquire and a release are answered as ever."""
+
+    check_status: int | None = 500
+
+    def _handle(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/admission"):
+            body = json.loads(request.content)
+            if body["action"] == "check":
+                self.calls.append(body)
+                if self.check_status is None:
+                    raise httpx.ConnectError("connection refused", request=request)
+                return httpx.Response(self.check_status)
+        return super()._handle(request)
+
+
+def _counted_by_a_key(
+    settings: Settings, install: FakeInstall, authority: Authority
+) -> tuple[FastAPI, FakeDriverClient, dict[str, str]]:
+    """An app where a key that may use `allowed` counts through `authority`."""
+    token = install.client_key(name="app", jti="key-1")
+    app = create_app(settings=settings)
+    app.state.auth_state = install.auth_state()
+    app.state.client_key_guard = authority.as_guard(ttl_seconds=0)
+    allowed = FakeDriverClient(name="allowed-driver", model_id="allowed", supports_tools=True)
+    allowed.prompt_tokens = 11
+    app.state.routing = make_routing_table(allowed)
+    return app, allowed, {"authorization": f"Bearer {token}"}
+
+
+@pytest.mark.parametrize(
+    ("status", "said"),
+    [
+        (500, "Client access needs the admission authority"),
+        (502, "Client access needs the admission authority"),
+        (503, "Client access needs the admission authority"),
+        (None, "Client admission is unavailable"),
+    ],
+    ids=["a 500", "a 502", "a 503", "no answer"],
+)
+@pytest.mark.parametrize(("path", "body"), COUNT_DOORS)
+def test_a_count_when_the_key_authority_cannot_check_is_a_400_and_counts_nothing(
+    settings: Settings,
+    install: FakeInstall,
+    path: str,
+    body: Any,
+    status: int | None,
+    said: str,
+) -> None:
+    """Claude Code's `/context` retries a 5xx before it counts by sending the request, so
+    a count is a 400 whatever cannot be checked: the key check is no exception. The
+    authority that answers a 5xx (or does not answer) to `check` was a 503 with a
+    `Retry-After`, from before the counting begins, and the round-four rule held only for
+    what came after. Fail-closed all the same: nothing was counted."""
+    authority = CheckFails()
+    authority.check_status = status
+    app, allowed, headers = _counted_by_a_key(settings, install, authority)
+    with TestClient(app) as client:
+        r = client.post(path, json={**body(), "model": "allowed"}, headers=headers)
+    assert r.status_code == 400, r.text
+    assert "Retry-After" not in r.headers
+    message = r.json()["error"]["message"]
+    assert message.startswith(f"Cannot count tokens for 'allowed' without generating: {said}")
+    assert allowed.count_calls == [] and allowed.calls == []
+    assert [call["action"] for call in authority.calls] == ["check"]
+
+
+@pytest.mark.parametrize(("path", "body"), COUNT_DOORS)
+def test_a_count_when_the_key_policy_cannot_be_read_is_a_400_too(
+    settings: Settings, install: FakeInstall, path: str, body: Any
+) -> None:
+    """The other way a key cannot be checked: the agent that holds the key policy does not
+    answer, and with no policy fresh enough the door's own credential check says so (a 503
+    on the doors that generate)."""
+    authority = Authority()
+    authority.fail = True
+    app, allowed, headers = _counted_by_a_key(settings, install, authority)
+    with TestClient(app) as client:
+        r = client.post(path, json={**body(), "model": "allowed"}, headers=headers)
+    assert r.status_code == 400, r.text
+    assert "Retry-After" not in r.headers
+    message = r.json()["error"]["message"]
+    assert message.startswith("Cannot count tokens without generating: ")
+    assert "policy" in message and "control root" in message
+    assert allowed.count_calls == [] and allowed.calls == []
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        pytest.param("/v1/messages", _messages, id="messages"),
+        pytest.param("/v1/responses", _responses, id="responses"),
+    ],
+)
+def test_a_door_that_generates_is_still_a_503_when_the_key_policy_cannot_be_read(
+    settings: Settings, install: FakeInstall, path: str, body: Any
+) -> None:
+    """The control: only a count is a 400. Generating through a key that cannot be
+    checked is a 503 to try again, as it was."""
+    authority = Authority()
+    authority.fail = True
+    app, allowed, headers = _counted_by_a_key(settings, install, authority)
+    with TestClient(app) as client:
+        r = client.post(path, json={**body(), "model": "allowed"}, headers=headers)
+    assert r.status_code == 503, r.text
+    assert allowed.calls == []
+
+
+@pytest.mark.parametrize(
+    ("check_status", "messages_status", "responses_status"),
+    [(401, 403, 401), (403, 403, 403)],
+    ids=["a 401", "a 403"],
+)
+@pytest.mark.parametrize(("path", "body"), COUNT_DOORS)
+def test_a_count_whose_key_the_authority_turns_away_is_still_that_refusal(
+    settings: Settings,
+    install: FakeInstall,
+    path: str,
+    body: Any,
+    check_status: int,
+    messages_status: int,
+    responses_status: int,
+) -> None:
+    """A key the authority refuses is the key's refusal, not a count that cannot be given:
+    a 401 or a 403 stays itself (the Messages door's 401 is the 403 it always was, since
+    Claude Code retries a 401 without bound)."""
+    authority = CheckFails()
+    authority.check_status = check_status
+    app, allowed, headers = _counted_by_a_key(settings, install, authority)
+    with TestClient(app) as client:
+        r = client.post(path, json={**body(), "model": "allowed"}, headers=headers)
+    expected = messages_status if path.startswith("/v1/messages") else responses_status
+    assert r.status_code == expected, r.text
+    assert "Cannot count tokens" not in r.text
+    assert allowed.count_calls == []
+
+
+@pytest.mark.parametrize(("path", "body"), COUNT_DOORS)
+def test_a_count_with_a_key_that_was_turned_off_is_still_that_refusal(
+    settings: Settings, install: FakeInstall, path: str, body: Any
+) -> None:
+    authority = Authority()
+    authority.revoke("key-1")
+    app, allowed, headers = _counted_by_a_key(settings, install, authority)
+    with TestClient(app) as client:
+        r = client.post(path, json={**body(), "model": "allowed"}, headers=headers)
+    assert r.status_code == (403 if path.startswith("/v1/messages") else 401), r.text
+    assert "turned off" in r.json()["error"]["message"]
+    assert allowed.count_calls == []
 
 
 # --------------------------------------------------------------------------- #

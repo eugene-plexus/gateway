@@ -43,6 +43,14 @@ _RETRY_AFTER_SECONDS = 5.0
 _WARN_INTERVAL_SECONDS = 60.0
 
 
+def token_refused_words(refusal: str) -> str:
+    """Why a request went to another machine with no token, in the one set of words that
+    the routing table's read of a topology answer and admission's re-read of a driver's
+    listing both say it. The far side saw no credential, and its 401 says nothing of a
+    grant it never saw: the reason is on this machine, with this node's agent."""
+    return f"this node's agent would not give the gateway a token for it: {refusal}"
+
+
 class Outbound:
     """Tokens for this gateway's outbound calls, one recipient at a time."""
 
@@ -171,6 +179,11 @@ class _OutboundAuth(httpx.Auth):
     def __init__(self, outbound: Outbound, recipient: str | None) -> None:
         self._outbound = outbound
         self._recipient = recipient
+
+    def refusal(self) -> str | None:
+        """Why this node's agent last refused a token for the recipient this auth carries
+        one for, if it did: then the requests it was applied to went out with none."""
+        return self._outbound.refusal(self._recipient)
 
     def sync_auth_flow(self, request: httpx.Request) -> Any:  # pragma: no cover
         raise RuntimeError("the gateway's outbound calls are async")

@@ -22,8 +22,8 @@ gateway's own settings (a search loop's forced first turn) are not the
 caller's, and are never named.
 
 Three things live here and nowhere else: matching a listing against a request,
-the driver-to-door spelling (of one field, and of a whole request's list of them),
-and the merge.
+the driver-to-door spelling (of one field, and of a whole request's list of them,
+and which door a request came in by), and the merge.
 """
 
 from __future__ import annotations
@@ -75,7 +75,28 @@ _RESPONSES: dict[str, str] = {
 
 _DOORS: dict[str, dict[str, str]] = {"chat": {}, "messages": _MESSAGES, "responses": _RESPONSES}
 
+#: The doors a path is, where it is not the chat door's: the Messages door and its
+#: count, the Responses door and its count.
+_DOOR_OF_PATH = {
+    "/v1/messages": "messages",
+    "/v1/messages/count_tokens": "messages",
+    "/v1/responses": "responses",
+    "/v1/responses/input_tokens": "responses",
+}
+
 _CAMEL = re.compile(r"(?<=[a-z0-9])([A-Z])")
+
+
+def door_of(path: str) -> str:
+    """The door a request to `path` came in by, for `spelled`: `messages`, `responses`, or
+    the chat door (`chat`), whose words every other front-door path is spelled in."""
+    return _DOOR_OF_PATH.get(path, "chat")
+
+
+def worded(name: str, door: str = "chat") -> str:
+    """One driver field as `door`'s caller wrote it, or as it came when no table has a
+    word for it (a name nobody has listed: a refusal does not guess at one)."""
+    return _DOORS.get(door, {}).get(name) or WIRE_NAMES.get(name, name)
 
 
 def spelled(name: str, door: str = "chat") -> str:
@@ -95,20 +116,22 @@ def spelled(name: str, door: str = "chat") -> str:
 _TOOLS_FIRST = ("tools", "toolChoice", "parallelToolCalls")
 
 
-def carried(settings: Iterable[str]) -> list[str]:
+def carried(settings: Iterable[str], door: str = "chat") -> list[str]:
     """What a request carries, in its caller's words, in an order a person reads.
 
     `settings` are the driver's field names (`GenerateRequest.callerSettings`): each
-    is said the way the chat door spells it (`WIRE_NAMES`), the tools first and the
-    settings that ride with them next, the others alphabetically, so the same
-    request is worded the same way every time (`callerSettings` is a set to the
-    code that reads it). Every setting the caller sent is named, `tools` included
-    whenever the caller sent the key, with a list or not: an empty one is still
-    something the caller said.
+    is said the way `door`'s caller wrote it (`worded`: a Messages caller wrote
+    `tool_choice.disable_parallel_tool_use` where it meant the parallel switch off,
+    and a Responses caller `max_output_tokens`; the chat door's names are the rest),
+    the tools first and the settings that ride with them next, the others
+    alphabetically, so the same request is worded the same way every time
+    (`callerSettings` is a set to the code that reads it). Every setting the caller
+    sent is named, `tools` included whenever the caller sent the key, with a list or
+    not: an empty one is still something the caller said.
     """
     sent_names = set(settings)
-    first = [WIRE_NAMES.get(name, name) for name in _TOOLS_FIRST if name in sent_names]
-    rest = sorted(WIRE_NAMES.get(name, name) for name in sent_names.difference(_TOOLS_FIRST))
+    first = [worded(name, door) for name in _TOOLS_FIRST if name in sent_names]
+    rest = sorted(worded(name, door) for name in sent_names.difference(_TOOLS_FIRST))
     return [*first, *rest]
 
 
@@ -150,17 +173,24 @@ def not_honoured(
     is in the request's own `callerSettings`, so a driver's words are matched
     against what the caller sent and never passed on.
 
-    **`tool_choice: none` to a backend that never reads `tool_choice` does not
-    name `parallel_tool_calls`.** Such a backend lists `toolChoice` and cannot be
-    told `none`, so its driver honours it as it can, by sending no tools and none
-    of what rides with them (`inference-driver`'s `_payload_for`; the driver's
-    own header leaves it out the same way). Nothing is left on the request for
-    the backend to ignore, though `parallel_tool_calls: false` is in its listing.
+    **`tool_choice: none` to a backend that never reads `tool_choice` and whose gap
+    does not name `none` does not name `parallel_tool_calls`.** Such a backend lists
+    `toolChoice` and cannot be told `none`, so its driver honours it as it can, by
+    sending no tools and none of what rides with them (`inference-driver`'s
+    `_payload_for`, which does this exactly where a `toolChoice` gap leaves `none` out:
+    `_none_is_given_as_no_tools`; its own header leaves the switch out the same way).
+    Nothing is left on the request for the backend to ignore, though
+    `parallel_tool_calls: false` is in its listing. **A gap that names `none`** (an
+    OpenRouter model whose listing leaves `tool_choice` out: a strict upstream refuses
+    a history that carries tool calls without their definitions) keeps the tools and
+    delivers neither setting, so `none` is named, and the switch with it.
     """
     entries = list(listed or ())
-    # A listing names `toolChoice` exactly for a backend that never reads it.
-    unread = any(entry.setting == "toolChoice" for entry in entries)
-    tools_unsent = unread and sent(request, "toolChoice") == "none"
+    # The driver's rule: some `toolChoice` gap that leaves `none` out makes `none` an
+    # instruction to send no tools, and nothing is left for the backend to ignore.
+    tools_unsent = sent(request, "toolChoice") == "none" and any(
+        entry.setting == "toolChoice" and "none" not in entry.values for entry in entries
+    )
     named: dict[str, None] = {}
     for entry in entries:
         if tools_unsent and entry.setting == "parallelToolCalls":
@@ -207,8 +237,10 @@ __all__ = [
     "WIRE_NAMES",
     "added_to",
     "carried",
+    "door_of",
     "merge",
     "not_honoured",
     "sent",
     "spelled",
+    "worded",
 ]
