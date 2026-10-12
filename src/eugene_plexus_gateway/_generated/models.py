@@ -2636,6 +2636,14 @@ class EmbeddingUsage(BaseModel):
     total_tokens: int | None = Field(None, ge=0)
 
 
+class Documents(RootModel[str]):
+    root: str = Field(..., max_length=1048576)
+
+
+class Text(RootModel[str]):
+    root: str = Field(..., max_length=1048576)
+
+
 class RerankDocument(BaseModel):
     model_config = ConfigDict(
         extra='allow',
@@ -2643,10 +2651,18 @@ class RerankDocument(BaseModel):
     text: str = Field(
         ...,
         description='The passage. Other fields are kept by the caller, not read here.',
+        max_length=1048576,
     )
 
 
-class Object2(StrEnum):
+class RerankObject(StrEnum):
+    """
+    Named, not inline: an inline enum here made the Python generator
+    number it `Object2` and rename the Responses door's `Object2` to
+    `Object3` in every consumer (MR6, 2026-10-12).
+
+    """
+
     list = 'list'
 
 
@@ -3214,7 +3230,7 @@ class ResponsesTool(BaseModel):
     strict: bool | None = None
 
 
-class Object3(StrEnum):
+class Object2(StrEnum):
     response = 'response'
 
 
@@ -4400,16 +4416,19 @@ class RerankRequest(BaseModel):
         description='A model whose `x_eugene_plexus.surfaces` include `rerank`.\nLeft out: the one such model this key may use (see the\noperation).\n',
     )
     query: str = Field(
-        ..., description='The question the passages are scored against.', min_length=1
+        ...,
+        description='The question the passages are scored against. At most 1,048,576\ncharacters, as one passage.\n',
+        max_length=1048576,
+        min_length=1,
     )
-    documents: list[str | RerankDocument] | None = Field(
+    documents: list[Documents | RerankDocument] | None = Field(
         None,
-        description='The passages (Jina, Cohere): strings, or objects whose `text`\nis the passage. Answered as `RerankResponse`.\n',
+        description="The passages (Jina, Cohere): strings, or objects whose `text`\nis the passage. Answered as `RerankResponse`. At most 1,048,576\ncharacters a passage (the driver's limit); a longer one is a 400\nnaming its position. A passage longer than the model reads is a\n400 naming the model's limit.\n",
         max_length=1000,
     )
-    texts: list[str] | None = Field(
+    texts: list[Text] | None = Field(
         None,
-        description='The passages (TEI). Answered as `TeiRerankResponse`.',
+        description='The passages (TEI). Answered as `TeiRerankResponse`. The same\nlimits as `documents`.\n',
         max_length=1000,
     )
     top_n: int | None = Field(
@@ -4430,10 +4449,11 @@ class RerankRequest(BaseModel):
     )
     truncate: bool | None = Field(
         None,
-        description="TEI's. **Accepted and ignored**, and named in `x-eugene-plexus-ignored-settings`.",
+        description="TEI's. `false`, its default, is what this door does: a passage\nlonger than the model reads is refused, not cut. `true` is\n**accepted and ignored**, and named in\n`x-eugene-plexus-ignored-settings`.\n",
     )
     truncation_direction: str | None = Field(
-        None, description="TEI's. **Accepted and ignored**, and named."
+        None,
+        description="TEI's, and only meaningful with `truncate: true`: named with it\nthen, and not otherwise, as nothing is cut.\n",
     )
     max_chunks_per_doc: int | None = Field(
         None, description="Cohere's. **Accepted and ignored**, and named."
@@ -4655,7 +4675,7 @@ class ResponsesResponse(BaseModel):
         extra='allow',
     )
     id: str
-    object: Object3
+    object: Object2
     created_at: int
     status: Status1 = Field(
         ...,
@@ -5274,7 +5294,7 @@ class RerankResponse(BaseModel):
     id: str | None = Field(
         None, description="This answer's own id, as Cohere's carry one."
     )
-    object: Object2
+    object: RerankObject
     model: str = Field(
         ...,
         description='The model that scored these. After a same-model failover it\nstill names that model; by the rule above it can never name a\ndifferent one.\n',

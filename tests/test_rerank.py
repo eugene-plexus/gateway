@@ -418,17 +418,50 @@ def test_the_position_is_where_the_passage_is_not_where_it_was_counted_from(
     assert response.json()["error"]["param"] == "documents[40]"
 
 
-def test_a_passage_the_driver_could_not_hold_is_refused_not_cut(settings: Settings) -> None:
-    """The driver's contract takes at most 1,048,576 characters of one passage
-    or of the query; a longer one is a 400 here, not a validation error raised
-    while the request to the driver is built."""
-    long = "x" * 1_048_577
-    first, fake = _refused(settings, documents=[BERLIN, long])
-    second, _ = _refused(settings, query=long)
-    assert first.status_code == 400 and first.json()["error"]["param"] == "documents[1]"
-    assert "1,048,577 characters" in first.json()["error"]["message"]
-    assert second.status_code == 400 and second.json()["error"]["param"] == "query"
+LIMIT = 1_048_576
+LIMITED = ["query", "documents string", "documents object", "texts item"]
+
+
+def _limited(characters: int) -> list[Any]:
+    """The four places the contract gives `maxLength: 1048576`: a body that puts
+    `characters` in each, and the position a refusal must name."""
+    long = "x" * characters
+    return [
+        pytest.param({"query": long}, "query", id=LIMITED[0]),
+        pytest.param({"documents": [BERLIN, long]}, "documents[1]", id=LIMITED[1]),
+        pytest.param({"documents": [{"text": long}]}, "documents[0]", id=LIMITED[2]),
+        pytest.param(_in("texts", [BERLIN, long]), "texts[1]", id=LIMITED[3]),
+    ]
+
+
+@pytest.mark.parametrize(("over", "position"), _limited(LIMIT + 1))
+def test_a_passage_or_query_past_the_limit_is_a_400_naming_where_never_a_422(
+    settings: Settings, over: dict[str, Any], position: str
+) -> None:
+    """The contract takes at most 1,048,576 characters of the query and of one
+    passage in any of its four shapes. The body is read by hand, so a longer one
+    is the 400 the contract says, in OpenAI's envelope and naming where: never
+    FastAPI's 422 `{"detail": [...]}`, and never a validation error raised while
+    the request to the driver is built."""
+    response, fake = _refused(settings, **over)
+    assert response.status_code == 400, (response.status_code, response.text[:300])
+    error = response.json()["error"]
+    assert error["type"] == "invalid_request_error" and error["param"] == position
+    assert f"{LIMIT + 1:,} characters" in error["message"], error["message"]
+    assert f"{LIMIT:,}" in error["message"], error["message"]
     assert not fake.heard
+
+
+@pytest.mark.parametrize(("over", "position"), _limited(LIMIT))
+def test_a_passage_or_query_of_exactly_the_limit_is_taken(
+    settings: Settings, over: dict[str, Any], position: str
+) -> None:
+    """The limit is inclusive, as `maxLength` is."""
+    fake = sorter()
+    with serve(settings, fake) as client:
+        response = rerank(client, **over)
+    assert response.status_code == 200, (response.status_code, response.text[:300])
+    assert len(fake.heard) == 1
 
 
 def test_a_body_that_is_not_json_or_not_an_object_is_a_400(settings: Settings) -> None:
@@ -660,11 +693,74 @@ def test_the_five_ignored_settings_are_named_in_one_stable_order(settings: Setti
     assert response.headers[IGNORED] == ORDER
 
 
-@pytest.mark.parametrize("name", list(SENT))
-def test_each_ignored_setting_is_named_alone(settings: Settings, name: str) -> None:
+@pytest.mark.parametrize(
+    "name", ["truncate", "max_chunks_per_doc", "max_tokens_per_doc", "rank_fields"]
+)
+def test_each_ignored_setting_that_stands_alone_is_named_alone(
+    settings: Settings, name: str
+) -> None:
+    """`truncation_direction` does not stand alone: it is named beside a
+    `truncate` that asks for a cut, and the test after next says when."""
     with serve(settings, sorter()) as client:
         response = rerank(client, **{name: SENT[name]})
     assert response.headers[IGNORED] == name
+
+
+def test_truncate_false_is_what_the_door_does_and_is_not_named(settings: Settings) -> None:
+    """TEI's default, `truncate: false`, asks for a passage longer than the model
+    reads to be refused rather than cut, which is what this door does, so there
+    is nothing ignored to name. `truncate: true` asks for a cut that is not made:
+    named, and the passage reaches the driver whole."""
+    long = "a very long passage " * 400
+    fake = sorter()
+    with serve(settings, fake) as client:
+        refused_not_cut = rerank(client, documents=[BERLIN, long], truncate=False)
+        asked_to_cut = rerank(client, documents=[BERLIN, long], truncate=True)
+    assert refused_not_cut.status_code == 200 and IGNORED not in refused_not_cut.headers
+    assert asked_to_cut.status_code == 200 and asked_to_cut.headers[IGNORED] == "truncate"
+    # Never cut, whichever way it was asked.
+    assert [[d.root for d in heard.documents] for heard in fake.heard] == [[BERLIN, long]] * 2
+
+
+@pytest.mark.parametrize(
+    ("over", "named"),
+    [
+        ({"truncation_direction": "left"}, None),
+        ({"truncation_direction": "left", "truncate": False}, None),
+        ({"truncation_direction": "left", "truncate": None}, None),
+        ({"truncation_direction": "left", "truncate": True}, "truncate, truncation_direction"),
+        ({"truncation_direction": None, "truncate": True}, "truncate"),
+    ],
+    ids=["alone", "beside false", "beside null", "beside true", "null beside true"],
+)
+def test_a_truncation_direction_is_named_only_beside_a_truncate_that_asks_for_a_cut(
+    settings: Settings, over: dict[str, Any], named: str | None
+) -> None:
+    """It says which end to cut, so it means something only when a cut is asked
+    for. Without that nothing is cut, and there is no direction to ignore."""
+    with serve(settings, sorter()) as client:
+        response = rerank(client, **over)
+    assert response.status_code == 200, response.text
+    assert response.headers.get(IGNORED) == named
+
+
+@pytest.mark.parametrize("shape", ["documents", "texts"])
+def test_a_tei_clients_own_defaults_name_nothing(settings: Settings, shape: str) -> None:
+    """A client that sends TEI's defaults explicitly (`truncate: false`,
+    `truncation_direction: "right"`, `raw_scores: false`, `return_text: false`)
+    asks for nothing this door does not do. A header on every one of its answers
+    would teach it to ignore the header."""
+    with serve(settings, sorter()) as client:
+        response = rerank(
+            client,
+            truncate=False,
+            truncation_direction="right",
+            raw_scores=False,
+            return_text=False,
+            **_in(shape),
+        )
+    assert response.status_code == 200, response.text
+    assert IGNORED not in response.headers
 
 
 @pytest.mark.parametrize("shape", ["documents", "texts"])

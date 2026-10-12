@@ -15,8 +15,8 @@ does: it reads the JSON itself and refuses in OpenAI's envelope, in words that
 say which field and what was found there.
 
 Fields this door does not know are ignored, as the other OpenAI-shaped bodies'
-are. The five it knows and does not honour are named, in one order, on the
-answer (`IGNORED`).
+are. What it knows and does not honour is named, in one order, on the answer
+(`IGNORED`, and `carries` for when a setting counts as sent).
 """
 
 from __future__ import annotations
@@ -31,17 +31,16 @@ from ._generated.driver_models import RerankedPassage, Usage
 #: Cohere's limit, and the driver's (`RerankPassagesRequest.documents`).
 MAX_PASSAGES = 1000
 
-#: What the driver's request takes of the query and of one passage
-#: (`maxLength`). The gateway's own contract says nothing about it, so a longer
-#: one is refused here, in words, instead of failing as a validation error
-#: while the request to the driver is built.
+#: What the contract takes of the query and of one passage (`maxLength`, the
+#: driver's own limit). A longer one is a 400 that names its position: the body
+#: is read by hand here, so it is never a 422, and never a validation error
+#: raised while the request to the driver is built.
 MAX_CHARACTERS = 1_048_576
 
 #: What a rerank body may carry that this door accepts and does not act on, in
 #: the order they are named on `x-eugene-plexus-ignored-settings`. None reaches
 #: a backend: the driver's `RerankPassagesRequest` has no field for any of
-#: them, and a passage longer than the model takes is a 400 that names the
-#: limit rather than a cut one (so `truncate` would be a lie).
+#: them. Which of them a request counts as carrying is `carries`.
 IGNORED = (
     "truncate",
     "truncation_direction",
@@ -97,6 +96,31 @@ def _kind(value: Any) -> str:
     if isinstance(value, dict):
         return "an object"
     return type(value).__name__
+
+
+def carries(body: dict[str, Any], name: str) -> bool:
+    """Whether the body carries this ignored setting, so that the answer names it.
+
+    A JSON `null` is not a setting. Past that, a setting is named when it asks
+    for something this door does not do:
+
+    * `truncate: false` is TEI's default and is what this door does: a passage
+      longer than the model reads is refused, never cut. Only another value asks
+      for a cut, and a cut is not made.
+    * `truncation_direction` says which end to cut, so it means something only
+      beside a `truncate` that asks for one. Without it nothing is cut and there
+      is no direction to ignore, so it is not named.
+    * The others (Cohere's `max_chunks_per_doc`, `max_tokens_per_doc` and
+      `rank_fields`) ask for something whenever they are sent.
+    """
+    value = body.get(name)
+    if value is None:
+        return False
+    if name == "truncate":
+        return value is not False
+    if name == "truncation_direction":
+        return carries(body, "truncate")
+    return True
 
 
 def _flag(body: dict[str, Any], name: str) -> bool:
@@ -208,7 +232,7 @@ def parse(body: Any) -> RerankAsk:
         top_n=top_n,
         with_text=_flag(body, "return_documents") or _flag(body, "return_text"),
         raw_scores=_flag(body, "raw_scores"),
-        ignored=[name for name in IGNORED if body.get(name) is not None],
+        ignored=[name for name in IGNORED if carries(body, name)],
     )
 
 
@@ -276,6 +300,7 @@ __all__ = [
     "MAX_PASSAGES",
     "Refusal",
     "RerankAsk",
+    "carries",
     "envelope",
     "parse",
     "results",
