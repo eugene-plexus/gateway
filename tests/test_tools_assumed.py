@@ -970,6 +970,8 @@ class _Install(BaseHTTPRequestHandler):
 
     generate_calls: ClassVar[list[dict[str, Any]]] = []
     per_request = "topK"
+    #: A driver restarting: its engine is loading, so its listing answers 503.
+    info_down: ClassVar[bool] = False
 
     def log_message(self, *_args: object) -> None:
         pass
@@ -985,6 +987,9 @@ class _Install(BaseHTTPRequestHandler):
                 "status": "running",
             }
             self._send(200, {"components": [driver]})
+        elif path == "/v1/info" and self.info_down:
+            problem = {"type": "about:blank", "title": "The engine is still loading", "status": 503}
+            self._send(503, {"detail": problem})
         elif path == "/v1/info":
             self._send(
                 200,
@@ -1111,6 +1116,24 @@ def test_codex_through_the_wire_is_answered_and_names_the_parallel_switch(
     r = wired.post("/v1/responses", json=codex_request(model=MODEL))
     assert r.status_code == 200, r.text
     assert "parallel_tool_calls" in _header(r) and "tool_choice" not in _header(r)
+
+
+def test_a_real_driver_that_answers_its_listing_503_is_named_by_what_it_said(
+    wired: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through the real routing table and HTTP client over a real socket: the driver
+    restarts, and while its engine loads it answers `/v1/info` 503. The re-read of
+    its listing that a request with tools makes meets the real error, and the
+    caller is told what the driver said, as a 503 to try again, not that its tools
+    are the trouble."""
+    monkeypatch.setattr(_Install, "info_down", True)
+    r = _post(wired, "chat")
+    assert r.status_code == 503, r.text
+    assert r.headers["Retry-After"] == "5"
+    message = r.json()["error"]["message"]
+    assert "driver 'strata-box' (http://127.0.0.1:" in message
+    assert "answered 503: The engine is still loading" in message
+    assert "Remove" not in message
 
 
 @pytest.fixture
