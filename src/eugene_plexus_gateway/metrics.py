@@ -406,55 +406,12 @@ class MetricsStore:
         conn.commit()
 
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        # v10 added a table and no column: the DDL above created it, so a
-        # v9 file needs only its version moved on. v11 (PC5) adds columns.
-        # v12 (CB5) adds a value, `evicted`, to the affinity column and no
-        # column, so a v11 file needs only its version moved on.
-        if row is not None and int(row[0]) in (2, 3, 4, 5, 6, 7, 8, 9, 10, 11):
-            columns = {r[1] for r in conn.execute("PRAGMA table_info(request)")}
-            for column in ("client_key_id", "client_key_name"):
-                if column not in columns:
-                    conn.execute(f"ALTER TABLE request ADD COLUMN {column} TEXT")
-            for table, additions in {
-                "request": {
-                    "correlation_id": "TEXT",
-                    "elapsed_ms": "INTEGER",
-                    # v7: the door and its unit (P3b).
-                    "door": "TEXT",
-                    "characters": "INTEGER",
-                    "audio_seconds": "REAL",
-                    # v8: the image count (P4).
-                    "images": "INTEGER",
-                    # v9: the seconds of video asked for (P5).
-                    "video_seconds": "INTEGER",
-                    # v11: the prompt cache and the affinity outcome (PC5).
-                    "cached_tokens": "INTEGER",
-                    "affinity": "TEXT",
-                },
-                "attempt": {
-                    "retry_disposition": "TEXT",
-                    "usage_known": "INTEGER NOT NULL DEFAULT 0",
-                    "prompt_tokens": "INTEGER",
-                    "completion_tokens": "INTEGER",
-                    # v5: TTFT. Additive, so every older version migrates
-                    # in place — the existence check makes this idempotent
-                    # whatever version the file starts at.
-                    "first_ms": "INTEGER",
-                    # v6: the model an attempt asked for (P1).
-                    "model": "TEXT",
-                    # v11: its cached prompt tokens (PC5).
-                    "cached_tokens": "INTEGER",
-                },
-            }.items():
-                existing = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
-                for column, kind in additions.items():
-                    if column not in existing:
-                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
-            conn.execute(
-                "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),)
-            )
-            conn.commit()
-            row = (str(SCHEMA_VERSION),)
+        # **Only the current schema is read.** v0.1.0 already wrote 12, so no
+        # file that release or a later one wrote needs migrating. A file from
+        # before it (an alpha: 2 to 11) is not migrated in place any more: it
+        # is kept aside whole, as a file from a build that writes a newer
+        # schema is, and a fresh store starts. What was measured then stays
+        # readable in the kept file.
         if row is None:
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
@@ -462,13 +419,18 @@ class MetricsStore:
             )
             conn.commit()
         elif int(row[0]) != SCHEMA_VERSION:
-            # A version this build does not know: rename the file aside
+            # A version this build does not write: rename the file aside
             # and start fresh rather than refuse to boot. Metrics are
             # never worth a degraded control plane, and this is the one
-            # place where discarding data is the right answer.
+            # place where setting history aside is the right answer. Never
+            # over an earlier file kept the same way: that is history too.
             found = row[0]
             conn.close()
             aside = self._path.with_suffix(f".v{found}.bak")
+            copy = 1
+            while aside.exists():
+                aside = self._path.with_suffix(f".v{found}.{copy}.bak")
+                copy += 1
             log.warning(
                 "metrics store at %s has schema version %s, expected %d; moving it to %s "
                 "and starting fresh. History before now is in that file.",
@@ -477,7 +439,6 @@ class MetricsStore:
                 SCHEMA_VERSION,
                 aside.name,
             )
-            aside.unlink(missing_ok=True)
             self._path.replace(aside)
             return self._open()
         conn.execute(

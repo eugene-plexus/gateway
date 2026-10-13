@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-import sqlite3
 import time
 from collections.abc import Iterator
-from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
 
 from eugene_plexus_gateway._generated.driver_models import Usage
 from eugene_plexus_gateway.app import create_app
-from eugene_plexus_gateway.metrics import _DDL, SCHEMA_VERSION, MetricsStore
 from eugene_plexus_gateway.settings import Settings
 
 from .conftest import FakeDriverClient, make_routing_table, runtime_facts
@@ -105,35 +102,3 @@ def test_nothing_reported_is_null_not_zero(settings: Settings) -> None:
     assert group["promptCache"] is None
     # One backend: there was no choice for affinity to make.
     assert group["affinity"] is None
-
-
-async def test_a_v10_store_gains_the_columns_in_place(tmp_path) -> None:  # type: ignore[no-untyped-def]
-    path = tmp_path / "metrics.sqlite3"
-    conn = sqlite3.connect(path)
-    v10 = _DDL.replace(
-        "    video_seconds     INTEGER,\n    cached_tokens     INTEGER,\n    affinity          TEXT\n",
-        "    video_seconds     INTEGER\n",
-    ).replace("    first_ms   INTEGER,\n    cached_tokens INTEGER\n", "    first_ms   INTEGER\n")
-    assert v10 != _DDL
-    conn.executescript(v10)
-    conn.execute("INSERT INTO meta VALUES ('schema_version', '10')")
-    conn.execute(
-        "INSERT INTO request (started_at, requested_model, attempts, total_ms, outcome)"
-        " VALUES (?, 'old', 1, 5, 'served')",
-        (datetime.now(UTC).isoformat(),),
-    )
-    conn.commit()
-    conn.close()
-    store = MetricsStore(path)
-    await store.start()
-    try:
-        rows, _ = store.requests()
-        assert len(rows) == 1 and rows[0]["cachedTokens"] is None and rows[0]["affinity"] is None
-        assert not list(tmp_path.glob("*.bak"))
-    finally:
-        await store.aclose()
-    conn = sqlite3.connect(path)
-    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone() == (
-        str(SCHEMA_VERSION),
-    )
-    conn.close()

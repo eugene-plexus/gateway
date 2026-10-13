@@ -15,14 +15,10 @@ not merge.
 from __future__ import annotations
 
 import asyncio
-import sqlite3
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
-
-from eugene_plexus_gateway.metrics import SCHEMA_VERSION
 
 from .test_metrics import (  # noqa: F401  (fixtures resolve by name)
     _drain,
@@ -196,49 +192,6 @@ def test_group_by_model_keeps_the_model_and_drops_the_backend(tmp_path: Path) ->
     asyncio.run(run())
 
 
-def test_a_v4_store_migrates_in_place(tmp_path: Path) -> None:
-    """The upgrade an alpha install performs on its next boot. In place,
-    keeping the rows — renaming aside is for versions this build does
-    not know, and v4 is not one of those."""
-    path = tmp_path / "m.sqlite3"
-
-    async def build() -> None:
-        store = await _store(path)
-        try:
-            store._insert([_row()])
-        finally:
-            await store.aclose()
-
-    asyncio.run(build())
-
-    conn = sqlite3.connect(path)
-    conn.execute("ALTER TABLE attempt DROP COLUMN first_ms")
-    conn.execute("UPDATE meta SET value = '4' WHERE key = 'schema_version'")
-    conn.commit()
-    conn.close()
-
-    async def reopen() -> None:
-        store = await _store(path)
-        try:
-            groups = store.summary(**_window())
-            assert groups[0]["requests"] == 1, "migration lost the v4 rows"
-            assert groups[0]["ttftMs"] is None
-            with store._reader() as conn:
-                assert conn is not None
-                version = conn.execute(
-                    "SELECT value FROM meta WHERE key = 'schema_version'"
-                ).fetchone()
-                columns = {r[1] for r in conn.execute("PRAGMA table_info(attempt)")}
-            assert version == (str(SCHEMA_VERSION),)
-            assert "first_ms" in columns
-            assert "model" in columns
-        finally:
-            await store.aclose()
-
-    asyncio.run(reopen())
-    assert not path.with_suffix(".v4.bak").exists(), "an in-place upgrade renamed the file aside"
-
-
 def test_a_streamed_completion_records_its_first_token_time(
     metrics_client: TestClient,  # noqa: F811  (pytest fixture, imported above)
 ) -> None:
@@ -290,121 +243,3 @@ def test_a_non_streamed_completion_has_no_first_token_time(
     assert page["requests"][0]["tries"][0]["firstMs"] is None
     body = metrics_client.get("/v1/metrics").json()
     assert body["groups"][0]["ttftMs"] is None
-
-
-def test_a_v6_store_migrates_in_place_gaining_the_door_and_its_units(tmp_path: Path) -> None:
-    """P3b's v7: an alpha.4 install's metrics keep their rows and gain the
-    door, characters and audio seconds, null on every older row."""
-    path = tmp_path / "m.sqlite3"
-
-    async def build() -> None:
-        store = await _store(path)
-        try:
-            store._insert([_row()])
-        finally:
-            await store.aclose()
-
-    asyncio.run(build())
-
-    conn = sqlite3.connect(path)
-    for column in ("door", "characters", "audio_seconds", "images", "video_seconds"):
-        conn.execute(f"ALTER TABLE request DROP COLUMN {column}")
-    conn.execute("UPDATE meta SET value = '6' WHERE key = 'schema_version'")
-    conn.commit()
-    conn.close()
-
-    async def reopen() -> None:
-        store = await _store(path)
-        try:
-            rows, _ = store.requests()
-            assert len(rows) == 1, "migration lost the v6 rows"
-            assert (
-                rows[0]["door"],
-                rows[0]["characters"],
-                rows[0]["audioSeconds"],
-                rows[0]["images"],
-            ) == (None, None, None, None)
-            with store._reader() as conn:
-                assert conn is not None
-                version = conn.execute(
-                    "SELECT value FROM meta WHERE key = 'schema_version'"
-                ).fetchone()
-            assert version == (str(SCHEMA_VERSION),) == ("12",)
-        finally:
-            await store.aclose()
-
-    asyncio.run(reopen())
-    assert not path.with_suffix(".v6.bak").exists(), "an in-place upgrade renamed the file aside"
-
-
-def test_a_v7_store_migrates_in_place_gaining_the_image_count(tmp_path: Path) -> None:
-    """P4's v8: an alpha.4-plus-P3 store keeps its rows and its door, and
-    gains `images`, null on every older row."""
-    path = tmp_path / "m.sqlite3"
-
-    async def build() -> None:
-        store = await _store(path)
-        try:
-            store._insert([replace(_row(), door="speech", characters=12)])
-        finally:
-            await store.aclose()
-
-    asyncio.run(build())
-    conn = sqlite3.connect(path)
-    conn.execute("ALTER TABLE request DROP COLUMN images")
-    conn.execute("ALTER TABLE request DROP COLUMN video_seconds")
-    conn.execute("UPDATE meta SET value = '7' WHERE key = 'schema_version'")
-    conn.commit()
-    conn.close()
-
-    async def reopen() -> None:
-        store = await _store(path)
-        try:
-            rows, _ = store.requests()
-            assert [(r["door"], r["characters"], r["images"]) for r in rows] == [
-                ("speech", 12, None)
-            ]
-            store._insert([replace(_row(), door="images", images=2)])
-            rows, _ = store.requests()
-            assert rows[0]["door"] == "images" and rows[0]["images"] == 2
-        finally:
-            await store.aclose()
-
-    asyncio.run(reopen())
-    assert not path.with_suffix(".v7.bak").exists(), "an in-place upgrade renamed the file aside"
-
-
-def test_a_v8_store_migrates_in_place_gaining_video_seconds(tmp_path: Path) -> None:
-    """P5's v9: a store from P4 keeps its image counts and gains the seconds
-    of video a job asked for, null on every older row."""
-    path = tmp_path / "m.sqlite3"
-
-    async def build() -> None:
-        store = await _store(path)
-        try:
-            store._insert([replace(_row(), door="images", images=2)])
-        finally:
-            await store.aclose()
-
-    asyncio.run(build())
-    conn = sqlite3.connect(path)
-    conn.execute("ALTER TABLE request DROP COLUMN video_seconds")
-    conn.execute("UPDATE meta SET value = '8' WHERE key = 'schema_version'")
-    conn.commit()
-    conn.close()
-
-    async def reopen() -> None:
-        store = await _store(path)
-        try:
-            rows, _ = store.requests()
-            assert [(r["door"], r["images"], r["videoSeconds"]) for r in rows] == [
-                ("images", 2, None)
-            ]
-            store._insert([replace(_row(), door="videos", video_seconds=4)])
-            rows, _ = store.requests()
-            assert (rows[0]["door"], rows[0]["videoSeconds"]) == ("videos", 4)
-        finally:
-            await store.aclose()
-
-    asyncio.run(reopen())
-    assert not path.with_suffix(".v8.bak").exists(), "an in-place upgrade renamed the file aside"

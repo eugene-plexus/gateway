@@ -1,32 +1,19 @@
-"""Keep pre-A5 history; report known per-key usage without inventing tokens."""
+"""Report known per-key usage without inventing tokens."""
 
-import sqlite3
 from datetime import UTC, datetime, timedelta
 
-from eugene_plexus_gateway.metrics import _DDL, MetricsStore, RequestRow
+from eugene_plexus_gateway.metrics import AttemptRow, MetricsStore, RequestRow
 
 
-async def test_v2_migration_keeps_history_and_attributed_totals(tmp_path):
+async def test_attributed_totals_count_known_usage_and_say_how_many_requests_lacked_it(tmp_path):
     path = tmp_path / "metrics.sqlite3"
-    conn = sqlite3.connect(path)
-    old = (
-        _DDL.replace("    client_key_id     TEXT,\n", "")
-        .replace("    client_key_name   TEXT,\n", "")
-        .replace("    correlation_id    TEXT,\n", "")
-        .replace("    elapsed_ms        INTEGER\n", "")
-        .replace("    strategy          TEXT,\n", "    strategy          TEXT\n")
-    )
-    conn.executescript(old)
     now = datetime.now(UTC)
-    conn.execute("INSERT INTO meta VALUES ('schema_version', '2')")
-    conn.execute(
-        "INSERT INTO request (started_at, requested_model, attempts, total_ms, outcome) VALUES (?, ?, ?, ?, ?)",
-        (now.isoformat(), "old", 1, 5, "served"),
-    )
-    conn.commit()
-    conn.close()
     store = MetricsStore(path)
     await store.start()
+    # A request no key is attributed to, as an anonymous one is.
+    store.record(
+        RequestRow(started_at=now, requested_model="old", attempts=1, total_ms=5, outcome="served")
+    )
     for key, attempts, outcome, prompt, completion in [
         ("a", 2, "served", 10, 4),
         ("a", 0, "error", None, None),
@@ -68,28 +55,21 @@ async def test_v2_migration_keeps_history_and_attributed_totals(tmp_path):
         await store.aclose()
 
 
-async def test_v3_attempts_survive_migration_with_usage_explicitly_unknown(tmp_path):
+async def test_an_attempt_that_reported_no_usage_reads_as_unknown_not_zero(tmp_path):
     path = tmp_path / "metrics.sqlite3"
-    conn = sqlite3.connect(path)
-    old = _DDL.replace(
-        "    client_key_name   TEXT,\n    correlation_id    TEXT,\n    elapsed_ms        INTEGER\n",
-        "    client_key_name   TEXT\n",
-    ).replace(
-        "    backend_ms INTEGER,\n    retry_disposition TEXT,\n    usage_known INTEGER NOT NULL DEFAULT 0,\n    prompt_tokens INTEGER,\n    completion_tokens INTEGER,\n    first_ms   INTEGER,\n    cached_tokens INTEGER\n",
-        "    backend_ms INTEGER\n",
+    store = MetricsStore(path)
+    await store.start()
+    store.record(
+        RequestRow(
+            started_at=datetime.now(UTC),
+            requested_model="old",
+            attempts=1,
+            total_ms=5,
+            outcome="error",
+            tries=[AttemptRow(driver="old-driver", elapsed_ms=5, served=False)],
+        )
     )
-    conn.executescript(old)
-    assert "usage_known" not in {row[1] for row in conn.execute("PRAGMA table_info(attempt)")}
-    conn.execute("INSERT INTO meta VALUES ('schema_version', '3')")
-    conn.execute(
-        "INSERT INTO request (started_at, requested_model, attempts, total_ms, outcome) VALUES (?, 'old', 1, 5, 'error')",
-        (datetime.now(UTC).isoformat(),),
-    )
-    conn.execute(
-        "INSERT INTO attempt (request_id, seq, driver, elapsed_ms, served) VALUES (1, 0, 'old-driver', 5, 0)"
-    )
-    conn.commit()
-    conn.close()
+    await store.aclose()
     store = MetricsStore(path)
     await store.start()
     try:

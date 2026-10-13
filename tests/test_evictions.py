@@ -108,39 +108,6 @@ async def test_the_next_turn_is_judged_against_this_one():
     assert third.affinity == EVICTED, "judged against the 2,000-token second turn"
 
 
-async def test_a_v11_store_moves_on_in_place(tmp_path) -> None:  # type: ignore[no-untyped-def]
-    """v12 adds a value, not a column: a v11 store keeps its rows."""
-    import sqlite3
-    from datetime import UTC, datetime
-
-    from eugene_plexus_gateway.metrics import _DDL, SCHEMA_VERSION, MetricsStore
-
-    path = tmp_path / "metrics.sqlite3"
-    conn = sqlite3.connect(path)
-    conn.executescript(_DDL)
-    conn.execute("INSERT INTO meta VALUES ('schema_version', '11')")
-    conn.execute(
-        "INSERT INTO request (started_at, requested_model, attempts, total_ms, outcome, affinity)"
-        " VALUES (?, 'old', 1, 5, 'served', 'hit')",
-        (datetime.now(UTC).isoformat(),),
-    )
-    conn.commit()
-    conn.close()
-    store = MetricsStore(path)
-    await store.start()
-    try:
-        rows, _ = store.requests()
-        assert [r["affinity"] for r in rows] == ["hit"]
-        assert not list(tmp_path.glob("*.bak"))
-    finally:
-        await store.aclose()
-    conn = sqlite3.connect(path)
-    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone() == (
-        str(SCHEMA_VERSION),
-    )
-    conn.close()
-
-
 async def test_the_driver_is_told_the_conversation():
     """CB4: a driver that pins slots needs the key; it never goes upstream."""
     table, a, b = _table()
