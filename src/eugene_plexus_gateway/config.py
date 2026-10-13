@@ -117,11 +117,10 @@ FIELDS: list[ConfigField] = [
         label="Default temperature",
         description=(
             "Sampling randomness used when neither the request nor the model's "
-            "default Library profile specifies one. 0 = deterministic / most likely next "
-            "token; 1 = the model's own default randomness; higher "
-            "gets more varied. The gateway owns this — whatever value "
-            "reaches a backend, the gateway put it there, and a driver "
-            "never substitutes a default of its own."
+            "default Library profile sets one.\n\n"
+            "0 is deterministic, always the most likely next token; 1 is the model's "
+            "own default randomness; higher is more varied. Drivers add no default of "
+            "their own."
         ),
         category="generation",
         valueType=ConfigValueType.number,
@@ -133,12 +132,12 @@ FIELDS: list[ConfigField] = [
         key="defaultMaxTokens",
         label="Default max output tokens",
         description=(
-            "Cap on a single response when neither the request nor the model's "
-            "default Library profile specifies one (roughly 0.75 words per token; 2048 is 1,500 "
-            "words). Blank, the default, sets no cap: an answer runs until the model "
-            "finishes, bounded by its context window and the request deadline. A cap "
-            "cuts off a reasoning model that is still thinking, so it never answers. "
-            "Not applied to /v1/responses (Codex CLI) either way. Set Max tokens on a "
+            "Caps a single response when neither the request nor the model's "
+            "default Library profile sets a limit.\n\n"
+            "Blank, the default, sets no cap: an answer runs until the model finishes, "
+            "bounded by its context window and the request deadline. A cap cuts off a "
+            "reasoning model that is still thinking, so it never answers. It is not "
+            "applied to `/v1/responses` (Codex CLI) either way. Set Max tokens on a "
             "model's profile to cap one model."
         ),
         category="generation",
@@ -152,12 +151,13 @@ FIELDS: list[ConfigField] = [
         key="maxToolCalls",
         label="Web searches and images per request",
         description=(
-            "How many web searches and images this install runs for one request when "
-            "the caller does not say (P8). Past it the model is told no more are "
-            "available and answers with what it has. A caller's own max_tool_calls "
-            "(Codex) or max_uses (Claude Code) wins over this. Each search sends the "
-            "model's query to your search account, and a paid one counts every search; "
-            "each image is billed by the provider that makes it."
+            "How many web searches and images this install runs for one request "
+            "when the caller does not say.\n\n"
+            "Past the limit the model is told no more are available and answers with "
+            "what it has. A caller's own `max_tool_calls` (Codex) or `max_uses` "
+            "(Claude Code) wins. Each search sends the model's query to your search "
+            "account, and a paid account counts every search; each image is billed by "
+            "the provider that makes it."
         ),
         category="generation",
         valueType=ConfigValueType.integer,
@@ -169,12 +169,12 @@ FIELDS: list[ConfigField] = [
         key="webSearchOrder",
         label="Web search order",
         description=(
-            "Which search account a web search tries first. Accounts named here are "
-            "tried first, in this order, each as its name or node:name (a bare name "
-            "matches that account on every machine); the rest follow by the default "
-            "rule -- free accounts before billed ones, this machine's before another's. "
-            "A name that matches no account is ignored. A later account is tried only "
-            "when an earlier one could not answer. Takes effect on the next search."
+            "Which search account a web search tries first.\n\n"
+            "Name accounts in the order to try them, each as its name or `node:name`; "
+            "a bare name matches that account on every machine. The rest follow by the "
+            "default rule: free accounts before billed ones, this machine's before "
+            "another's. A name that matches no account is ignored. A later account is "
+            "tried only when an earlier one could not answer."
         ),
         category="generation",
         valueType=ConfigValueType.string_list,
@@ -185,11 +185,12 @@ FIELDS: list[ConfigField] = [
         key="imageToolModel",
         label="Image model for tools",
         description=(
-            "The image model that answers an app's image_generation tool on "
-            "/v1/responses when the app does not name one this install serves (P8e). "
-            "Blank, the default, uses the one image model a key may use, and asks "
-            "for this setting only when there are several. An id as /v1/models lists "
-            "it, such as openrouter/openai/gpt-image-1."
+            "The image model that answers an app's `image_generation` tool on "
+            "`/v1/responses`.\n\n"
+            "Used when the app does not name an image model this install serves. "
+            "Blank, the default, uses the one image model a key may use, and asks for "
+            "this setting only when there are several. Use an id as `/v1/models` lists "
+            "it, such as `openrouter/openai/gpt-image-1`."
         ),
         category="generation",
         valueType=ConfigValueType.string,
@@ -288,12 +289,12 @@ FIELDS: list[ConfigField] = [
         key="maxImagesPerRequest",
         label="Images per request",
         description=(
-            "Most images one request may carry, counted across the whole "
-            "conversation, because a chat client resends its history and the "
-            "model sees every picture in it each time. A request over the "
-            "limit is refused with a message naming this setting, before "
-            "anything is sent to a model. Each image is still limited to "
-            "5 MiB and the request to 10 MiB of images in total. At most 64."
+            "The most images one request may carry, counted across the whole "
+            "conversation.\n\n"
+            "A chat client resends its history, so the model sees every picture in it "
+            "each time. A request over the limit is refused, with a message naming "
+            "this setting, before anything is sent to a model. Each image is still "
+            "limited to 5 MiB and the request to 10 MiB of images in total."
         ),
         category="routing",
         valueType=ConfigValueType.integer,
@@ -305,17 +306,14 @@ FIELDS: list[ConfigField] = [
         key="modelSlots",
         label="Model slots (priority lists)",
         description=(
-            'Ordered fallbacks per model. Each entry is {"model": the name a '
-            'client asks for, "targets": [model ids to try in order]}. A '
-            "request for `model` is served by the drivers serving `model` "
-            "itself (load-balanced across replicas), then by each target's "
-            "drivers in turn when everything before it has nothing that "
-            "answers. Targets are model ids, not driver names, because a "
-            "model id names every replica serving it. A cloud subscription "
-            "is a target like any other — a claude_code_cli driver already "
-            "serves a model id. Example: "
-            '[{"model": "coder", "targets": ["qwen3-coder-30b", "claude-opus-4-7"]}]. '
-            "Takes effect on the next request; no restart."
+            "Ordered fallbacks for a model: when nothing serving it can answer, "
+            "the next target is tried.\n\n"
+            'Each entry is `{"model": the name a client asks for, "targets": '
+            "[model ids to try in order]}`. Targets are model ids, not driver "
+            "names, because a model id names every replica serving it; a cloud "
+            "subscription is a target like any other.\n\n"
+            'Example: `[{"model": "coder", "targets": ["qwen3-coder-30b", '
+            '"claude-opus-4-7"]}]`'
         ),
         category="lifecycle",
         valueType=ConfigValueType.model_slots,
@@ -325,14 +323,15 @@ FIELDS: list[ConfigField] = [
         key="inConversationSystem",
         label="System messages after the first",
         description=(
-            "Where a system message that comes after the conversation has started "
-            "goes. Claude Code sends them mid-conversation, and the Qwen 3.5 and "
-            "later chat templates refuse any system message but the first, so those "
-            "models answer an error. `user_turn` (the default) keeps each one where "
-            "the client put it, as a user turn marked `<system-reminder>`, which "
-            "every model measured accepts and which keeps the start of the prompt "
-            "the same for the engine's cache; leading system messages become one. "
-            "`system` sends them exactly as the client did."
+            "Where a system message that arrives after the conversation has "
+            "started goes.\n\n"
+            "Claude Code sends them mid-conversation, and the Qwen 3.5 and later chat "
+            "templates refuse any system message but the first, so those models answer "
+            "with an error. `user_turn` (the default) keeps each one in place as a "
+            "user turn marked `<system-reminder>`, which every model we tested accepts "
+            "and which keeps the start of the prompt stable for the engine's cache; "
+            "leading system messages become one. `system` sends them exactly as the "
+            "client did."
         ),
         category="generation",
         valueType=ConfigValueType.enum,
@@ -344,22 +343,17 @@ FIELDS: list[ConfigField] = [
         key="loadBalancing",
         label="New conversations go to",
         description=(
-            "Where a NEW conversation goes among the replicas serving one model. "
-            "A conversation already under way goes back to the replica that served "
-            "it whatever this says (see Keep each conversation on its replica). "
-            "`spread` (the default) sends it to the replica holding the fewest "
-            "conversations per slot, counting every conversation it served in the "
-            "last 30 minutes whether or not a request is in flight, ties to the "
-            "fewest in flight, then in turn. Measured with 32 agent sessions on "
-            "eight replicas: 80.2% of prompt tokens reused against 60.4% by least "
-            "busy, and the median first token in 1.05 s against 4.00 s, because a "
-            "replica whose agents are all thinking between turns looks empty to a "
-            "count of requests in flight. "
-            "`least_busy` sends it to the driver with the fewest requests in flight "
-            "per slot of capacity, breaking ties round-robin. `round_robin` "
-            "alternates strictly, which is worth having when comparing two replicas "
-            "or reproducing a report. The load signal is the gateway's own in-flight "
-            "count, so both work for every engine."
+            "Where a new conversation goes among the replicas serving one model.\n\n"
+            "A conversation already under way stays on its replica (see Keep each "
+            "conversation on its replica).\n\n"
+            "- `spread` (default): the replica holding the fewest conversations per "
+            "slot, counting those served in the last 30 minutes whether or not a "
+            "request is in flight. It suits agent sessions, whose pauses between "
+            "turns make a replica look empty to `least_busy`.\n"
+            "- `least_busy`: the replica with the fewest requests in flight per "
+            "slot.\n"
+            "- `round_robin`: each replica in turn, for comparing replicas or "
+            "reproducing a report."
         ),
         category="lifecycle",
         valueType=ConfigValueType.enum,
@@ -375,14 +369,12 @@ FIELDS: list[ConfigField] = [
         key="conversationAffinity",
         label="Keep each conversation on its replica",
         description=(
-            "Send each turn of a conversation back to the replica that served its "
-            "last one, because only that replica's engine holds its prompt in cache; "
-            "it moves only when that replica is full and another has a free slot. "
-            "Measured with twelve agent sessions on three replicas: on, 80.8% of "
-            "prompt tokens were reused and the median first token came in 0.71 s; "
-            "off, 67.7% and 1.49 s. Turn it off only to benchmark replicas against "
-            "each other, where a tool repeating one prompt would otherwise land on "
-            "one replica every time."
+            "Sends each turn of a conversation back to the replica that served its "
+            "last one.\n\n"
+            "Only that replica's engine holds the conversation's prompt in cache; it "
+            "moves only when that replica is full and another has a free slot. Turn it "
+            "off only to benchmark replicas against each other, where a tool repeating "
+            "one prompt would otherwise land on one replica every time."
         ),
         category="lifecycle",
         valueType=ConfigValueType.boolean,
@@ -392,12 +384,12 @@ FIELDS: list[ConfigField] = [
         key="swapWaitSeconds",
         label="Start-on-demand wait",
         description=(
-            "How long a request waits for a stopped runtime marked "
-            "`startOnDemand` to reach `ready` before the next fallback is "
-            "tried (or a 503 is returned). Engine-dependent: llama.cpp loads "
-            "a small model in seconds, a 30B off disk in a minute; vLLM's "
-            "silent load is minutes. The response reports what it waited in "
-            "`x_eugene_plexus.waited_ms`."
+            "How long a request waits for a stopped start-on-demand runtime to "
+            "become ready.\n\n"
+            "After that the next fallback is tried, or a 503 is returned. Loading "
+            "varies by engine: llama.cpp loads a small model in seconds and a 30B "
+            "model from disk in about a minute; vLLM can take minutes. The response "
+            "reports the wait in `x_eugene_plexus.waited_ms`."
         ),
         category="lifecycle",
         valueType=ConfigValueType.duration,
@@ -409,10 +401,11 @@ FIELDS: list[ConfigField] = [
         key="idleCheckSeconds",
         label="Idle check interval",
         description=(
-            "How often the gateway checks each runtime's `idleUnloadSeconds` "
-            "and asks its agent to unload one that has been idle that long "
-            "with nothing in flight. A runtime that declared no timeout is "
-            "never unloaded by the gateway."
+            "How often the gateway checks each runtime's `idleUnloadSeconds` and "
+            "unloads idle ones.\n\n"
+            "It asks the runtime's agent to unload one that has been idle that long "
+            "with nothing in flight. A runtime with no timeout is never unloaded by "
+            "the gateway."
         ),
         category="lifecycle",
         valueType=ConfigValueType.duration,
@@ -424,17 +417,14 @@ FIELDS: list[ConfigField] = [
         key="controlUrl",
         label="Control root",
         description=(
-            "Where the control root is, when this gateway should not work it "
-            "out itself. Leave it empty and the gateway asks its own agent on "
-            "every refresh: the control root this node is enrolled to, else "
-            "the control component the agent runs, else this host alone. Set "
-            "it to override that -- for a gateway whose agent is neither "
-            "enrolled nor running a control root, or to force an address -- "
-            "and it is used as given, even when wrong. Either way the gateway "
-            "reads the node list from the root and talks to each node's own "
-            "agent for that node's drivers and runtimes. Takes effect on the "
-            "next routing refresh; the Inference screen's routing table says "
-            "which address is in use and whether it answered."
+            "The control root's address, for a gateway that should not work it out "
+            "itself.\n\n"
+            "Empty, the gateway asks its own agent on every refresh: the control root "
+            "this node is enrolled to, else the control component the agent runs, else "
+            "this host alone. Set it for a gateway whose agent is neither enrolled nor "
+            "running a control root, or to force an address; it is used as given, even "
+            "when wrong. The Inference screen's routing table says which address is in "
+            "use and whether it answered."
         ),
         category="routing",
         valueType=ConfigValueType.url,
@@ -460,16 +450,12 @@ FIELDS: list[ConfigField] = [
         key="metricsEnabled",
         label="Retain request metrics",
         description=(
-            "Keep a record of how each completion was served - which "
-            "backend answered, how long it took, how many tokens it "
-            "produced, whether failover fired, whether a sleeping model "
-            "had to be woken. This is what makes 'is this backend faster "
-            "than that one for this model' answerable.\n\n"
-            "Stored on this machine only, in `metrics.sqlite3` beside "
-            "this config. Never sent anywhere, and never part of the "
-            "replicated install log. Turning it off stops recording from "
-            "then on; nothing reconstructs the traffic served while it "
-            "was off."
+            "Records how each completion was served, so you can compare backends.\n\n"
+            "Each record says which backend answered, how long it took, how many "
+            "tokens it produced, whether failover fired and whether a sleeping model "
+            "had to be woken. Stored on this machine only, in `metrics.sqlite3` beside "
+            "this config; never sent anywhere or replicated. Turning it off stops "
+            "recording, and nothing reconstructs the traffic served while it was off."
         ),
         category="metrics",
         valueType=ConfigValueType.boolean,
@@ -480,13 +466,11 @@ FIELDS: list[ConfigField] = [
         key="metricsRetentionDays",
         label="Keep individual requests for",
         description=(
-            "How long the per-request rows are kept. Aggregates by hour "
-            "are kept indefinitely regardless - they are tiny - so "
-            "lowering this loses the ability to ask about a specific "
-            "request, not the shape of a day.\n\n"
-            "A request costs roughly 200 bytes, so a busy install at one "
-            "completion per second is about 17 MB a day. A normal one is "
-            "far below that."
+            "How long individual request records are kept.\n\n"
+            "Hourly aggregates are kept indefinitely regardless, so lowering this "
+            "loses the ability to ask about a specific request, not the shape of a "
+            "day. A request costs roughly 200 bytes; a busy install at one completion "
+            "per second is about 17 MB a day."
         ),
         category="metrics",
         valueType=ConfigValueType.integer,
@@ -520,13 +504,14 @@ FIELDS: list[ConfigField] = [
         key="corsEnabled",
         label="Answer browser clients (CORS)",
         description=(
-            "Let a web page on another origin call this gateway's OpenAI-compatible "
-            "paths (/v1/models, /v1/chat/completions, /v1/embeddings) directly -- the "
-            "playground's direct mode, Open WebUI in a tab, a web app built on the "
-            "OpenAI SDK. Operator paths (/v1/config, /v1/admin, /v1/metrics) never "
-            "answer browsers from another origin regardless. Off, a browser gets "
-            "'Failed to fetch' and a curl of the same preflight gets a 403 that says "
-            "why. Takes effect on the next request."
+            "Lets a web page on another origin call this gateway's "
+            "OpenAI-compatible paths directly.\n\n"
+            "That covers `/v1/models`, `/v1/chat/completions` and `/v1/embeddings`, "
+            "for the playground's direct mode, Open WebUI in a tab or a web app built "
+            "on the OpenAI SDK. Operator paths (`/v1/config`, `/v1/admin`, "
+            "`/v1/metrics`) never answer browsers from another origin. Off, a browser "
+            'gets "Failed to fetch" and a curl of the same preflight gets a 403 that '
+            "says why."
         ),
         category="clients",
         valueType=ConfigValueType.boolean,
@@ -536,12 +521,11 @@ FIELDS: list[ConfigField] = [
         key="corsAllowedOrigins",
         label="Allowed browser origins",
         description=(
-            "Which origins may call the OpenAI-compatible paths from a browser, as "
-            "the browser spells them: scheme, host and port, no path -- "
-            "http://192.168.1.20:8079, for example. Empty means any origin, which is "
-            "safe because every request still needs a bearer token the page must "
-            "hold; list origins to admit only your own UI's. Takes effect on the "
-            "next request."
+            "The origins that may call the OpenAI-compatible paths from a browser.\n\n"
+            "Spell each as the browser does: scheme, host and port, no path, for "
+            "example `http://192.168.1.20:8079`. Empty means any origin, which is safe "
+            "because every request still needs a bearer token the page must hold; list "
+            "origins to admit only your own UI's."
         ),
         category="clients",
         valueType=ConfigValueType.url_list,
