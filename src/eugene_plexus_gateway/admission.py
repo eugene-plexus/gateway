@@ -110,17 +110,20 @@ class ClientRequest:
             if response.status_code >= 400:
                 if action == "acquire" and response.status_code < 500:
                     self.attempted = False
-                status = response.status_code
-                if status not in (401, 403, 409, 429):
-                    status = 503
+                # What the authority answered, said as it was: every status outside the four
+                # it refuses a key with is a 503 here, and a person told only "needs the
+                # admission authority" could not tell a 500 from a 404 from a 504.
+                answered = response.status_code
+                status = answered if answered in (401, 403, 409, 429) else 503
                 message = {
                     401: "This client key is unregistered, expired or revoked.",
                     403: "This client key does not permit the requested model.",
                     409: "Request permissions or reservation changed; start a new request.",
                     429: "This key's shared concurrency or request-rate limit is reached. "
                     "Wait or cancel an active request; switching gateways does not add allowance.",
-                    503: "Client access needs the admission authority. Check the local agent and "
-                    "active control root; operator management remains available.",
+                    503: f"Client access needs the admission authority, which answered {answered}. "
+                    "Check the local agent and active control root; operator management "
+                    "remains available.",
                 }[status]
                 retry = response.headers.get("Retry-After", "5") if status in (429, 503) else None
                 if retry is not None and (not retry.isdigit() or len(retry) > 5):
@@ -141,7 +144,7 @@ class ClientRequest:
         except (httpx.HTTPError, ValueError, TimeoutError) as exc:
             raise AdmissionFailure(
                 503,
-                "Client admission is unavailable. Restore the agent/control "
+                f"Client admission is unavailable ({_observed(exc)}). Restore the agent/control "
                 "connection; this gateway will not create a separate allowance.",
                 "5",
             ) from exc
@@ -338,6 +341,21 @@ def _plain(text: str, limit: int = MAX_CAUSE_CHARS) -> str:
     return cut.rstrip() + "..."
 
 
+def _observed(exc: Exception) -> str:
+    """What `exc` was, in words, never empty: its class, and its own words when it has any,
+    on one line and capped (`_plain`).
+
+    The class is always said, because an exception's own words may be none (an httpx timeout's
+    text is empty, as is a bare `TimeoutError`) and may be many lines (a malformed answer's
+    validation error), and a failure that names no cause leaves a person to guess it. It is
+    said inside a parenthesis, so without the full stop its own words may end with (a cut
+    one keeps its ellipsis, `_without_full_stop`): "response.)." reads as a mistake.
+    """
+    said = " ".join(str(exc).split())
+    words = f"{type(exc).__name__}: {said}" if said else type(exc).__name__
+    return _without_full_stop(_plain(words))
+
+
 def _changed(backend: Any, what: str) -> Unconfirmed:
     """A driver that answered, but not as it did at the last refresh: a state a
     retry may find changed again (its engine was loading, it was reconfigured)."""
@@ -514,13 +532,14 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
       takes none. Unknown is yes for tools and the settings that ride with them,
       and nowhere else. **That holds for a model whose tool calling is off, with or
       without tools in the request**: a setting is admitted where the driver lists
-      it. A driver whose engine cannot take tools (the Claude Code and Codex CLI
-      subscriptions, OpenAI's Responses-only models) refuses an explicit
-      `tool_choice` or `parallel_tool_calls` with a 400 that does not cascade, so a
-      slot [subscription model, local model] would stop at the first; admission
-      turns such a model away on its listing instead, and the next target serves.
-      A driver that lists the two for every chat model whose tools are off and drops
-      them from a request that carries no tools is admitted them by the same rule.
+      it. A current driver lists `tool_choice` and `parallel_tool_calls` for every chat
+      model whose tools are off (the Claude Code and Codex CLI subscriptions, OpenAI's
+      Responses-only models, a listing that names no tools, a learned refusal) and drops
+      them from a request that carries no tools, so such a model is admitted them by the
+      same rule and serves the request itself. A driver that does not list the two (an
+      older one, which refused them with a 400 that does not cascade, so a slot
+      [subscription model, local model] would stop at the first) is turned away on its
+      listing, and the next target serves.
 
     A backend turned away for its tools does not count toward what "some backend
     takes", so a refusal for another setting names that setting, not one a

@@ -5259,10 +5259,13 @@ def _driver_failure_status(e: DriverError) -> _Failure:
             error_type=responses.OVERLOADED,
         )
     if upstream == 503:
+        # One full stop after the driver's detail, whichever way it ended: its own words
+        # often end in one (a problem's detail, and the "Outcome unknown ... occurred."
+        # that `DriverError` adds), and a second made "occurred.. If an engine".
         return _Failure(
             code=503,
             message=(
-                f"A backend serving this model is not ready yet: {detail}. "
+                f"A backend serving this model is not ready yet: {admission.as_sentence(detail)} "
                 f"If an engine is still loading its weights this will clear on its own."
             ),
             error_type="service_unavailable",

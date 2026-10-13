@@ -81,7 +81,7 @@ The status codes distinguish the cases that differ operationally, because "it di
 
 Transport errors, timeouts and 5xx cascade to the next backend; 4xx fails hard.
 
-`POST /v1/messages/count_tokens` and `POST /v1/responses/input_tokens` are a key check and never an admission, and a count the gateway cannot give is a **400** with the cause, never a 5xx: Claude Code's `/context` retries a 5xx before it counts by sending the request. That includes a key that cannot be checked (an authority that does not answer, an agent that cannot give the key policy): nothing is counted, and it is a 400. A key the authority refuses (a 401 or 403) is still that refusal. A count's body is bounded like any other (16 MiB), and a browser may call both.
+`POST /v1/messages/count_tokens` and `POST /v1/responses/input_tokens` are a key check and never an admission, and a count the gateway cannot give is a **400** with the cause, never a 5xx: Claude Code's `/context` retries a 5xx before it counts by sending the request. That includes a key that cannot be checked (an authority that does not answer, an agent that cannot give the key policy): nothing is counted, and it is a 400. For an authority the 400 says what was observed: the status it answered, or the exception its call ended in (its class and its words). A key the authority refuses (a 401 or 403) is still that refusal. A count's body is bounded like any other (16 MiB), and a browser may call both.
 
 ## Safe mode
 

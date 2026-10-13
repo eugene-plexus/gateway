@@ -12,6 +12,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from eugene_plexus_gateway import admission
 from eugene_plexus_gateway._generated.driver_models import Usage
 from eugene_plexus_gateway.app import create_app
 from tests.conftest import FakeDriverClient, install_snapshot, make_routing_table
@@ -169,6 +170,172 @@ def test_refusal_precedes_backend_and_keeps_operator_repair_available(setup, cod
         assert "retry-after" in response.headers["Access-Control-Expose-Headers"].lower()
         assert not allowed.calls and not excluded.calls
         assert c.get("/v1/config", headers=operator).status_code == 200
+
+
+@pytest.mark.parametrize("code", [404, 500, 502, 504])
+def test_a_door_that_generates_says_what_the_authority_answered_and_keeps_its_503(setup, code):
+    """Every status the authority answers outside the four it refuses a key with is a 503 to
+    try again, with the authority's own `Retry-After`, as it always was. What changed is that
+    the sentence says which status it was: a 500, a 404 (an agent that has no admission
+    route) and a 504 read the same, and a person was left to guess."""
+    app, authority, allowed, excluded, headers, _ = setup
+    authority.refuse_acquire = code
+    with TestClient(app) as c:
+        response = c.post("/v1/chat/completions", json=body(), headers=headers)
+    assert response.status_code == 503 and response.headers["Retry-After"] == "7"
+    message = response.json()["error"]["message"]
+    assert f"needs the admission authority, which answered {code}. Check the" in message
+    assert not allowed.calls and not excluded.calls
+
+
+class _Guard:
+    """The authority as `ClientRequest.contact` meets it: it answers, or the call ends in an
+    exception."""
+
+    def __init__(self, outcome):
+        self.outcome = outcome
+
+    async def admission(self, body):
+        if isinstance(self.outcome, Exception):
+            raise self.outcome
+        return self.outcome
+
+
+async def _contact(outcome, action="check", *, deadline=None):
+    context = admission.ClientRequest({"type": "http"})
+    context.key_id, context.guard = "key-1", _Guard(outcome)
+    context.deadline = time.perf_counter() + 30 if deadline is None else deadline
+    return await context.contact(action)
+
+
+@pytest.mark.parametrize("answered", [400, 404, 500, 502, 503, 504])
+@pytest.mark.parametrize(("header", "retry"), [({"Retry-After": "7"}, "7"), ({}, "5")])
+async def test_an_authority_that_cannot_answer_is_a_503_that_says_what_it_answered(
+    answered, header, retry
+):
+    with pytest.raises(admission.AdmissionFailure) as raised:
+        await _contact(httpx.Response(answered, headers=header))
+    assert (raised.value.status, raised.value.retry) == (503, retry)
+    assert raised.value.message == (
+        f"Client access needs the admission authority, which answered {answered}. Check the "
+        "local agent and active control root; operator management remains available."
+    )
+
+
+@pytest.mark.parametrize(
+    ("answered", "said", "retry"),
+    [
+        (401, "This client key is unregistered, expired or revoked.", None),
+        (403, "This client key does not permit the requested model.", None),
+        (409, "Request permissions or reservation changed; start a new request.", None),
+        (
+            429,
+            "This key's shared concurrency or request-rate limit is reached. Wait or cancel an "
+            "active request; switching gateways does not add allowance.",
+            "7",
+        ),
+    ],
+)
+async def test_what_the_authority_refuses_a_key_with_keeps_its_own_words(answered, said, retry):
+    """The control: these four are the key's refusal, said as it always was, not a failure
+    to reach the authority."""
+    with pytest.raises(admission.AdmissionFailure) as raised:
+        await _contact(httpx.Response(answered, headers={"Retry-After": "7"}))
+    assert (raised.value.status, raised.value.message, raised.value.retry) == (
+        answered,
+        said,
+        retry,
+    )
+
+
+@pytest.mark.parametrize(
+    ("outcome", "action", "observed"),
+    [
+        pytest.param(
+            httpx.ConnectError("connection refused"),
+            "check",
+            "ConnectError: connection refused",
+            id="a refused connection",
+        ),
+        pytest.param(httpx.ReadTimeout(""), "check", "ReadTimeout", id="a timeout has no words"),
+        pytest.param(
+            httpx.RemoteProtocolError("Server disconnected without sending a response."),
+            "acquire",
+            "RemoteProtocolError: Server disconnected without sending a response",
+            id="a dropped connection, whose own full stop is not said twice",
+        ),
+        pytest.param(
+            httpx.Response(200, content=b"this is not json"),
+            "check",
+            "JSONDecodeError: Expecting value: line 1 column 1 (char 0)",
+            id="an answer that is not JSON",
+        ),
+        pytest.param(
+            httpx.Response(200, json={"keyId": "another-key", "keyName": "k", "leaseSeconds": 30}),
+            "check",
+            "ValueError: authority returned another key",
+            id="the answer for another key",
+        ),
+        pytest.param(
+            httpx.Response(200, json={"keyId": "key-1", "keyName": "k"}),
+            "acquire",
+            "ValueError: no reservation duration",
+            id="a reservation with no duration",
+        ),
+    ],
+)
+async def test_an_authority_that_did_not_answer_is_a_503_naming_what_the_call_ended_in(
+    outcome, action, observed
+):
+    with pytest.raises(admission.AdmissionFailure) as raised:
+        await _contact(outcome, action)
+    assert (raised.value.status, raised.value.retry) == (503, "5")
+    assert raised.value.message == (
+        f"Client admission is unavailable ({observed}). Restore the agent/control "
+        "connection; this gateway will not create a separate allowance."
+    )
+
+
+async def test_a_renewal_past_its_deadline_names_the_timeout():
+    """A bare `TimeoutError` has no words, and is said as its class."""
+    with pytest.raises(admission.AdmissionFailure) as raised:
+        await _contact(httpx.Response(200), "renew", deadline=0.0)
+    assert raised.value.message.startswith(
+        "Client admission is unavailable (TimeoutError). Restore"
+    )
+
+
+async def test_an_answer_that_is_not_an_admission_result_is_named_on_one_line_and_capped():
+    """A malformed answer's validation error is many lines, and as long as the answer."""
+    with pytest.raises(admission.AdmissionFailure) as raised:
+        await _contact(httpx.Response(200, json={"keyId": "key-1", "leaseSeconds": "x" * 500}))
+    message = raised.value.message
+    head = "Client admission is unavailable ("
+    assert message.startswith(head + "ValidationError: ")
+    observed = message[len(head) :].split("). Restore", 1)[0]
+    assert len(observed) <= admission.MAX_CAUSE_CHARS and observed.endswith("...")
+    assert "\n" not in message and "  " not in message
+
+
+@pytest.mark.parametrize(
+    ("exc", "said"),
+    [
+        (ValueError("two\n   lines"), "ValueError: two lines"),
+        (ValueError("   "), "ValueError"),
+        (httpx.ReadTimeout(""), "ReadTimeout"),
+        (TimeoutError(), "TimeoutError"),
+        (ValueError("ends in a stop."), "ValueError: ends in a stop"),
+        (ValueError("was cut..."), "ValueError: was cut..."),
+    ],
+)
+def test_what_a_failure_was_is_its_class_and_its_words_on_one_line(exc, said):
+    assert admission._observed(exc) == said
+
+
+def test_what_a_failure_was_is_capped_at_a_word():
+    said = admission._observed(ValueError("word " * 100))
+    assert len(said) <= admission.MAX_CAUSE_CHARS
+    assert said.startswith("ValueError: word word") and said.endswith("word...")
 
 
 def test_anthropic_current_authority_revocation_keeps_non_retrying_403(setup):

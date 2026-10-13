@@ -2591,6 +2591,53 @@ def test_a_driver_that_says_it_serves_nothing_is_a_502_with_no_retry_advice(
     assert fake.calls == []
 
 
+@pytest.mark.parametrize("door", ["chat", "messages", "responses"])
+def test_a_degraded_driver_whose_runtime_moved_is_still_a_502(
+    settings: Settings, door: str
+) -> None:
+    """A driver that follows a runtime and restarts without being able to build its engine
+    reports no runtime (and lists no model), so its `runtime` is not the one the table
+    cached at the last refresh. A changed runtime on its own is a state a retry may find
+    undone, a 503 to try again; this driver says it serves nothing, and waiting does not
+    build it. `info.degraded` is read before the runtime is compared, so the caller gets
+    the 502 with what to look at and no retry advice, as a degraded driver whose runtime
+    did not move does."""
+    fake = _backend("restarted", runtime="llama-1")
+    app = _app(settings, fake, runtimes=[runtime_facts("llama-1", alias=MODEL)])
+    fake.runtime, fake.degraded, fake.model_id = None, DEGRADED, None  # as it restarts
+    with TestClient(app) as client:
+        r = _post(client, door)
+    assert r.status_code == 502, r.text
+    assert "Retry-After" not in r.headers
+    message = r.json()["error"]["message"]
+    assert (
+        f"driver 'restarted' (http://fake-driver): it says it serves nothing: {DEGRADED}" in message
+    )
+    assert (
+        "Look at the health and configuration of driver 'restarted' (http://fake-driver)" in message
+    )
+    assert "now follows" not in message and "as at the last refresh" not in message
+    assert "try again" not in message.lower() and "few seconds" not in message
+    assert fake.calls == []
+
+
+def test_the_runtime_a_driver_moved_to_is_still_a_retry_when_it_is_not_degraded(
+    settings: Settings,
+) -> None:
+    """The control for the test above: the same change of runtime without the driver
+    saying it serves nothing is the retryable 503 it has always been."""
+    fake = _backend("restarted", runtime="llama-1")
+    app = _app(settings, fake, runtimes=[runtime_facts("llama-1", alias=MODEL)])
+    fake.runtime = None
+    with TestClient(app) as client:
+        r = _tools_post(client)
+    assert r.status_code == 503 and r.headers["Retry-After"] == "5", r.text
+    message = r.json()["error"]["message"]
+    assert "now follows no runtime, not runtime 'llama-1' as at the last refresh" in message
+    assert "serves nothing" not in message
+    assert fake.calls == []
+
+
 def test_a_driver_that_serves_nothing_among_drivers_one_of_which_will_answer_is_a_retry(
     settings: Settings,
 ) -> None:
@@ -2808,6 +2855,37 @@ def test_a_refusal_to_a_request_that_went_out_with_no_token_says_each_part_whole
     refused = admission.unread_because(sent, _answered(status, "bad token"))
     assert not refused.transient and refused.kind == "upstream_auth_error"
     assert f"refused the gateway's credential (answered {status}: bad token)" in refused.text
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_long_reason_the_agent_gave_for_sending_no_token_is_capped_on_its_own(
+    status: int,
+) -> None:
+    """The other half of the test above: the reason is a cause of its own, and is as long as
+    the agent's words are. It is one line of whole words ended with an ellipsis, as any
+    cause is, and the short answer before it is not cut to make room."""
+    reason = "403: " + LONG_DETAIL
+    backend = SimpleNamespace(
+        name="a",
+        node="far",
+        url="http://a",
+        client=SimpleNamespace(credential_refusal=lambda: reason),
+    )
+    said = admission.unread_because(backend, _answered(status, "Missing token"))
+    assert said.transient and said.remedy is None and said.kind == "upstream_error"
+    head = f"driver 'a' on node 'far' (http://a): answered {status}: Missing token ("
+    assert said.text.startswith(head) and said.text.endswith(")")
+    unsent = said.text[len(head) : -len(")")]
+    lead = "this node's agent would not give the gateway a token for it: 403: one two three word"
+    assert unsent.startswith(lead)
+    assert len(unsent) <= admission.MAX_CAUSE_CHARS and unsent.endswith("...")
+    assert "\n" not in said.text and "\t" not in said.text and "  " not in said.text
+    whole = " ".join(
+        f"this node's agent would not give the gateway a token for it: {reason}".split()
+    )
+    kept = unsent[: -len("...")]
+    assert len(whole) > admission.MAX_CAUSE_CHARS, "the case is long enough to be cut"
+    assert whole.startswith(kept) and whole[len(kept)] == " ", "the cut falls between two words"
 
 
 @pytest.mark.parametrize(
@@ -3369,15 +3447,19 @@ def test_a_count_before_the_model_is_known_names_no_model() -> None:
 class CheckFails(Authority):
     """An admission authority that cannot answer a key CHECK, which is what a count makes:
     it answers `check_status`, or does not answer at all when that is None (a refused
-    connection). The policy read, an acquire and a release are answered as ever."""
+    connection), or ends the call in `check_error` when one is set. The policy read, an
+    acquire and a release are answered as ever."""
 
     check_status: int | None = 500
+    check_error: Exception | None = None
 
     def _handle(self, request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/admission"):
             body = json.loads(request.content)
             if body["action"] == "check":
                 self.calls.append(body)
+                if self.check_error is not None:
+                    raise self.check_error  # httpx attaches the request to what a transport raises
                 if self.check_status is None:
                     raise httpx.ConnectError("connection refused", request=request)
                 return httpx.Response(self.check_status)
@@ -3398,15 +3480,23 @@ def _counted_by_a_key(
     return app, allowed, {"authorization": f"Bearer {token}"}
 
 
+#: What the count says of an authority that could not check the key, for each way it can fail:
+#: the status it answered, or the exception the call ended in (class and its words), and never
+#: only "needs the admission authority", which left a 500 and a 404 and a hang to be guessed.
+AUTHORITY_ANSWERED = "Client access needs the admission authority, which answered {}."
+
+
 @pytest.mark.parametrize(
     ("status", "said"),
     [
-        (500, "Client access needs the admission authority"),
-        (502, "Client access needs the admission authority"),
-        (503, "Client access needs the admission authority"),
-        (None, "Client admission is unavailable"),
+        (500, AUTHORITY_ANSWERED.format(500)),
+        (502, AUTHORITY_ANSWERED.format(502)),
+        (503, AUTHORITY_ANSWERED.format(503)),
+        (504, AUTHORITY_ANSWERED.format(504)),
+        (404, AUTHORITY_ANSWERED.format(404)),
+        (None, "Client admission is unavailable (ConnectError: connection refused)."),
     ],
-    ids=["a 500", "a 502", "a 503", "no answer"],
+    ids=["a 500", "a 502", "a 503", "a 504", "a 404", "no answer"],
 )
 @pytest.mark.parametrize(("path", "body"), COUNT_DOORS)
 def test_a_count_when_the_key_authority_cannot_check_is_a_400_and_counts_nothing(
@@ -3421,7 +3511,10 @@ def test_a_count_when_the_key_authority_cannot_check_is_a_400_and_counts_nothing
     a count is a 400 whatever cannot be checked: the key check is no exception. The
     authority that answers a 5xx (or does not answer) to `check` was a 503 with a
     `Retry-After`, from before the counting begins, and the round-four rule held only for
-    what came after. Fail-closed all the same: nothing was counted."""
+    what came after. Fail-closed all the same: nothing was counted.
+
+    **It says what was observed**: the status the authority answered, or what the call
+    ended in. Every one of these read the same sentence until round six."""
     authority = CheckFails()
     authority.check_status = status
     app, allowed, headers = _counted_by_a_key(settings, install, authority)
@@ -3431,8 +3524,47 @@ def test_a_count_when_the_key_authority_cannot_check_is_a_400_and_counts_nothing
     assert "Retry-After" not in r.headers
     message = r.json()["error"]["message"]
     assert message.startswith(f"Cannot count tokens for 'allowed' without generating: {said}")
+    assert ".." not in message
     assert allowed.count_calls == [] and allowed.calls == []
     assert [call["action"] for call in authority.calls] == ["check"]
+
+
+@pytest.mark.parametrize(
+    ("error", "observed"),
+    [
+        pytest.param(httpx.ReadTimeout(""), "ReadTimeout", id="a timeout, whose own text is empty"),
+        # Its own words end in a full stop, which the sentence around them supplies.
+        pytest.param(
+            httpx.RemoteProtocolError("Server disconnected without sending a response."),
+            "RemoteProtocolError: Server disconnected without sending a response",
+            id="a dropped connection",
+        ),
+    ],
+)
+@pytest.mark.parametrize(("path", "body"), COUNT_DOORS)
+def test_a_count_names_the_exception_the_key_check_ended_in(
+    settings: Settings,
+    install: FakeInstall,
+    path: str,
+    body: Any,
+    error: Exception,
+    observed: str,
+) -> None:
+    """The other half of the observed cause: a check that never got an answer says what it
+    got instead, as its class and its own words (an httpx timeout has none)."""
+    authority = CheckFails()
+    authority.check_error = error
+    app, allowed, headers = _counted_by_a_key(settings, install, authority)
+    with TestClient(app) as client:
+        r = client.post(path, json={**body(), "model": "allowed"}, headers=headers)
+    assert r.status_code == 400, r.text
+    assert "Retry-After" not in r.headers
+    message = r.json()["error"]["message"]
+    assert message.startswith(
+        f"Cannot count tokens for 'allowed' without generating: Client admission is unavailable "
+        f"({observed}). Restore the agent/control connection;"
+    )
+    assert allowed.count_calls == [] and allowed.calls == []
 
 
 @pytest.mark.parametrize(("path", "body"), COUNT_DOORS)
@@ -3804,3 +3936,75 @@ def test_a_callers_own_forced_choice_on_a_search_is_named(settings: Settings) ->
         r = chat(client, tool_choice="required")
     assert r.status_code == 200, r.text
     assert _header(r) == ["tool_choice"]
+
+
+# --------------------------------------------------------------------------- #
+# The front door's 503 for a backend that is not ready ends in one full stop
+# --------------------------------------------------------------------------- #
+
+#: What the door says after the driver's words, whichever way they ended.
+LOADING_ADVICE = "If an engine is still loading its weights this will clear on its own."
+
+
+def _driver_503(detail: str | None) -> DriverError:
+    """A driver's 503 as the real client raises it: with a problem body whose detail is
+    `detail`, or, when that is None, with no problem body at all (a proxy's page), which
+    `DriverError` words as an outcome it does not know, in a sentence of its own."""
+    problem = (
+        Problem(type="about:blank", title="Not ready", status=503, detail=detail)
+        if detail is not None
+        else None
+    )
+    return DriverError(
+        driver_name="strata-box",
+        driver_url="http://fake-driver",
+        status_code=503,
+        problem=problem,
+        raw_body="engine loading",
+    )
+
+
+@pytest.mark.parametrize("door", ["chat", "messages", "responses"])
+@pytest.mark.parametrize(
+    ("detail", "said"),
+    [
+        pytest.param(
+            None,
+            "driver 'strata-box' (http://fake-driver) returned 503 (no problem+json body): "
+            "engine loading Outcome unknown: no automatic replay; work may have occurred.",
+            id="a driver's outcome unknown, which ends in a full stop of its own",
+        ),
+        pytest.param(
+            "The engine is still loading.",
+            "The engine is still loading.",
+            id="a detail that ends in a full stop",
+        ),
+        pytest.param(
+            "The engine is still loading",
+            "The engine is still loading.",
+            id="a detail that does not",
+        ),
+        pytest.param(
+            "The engine is still loading...",
+            "The engine is still loading...",
+            id="a detail that was cut, which ends in an ellipsis",
+        ),
+    ],
+)
+def test_the_503_for_a_backend_not_ready_ends_the_drivers_words_in_one_full_stop(
+    settings: Settings, door: str, detail: str | None, said: str
+) -> None:
+    """A driver that answers 503 is a backend that is not ready, and the door says so with
+    the driver's words and what usually clears it. The words often end in a full stop of
+    their own, and the door's own made it "occurred.. If an engine is still loading"."""
+    fake = _backend("strata-box")
+    error = _driver_503(detail)
+    fake.generate_error = error
+    with TestClient(_app(settings, fake)) as client:
+        r = _post(client, door)
+    assert r.status_code == 503, r.text
+    message = r.json()["error"]["message"]
+    assert ".." not in message.replace("...", "")
+    assert f"A backend serving this model is not ready yet: {said} {LOADING_ADVICE}" in message
+    assert message.count("Outcome unknown") == 1, "an unknown outcome is said once"
+    assert fake.calls, "the driver was asked, and answered 503"
