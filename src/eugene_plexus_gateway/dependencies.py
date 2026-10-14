@@ -116,10 +116,11 @@ async def require_authorized(
     guard: ClientKeyGuard | None = getattr(request.app.state, "client_key_guard", None)
     decision = await guard.decision(claims.jti) if guard is not None else "unavailable"
     if decision == "unavailable":
+        cause = guard.unavailable_reason if guard else "No client-key policy guard is configured."
         raise _problem(
             503,
             "Client-key policy unavailable",
-            "Client access is paused until a fresh key policy is available. "
+            f"{cause} Client access is paused until a fresh key policy is available. "
             "Check the local agent and control root; operator sign-in remains available.",
         )
     if decision == "unregistered":

@@ -296,3 +296,39 @@ async def test_a_stream_cut_for_room_after_output_does_not_cool_the_replica():
         ):
             pass
     assert first.circuit.failures == 0
+
+
+@pytest.mark.parametrize("operation", ["generate", "stream"])
+async def test_loading_replica_is_available_as_soon_as_it_answers(operation):
+    first, second = FakeDriverClient(name="primary"), FakeDriverClient(name="backup")
+    first.circuit = Circuit()
+    loading = DriverError(
+        driver_name="primary",
+        driver_url="http://primary",
+        status_code=502,
+        problem=Problem(
+            type="https://github.com/eugene-plexus/inference-driver#backend-loading",
+            title="Backend is loading its model",
+            status=502,
+            retryDisposition="safe",
+        ),
+        raw_body="",
+    )
+    first.generate_error = first.stream_error = loading
+    first.stream_error_after = 0
+    request = GenerateRequest(messages=[{"role": "user", "content": "hi"}])
+
+    async def invoke():
+        client = FailoverDriverClient(name="model", candidates=[first, second])
+        if operation == "stream":
+            _ = [event async for event in client.stream(request)]
+        else:
+            await client.generate(request)
+        return client
+
+    for _ in range(4):
+        assert (await invoke()).served_by == "backup"
+    assert first.circuit.failures == 0
+    first.generate_error = first.stream_error = None
+    first.stream_error_after = None
+    assert (await invoke()).served_by == "primary"

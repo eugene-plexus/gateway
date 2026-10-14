@@ -71,7 +71,7 @@ uvicorn really advertises, and it decides which branch of Starlette's
 `StreamingResponse` runs -- so it is part of the subject, not padding."""
 
 
-def _request(app: FastAPI, gone: asyncio.Event) -> Request:
+def _request(app: FastAPI, gone: asyncio.Event, body: bytes | None = None) -> Request:
     """A real `Request` whose receive channel reports a disconnect once
     `gone` is set — the shape uvicorn delivers."""
 
@@ -86,7 +86,7 @@ def _request(app: FastAPI, gone: asyncio.Event) -> Request:
             sent_body = True
             return {
                 "type": "http.request",
-                "body": b'{"model":"m","messages":[{"role":"user","content":"hi"}]}',
+                "body": body or b'{"model":"m","messages":[{"role":"user","content":"hi"}]}',
                 "more_body": False,
             }
         await gone.wait()
@@ -95,9 +95,9 @@ def _request(app: FastAPI, gone: asyncio.Event) -> Request:
     return Request(_SCOPE | {"app": app}, receive)
 
 
-async def _drive(app: FastAPI, hang: _Hang, call: Any) -> Any:
+async def _drive(app: FastAPI, hang: _Hang, call: Any, body: bytes | None = None) -> Any:
     gone = asyncio.Event()
-    request = _request(app, gone)
+    request = _request(app, gone, body)
     route = asyncio.ensure_future(call(request))
     await asyncio.wait_for(hang.entered.wait(), timeout=5)
     gone.set()
@@ -146,7 +146,9 @@ async def test_a_closed_tab_cancels_the_embedding(app: FastAPI) -> None:
     body = EmbeddingRequest(model="m", input="hi")
     # Called by hand, so it is handed what FastAPI would inject (MR0: the
     # answer's headers are set on it).
-    answer = await _drive(app, hang, lambda r: create_embedding(r, body, Response()))
+    answer = await _drive(
+        app, hang, lambda r: create_embedding(r, body, Response()), body.model_dump_json().encode()
+    )
 
     assert hang.cancelled
     assert not hang.finished

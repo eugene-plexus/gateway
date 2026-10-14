@@ -359,6 +359,29 @@ def test_the_chat_stream_says_a_search_ran_only_to_a_caller_that_asked(settings,
     assert usage[-1]["usage"]["prompt_tokens"] == 20, "both turns' tokens are counted"
 
 
+@pytest.mark.parametrize("drafts", [0, 1, 2])
+def test_chat_citation_spans_index_the_text_sent_across_search_rounds(settings, search, drafts):
+    turns = [
+        Turn(f"Draft {i} with caf\u00e9.", calls=[search_call(call_id=f"search-{i}")])
+        for i in range(drafts)
+    ]
+    if not drafts:
+        turns.append(Turn(calls=[search_call()]))
+    model = ScriptedDriver(turns=[*turns, Turn(ANSWER)])
+    with TestClient(app_with(settings, model, searches=[account(search)])) as client:
+        response = chat(client, stream=True)
+    frames = sse(response)
+    deltas = [choice["delta"] for frame in frames for choice in frame.get("choices") or []]
+    text = "".join(delta.get("content") or "" for delta in deltas)
+    annotations = [a for delta in deltas for a in delta.get("annotations") or []]
+    assert annotations
+    for annotation in annotations:
+        span = annotation["url_citation"]
+        assert text[span["start_index"] : span["end_index"]] == (
+            "[Eugene Plexus on GitHub](https://github.com/eugene-plexus)"
+        )
+
+
 def test_a_chat_stream_without_progress_is_not_told_a_search_ran(settings, search) -> None:
     model = ScriptedDriver(
         turns=[Turn("Let me look.", calls=[search_call()]), Turn(ANSWER)],
@@ -755,6 +778,29 @@ def test_responses_records_each_search_as_a_web_search_call_item(settings, searc
     assert [s["url"] for s in call["action"]["sources"]] == [r["url"] for r in RESULTS]
     annotations = output[1]["content"][0]["annotations"]
     assert annotations[0]["type"] == "url_citation" and annotations[0]["url"] == RESULTS[0]["url"]
+
+
+def test_responses_citations_index_each_streamed_message_after_a_draft(settings, search):
+    model = ScriptedDriver(turns=[Turn("A draft.", calls=[search_call()]), Turn(ANSWER)])
+    with TestClient(app_with(settings, model, searches=[account(search)])) as client:
+        response = client.post(
+            "/v1/responses",
+            json={"model": MODEL, "input": "q", "tools": [{"type": "web_search"}], "stream": True},
+        )
+    streamed = {}
+    count = 0
+    for name, data in events(response):
+        if name == "response.output_text.delta":
+            item = data["item_id"]
+            streamed[item] = streamed.get(item, "") + data["delta"]
+        elif name == "response.output_text.annotation.added":
+            annotation = data["annotation"]
+            text = streamed[data["item_id"]]
+            assert text[annotation["start_index"] : annotation["end_index"]] == (
+                "[Eugene Plexus on GitHub](https://github.com/eugene-plexus)"
+            )
+            count += 1
+    assert count
 
 
 def test_responses_streams_a_search_as_openai_does(settings, search) -> None:

@@ -852,6 +852,7 @@ class BoundClient:
         self.model = model
         #: The id callers use -- `<driver>/<model>` for an account.
         self.public_model = public_model
+        self.confirmed_local = False
         self.circuit = Circuit()
         # Mirrors TieredClient's surface, as HttpDriverClient does.
         self.attempts = 1
@@ -895,14 +896,54 @@ class BoundClient:
         return result
 
     async def embed(self, request: EmbedRequest) -> EmbedResponse:
-        result = await self._inner.embed(self._bind(request))
+        result = await self._read("embedding", lambda: self._inner.embed(self._bind(request)))
         result.modelId = self._publish(result.modelId)
         return result
 
     async def rerank(self, request: RerankPassagesRequest) -> RerankPassagesResponse:
-        result = await self._inner.rerank(self._bind(request))
+        result = await self._read("rerank", lambda: self._inner.rerank(self._bind(request)))
         result.modelId = self._publish(result.modelId)
         return result
+
+    async def _read[T](self, operation: str, call: Callable[[], Awaitable[T]]) -> T:
+        """Only confirmed-local embeddings and rankings have no paid side effects.
+
+        A deadline still means work may be running, so keep its no-retry rule.
+        The owning tier contains replicas of one model, never a different one.
+        """
+        confirmed_local = self.confirmed_local
+        try:
+            return await call()
+        except (httpx.HTTPError, DriverError) as exc:
+            uncertain_read = isinstance(exc, httpx.NetworkError | httpx.RemoteProtocolError) or (
+                isinstance(exc, DriverError)
+                and exc.status_code == 502
+                and retry_disposition(exc) == "indeterminate"
+            )
+            if not confirmed_local or not self.confirmed_local or not uncertain_read:
+                raise
+            detail = (
+                exc.problem.detail
+                if isinstance(exc, DriverError) and exc.problem and exc.problem.detail
+                else str(exc) or type(exc).__name__
+            )
+            detail = detail.partition(" Outcome unknown:")[0].rstrip(". ")
+            raise DriverError(
+                driver_name=self.name,
+                driver_url=self.base_url,
+                status_code=502,
+                problem=Problem(
+                    type="about:blank",
+                    title="Local backend read failed",
+                    status=502,
+                    detail=(
+                        f"The local backend behind {self.name!r} could not complete "
+                        f"the {operation}: {detail}."
+                    ),
+                    retryDisposition=RetryDisposition.safe,
+                ),
+                raw_body="",
+            ) from exc
 
     async def decide(self, request: DecisionRequest) -> DecisionResponse:
         result = await self._inner.decide(self._bind(request))
@@ -1451,7 +1492,12 @@ class TieredClient:
             circuit.finish(
                 failed=error is not None
                 and retry_disposition(error) != "terminal"
-                and not capacity_refused(error),
+                and not capacity_refused(error)
+                and not (
+                    isinstance(error, DriverError)
+                    and error.problem is not None
+                    and str(error.problem.type or "").endswith("#backend-loading")
+                ),
                 retry_after=delay,
                 probe_epoch=probe_epoch,
             )

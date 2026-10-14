@@ -63,6 +63,7 @@ class ClientKeyGuard:
         self._initial_age = 0.0
         self._next_attempt = 0.0
         self._failures = 0
+        self.last_failure: str | None = None
         self._task: asyncio.Task[None] | None = None
         self._client: httpx.AsyncClient | None = None
         self._last_warning = -math.inf
@@ -75,6 +76,30 @@ class ClientKeyGuard:
     @property
     def revision(self) -> int | None:
         return self._policy.revision if self._policy else None
+
+    @property
+    def unavailable_reason(self) -> str:
+        if self.last_failure:
+            return self.last_failure
+        if self._policy is None:
+            return "No key policy has been read from the local agent."
+        return "The cached key policy is too old or its timestamp is in the future."
+
+    def _failure_reason(self, exc: Exception) -> str:
+        # Never quote a policy response or validation input: either may carry
+        # credentials. Name the observed status/operation instead.
+        if isinstance(exc, httpx.HTTPStatusError):
+            return (
+                "The local agent answered the key-policy request "
+                f"with HTTP {exc.response.status_code}."
+            )
+        if isinstance(exc, httpx.TimeoutException | TimeoutError):
+            return f"The key-policy request to the local agent timed out after {self._timeout:g} s."
+        if isinstance(exc, httpx.HTTPError):
+            return f"The key-policy connection to the local agent failed ({type(exc).__name__})."
+        if isinstance(exc, OSError):
+            return f"The key policy could not be saved locally ({type(exc).__name__})."
+        return f"The local agent returned an invalid key policy ({type(exc).__name__})."
 
     @property
     def _revoked(self) -> frozenset[str]:
@@ -256,7 +281,8 @@ class ClientKeyGuard:
                 fresh = fresh.model_copy(update={"keys": list(entries.values())})
             self._observed_revoked.update(k.id for k in fresh.keys if k.revokedAt is not None)
             self._save(fresh)
-        except (httpx.HTTPError, OSError, ValueError, KeyError, TypeError, TimeoutError):
+        except (httpx.HTTPError, OSError, ValueError, KeyError, TypeError, TimeoutError) as exc:
+            self.last_failure = self._failure_reason(exc)
             self._failures += 1
             self._next_attempt = time.perf_counter() + min(
                 15.0, self._retry * 2 ** min(self._failures - 1, 4)
@@ -273,6 +299,7 @@ class ClientKeyGuard:
         self._fetched_at = time.perf_counter()
         self._next_attempt = self._fetched_at + self._ttl
         self._failures = 0
+        self.last_failure = None
 
     def _ensure_client(self) -> httpx.AsyncClient:
         if self._client is None:

@@ -1378,6 +1378,7 @@ class RoutingTable:
             if bound is None or bound.public_model != public or bound._inner is not driver.client:
                 bound = BoundClient(driver.client, model=entry.id, public_model=public)
                 self._bound[bound_key] = bound
+            bound.confirmed_local = light.locality == "local" and light.localOnlyEnforced is True
             backend = replace(driver, client=bound, model=entry, public_id=public)
             self._join_runtime(backend, runtimes, by_alias)
             if driver.runtime is None and backend.runtime is not None:
@@ -2630,15 +2631,24 @@ class RoutingTable:
                 continue
             backends = resolution.backends()
             providers = {b.info.provider for b in backends if b.info.provider}
+            locality = _locality(backends)
+            owner = (
+                "local"
+                if locality == ModelLocality.local
+                else next(iter(providers))
+                if len(providers) == 1
+                else "mixed"
+                if providers
+                else "unknown"
+            )
             eligible = resolution.eligible_backends()
             out.append(
                 Model(
                     id=model_id,
                     object="model",
                     # OpenAI sends an organisation here; we send the
-                    # provider. `local` when the driver didn't name one,
-                    # which is the openai_compat_http local-engine case.
-                    owned_by=sorted(providers)[0] if len(providers) == 1 else "local",
+                    # provider, but only confirmed-local models say local.
+                    owned_by=owner,
                     x_eugene_plexus=ModelRoutingInfo(
                         drivers=[b.name for b in backends],
                         backends=sorted({_backend_kind(b) for b in backends}),
@@ -2658,7 +2668,7 @@ class RoutingTable:
                         audio_output=any(takes(b.caps, _SPEAKS) for b in backends),
                         **_video_listing(backends),
                         **_image_listing(backends),
-                        locality=_locality(backends),
+                        locality=locality,
                         voices=self.voices_for(resolution),
                         voice_names=self.voice_names_for(resolution),
                         speech_formats=self.speech_formats_for(resolution) or None,

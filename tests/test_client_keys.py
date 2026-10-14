@@ -395,6 +395,44 @@ def test_no_policy_is_503_for_both_protocols_but_operator_can_repair(
     )
 
 
+@pytest.mark.parametrize("failure", ["connect", "status", "invalid", "timeout"])
+def test_policy_failure_names_its_observed_cause_on_both_doors(authed_app, client_key, failure):
+    def failed(request):
+        if failure == "connect":
+            raise httpx.ConnectError("connection refused")
+        if failure == "timeout":
+            raise httpx.ReadTimeout("")
+        if failure == "status":
+            return httpx.Response(503, json={"detail": "PRIVATE_POLICY_BODY"})
+        return httpx.Response(200, json={"revision": "PRIVATE_POLICY_BODY"})
+
+    guard = authed_app.state.client_key_guard
+    guard._client = httpx.AsyncClient(transport=httpx.MockTransport(failed))
+    expected = {
+        "connect": "ConnectError",
+        "status": "HTTP 503",
+        "invalid": "invalid key policy",
+        "timeout": "timed out",
+    }[failure]
+    with TestClient(authed_app) as client:
+        responses = [
+            client.get("/v1/models", headers={"Authorization": f"Bearer {client_key}"}),
+            client.post(
+                "/v1/messages",
+                headers={"x-api-key": client_key},
+                json={
+                    "model": FAKE_MODEL,
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            ),
+        ]
+    for response in responses:
+        assert response.status_code == 503
+        assert expected in response.text
+        assert "PRIVATE_POLICY_BODY" not in response.text
+
+
 def test_revoked_and_unknown_anthropic_keys_are_403(authed_client, client_key, agent, install):
     agent.revoke("key-1")
     body = {

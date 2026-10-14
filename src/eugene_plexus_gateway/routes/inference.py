@@ -608,6 +608,30 @@ def _wrong_surface(model: str, surfaces: Sequence[str], *, wanted: str, instead:
     )
 
 
+def _wrong_first_target(resolution: Resolution, wanted: str) -> _Failure | None:
+    """Single-model doors never cascade to another model in an alias."""
+    if not resolution.configured or not resolution.tiers:
+        return None
+    first = resolution.tiers[0]
+    surfaces = sorted(
+        {s for b in first.backends if b.public_id == first.target for s in b.surfaces}
+    )
+    if not surfaces or wanted in surfaces:
+        # No report means unavailable, not proof that this model cannot serve
+        # the surface. Keep the existing retryable 503 in that case.
+        return None
+    return _Failure(
+        code=400,
+        message=(
+            f"The alias {resolution.model!r} uses its first target {first.target!r} "
+            f"for {wanted}, but that model serves {', '.join(surfaces)} and not {wanted}. "
+            "Choose a model or first target that serves this request."
+        ),
+        error_type="invalid_request_error",
+        param="model",
+    )
+
+
 def _encode_embedding(vector: list[float], encoding_format: str | None) -> list[float] | str:
     """Floats, or the base64 the OpenAI SDKs ask for by default.
 
@@ -638,7 +662,7 @@ def _not_ready(resolution: Resolution, wake: WakeResult | None) -> _Failure:
     return _Failure(
         code=503,
         message=(
-            f"No backend serving {resolution.model!r} is ready: {detail}. "
+            f"No backend serving {resolution.model!r} is ready: {admission.as_sentence(detail)} "
             f"Runtimes: {', '.join(states) if states else 'none reported'}."
         ),
         error_type="service_unavailable",
@@ -2097,6 +2121,17 @@ async def create_embedding(request: Request, body: EmbeddingRequest, response: R
     so** (MR0): `x-eugene-plexus-ignored-settings` names each one the request
     carried. The vectors come back at the model's own width.
     """
+    # The generated model discards extra fields. Inspect the original object
+    # so an unsupported hint cannot silently change the caller's meaning.
+    raw = await request.json()
+    unknown = sorted(set(raw) - EmbeddingRequest.model_fields.keys())
+    if unknown:
+        return _error(
+            code=400,
+            message=f"Unknown embeddings field(s): {', '.join(unknown)}.",
+            error_type="invalid_request_error",
+            param=unknown[0],
+        )
     await admission.authorize(request, body.model)
     table = _routing(request)
     if table is None:
@@ -2110,6 +2145,8 @@ async def create_embedding(request: Request, body: EmbeddingRequest, response: R
     if not resolution.has_backends():
         return _no_such_model(body.model, table).as_openai()
 
+    if mismatch := _wrong_first_target(resolution, "embeddings"):
+        return mismatch.as_openai()
     surfaces = resolution.surfaces()
     if surfaces and "embeddings" not in surfaces:
         return _wrong_surface(
@@ -2578,6 +2615,8 @@ async def create_moderation(request: Request) -> Any:
     resolution = await admission.permitted(table.resolve(model))
     if not resolution.has_backends():
         return _no_such_model(model, table).as_openai()
+    if mismatch := _wrong_first_target(resolution, "moderation"):
+        return mismatch.as_openai()
     surfaces = resolution.surfaces()
     if surfaces and "moderation" not in surfaces:
         return _wrong_surface(
@@ -2758,6 +2797,8 @@ async def create_rerank(request: Request) -> Any:
     resolution = await admission.permitted(table.resolve(model))
     if not resolution.has_backends():
         return _no_such_model(model, table).as_openai()
+    if mismatch := _wrong_first_target(resolution, "rerank"):
+        return mismatch.as_openai()
     surfaces = resolution.surfaces()
     if surfaces and "rerank" not in surfaces:
         return _wrong_surface(
@@ -2932,6 +2973,8 @@ async def create_speech(request: Request) -> Any:
     resolution = await admission.permitted(table.resolve(body.model))
     if not resolution.has_backends():
         return _no_such_model(body.model, table).as_openai()
+    if mismatch := _wrong_first_target(resolution, "speech"):
+        return mismatch.as_openai()
     surfaces = resolution.surfaces()
     if surfaces and "speech" not in surfaces:
         return _wrong_surface(
@@ -3911,6 +3954,8 @@ async def create_decision(request: Request, body: SystemOneRequest) -> Any:
     if not resolution.has_backends():
         return _no_such_model(body.model, table).as_openai()
 
+    if mismatch := _wrong_first_target(resolution, "decisions"):
+        return mismatch.as_openai()
     surfaces = resolution.surfaces()
     if surfaces and "decisions" not in surfaces:
         return _wrong_surface(
@@ -5210,6 +5255,7 @@ def _driver_failure_status(e: DriverError) -> _Failure:
         return _Failure(code=422, message=str(e), error_type="repetition_detected")
     upstream = e.status_code
     detail = e.problem.detail if e.problem is not None and e.problem.detail else str(e)
+    sentence = admission.as_sentence(detail)
 
     if e.problem is not None and str(e.problem.type or "").endswith("#backend-credential-refused"):
         # **The hop past the driver, since 2026-09-28.** The provider
@@ -5224,7 +5270,7 @@ def _driver_failure_status(e: DriverError) -> _Failure:
             code=502,
             message=(
                 f"The driver {e.driver_name!r} at {e.driver_url} could not use its provider: "
-                f"{detail} That driver's key is under Config -> {e.driver_name}."
+                f"{sentence} That driver's key is under Config -> {e.driver_name}."
             ),
             error_type="upstream_auth_error",
         )
@@ -5237,7 +5283,7 @@ def _driver_failure_status(e: DriverError) -> _Failure:
         return _Failure(
             code=504,
             message=(
-                f"A backend was still working when the deadline passed: {detail} "
+                f"A backend was still working when the deadline passed: {sentence} "
                 f"It was not retried on another backend, because another backend would "
                 f"take the same time on the same prompt. Raise requestTimeoutSeconds on "
                 f"the gateway (Config -> Gateway -> Routing) if this model needs longer."
@@ -5253,7 +5299,7 @@ def _driver_failure_status(e: DriverError) -> _Failure:
             code=503,
             message=(
                 f"Every replica of this model that was tried had no room for this request "
-                f"now: {detail} Retry the request. If this happens often, give the model "
+                f"now: {sentence} Retry the request. If this happens often, give the model "
                 f"more context or another replica."
             ),
             error_type=responses.OVERLOADED,
@@ -5292,7 +5338,7 @@ def _driver_failure_status(e: DriverError) -> _Failure:
             code=502,
             message=(
                 f"The driver {e.driver_name!r} at {e.driver_url} refused the gateway's "
-                f"credential (HTTP {upstream}): {detail} Nothing is wrong with this "
+                f"credential (HTTP {upstream}): {sentence} Nothing is wrong with this "
                 f"request. {credential_refused_next_step([f'driver {e.driver_name!r}'])}"
             ),
             error_type="upstream_auth_error",

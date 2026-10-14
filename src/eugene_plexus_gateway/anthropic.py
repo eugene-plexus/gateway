@@ -247,8 +247,9 @@ async def authorize(request: Request) -> None:
     guard = getattr(request.app.state, "client_key_guard", None)
     decision = await guard.decision(payload.jti) if guard is not None else "unavailable"
     if decision == "unavailable":
+        cause = guard.unavailable_reason if guard else "No client-key policy guard is configured."
         raise Refusal(
-            "Client-key policy unavailable; check the agent/control root. "
+            f"Client-key policy unavailable: {cause} Check the agent/control root. "
             "Operator sign-in remains available.",
             status=503,
             kind="api_error",

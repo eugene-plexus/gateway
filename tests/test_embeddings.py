@@ -133,6 +133,21 @@ def test_an_empty_batch_is_refused_too(embed_client) -> None:  # type: ignore[no
 # --------------------------------------------------------------------- #
 # settings it accepts and does not honour (MR0)
 # --------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("unknown", ["input_type", "bogus"])
+def test_unknown_fields_are_refused_and_named(embed_client, unknown: str) -> None:  # type: ignore[no-untyped-def]
+    driver, client = embed_client
+    response = client.post(
+        "/v1/embeddings",
+        json={"model": "nomic-embed-text", "input": "a", unknown: "private-value"},
+    )
+    assert response.status_code == 400
+    assert unknown in response.json()["error"]["message"]
+    assert "private-value" not in response.text
+    assert driver.embed_calls == 0
+
+
 #
 # Until MR0 the contract called `dimensions` "passed through" and `user`
 # "recorded", and the door dropped both without a word. A caller asking for

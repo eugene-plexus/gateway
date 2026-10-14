@@ -274,7 +274,7 @@ class LifecycleManager:
                 status, detail = await self._client.start(agent, new.name, node=node)
                 if status != 202:
                     raise ValueError(
-                        f"{source} is stopped; {target} could not start: {detail}. "
+                        f"{source} is stopped; {target} could not start: {detail.rstrip('. ')}. "
                         f"Start {source} to restore it."
                     )
                 await self._table.refresh()
