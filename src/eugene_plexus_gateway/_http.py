@@ -54,6 +54,11 @@ import httpx
 _LOCK = threading.RLock()
 _CONTEXT: ssl.SSLContext | None = None
 
+# Retire idle connections before the common two- and five-second server
+# deadlines. This reduces close/reuse races without replaying a POST whose
+# outcome is unknown. Explicit caller limits still take precedence.
+_KEEPALIVE_SECONDS = 1.5
+
 
 def ssl_context() -> ssl.SSLContext:
     """The process-wide SSL context, built at most once.
@@ -98,6 +103,7 @@ def internal_client(**kwargs: Any) -> httpx.AsyncClient:
     supervised engine. Never routed through the user's proxy."""
     kwargs.setdefault("verify", ssl_context())
     kwargs.setdefault("trust_env", False)
+    kwargs.setdefault("limits", httpx.Limits(keepalive_expiry=_KEEPALIVE_SECONDS))
     return httpx.AsyncClient(**kwargs)
 
 
@@ -106,6 +112,7 @@ def egress_client(**kwargs: Any) -> httpx.AsyncClient:
     environment, because that is how those users reach it at all."""
     kwargs.setdefault("verify", ssl_context())
     kwargs.setdefault("trust_env", True)
+    kwargs.setdefault("limits", httpx.Limits(keepalive_expiry=_KEEPALIVE_SECONDS))
     return httpx.AsyncClient(**kwargs)
 
 
@@ -113,6 +120,7 @@ def client_for(url: str, **kwargs: Any) -> httpx.AsyncClient:
     """Whichever of the two `url` calls for."""
     kwargs.setdefault("trust_env", not is_internal(url))
     kwargs.setdefault("verify", ssl_context())
+    kwargs.setdefault("limits", httpx.Limits(keepalive_expiry=_KEEPALIVE_SECONDS))
     return httpx.AsyncClient(**kwargs)
 
 
@@ -120,6 +128,7 @@ def sync_client_for(url: str, **kwargs: Any) -> httpx.Client:
     """`client_for`, for the few synchronous call sites."""
     kwargs.setdefault("trust_env", not is_internal(url))
     kwargs.setdefault("verify", ssl_context())
+    kwargs.setdefault("limits", httpx.Limits(keepalive_expiry=_KEEPALIVE_SECONDS))
     return httpx.Client(**kwargs)
 
 
