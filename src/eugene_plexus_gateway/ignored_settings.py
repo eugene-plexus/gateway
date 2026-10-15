@@ -62,6 +62,7 @@ WIRE_NAMES: dict[str, str] = {
 #: opposite sense (`disable_parallel_tool_use: true` is `parallel_tool_calls:
 #: false`), so that is where a caller of this door looks for it.
 _MESSAGES: dict[str, str] = {
+    "reasoningEffort": "output_config.effort",
     "stop": "stop_sequences",
     "responseFormat": "output_config.format",
     "parallelToolCalls": "tool_choice.disable_parallel_tool_use",
@@ -69,6 +70,7 @@ _MESSAGES: dict[str, str] = {
 
 #: Where the Responses door's caller says it differently.
 _RESPONSES: dict[str, str] = {
+    "reasoningEffort": "reasoning.effort",
     "maxTokens": "max_output_tokens",
     "responseFormat": "text.format",
 }

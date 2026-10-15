@@ -14,6 +14,7 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -24,6 +25,7 @@ from eugene_plexus_gateway._generated.driver_models import (
     FunctionCall,
     GenerateRequest,
     GenerateResponse,
+    ReasoningEffort,
     ToolCall,
 )
 from eugene_plexus_gateway.app import create_app
@@ -146,6 +148,54 @@ def test_reasoning_effort_max_reaches_the_driver(settings: Settings) -> None:
     assert rich.calls[-1].reasoningEffort.value == "max"
 
 
+@pytest.mark.parametrize("effort", list(ReasoningEffort))
+@pytest.mark.parametrize("stream", [False, True])
+def test_unsupported_effort_is_omitted_without_restricting_routing(
+    settings: Settings, effort: ReasoningEffort, stream: bool
+) -> None:
+    plain = Rich(False, name="plain", model_id="plain")
+    rich = Rich(name="rich", model_id="rich")
+    slots = [{"model": "assistant", "targets": ["plain", "rich"]}]
+    with serve(settings, plain, rich, slots=slots) as client:
+        response = client.post(
+            "/v1/chat/completions", json=chat("assistant", reasoning_effort=effort, stream=stream)
+        )
+    assert response.status_code == 200, response.text
+    assert len(plain.calls) == 1 and not rich.calls
+    assert plain.calls[0].reasoningEffort is None
+    assert "reasoningEffort" not in (plain.calls[0].callerSettings or [])
+    assert response.headers["x-eugene-plexus-ignored-settings"] == "reasoning_effort"
+    if stream:
+        assert "[DONE]" in response.text
+
+
+@pytest.mark.parametrize("primary_takes", [False, True])
+@pytest.mark.parametrize("stream", [False, True])
+def test_effort_is_prepared_independently_for_each_fallback(
+    settings: Settings, primary_takes: bool, stream: bool
+) -> None:
+    primary = Rich(primary_takes, name="primary", model_id="primary")
+    primary.tool_calls = []  # use the fake's transport-failure path for streams too
+    primary.generate_error = httpx.ConnectError("connection refused")
+    backup = Rich(not primary_takes, name="backup", model_id="backup")
+    slots = [{"model": "assistant", "targets": ["primary", "backup"]}]
+    with serve(settings, primary, backup, slots=slots) as client:
+        response = client.post(
+            "/v1/chat/completions", json=chat("assistant", reasoning_effort="high", stream=stream)
+        )
+    assert response.status_code == 200, response.text
+    sent = backup.calls[-1]
+    assert sent.reasoningEffort == (None if primary_takes else ReasoningEffort.high)
+    assert ("reasoningEffort" in (sent.callerSettings or [])) is not primary_takes
+    # A stream's header is already sent before failover; a whole answer names its server.
+    ignored = not primary_takes if stream else primary_takes
+    assert response.headers.get("x-eugene-plexus-ignored-settings") == (
+        "reasoning_effort" if ignored else None
+    )
+    if stream:
+        assert "[DONE]" in response.text
+
+
 def test_logprobs_false_asks_for_nothing(settings: Settings) -> None:
     plain = Rich(False, name="plain", model_id="m")
     with serve(settings, plain) as client:
@@ -153,6 +203,59 @@ def test_logprobs_false_asks_for_nothing(settings: Settings) -> None:
     assert response.status_code == 200, response.text
     assert plain.calls[-1].logprobs is None
     assert "logprobs" not in (plain.calls[-1].callerSettings or [])
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("takes", [False, True])
+@pytest.mark.parametrize("effort", ["none", "low", "high", "max"])
+@pytest.mark.parametrize("door", ["responses", "messages"])
+def test_other_doors_carry_effort_and_name_unsupported_effort(
+    settings: Settings, stream: bool, takes: bool, effort: str, door: str
+) -> None:
+    driver = Rich(takes, name="d", model_id="m")
+    body = (
+        {"model": "m", "input": "hi", "reasoning": {"effort": effort}}
+        if door == "responses"
+        else {
+            "model": "m",
+            "max_tokens": 20,
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": effort},
+        }
+    )
+    body["stream"] = stream
+    with serve(settings, driver) as client:
+        response = client.post(f"/v1/{door}", json=body)
+    assert response.status_code == 200, response.text
+    assert driver.calls[-1].reasoningEffort == (ReasoningEffort(effort) if takes else None)
+    assert response.headers.get("x-eugene-plexus-ignored-settings") == (
+        None if takes else "reasoning.effort" if door == "responses" else "output_config.effort"
+    )
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("takes", [False, True])
+def test_messages_disabled_thinking_reaches_the_backend(
+    settings: Settings, stream: bool, takes: bool
+) -> None:
+    driver = Rich(takes, name="d", model_id="m")
+    with serve(settings, driver) as client:
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "m",
+                "max_tokens": 20,
+                "stream": stream,
+                "messages": [{"role": "user", "content": "hi"}],
+                "thinking": {"type": "disabled"},
+                "output_config": {"effort": "high"},
+            },
+        )
+    assert response.status_code == 200, response.text
+    assert driver.calls[-1].reasoningEffort == (ReasoningEffort.none if takes else None)
+    assert response.headers.get("x-eugene-plexus-ignored-settings") == (
+        None if takes else "thinking"
+    )
 
 
 def test_a_setting_routes_past_a_backend_that_does_not_take_it(settings: Settings) -> None:
@@ -170,7 +273,6 @@ def test_a_setting_routes_past_a_backend_that_does_not_take_it(settings: Setting
     ("field", "value"),
     [
         ("logit_bias", {"1": 5}),
-        ("reasoning_effort", "high"),
         ("verbosity", "low"),
         ("prediction", {"type": "content", "content": "x"}),
         ("web_search_options", {}),

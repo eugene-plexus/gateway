@@ -185,8 +185,13 @@ class ReasoningEffort(StrEnum):
     How much a reasoning model thinks before it answers: OpenAI's
     `reasoning_effort` (P2c, 2026-09-28). Measured on
     `openai/gpt-oss-20b` through OpenRouter: 17 reasoning tokens at
-    `low`, 275 at `high`. A setting, so it routes only to a model
-    that lists it (A2). `max` was added 2026-10-03: GPT-6 and
+    `low`, 275 at `high`. Since 2026-10-15 this is a best-effort
+    preference, not a routing constraint: forwarded where supported,
+    otherwise omitted and named in the ignored-settings header, without
+    refusing the request. An omitted value leaves the backend's default
+    in effect, including when the caller requested `none`.
+    Strata supports it through its template effort controls.
+    `max` was added 2026-10-03: GPT-6 and
     OpenRouter accept it, and a caller sending it was refused here.
 
     """
@@ -1706,7 +1711,7 @@ class ModelCapabilities(BaseModel):
     )
     rerank: bool | None = Field(
         None,
-        description='The model is a reranker: it scores how well a passage answers\na question instead of turning text into a vector (a pooling\ntype of 4, `rank`, or classifier output labels in its\nmetadata). The console says "sort results". It needs\n`--reranking` the way an embedder needs `--embeddings`, and\nthe agent starts one that way by itself (`RuntimeMode`).\n\n**The metadata can miss one.** A cross-encoder converted\nwithout either key (the gpustack bge-reranker-v2-m3 file is\none: a non-causal `bert` with a classifier head and neither\nkey) reads as `embedding`, and `ModelProfileSpec.mode` is\nhow a person says otherwise.\n',
+        description='The model is a reranker: it scores how well a passage answers\na question instead of turning text into a vector (a pooling\ntype of 4, `rank`, classifier output labels in its metadata,\nor a non-causal attention model with `cls.*` classifier\ntensors). The console says "sort results". It needs\n`--reranking` the way an embedder needs `--embeddings`, and\nthe agent starts one that way by itself (`RuntimeMode`).\n\nA classifier head identifies cross-encoders such as\nbge-reranker-v2-m3 even when neither pooling nor output-label\nmetadata is present. A conversion with none of these markers\ncan still require a `ModelProfileSpec.mode` override.\n',
     )
     vision: bool | None = Field(
         None,

@@ -162,8 +162,13 @@ class ReasoningEffort(StrEnum):
     How much a reasoning model thinks before it answers: OpenAI's
     `reasoning_effort` (P2c, 2026-09-28). Measured on
     `openai/gpt-oss-20b` through OpenRouter: 17 reasoning tokens at
-    `low`, 275 at `high`. A setting, so it routes only to a model
-    that lists it (A2). `max` was added 2026-10-03: GPT-6 and
+    `low`, 275 at `high`. Since 2026-10-15 this is a best-effort
+    preference, not a routing constraint: forwarded where supported,
+    otherwise omitted and named in the ignored-settings header, without
+    refusing the request. An omitted value leaves the backend's default
+    in effect, including when the caller requested `none`.
+    Strata supports it through its template effort controls.
+    `max` was added 2026-10-03: GPT-6 and
     OpenRouter accept it, and a caller sending it was refused here.
 
     """
@@ -3526,7 +3531,7 @@ class Capabilities(BaseModel):
     )
     settingsNotHonoured: list[SettingNotHonoured] | None = Field(
         None,
-        description="Settings this backend is sent and is measured not to honour,\nby value (2026-10-12, `docs/design/tools-assumed.md`). A\nmeasured gap is named, not refused, so these are in\n`supportedSettings` too. Static per backend, so the gateway\nnames them on its own `x-eugene-plexus-ignored-settings`\nbefore a stream opens, without waiting for this driver's\nper-request header. Absent or empty: everything carried is\nhonoured. Strata lists `toolChoice` with `required` and\n`function` (it honours `auto`; `none` this driver honours by\nsending no tools) and `parallelToolCalls` with `false`.\n",
+        description="Settings, by value, that this backend does not honour though\nthe request is served (2026-10-12, `docs/design/tools-assumed.md`).\nEither sent and known to be ignored (Strata: measured; Ollama:\nread from its source), or not delivered because the provider\ncannot take it: Gemini's API has\nno field for `parallelToolCalls` `false`, and OpenRouter, asked\nonly for providers that take every parameter sent\n(`require_parameters`), lists no provider of the model taking\nit. A gap is named, not refused, so these are in\n`supportedSettings` too. Static per backend, so the gateway\nnames them on its own `x-eugene-plexus-ignored-settings`\nbefore a stream opens, without waiting for this driver's\nper-request header. Absent or empty: everything carried is\nhonoured. Strata lists `toolChoice` with `required` and\n`function` (it honours `auto`; `none` this driver honours by\nsending no tools) and `parallelToolCalls` with `false`.\n",
     )
     streaming: bool | None = Field(
         None, description='Whether `/v1/generate/stream` emits true incremental tokens.'
@@ -3779,7 +3784,7 @@ class GenerateRequest(BaseModel):
     )
     callerSettings: list[str] | None = Field(
         None,
-        description="A2 provenance: names of settings explicitly requested by the caller,\nusing this request's field names (maxTokens, temperature, topP, seed,\nstop, tools, toolChoice, responseFormat, topK, minP, frequencyPenalty,\npresencePenalty, parallelToolCalls; since P2c logprobs, logitBias,\nreasoningEffort, verbosity, prediction, webSearchOptions). `topLogprobs`\nrides with `logprobs`. The hints (`promptCacheKey`,\n`promptCacheRetention`, `serviceTier`, `safetyIdentifier`) are never\nlisted: a backend that cannot carry a hint drops it. The gateway preserves this\nlist on each fallback attempt. An adapter must refuse a known unsupported\nexplicit setting with 400, rather than silently dropping it. Settings\nsupplied only by profiles/defaults retain the adapter's default behavior.\nThis field is internal and is not forwarded to upstream providers.\n",
+        description="A2 provenance: names of settings explicitly requested by the caller,\nusing this request's field names (maxTokens, temperature, topP, seed,\nstop, tools, toolChoice, responseFormat, topK, minP, frequencyPenalty,\npresencePenalty, parallelToolCalls; since P2c logprobs, logitBias,\nreasoningEffort, verbosity, prediction, webSearchOptions). `topLogprobs`\nrides with `logprobs`. The hints (`promptCacheKey`,\n`promptCacheRetention`, `serviceTier`, `safetyIdentifier`) are never\nlisted: a backend that cannot carry a hint drops it. The gateway preserves this\nlist on each fallback attempt, except `reasoningEffort` when the selected\nbackend does not support it: effort is a preference, omitted and named\nin the gateway's ignored-settings header. Drivers also omit unsupported\neffort without refusing a direct request, even when this list names it.\nAn adapter must refuse other known unsupported explicit settings with 400,\nrather than silently dropping them. Settings\nsupplied only by profiles/defaults retain the adapter's default behavior.\nThis field is internal and is not forwarded to upstream providers.\n",
     )
     completion: CompletionPrompt | None = None
     messages: list[Message] = Field(

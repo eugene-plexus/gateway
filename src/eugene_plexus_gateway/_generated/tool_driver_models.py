@@ -210,8 +210,13 @@ class ReasoningEffort(StrEnum):
     How much a reasoning model thinks before it answers: OpenAI's
     `reasoning_effort` (P2c, 2026-09-28). Measured on
     `openai/gpt-oss-20b` through OpenRouter: 17 reasoning tokens at
-    `low`, 275 at `high`. A setting, so it routes only to a model
-    that lists it (A2). `max` was added 2026-10-03: GPT-6 and
+    `low`, 275 at `high`. Since 2026-10-15 this is a best-effort
+    preference, not a routing constraint: forwarded where supported,
+    otherwise omitted and named in the ignored-settings header, without
+    refusing the request. An omitted value leaves the backend's default
+    in effect, including when the caller requested `none`.
+    Strata supports it through its template effort controls.
+    `max` was added 2026-10-03: GPT-6 and
     OpenRouter accept it, and a caller sending it was refused here.
 
     """

@@ -788,15 +788,28 @@ class _Serving:
         return _not_honoured_by(getattr(self.client, "entries", {}).get(answered), self.generate)
 
 
+def _drops_reasoning_effort(entry: DriverModel | None, generate: GenerateRequest) -> bool:
+    caps = entry.capabilities if entry is not None else None
+    return generate.reasoningEffort is not None and "reasoningEffort" not in (
+        caps.supportedSettings or [] if caps is not None else []
+    )
+
+
 def _not_honoured_by(entry: DriverModel | None, generate: GenerateRequest) -> tuple[str, ...]:
     """What `generate` carries and the backend listed as `entry` does not honour.
 
-    The driver's own field names (`ignored_settings.not_honoured`): nothing for an
-    entry that is missing, has no capabilities or lists nothing.
+    Includes an effort preference omitted for a backend that does not list support.
     """
-    return ignored_settings.not_honoured(
+    names = ignored_settings.not_honoured(
         getattr(getattr(entry, "capabilities", None), "settingsNotHonoured", None), generate
     )
+    if (
+        "reasoningEffort" in (generate.callerSettings or [])
+        and _drops_reasoning_effort(entry, generate)
+        and "reasoningEffort" not in names
+    ):
+        names = (*names, "reasoningEffort")
+    return names
 
 
 async def _prepare(
@@ -1035,7 +1048,7 @@ async def _prepare(
         generate.completion = completion
         generate.messages = []
     profiles = getattr(request.app.state, "profile_defaults", None)
-    if profiles is not None and isinstance(client, TieredClient):
+    if isinstance(client, TieredClient):
         # Capture the routing snapshot that selected these candidates. A later
         # topology refresh must not join this request to a replacement driver.
         paths = {
@@ -1048,7 +1061,21 @@ async def _prepare(
         async def prepare_candidate(
             candidate: DriverClient, original: GenerateRequest
         ) -> GenerateRequest:
-            if (
+            # Shape each attempt independently, including fallbacks to older drivers
+            # that still refuse unsupported effort. Keep it for capable backends.
+            if _drops_reasoning_effort(client.entries.get(candidate), original):
+                original = original.model_copy(
+                    update={
+                        "reasoningEffort": None,
+                        "callerSettings": [
+                            name
+                            for name in (original.callerSettings or [])
+                            if name != "reasoningEffort"
+                        ]
+                        or None,
+                    }
+                )
+            if profiles is None or (
                 body.max_tokens is not None
                 and body.temperature is not None
                 and body.top_p is not None
@@ -1522,7 +1549,9 @@ async def create_anthropic_message(request: Request) -> Any:
                 body, prepared, model=body.model, display=anthropic.thinking_display(raw)
             ),
             media_type="text/event-stream",
-            headers=ignored_settings.added_to(own, prepared.not_honoured, "messages"),
+            headers=ignored_settings.added_to(
+                own, anthropic.backend_ignored(prepared.not_honoured, raw), "messages"
+            ),
         )
 
     store = _store(request)
@@ -1568,7 +1597,11 @@ async def create_anthropic_message(request: Request) -> Any:
                 web_searches=_searches_run(prepared.client) or 0,
             ),
             headers={
-                **ignored_settings.added_to(own, prepared.not_honoured_by_answer(), "messages"),
+                **ignored_settings.added_to(
+                    own,
+                    anthropic.backend_ignored(prepared.not_honoured_by_answer(), raw),
+                    "messages",
+                ),
                 **anthropic.envelope_headers(
                     _routing_info(
                         prepared.client,

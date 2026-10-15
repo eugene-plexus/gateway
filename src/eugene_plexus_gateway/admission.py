@@ -567,6 +567,8 @@ async def permitted(resolution: Any, requirements: Any = None) -> Any:
     allowed = context.allowed_models if context else None
     resolution = resolution.restricted(allowed)
     settings = set(requirements.callerSettings or []) if requirements is not None else set()
+    # Effort is a preference: a backend that cannot carry it can still answer.
+    settings.discard("reasoningEffort")
     tools = bool(requirements.tools) if requirements is not None else False
     if not (local_only() or settings or tools) or not resolution.has_backends():
         return resolution

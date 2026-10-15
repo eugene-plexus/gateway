@@ -1107,8 +1107,6 @@ def translate_request(
     if raw.get("store") is True:
         ignored.append("store")
     reasoning = _mapping(raw, "reasoning", frozenset({"effort", "summary", "generate_summary"}))
-    if reasoning.get("effort") not in (None, "none"):
-        ignored.append("reasoning.effort")
     if reasoning.get("summary") not in (None, "none") or reasoning.get("generate_summary") not in (
         None,
         "none",
@@ -1183,10 +1181,13 @@ def translate_request(
             tool_choice=_tool_choice(raw.get("tool_choice")),
             parallel_tool_calls=raw.get("parallel_tool_calls"),
             response_format=_response_format(text),
+            reasoning_effort=reasoning.get("effort"),
         )
     except ValidationError as e:
         first = e.errors(include_input=False, include_context=False)[0]
         where = ".".join(_name(p) if isinstance(p, str) else str(p) for p in first.get("loc", ()))
+        if where == "reasoning_effort":
+            where = "reasoning.effort"
         raise Refusal(f"{where or 'body'}: has an invalid value.", param=where or None) from None
 
     return Translated(

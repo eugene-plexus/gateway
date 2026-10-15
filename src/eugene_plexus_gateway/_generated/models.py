@@ -221,8 +221,13 @@ class ReasoningEffort(StrEnum):
     How much a reasoning model thinks before it answers: OpenAI's
     `reasoning_effort` (P2c, 2026-09-28). Measured on
     `openai/gpt-oss-20b` through OpenRouter: 17 reasoning tokens at
-    `low`, 275 at `high`. A setting, so it routes only to a model
-    that lists it (A2). `max` was added 2026-10-03: GPT-6 and
+    `low`, 275 at `high`. Since 2026-10-15 this is a best-effort
+    preference, not a routing constraint: forwarded where supported,
+    otherwise omitted and named in the ignored-settings header, without
+    refusing the request. An omitted value leaves the backend's default
+    in effect, including when the caller requested `none`.
+    Strata supports it through its template effort controls.
+    `max` was added 2026-10-03: GPT-6 and
     OpenRouter accept it, and a caller sending it was refused here.
 
     """
@@ -4623,7 +4628,7 @@ class ResponsesRequest(BaseModel):
     )
     reasoning: dict[str, Any] | None = Field(
         None,
-        description='`effort` and `summary` are accepted and not honoured, and are\nnamed on the ignored-settings header when set. Codex sends\nnull for a model id it does not know.\n',
+        description='`effort` is carried to supporting backends, otherwise omitted and\nnamed as `reasoning.effort` on the ignored-settings header. `summary`\nis accepted and not honoured, and named when set. Codex sends null\nfor a model id it does not know.\n',
     )
     include: list[str] | None = Field(
         None,
@@ -5176,7 +5181,7 @@ class Model(BaseModel):
     )
     owned_by: str | None = Field(
         None,
-        description='OpenAI sends an organisation here. We send the provider —\n`local`, or the cloud provider key for a subscription\nbackend.\n',
+        description='OpenAI sends an organisation here. We send `local` only when\nevery backend reports local inference, otherwise the provider\nkey when there is one, `mixed` for multiple providers, or\n`unknown` when no provider or local inference is confirmed.\n',
     )
     x_eugene_plexus: ModelRoutingInfo | None = None
 
@@ -5387,11 +5392,11 @@ class AnthropicMessagesRequest(BaseModel):
     )
     thinking: dict[str, Any] | None = Field(
         None,
-        description='**Read and dropped, never refused**, and the distinction was\nmeasured. Present on every Claude Code request, in three\nshapes: `{"budget_tokens": N, "type": "enabled"}` for a\nknown Claude id, `{"type": "adaptive"}` for an arbitrary\nlocal id, and **`null` when the caller set\n`MAX_THINKING_TOKENS=0`** — so even `"thinking" in body` is\ntrue for the one configuration asking for no thinking at\nall.\n\n**What it does decide, since 2026-09-23: whether the\nresponse carries `thinking` blocks, and whether their text\nis shown.** Non-null and not `{"type": "disabled"}` returns\nthe model\'s reasoning, when the backend reported any, as a\n`thinking` block ahead of the answer -- with the text, or\nwith the text empty and the reasoning carried in `signature`\nwhen `display` is `"omitted"`. Absent, null or disabled\nreturns none, which is Anthropic\'s own behaviour and keeps\n`content[0].text` pointing at the answer for every client\nthat never asked.\n\nWhat it does not decide: a `budget_tokens` is not enforced,\nand `disabled` hides the blocks without stopping the model\nthinking. Either is named on the ignored-settings response\nheader. The operator\'s `thinkingMode` governs what a local\nmodel actually does.\n',
+        description='**Read and dropped, never refused**, and the distinction was\nmeasured. Present on every Claude Code request, in three\nshapes: `{"budget_tokens": N, "type": "enabled"}` for a\nknown Claude id, `{"type": "adaptive"}` for an arbitrary\nlocal id, and **`null` when the caller set\n`MAX_THINKING_TOKENS=0`** — so even `"thinking" in body` is\ntrue for the one configuration asking for no thinking at\nall.\n\n**What it does decide, since 2026-09-23: whether the\nresponse carries `thinking` blocks, and whether their text\nis shown.** Non-null and not `{"type": "disabled"}` returns\nthe model\'s reasoning, when the backend reported any, as a\n`thinking` block ahead of the answer -- with the text, or\nwith the text empty and the reasoning carried in `signature`\nwhen `display` is `"omitted"`. Absent, null or disabled\nreturns none, which is Anthropic\'s own behaviour and keeps\n`content[0].text` pointing at the answer for every client\nthat never asked.\n\nA `budget_tokens` is not enforced and is named on the ignored-settings\nheader. Since 2026-10-15, `disabled` also requests effort `none`, taking\nprecedence over `output_config.effort`. Supporting backends receive\nthe control; others omit it and name `thinking` on that header.\n',
     )
     output_config: dict[str, Any] | None = Field(
         None,
-        description='**Accepted for `effort` only, and not enforced.** Claude Code\nsends `{"effort": "high"}` on every request -- measured\n2026-09-23 (2.1.207 with agent-sdk 0.3.280, beta header\n`effort-2025-11-24`), absent from the 2026-09-19 capture --\nand the unknown-field refusal A2 added turned that into a\n400 on the first request of every session: **Claude Code\ncould not use this door at all** until this field was named.\nHow hard a local model thinks is the operator\'s\n`thinkingMode`, exactly as for `thinking.budget_tokens`, so a\nnon-null value is named on the ignored-settings header.\n\n**`format` is honoured** (2026-10-03): `{"type":\n"json_schema", "schema": {...}}` becomes the chat path\'s\n`response_format` of type `json_schema`. Claude Code sends it\nfor session titles, memory recall and prompt hooks. Any other\n`format` type, a `format` without a `schema` or with a key\nbeside `type` and `schema`, and any other key, is refused\nwith a 400 naming it: it changes what the answer is, and this\ndoor does not implement it.\n',
+        description='**`effort` is carried to supporting backends.** Claude Code\nsends `{"effort": "high"}` on every request -- measured\n2026-09-23 (2.1.207 with agent-sdk 0.3.280, beta header\n`effort-2025-11-24`), absent from the 2026-09-19 capture --\nand the unknown-field refusal A2 added turned that into a\n400 on the first request of every session: **Claude Code\ncould not use this door at all** until this field was named.\nSince 2026-10-15 it uses the shared reasoning-effort preference.\nUnsupported effort is omitted and named as `output_config.effort`\non the ignored-settings header, without refusing the request.\n\n**`format` is honoured** (2026-10-03): `{"type":\n"json_schema", "schema": {...}}` becomes the chat path\'s\n`response_format` of type `json_schema`. Claude Code sends it\nfor session titles, memory recall and prompt hooks. Any other\n`format` type, a `format` without a `schema` or with a key\nbeside `type` and `schema`, and any other key, is refused\nwith a 400 naming it: it changes what the answer is, and this\ndoor does not implement it.\n',
     )
     cache_control: dict[str, Any] | None = Field(
         None,
@@ -5649,6 +5654,10 @@ class ChatCompletionMessage(BaseModel):
     content: str | MessageContent1 | None = Field(
         None,
         description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",
+    )
+    reasoning: str | None = Field(
+        None,
+        description='Request alias for `reasoning_content`, used by Hermes Agent and\nOpenRouter-compatible clients when replaying assistant turns.\nPreserved as reasoning, never merged into visible content. If both\nfields contain non-null values, they must match. Responses use\n`reasoning_content`.\n',
     )
     reasoning_content: str | None = Field(
         None,

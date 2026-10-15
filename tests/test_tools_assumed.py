@@ -444,6 +444,7 @@ def _backend(name: str = "strata", **knobs: Any) -> FakeDriverClient:
     knobs.setdefault("supports_tools", True)
     knobs.setdefault("not_honoured", STRATA_GAPS)
     fake = FakeDriverClient(name=name, model_id=knobs.pop("model_id", MODEL), **knobs)
+    fake.supported_settings.append("reasoningEffort")
     fake.responses = ["ok"]
     return fake
 
@@ -697,8 +698,8 @@ def test_the_messages_door_keeps_the_hints_it_dropped_ahead_of_the_backends(
         r = _post(client, "messages", **FORCED["messages"])
     own, backend = r.headers[HEADER].rsplit(", ", 1)
     assert backend == "tool_choice"
-    # `context_management` and an `output_config` effort are on every Claude Code request.
-    assert own.split(", ")[:2] == ["context_management", "output_config"]
+    # Effort is now carried; these remaining hints are still dropped by the door.
+    assert own.split(", ")[:2] == ["context_management", "cache_control"]
 
 
 @pytest.mark.parametrize("streamed", [False, True], ids=["whole", "streamed"])
@@ -1049,6 +1050,7 @@ def test_a_stream_opens_before_its_backends_first_frame_and_the_head_carries_the
         name="strata", model_id=MODEL, supports_tools=True, not_honoured=STRATA_GAPS
     )
     fake.responses = ["pelican"]
+    fake.supported_settings.append("reasoningEffort")
     timeline = Timeline(_app(settings, fake))
     with TestClient(timeline) as client:
         r = _post(client, door, stream=True, **FORCED[door])

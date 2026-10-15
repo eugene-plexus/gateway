@@ -104,6 +104,7 @@ def parse_request(raw: Any, *, max_images: int = DEFAULT_MAX_IMAGES) -> ChatComp
                 raise Refusal(f"stream_options.{flag}", "must be a boolean")
         if body.get("stream") is not True:
             raise Refusal("stream_options", "requires stream true")
+    _translate_reasoning(body)
     _translate_functions(body)
     # Before the schema, so `{"id": ...}` -- the shape OpenAI takes here --
     # is told why rather than which of the response's fields it lacks.
@@ -144,6 +145,34 @@ def parse_request(raw: Any, *, max_images: int = DEFAULT_MAX_IMAGES) -> ChatComp
     if parsed.top_logprobs is not None and parsed.logprobs is not True:
         raise Refusal("top_logprobs", "requires logprobs true")
     return parsed
+
+
+def _translate_reasoning(body: dict[str, Any]) -> None:
+    """Hermes echoes reasoning under OpenRouter's name after a tool call."""
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return
+    translated = []
+    for index, original in enumerate(messages):
+        if not isinstance(original, dict) or "reasoning" not in original:
+            translated.append(original)
+            continue
+        message = dict(original)
+        alias = message.pop("reasoning")
+        where = f"messages[{index}].reasoning"
+        if alias is not None:
+            if not isinstance(alias, str):
+                raise Refusal(where, "must be a string or null")
+            if message.get("role") != "assistant":
+                raise Refusal(where, "is accepted only on assistant messages")
+            canonical = message.get("reasoning_content")
+            if canonical is not None and canonical != alias:
+                raise Refusal(
+                    where, "conflicts with reasoning_content; use one field or equal values"
+                )
+            message["reasoning_content"] = alias
+        translated.append(message)
+    body["messages"] = translated
 
 
 def parse_speech(raw: Any) -> SpeechRequest:

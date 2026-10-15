@@ -46,6 +46,7 @@ from ._generated.models import (
     ImageUrl,
     InputFile,
     NamedToolChoice,
+    ReasoningEffort,
     ResponseFormat,
     ResponseJsonSchema,
     Role1,
@@ -305,8 +306,8 @@ _DROPPED_TOP_LEVEL = (
     "diagnostics",
 )
 
-# The `output_config` keys this door accepts: `effort`, named and not
-# enforced, and since 2026-10-03 `format`, honoured (see `_output_format`).
+# The `output_config` keys this door carries: `effort` as a preference,
+# and `format` as a response-format constraint (see `_output_format`).
 # Anything else changes what the answer is in a way this door cannot carry.
 _ACCEPTED_OUTPUT_CONFIG = frozenset({"effort", "format"})
 
@@ -379,17 +380,11 @@ def compatibility_headers(raw: Mapping[str, Any]) -> dict[str, str]:
         if name == "metadata" or value is None:
             return False
         if name == "output_config":
-            # `format` is honoured; only an effort goes unenforced.
-            return not isinstance(value, Mapping) or value.get("effort") is not None
+            return False  # format and effort are carried to the shared chat path
         if name != "thinking":
             return True
-        # `thinking` decides whether reasoning is returned and whether its
-        # text is shown, and both are honoured. What is not: a token budget,
-        # and `disabled` as an instruction to the model -- the model thinks
-        # regardless, and only the operator's `thinkingMode` changes that.
-        return not isinstance(value, Mapping) or (
-            value.get("budget_tokens") is not None or value.get("type") == "disabled"
-        )
+        # A budget has no exact equivalent in the shared driver contract.
+        return not isinstance(value, Mapping) or value.get("budget_tokens") is not None
 
     ignored = [name for name in _DROPPED_TOP_LEVEL if not_honoured(name)]
 
@@ -410,6 +405,32 @@ def compatibility_headers(raw: Mapping[str, Any]) -> dict[str, str]:
 
 
 _MAX_STOP_SEQUENCES = 4
+
+
+def effort_field(raw: Mapping[str, Any]) -> str:
+    thinking = raw.get("thinking")
+    return (
+        "thinking"
+        if isinstance(thinking, Mapping) and thinking.get("type") == "disabled"
+        else "output_config.effort"
+    )
+
+
+def _effort(raw: Mapping[str, Any]) -> ReasoningEffort | None:
+    if effort_field(raw) == "thinking":
+        return ReasoningEffort.none
+    config = raw.get("output_config")
+    value = config.get("effort") if isinstance(config, Mapping) else None
+    if value is None:
+        return None
+    try:
+        return ReasoningEffort(value)
+    except (ValueError, TypeError):
+        raise Refusal("output_config.effort: has an invalid value.") from None
+
+
+def backend_ignored(names: tuple[str, ...], raw: Mapping[str, Any]) -> tuple[str, ...]:
+    return tuple(effort_field(raw) if name == "reasoningEffort" else name for name in names)
 
 
 def _validation_refusal(exc: ValidationError) -> Refusal:
@@ -826,8 +847,7 @@ def translate_request(
             if key not in _ACCEPTED_OUTPUT_CONFIG:
                 raise Refusal(
                     f"output_config.{chat_contract._field_name(str(key))}: unsupported "
-                    "setting. Only `effort` (accepted and not enforced: the model's settings "
-                    "profile governs how it thinks) and a `json_schema` `format` are "
+                    "setting. Only `effort` and a `json_schema` `format` are "
                     "accepted here."
                 )
         response_format = _output_format(output_config.get("format"))
@@ -988,6 +1008,7 @@ def translate_request(
         tool_choice=_tool_choice(body.tool_choice),
         parallel_tool_calls=_parallel_tool_calls(body.tool_choice),
         response_format=response_format,
+        reasoning_effort=_effort(raw),
     )
 
 

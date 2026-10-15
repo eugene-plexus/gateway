@@ -180,14 +180,17 @@ def test_a_developer_message_reaches_the_backend_as_system_in_place(settings: Se
     )
 
 
-def test_an_assistant_turn_hands_its_reasoning_back_to_the_driver(settings: Settings) -> None:
+@pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
+def test_an_assistant_turn_hands_its_reasoning_back_to_the_driver(
+    settings: Settings, field: str
+) -> None:
     fake = _fake(responses=["It is snowing."])
     messages = [
         {"role": "user", "content": "Weather in Oslo?"},
         {
             "role": "assistant",
             "content": None,
-            "reasoning_content": THOUGHT,
+            field: THOUGHT,
             "tool_calls": [
                 {
                     "id": "c1",
@@ -205,6 +208,40 @@ def test_an_assistant_turn_hands_its_reasoning_back_to_the_driver(settings: Sett
     sent = fake.calls[-1].messages
     assert sent[1].reasoning == THOUGHT
     assert sent[0].reasoning is None and sent[2].reasoning is None
+
+
+@pytest.mark.parametrize("alias", [None, "", THOUGHT])
+def test_equal_or_null_reasoning_aliases_preserve_the_text(
+    settings: Settings, alias: str | None
+) -> None:
+    fake = _fake(responses=["4"])
+    message = {"role": "assistant", "content": "hi", "reasoning": alias, "reasoning_content": alias}
+    with TestClient(_app(settings, fake)) as client:
+        r = client.post("/v1/chat/completions", json=_chat(messages=[message]))
+    assert r.status_code == 200, r.text
+    assert fake.calls[-1].messages[0].reasoning == alias
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"reasoning": {"text": "SECRET"}},
+        {"reasoning": 7},
+        {"reasoning": "SECRET", "reasoning_content": "different"},
+        {"role": "user", "reasoning": "SECRET"},
+    ],
+)
+def test_invalid_reasoning_alias_names_the_original_field(settings: Settings, extra: dict) -> None:
+    fake = _fake(responses=["4"])
+    with TestClient(_app(settings, fake)) as client:
+        r = client.post(
+            "/v1/chat/completions",
+            json=_chat(messages=[{"role": "assistant", "content": "hi", **extra}]),
+        )
+    assert r.status_code == 400
+    assert r.json()["error"]["param"] == "messages[0].reasoning"
+    assert "SECRET" not in r.text
+    assert not fake.calls
 
 
 def test_reasoning_content_on_a_user_message_is_refused_by_name(settings: Settings) -> None:
@@ -649,7 +686,7 @@ def test_output_config_effort_is_accepted_and_disclosed(settings: Settings) -> N
 
     assert r.status_code == 200, r.text
     ignored = r.headers.get("x-eugene-plexus-ignored-settings", "").split(", ")
-    assert "output_config" in ignored
+    assert "output_config.effort" in ignored
 
 
 @pytest.mark.parametrize(
@@ -719,7 +756,7 @@ def test_output_config_format_is_the_chat_paths_json_schema(
     # The format is honoured, so only an effort makes `output_config` an
     # ignored setting.
     ignored = r.headers.get("x-eugene-plexus-ignored-settings", "").split(", ")
-    assert ("output_config" in ignored) is (effort is not None)
+    assert ("output_config.effort" in ignored) is (effort is not None)
 
 
 def test_count_tokens_counts_a_request_with_an_output_format(settings: Settings) -> None:
