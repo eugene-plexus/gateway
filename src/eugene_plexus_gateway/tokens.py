@@ -519,6 +519,8 @@ class Claims:
     act: str | None = None
     """On an exchanged session: the machine that asked, `node:<name>`."""
     administration_version: int | None = None
+    browser_session: str | None = None
+    """Optional parent shared sign-in for a named administration token."""
     sid: str | None = None
     """On an exchanged session: the `jti` of the session it came from."""
 
@@ -668,6 +670,14 @@ def verify(
     _check_grants(key, str(typ), sub, aud)
     _check_lifetime(str(typ), iss, aud, exp - iat, act_claim)
 
+    browser_session = claims.get("eugene_browser_session")
+    if browser_session is not None and (
+        typ != TYP_ADMINISTRATION
+        or not isinstance(browser_session, str)
+        or len(browser_session) != 64
+        or any(c not in "0123456789abcdef" for c in browser_session)
+    ):
+        raise TokenError("invalid browser sign-in binding")
     administration_version = None
     if typ == TYP_ADMINISTRATION:
         administration_version = claims.get("administration_version")
@@ -700,4 +710,5 @@ def verify(
         act=act,
         sid=sid_claim,
         administration_version=administration_version,
+        browser_session=browser_session,
     )
