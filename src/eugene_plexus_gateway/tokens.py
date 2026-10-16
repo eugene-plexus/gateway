@@ -52,6 +52,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey,
 log = logging.getLogger(__name__)
 
 TYP_SESSION = "ep-session+jwt"
+TYP_ADMINISTRATION = "ep-administration+jwt"
+ADMINISTRATION_TTL_SECONDS = 3600
 TYP_SERVICE = "ep-service+jwt"
 TYP_CLIENT = "ep-client+jwt"
 TYP_BUNDLE = "ep-trust-bundle+jwt"
@@ -516,6 +518,7 @@ class Claims:
     jti: str
     act: str | None = None
     """On an exchanged session: the machine that asked, `node:<name>`."""
+    administration_version: int | None = None
     sid: str | None = None
     """On an exchanged session: the `jti` of the session it came from."""
 
@@ -559,7 +562,7 @@ def _aud(claims: Mapping[str, Any]) -> tuple[str, ...]:
 def _check_grants(key: TrustKey, typ: str, sub: str, aud: tuple[str, ...]) -> None:
     if GRANT_AUTHORITY in key.grants:
         return
-    if typ in (TYP_SESSION, TYP_CLIENT):
+    if typ in (TYP_SESSION, TYP_CLIENT, TYP_ADMINISTRATION):
         raise TokenError(f"{key.issuer} may not issue a {typ}: only the authority mints one")
     if GRANT_NODE not in key.grants:
         if GRANT_FILES in key.grants:
@@ -592,7 +595,9 @@ def _check_grants(key: TrustKey, typ: str, sub: str, aud: tuple[str, ...]) -> No
 
 
 def _check_lifetime(typ: str, iss: str, aud: tuple[str, ...], lifetime: int, act: Any) -> None:
-    if typ == TYP_SESSION:
+    if typ == TYP_ADMINISTRATION:
+        limit = ADMINISTRATION_TTL_SECONDS
+    elif typ == TYP_SESSION:
         limit = MAX_EXCHANGED_SECONDS if act is not None else MAX_SESSION_SECONDS
     elif typ == TYP_CLIENT:
         limit = MAX_CLIENT_SECONDS
@@ -663,7 +668,19 @@ def verify(
     _check_grants(key, str(typ), sub, aud)
     _check_lifetime(str(typ), iss, aud, exp - iat, act_claim)
 
-    if typ == TYP_SESSION:
+    administration_version = None
+    if typ == TYP_ADMINISTRATION:
+        administration_version = claims.get("administration_version")
+        if (
+            iss != ISSUER_CONTROL
+            or aud != (RECIPIENT_CONTROL,)
+            or sub == SUB_OPERATOR
+            or type(administration_version) is not int
+            or administration_version < 0
+            or sid_claim is not None
+        ):
+            raise TokenError("invalid administration session")
+    if typ in (TYP_SESSION, TYP_ADMINISTRATION):
         if jti in bundle.revoked_sessions or (sid_claim and sid_claim in bundle.revoked_sessions):
             raise TokenError("this session was signed out")
         if GRANT_AUTHORITY in key.grants and iss == ISSUER_CONTROL:
@@ -682,4 +699,5 @@ def verify(
         jti=jti,
         act=act,
         sid=sid_claim,
+        administration_version=administration_version,
     )
