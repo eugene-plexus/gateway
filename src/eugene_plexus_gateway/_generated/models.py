@@ -4842,6 +4842,12 @@ class MetricRequest(BaseModel):
     clientKeyName: str | None = Field(
         None, description='Registry name captured for this request.'
     )
+    personId: str | None = Field(
+        None, description='Stable person subject verified by the control root'
+    )
+    appClientId: str | None = Field(
+        None, description="Registered app bound to the person's proof."
+    )
     startedAt: AwareDatetime
     requestedModel: str
     servedModel: str | None = Field(

@@ -61,6 +61,16 @@ class Action(StrEnum):
     release = 'release'
 
 
+class Purpose(StrEnum):
+    """
+    Logs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.
+    """
+
+    inference = 'inference'
+    logs = 'logs'
+    catalog = 'catalog'
+
+
 class ClientAdmissionRequest(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -68,7 +78,17 @@ class ClientAdmissionRequest(BaseModel):
     action: Action
     keyId: str = Field(..., max_length=128, min_length=1)
     requestId: str = Field(..., max_length=128, min_length=1)
+    purpose: Purpose | None = Field(
+        'inference',
+        description='Logs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.',
+    )
     model: str | None = Field(None, max_length=256, min_length=1)
+    personToken: str | None = Field(
+        None,
+        description='Root-issued OIDC access token carried alongside the app key in\nX-Eugene-Person-Token. The root checks its signature, session,\ncurrent person access and exact registered app owner on every check,\nacquisition and renewal. Required for app:workbench@ keys. Never\npersist or log this token. A standalone authority refuses it.\n',
+        max_length=16384,
+        min_length=1,
+    )
 
 
 class ClientAdmissionResult(BaseModel):
@@ -77,6 +97,10 @@ class ClientAdmissionResult(BaseModel):
     )
     keyId: str
     keyName: str
+    personId: str | None = Field(
+        None, description='Stable subject verified by the root'
+    )
+    appClientId: str | None = None
     limits: ClientKeyLimits | None = None
     leaseSeconds: float | None = Field(None, gt=0.0, le=30.0)
 

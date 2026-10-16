@@ -56,6 +56,10 @@ class ClientRequest:
         self.id = str(uuid.uuid4())
         self.key_id: str | None = None
         self.key_name: str | None = None
+        self.person_id: str | None = None
+        self.app_client_id: str | None = None
+        self.person_token: str | None = None
+        self.purpose = "inference"
         self.model: str | None = None
         self.streamed = False
         self.recorded = False
@@ -104,7 +108,9 @@ class ClientRequest:
                         "action": action,
                         "keyId": self.key_id,
                         "requestId": self.id,
+                        **({"purpose": self.purpose} if self.purpose != "inference" else {}),
                         **({"model": self.model} if self.model else {}),
+                        **({"personToken": self.person_token} if self.person_token else {}),
                     }
                 )
             if response.status_code >= 400:
@@ -116,8 +122,16 @@ class ClientRequest:
                 answered = response.status_code
                 status = answered if answered in (401, 403, 409, 429) else 503
                 message = {
-                    401: "This client key is unregistered, expired or revoked.",
-                    403: "This client key does not permit the requested model.",
+                    401: (
+                        "The app key or person's sign-in is invalid, expired or revoked."
+                        if self.person_token
+                        else "This client key is unregistered, expired or revoked."
+                    ),
+                    403: (
+                        "The person or app does not have access to this request."
+                        if self.person_token
+                        else "This client key does not permit the requested model."
+                    ),
                     409: "Request permissions or reservation changed; start a new request.",
                     429: "This key's shared concurrency or request-rate limit is reached. "
                     "Wait or cancel an active request; switching gateways does not add allowance.",
@@ -132,6 +146,14 @@ class ClientRequest:
             result = ClientAdmissionResult.model_validate(response.json())
             if result.keyId != self.key_id:
                 raise ValueError("authority returned another key")
+            if action != "release":
+                if self.person_token and (not result.personId or not result.appClientId):
+                    raise ValueError("authority did not verify the person")
+                if self.person_id and (
+                    result.personId != self.person_id or result.appClientId != self.app_client_id
+                ):
+                    raise ValueError("authority changed the person")
+                self.person_id, self.app_client_id = result.personId, result.appClientId
             if action in ("acquire", "renew"):
                 if not result.leaseSeconds:
                     raise ValueError("no reservation duration")
@@ -151,6 +173,28 @@ class ClientRequest:
 
     async def authorize(self, request: Request, model: str | None, streamed: bool = False) -> None:
         self.model, self.streamed = model, streamed
+        operation = request.headers.getlist("x-eugene-app-operation")
+        if operation:
+            if (
+                operation != ["catalog"]
+                or model is not None
+                or request.url.path != "/v1/models"
+                or request.headers.get("x-eugene-person-token")
+            ):
+                raise AdmissionFailure(
+                    403, "App catalog access only lists models; it cannot run them."
+                )
+            self.purpose = "catalog"
+        presented = request.headers.getlist("x-eugene-person-token")
+        if presented:
+            if (
+                self.key_id is None
+                or len(presented) != 1
+                or not presented[0]
+                or len(presented[0]) > 16384
+            ):
+                raise AdmissionFailure(401, "A person token must accompany exactly one app key.")
+            self.person_token = presented[0]
         if self.key_id is None:
             return
         self.guard = getattr(request.app.state, "client_key_guard", None)
@@ -211,6 +255,8 @@ class ClientRequest:
                 else None,
                 client_key_id=self.key_id,
                 client_key_name=self.key_name,
+                person_id=self.person_id,
+                app_client_id=self.app_client_id,
                 request_id=self.id,
                 elapsed_ms=int((time.perf_counter() - self.started) * 1000),
             )

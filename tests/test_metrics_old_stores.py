@@ -1,17 +1,15 @@
-"""A metrics store an older build wrote is kept aside whole, and a fresh one starts.
+"""Released v12 history migrates in place; older alpha and future files are kept aside.
 
-v0.1.0 already wrote this build's schema (12), so no file that release or a
-later one wrote needs migrating. The alphas wrote 2 to 11, and were migrated
-in place by a branch that is gone: a file of any other schema now takes the
-one path a build has for a version it does not write, which renames the file
-aside (`metrics.v<N>.bak`, history readable in it) and starts fresh.
+Schema 13 adds person attribution to the released schema 12 without losing
+dashboard history. Other schemas retain the prior backup-and-reset behavior
+(`metrics.v<N>.bak`, history readable in it).
 
 **The fixtures are real files of the old formats.** Schema 2 is the DDL of the
 build that introduced it (gateway `7cf5640`, 2026-09-10), copied from that
 commit, with rows written as that build wrote them. Schema 11 (`601f4c7`) has
-the DDL this build has: 12 (`2a2be9c`) added a value to a column and no
-column, which `git diff 601f4c7 2a2be9c` on the DDL shows empty, so `_DDL` is
-the real v11 file. Schema 13 is a build newer than this one.
+the same DDL as 12 (`2a2be9c`), which added a value to a column and no column.
+Removing the two attribution columns from today's `_DDL` reproduces it.
+Schema 14 represents a build newer than this one.
 
 The cases: each such file is set aside whole and its history is readable
 there; nothing old is read back; a second start opens the fresh file in place
@@ -124,6 +122,11 @@ CREATE TABLE IF NOT EXISTS rollup (
 """
 
 
+V12_DDL = _DDL.replace("    person_id        TEXT,\n", "").replace(
+    "    app_client_id    TEXT,\n", ""
+)
+
+
 def build_old_store(path: Path, version: str) -> None:
     """A store as the build of that schema left it, with one served request."""
     conn = sqlite3.connect(path)
@@ -142,7 +145,7 @@ def build_old_store(path: Path, version: str) -> None:
             " 800, 1, NULL, 790)"
         )
     else:
-        conn.executescript(_DDL)
+        conn.executescript(V12_DDL if version in ("11", "12") else _DDL)
         conn.execute(
             "INSERT INTO request (started_at, requested_model, served_model, attempts, tier,"
             " total_ms, outcome, affinity) VALUES ('2026-10-01T10:00:00Z', 'qwen', 'qwen', 1,"
@@ -183,7 +186,33 @@ def a_request() -> RequestRow:
     )
 
 
-@pytest.mark.parametrize("version", ["2", "11", "13"])
+async def test_released_v12_history_is_preserved_when_person_attribution_is_added(tmp_path):
+    path = tmp_path / "metrics.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(V12_DDL)
+        conn.execute("INSERT INTO meta VALUES ('schema_version', '12')")
+        conn.execute(
+            "INSERT INTO request (started_at, requested_model, attempts, total_ms, outcome) "
+            "VALUES (?, 'old-history', 1, 9, 'served')",
+            (datetime.now(UTC).isoformat(),),
+        )
+    store = MetricsStore(path)
+    await store.start()
+    row = a_request()
+    row.person_id, row.app_client_id = "ada", "workbench"
+    store.record(row)
+    await store.aclose()
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT requested_model, person_id, app_client_id FROM request ORDER BY id"
+        ).fetchall() == [
+            ("old-history", None, None),
+            ("new", "ada", "workbench"),
+        ]
+    assert not list(tmp_path.glob("*.bak"))
+
+
+@pytest.mark.parametrize("version", ["2", "11", "14"])
 async def test_a_store_of_another_schema_is_kept_aside_whole(
     tmp_path: Path, version: str, caplog: pytest.LogCaptureFixture
 ) -> None:

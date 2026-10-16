@@ -50,7 +50,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # Bounded because the alternative to dropping rows is stalling
 # completions, and that trade is never worth making. Sized so a burst
@@ -186,6 +186,8 @@ class RequestRow:
     candidates: list[CandidateRow] = field(default_factory=list)
     client_key_id: str | None = None
     client_key_name: str | None = None
+    person_id: str | None = None
+    app_client_id: str | None = None
     request_id: str | None = None
     elapsed_ms: int | None = None
     # v7 (P3b): the door, and the unit a door that is not token-shaped is
@@ -230,6 +232,8 @@ CREATE TABLE IF NOT EXISTS request (
     strategy          TEXT,
     client_key_id     TEXT,
     client_key_name   TEXT,
+    person_id        TEXT,
+    app_client_id    TEXT,
     correlation_id    TEXT,
     elapsed_ms        INTEGER,
     door              TEXT,
@@ -406,18 +410,22 @@ class MetricsStore:
         conn.commit()
 
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        # **Only the current schema is read.** v0.1.0 already wrote 12, so no
-        # file that release or a later one wrote needs migrating. A file from
-        # before it (an alpha: 2 to 11) is not migrated in place any more: it
-        # is kept aside whole, as a file from a build that writes a newer
-        # schema is, and a fresh store starts. What was measured then stays
-        # readable in the kept file.
+        # The released v12 store gains nullable person attribution in place.
+        # Alpha schemas and unknown future schemas remain kept aside whole.
         if row is None:
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
             conn.commit()
+        elif int(row[0]) == 12:
+            # U3 adds attribution without discarding the existing dashboard history.
+            with conn:
+                conn.execute("ALTER TABLE request ADD COLUMN person_id TEXT")
+                conn.execute("ALTER TABLE request ADD COLUMN app_client_id TEXT")
+                conn.execute(
+                    "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),)
+                )
         elif int(row[0]) != SCHEMA_VERSION:
             # A version this build does not write: rename the file aside
             # and start fresh rather than refuse to boot. Metrics are
@@ -555,9 +563,9 @@ class MetricsStore:
                     " completion_tokens, outcome, routing_ms, refreshed, strategy,"
                     " client_key_id, client_key_name, correlation_id, elapsed_ms,"
                     " door, characters, audio_seconds, images, video_seconds,"
-                    " cached_tokens, affinity)"
+                    " cached_tokens, affinity, person_id, app_client_id)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-                    " ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         _iso(row.started_at),
                         row.requested_model,
@@ -585,6 +593,8 @@ class MetricsStore:
                         row.video_seconds,
                         row.cached_tokens,
                         row.affinity,
+                        row.person_id,
+                        row.app_client_id,
                     ),
                 )
                 request_id = cursor.lastrowid
@@ -1080,7 +1090,7 @@ class MetricsStore:
                        completion_tokens, outcome, routing_ms, refreshed, strategy,
                        client_key_id, client_key_name, correlation_id, elapsed_ms,
                        door, characters, audio_seconds, images, video_seconds,
-                       cached_tokens, affinity
+                       cached_tokens, affinity, person_id, app_client_id
                 FROM request r {clause}
                 ORDER BY id DESC LIMIT ?
                 """,
@@ -1233,6 +1243,8 @@ class MetricsStore:
                 "videoSeconds": r[24],
                 "cachedTokens": r[25],
                 "affinity": r[26],
+                "personId": r[27],
+                "appClientId": r[28],
                 "tries": tries[r[0]],
                 "candidates": considered[r[0]],
                 **_tool_lists(searched[r[0]]),

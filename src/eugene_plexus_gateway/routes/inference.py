@@ -308,6 +308,8 @@ def _record(
                 candidates=considered,
                 client_key_id=context.key_id if context else None,
                 client_key_name=context.key_name if context else None,
+                person_id=context.person_id if context else None,
+                app_client_id=context.app_client_id if context else None,
                 request_id=context.id if context else None,
                 elapsed_ms=int((time.perf_counter() - context.started) * 1000) if context else None,
                 door=door,
