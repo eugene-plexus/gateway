@@ -401,6 +401,10 @@ def compatibility_headers(raw: Mapping[str, Any]) -> dict[str, str]:
         has_cache(raw.get(name)) for name in ("system", "messages", "tools")
     ):
         ignored.append("cache_control")
+    # MR9a: a local model cannot say which of a search result's blocks it
+    # drew on, so no `search_result_location` comes back; named, not faked.
+    if any(_citations_enabled(b) for b in _search_result_blocks(raw.get("messages"))):
+        ignored.append("citations")
     return {"x-eugene-plexus-ignored-settings": ", ".join(ignored)} if ignored else {}
 
 
@@ -528,18 +532,99 @@ def _system_text(system: Any) -> str | None:
     return "\n\n".join(p for p in parts if p) or None
 
 
-def _tool_result_text(block: Any) -> str:
+class _Numbering:
+    """Search results numbered as Anthropic numbers them (MR9a).
+
+    `search_result_index` counts every `search_result` block in the
+    request, in order, across messages and tool results alike, so the
+    walk that meets them in that order hands out the numbers. The model
+    is shown one more than the index: "[Search result 1]" is index 0.
+    """
+
+    def __init__(self) -> None:
+        self.count = 0
+
+    def next(self) -> int:
+        self.count += 1
+        return self.count
+
+
+def _search_result_blocks(messages: Any) -> list[Mapping[str, Any]]:
+    """Every `search_result` block in a raw request, in request order."""
+    found: list[Mapping[str, Any]] = []
+    for turn in messages if isinstance(messages, list) else ():
+        content = turn.get("content") if isinstance(turn, Mapping) else None
+        for block in content if isinstance(content, list) else ():
+            if not isinstance(block, Mapping):
+                continue
+            if block.get("type") == "search_result":
+                found.append(block)
+            elif block.get("type") == "tool_result" and isinstance(block.get("content"), list):
+                found.extend(
+                    inner
+                    for inner in block["content"]
+                    if isinstance(inner, Mapping) and inner.get("type") == "search_result"
+                )
+    return found
+
+
+def _citations_enabled(block: Mapping[str, Any]) -> bool:
+    citations = block.get("citations")
+    return isinstance(citations, Mapping) and citations.get("enabled") is True
+
+
+def _search_result_text(block: Any, where: str, numbering: _Numbering) -> str:
+    """A `search_result` block as text the model reads, numbered (MR9a).
+
+    **Dropped silently until MR9a**: no branch read it, so a RAG client's
+    passages never reached the model and the answer read as if they had.
+    No backend here takes the block itself, so every one is given its
+    words, with the source and title Anthropic's own model is shown. The
+    checks are upstream's, so a request refused there is refused here.
+    """
+    source, title, content = (_field(block, k) for k in ("source", "title", "content"))
+    if not isinstance(source, str) or not source:
+        raise Refusal(
+            f"{where}.source: a search result needs a source, a URL or any stable identifier."
+        )
+    if not isinstance(title, str):
+        raise Refusal(f"{where}.title: a search result needs a title.")
+    if not isinstance(content, list) or not content:
+        raise Refusal(f"{where}.content: a search result needs a list of text blocks.")
+    texts: list[str] = []
+    for i, inner in enumerate(content):
+        text = _field(inner, "text")
+        if _field(inner, "type") != "text" or not isinstance(text, str) or not text:
+            raise Refusal(
+                f"{where}.content.{i}: a search result holds text blocks only, each with text."
+            )
+        texts.append(text)
+    number = numbering.next()
+    label = f"{title} ({source})" if title else source
+    words = "\n\n".join(texts)
+    return f"[Search result {number}: {label}]\n{words}\n[End of search result {number}]"
+
+
+def _tool_result_text(block: Any, where: str = "", numbering: _Numbering | None = None) -> str:
     """A tool result as the text an OpenAI `tool` message carries.
 
     `is_error` is carried into the text rather than dropped: a harness
     that cannot see that its own tool failed will call it again, which
-    is the looping symptom in miniature.
+    is the looping symptom in miniature. A `search_result` a tool
+    returned is its words, numbered across the request (MR9a).
     """
     content = _field(block, "content")
     if isinstance(content, str):
         text = content
     elif isinstance(content, list):
-        text = "\n".join(str(_field(b, "text") or "") for b in content if _field(b, "text"))
+        numbering = numbering or _Numbering()
+        pieces: list[str] = []
+        for i, inner in enumerate(content):
+            if _field(inner, "type") == "search_result":
+                pieces.append(_search_result_text(inner, f"{where}.content.{i}", numbering))
+            elif _field(inner, "text"):
+                pieces.append(str(_field(inner, "text")))
+        text = "\n".join(pieces)
     else:
         text = ""
     if _field(block, "is_error"):
@@ -715,6 +800,81 @@ def _parallel_tool_calls(choice: Any) -> bool | None:
     return None if disable is None else not disable
 
 
+#: Anthropic's memory tool (MR9a). Client-side by definition: the API adds
+#: the protocol text below and the model asks for file operations under
+#: `/memories`, which the caller runs on its own storage.
+MEMORY_TOOL = "memory_20250818"
+
+#: What Anthropic's API adds to the system prompt when the tool is
+#: present, word for word as its documentation gives it (read 2026-10-18).
+MEMORY_PROTOCOL = (
+    "IMPORTANT: ALWAYS VIEW YOUR MEMORY DIRECTORY BEFORE DOING ANYTHING ELSE.\n"
+    "MEMORY PROTOCOL:\n"
+    "1. Use the `view` command of your `memory` tool to check for earlier progress.\n"
+    "2. ... (work on the task) ...\n"
+    "   - As you make progress, record status / progress / thoughts etc in your memory.\n"
+    "ASSUME INTERRUPTION: Your context window might be reset at any moment, so you risk "
+    "losing any progress that is not recorded in your memory directory."
+)
+
+_MEMORY_DESCRIPTION = (
+    "Your memory: a directory of files under /memories that is kept between conversations. "
+    "Commands: `view` (path; optional view_range [start, end], end -1 for the rest) lists a "
+    "directory two levels deep or shows a file with line numbers; `create` (path, file_text) "
+    "creates or overwrites a file; `str_replace` (path, old_str, new_str) replaces text that "
+    "appears exactly once; `insert` (path, insert_line, insert_text) inserts text after a "
+    "line, 0 for the start; `delete` (path) deletes a file or directory; `rename` (old_path, "
+    "new_path) renames or moves one. Every path starts with /memories, and /memories itself "
+    "cannot be deleted or renamed. Keep the directory organised: update, rename or delete "
+    "files rather than adding new ones."
+)
+
+#: Flat rather than one schema per command: a backend's tool grammar
+#: follows `properties` and `required` everywhere, and the six commands'
+#: fields never collide.
+_MEMORY_FUNCTION = Tool(
+    type="function",
+    function=FunctionDefinition(
+        name="memory",
+        description=_MEMORY_DESCRIPTION,
+        parameters={
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "enum": ["view", "create", "str_replace", "insert", "delete", "rename"],
+                },
+                "path": {"type": "string", "description": "A path under /memories."},
+                "view_range": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "minItems": 2,
+                    "maxItems": 2,
+                    "description": "view: [start_line, end_line], 1-based; -1 ends at the end.",
+                },
+                "file_text": {"type": "string", "description": "create: the file's text."},
+                "old_str": {"type": "string", "description": "str_replace: the text to replace."},
+                "new_str": {"type": "string", "description": "str_replace: its replacement."},
+                "insert_line": {
+                    "type": "integer",
+                    "description": "insert: the line to insert after; 0 for the start.",
+                },
+                "insert_text": {"type": "string", "description": "insert: the text."},
+                "old_path": {"type": "string", "description": "rename: the path to move."},
+                "new_path": {"type": "string", "description": "rename: where it goes."},
+            },
+            "required": ["command"],
+        },
+    ),
+)
+
+
+def _offers_memory(tools: Any) -> bool:
+    return isinstance(tools, list) and any(
+        _field(t, "type") == MEMORY_TOOL for t in tools if t is not None
+    )
+
+
 def _tools(definitions: Any) -> list[Tool] | None:
     """Anthropic tool definitions in OpenAI's function shape.
 
@@ -732,6 +892,26 @@ def _tools(definitions: Any) -> list[Tool] | None:
     for definition in definitions:
         server_side = getattr(definition, "type", None)
         if server_side and server_tools.ANTHROPIC_TOOL.match(str(server_side)):
+            continue
+        if server_side == MEMORY_TOOL:
+            # Anthropic-defined but client-run (MR9a): the model asks, the
+            # caller's own handler acts on its own `/memories`. So it is a
+            # function here, and its call goes back as the `tool_use` named
+            # `memory` that Anthropic itself returns.
+            if definition.name != "memory":
+                raise Refusal(
+                    f"tools: the {MEMORY_TOOL} tool must be named 'memory', as Anthropic "
+                    f"requires; it was named {definition.name!r}."
+                )
+            if any(
+                getattr(other, "name", None) == "memory" and other is not definition
+                for other in definitions
+            ):
+                raise Refusal(
+                    "tools: two tools are named 'memory'. The memory tool takes that name; "
+                    "rename your own function."
+                )
+            out.append(_MEMORY_FUNCTION)
             continue
         if server_side:
             # `Input tag '<type>'` is Anthropic's own wording for a tool type
@@ -782,7 +962,10 @@ def search_plan(raw: Mapping[str, Any]) -> server_tools.SearchPlan | None:
     )
     if search is None:
         return None
-    functions = [t for t in tools if isinstance(t, Mapping) and not t.get("type")]
+    # The memory tool is the caller's to run, so it counts as one of theirs.
+    functions = [
+        t for t in tools if isinstance(t, Mapping) and t.get("type") in (None, "", MEMORY_TOOL)
+    ]
     return server_tools.plan_from_anthropic(search, has_functions=bool(functions))
 
 
@@ -869,12 +1052,24 @@ def translate_request(
             "answer stops, so the request was refused instead."
         )
 
+    if len({_citations_enabled(b) for b in _search_result_blocks(raw.get("messages"))}) > 1:
+        # Upstream's rule, kept so a request it refuses is refused here too.
+        raise Refusal(
+            "citations: every search result in a request must use the same citations "
+            "setting; some enable citations and some do not."
+        )
+
     messages: list[ChatCompletionMessage] = []
     system = _system_text(body.system)
+    if _offers_memory(raw.get("tools")):
+        # After the caller's own words, so an unchanged system prompt keeps
+        # the prefix a backend has cached.
+        system = f"{system}\n\n{MEMORY_PROTOCOL}" if system else MEMORY_PROTOCOL
     if system:
         messages.append(ChatCompletionMessage(role=Role1.system, content=system))
 
     budget = images.ImageBudget(max_images)
+    numbering = _Numbering()
     for turn_index, turn in enumerate(body.messages):
         blocks = _blocks(turn.content)
         role = turn.role.value
@@ -907,6 +1102,15 @@ def translate_request(
                         f"results, not on a {role} turn."
                     )
                 parts.extend(_document_part(block, where, budget))
+            elif kind == "search_result":
+                if role != "user":
+                    raise Refusal(
+                        f"{where}: search results are accepted on user turns and inside tool "
+                        f"results, not on a {role} turn."
+                    )
+                parts.append(
+                    TextContentPart(type="text", text=_search_result_text(block, where, numbering))
+                )
             elif kind == "thinking" and turn.role.value == "assistant":
                 # A thinking block we returned, handed back as Anthropic
                 # tells clients to: its text when it was shown, else the
@@ -950,7 +1154,7 @@ def translate_request(
                 # speaking, which is exactly the defect step 6 found on
                 # the other protocol.
                 call_id = str(_field(block, "tool_use_id") or "")
-                text = _tool_result_text(block)
+                text = _tool_result_text(block, where, numbering)
                 moved, kinds = _tool_result_attachments(block, where, budget)
                 if moved and role != "user":
                     raise Refusal(f"{where}: a tool result belongs on a user turn.")

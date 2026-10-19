@@ -98,7 +98,7 @@ class ClientAdmissionResult(BaseModel):
     keyId: str
     keyName: str
     personId: str | None = Field(
-        None, description='Stable subject verified by the root'
+        None, description='Stable subject verified by the root, never caller supplied.'
     )
     appClientId: str | None = None
     limits: ClientKeyLimits | None = None

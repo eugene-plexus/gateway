@@ -555,6 +555,16 @@ class ModelRequirementAuthority(StrEnum):
     engine = 'engine'
 
 
+class PreparationVisionMode(StrEnum):
+    """
+    Where to encode images during inference; off prepares text only.
+    """
+
+    off = 'off'
+    cpu = 'cpu'
+    gpu = 'gpu'
+
+
 class Context(RootModel[int]):
     root: int = Field(..., ge=1)
 
@@ -580,6 +590,10 @@ class ModelPreparation(BaseModel):
     contexts: list[Context] | None = Field(
         None,
         description="The context sizes, in tokens, the preparation can be asked for\n(LS5): an engine that fixes the context when it prepares\noffers its own choices, and without one takes its own\nrecommendation for the node. Strata's are its setup's own.\nAbsent: the preparation takes no context.\n",
+    )
+    visionModes: list[PreparationVisionMode] | None = Field(
+        None,
+        description="Image encoder choices supported by this model's preparation. Absent:\nno image preparation is offered. Omitting the choice in a run intent\npreserves text-only preparation. Enabling images downloads an extra\nencoder and uses additional memory while serving.\n",
     )
     minEngineVersion: str | None = Field(
         None,
@@ -2858,7 +2872,10 @@ class AnthropicContentBlock(BaseModel):
     `signature`) -- returned ahead of the answer when the request
     enabled thinking, and read back on an assistant turn as that
     turn's reasoning. `redacted_thinking` is accepted on the way in
-    and dropped. `server_tool_use` and `web_search_tool_result` (P8)
+    and dropped. `search_result` (`source`, a string here; `title`;
+    `content`, text blocks; `citations`) is read as text, numbered
+    across the request (MR9a; see the endpoint). `server_tool_use` and
+    `web_search_tool_result` (P8)
     are returned for a search this install ran and, handed back on
     an assistant turn, become that turn's history: the query, and
     each result's title, address and the excerpt the model read,
@@ -2910,9 +2927,9 @@ class AnthropicContentBlock(BaseModel):
         None,
         description='On `thinking`: opaque to the client, as Anthropic\'s is. From\nthis gateway it is empty when the text is shown, and\n`eugene-plexus-reasoning-v1:<base64 of the reasoning>` when\nthe request asked for `display: "omitted"` -- so a client\nthat echoes the block back unchanged, as Anthropic tells it\nto, returns the reasoning for the next turn. Not Anthropic\'s\nsignature and not verifiable by Anthropic; a signature\nwithout that prefix is ignored on the way in.\n',
     )
-    source: dict[str, Any] | None = Field(
+    source: dict[str, Any] | str | None = Field(
         None,
-        description='On `image`: `{"type": "base64", "media_type": "image/png",\n"data": "<base64>"}`. `media_type` is `image/png`,\n`image/jpeg`, `image/gif` or `image/webp`; the last two are\nre-encoded to PNG. A `url` or `file` source is refused.\n',
+        description='On `image`: `{"type": "base64", "media_type": "image/png",\n"data": "<base64>"}`. `media_type` is `image/png`,\n`image/jpeg`, `image/gif` or `image/webp`; the last two are\nre-encoded to PNG. A `url` or `file` source is refused. On\n`search_result`: a string, the URL or identifier the result\ncame from (MR9a).\n',
     )
     cache_control: dict[str, Any] | None = None
 
@@ -2939,7 +2956,10 @@ class AnthropicToolDefinition(BaseModel):
     anything this gateway would have to execute itself, rather than
     hand back to the caller — is refused with a 400, **except web
     search** (`web_search_<date>`), which this install's search
-    account runs since P8. There is no sandbox to run code in, and
+    account runs since P8, **and the memory tool**
+    (`memory_20250818`, named `memory`), which is client-run by
+    definition and becomes a function whose calls come back to the
+    caller (MR9a). There is no sandbox to run code in, and
     pretending otherwise would fail at the moment the model chose to
     use one. The refusal's message contains `Input tag '<type>'`, the
     wording Claude Code (2.1.280 and later) looks for to retry
@@ -4843,7 +4863,8 @@ class MetricRequest(BaseModel):
         None, description='Registry name captured for this request.'
     )
     personId: str | None = Field(
-        None, description='Stable person subject verified by the control root'
+        None,
+        description='Stable person subject verified by the control root, when present.',
     )
     appClientId: str | None = Field(
         None, description="Registered app bound to the person's proof."

@@ -542,6 +542,16 @@ class ModelRequirementAuthority(StrEnum):
     engine = 'engine'
 
 
+class PreparationVisionMode(StrEnum):
+    """
+    Where to encode images during inference; off prepares text only.
+    """
+
+    off = 'off'
+    cpu = 'cpu'
+    gpu = 'gpu'
+
+
 class Context(RootModel[int]):
     root: int = Field(..., ge=1)
 
@@ -567,6 +577,10 @@ class ModelPreparation(BaseModel):
     contexts: list[Context] | None = Field(
         None,
         description="The context sizes, in tokens, the preparation can be asked for\n(LS5): an engine that fixes the context when it prepares\noffers its own choices, and without one takes its own\nrecommendation for the node. Strata's are its setup's own.\nAbsent: the preparation takes no context.\n",
+    )
+    visionModes: list[PreparationVisionMode] | None = Field(
+        None,
+        description="Image encoder choices supported by this model's preparation. Absent:\nno image preparation is offered. Omitting the choice in a run intent\npreserves text-only preparation. Enabling images downloads an extra\nencoder and uses additional memory while serving.\n",
     )
     minEngineVersion: str | None = Field(
         None,
