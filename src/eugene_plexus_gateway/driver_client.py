@@ -1525,8 +1525,13 @@ class TieredClient:
             if is_last
             else f"trying backend {index + 2}/{total}"
         )
+        # The request's id, as Metrics shows it, so the console can open the
+        # log on this request (CX8). Imported here: admission imports us.
+        from . import admission
+
+        client = admission.current.get()
         log.warning(
-            "failover[%s]: slot %r backend %d/%d (%s) failed (%s); %s",
+            "failover[%s]: slot %r backend %d/%d (%s) failed (%s); %s%s",
             op,
             self.name,
             index + 1,
@@ -1534,6 +1539,7 @@ class TieredClient:
             candidate.base_url,
             type(exc).__name__,
             next_action,
+            f" (request {client.id})" if client is not None else "",
         )
 
     async def count_tokens(self, request: GenerateRequest) -> int:
