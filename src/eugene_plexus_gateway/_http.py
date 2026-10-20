@@ -301,6 +301,9 @@ class MachineTable:
     routes: dict[str, str | None] = field(default_factory=dict)
     required: bool = False
     names: dict[str, str] = field(default_factory=dict)
+    local: frozenset[str] = frozenset()
+    """Origins that are this machine under a LAN address (its own agent),
+    which a request may reach in plain HTTP whatever `required` says."""
 
     @property
     def empty(self) -> bool:
@@ -382,7 +385,13 @@ def parse_machine_table(document: Any) -> MachineTable:
         for k, v in (document.get("names") or {}).items()
         if isinstance(k, str) and isinstance(v, str)
     }
-    return MachineTable(machines, routes, bool(document.get("required")), names)
+    local: set[str] = set()
+    for key in document.get("local") or []:
+        try:
+            local.add(_origin(httpx.URL(str(key))))
+        except (httpx.InvalidURL, TypeError):
+            continue
+    return MachineTable(machines, routes, bool(document.get("required")), names, frozenset(local))
 
 
 _TABLE_OVERRIDE: MachineTable | None = None
@@ -639,7 +648,7 @@ def _pool_options(limits: httpx.Limits) -> dict[str, Any]:
 
 def _route(request: httpx.Request, table: MachineTable) -> MachineTable:
     """Carry a plain request for another machine to its TLS address, in place."""
-    if table.empty:
+    if table.empty and not table.required:
         return table
     try:
         carried = table.carry(request.url)
@@ -649,7 +658,48 @@ def _route(request: httpx.Request, table: MachineTable) -> MachineTable:
     if carried is not None:
         request.url = carried
         request.headers["Host"] = carried.netloc.decode("ascii")
+    elif table.required and request.url.scheme == "http" and _eugene_token(request.headers):
+        # An address the table does not name (a node just enrolled, another
+        # spelling of a machine's name): under required, a token of this
+        # install never crosses to another machine in plain HTTP. A request
+        # without one (a model server on the LAN) is not this rule's business.
+        if not _is_loopback(request.url.host) and _origin(request.url) not in table.local:
+            raise MachineRefused(
+                "Encryption between machines is required, and this request would carry "
+                f"an Eugene Plexus token to {request.url.host} in plain HTTP; it was not sent.",
+                request=request,
+            )
     return table
+
+
+def _is_loopback(host: str) -> bool:
+    host = host.strip("[]").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _eugene_token(headers: httpx.Headers) -> bool:
+    """Whether a request carries one of this install's own tokens: a JWS whose
+    header says `typ: ep-...` (sessions, service, client and administration
+    tokens all do), as a bearer or an `x-api-key`."""
+    values = [headers.get("authorization", ""), headers.get("x-api-key", "")]
+    for value in values:
+        token = value.split(" ", 1)[-1].strip()
+        head = token.split(".", 1)[0]
+        if not head.startswith("eyJ"):
+            continue
+        try:
+            padded = head + "=" * (-len(head) % 4)
+            typ = json.loads(base64.urlsafe_b64decode(padded)).get("typ", "")
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if isinstance(typ, str) and typ.lower().startswith("ep-"):
+            return True
+    return False
 
 
 class MachineTransport(httpx.AsyncBaseTransport):
