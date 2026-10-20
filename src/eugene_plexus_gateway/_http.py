@@ -61,6 +61,7 @@ import os
 import ssl
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
@@ -334,6 +335,11 @@ class MachineTable:
 
 EMPTY_TABLE = MachineTable()
 
+#: Where a transport reads its table: `machine_table`, unless a caller with a
+#: table of its own (an enrolment that pins the root from its join token)
+#: hands one in.
+TableSource = Callable[[], MachineTable]
+
 
 def parse_machine_table(document: Any) -> MachineTable:
     """A table from its JSON form. Entries that do not hold together are
@@ -466,8 +472,7 @@ def refused_pin(exc: BaseException) -> str | None:
 _REFUSALS_LOGGED: dict[tuple[str, str], float] = {}
 
 
-def _check_pin(machine: str, ssl_object: Any) -> None:
-    table = machine_table()
+def _check_pin(machine: str, ssl_object: Any, table: MachineTable) -> None:
     pins = table.machines.get(machine)
     # Positional: the sync backend hands over `_ssl._SSLSocket`, whose
     # argument is named `der`, where `ssl.SSLObject`'s is `binary_form`.
@@ -507,8 +512,10 @@ def _machine_context() -> ssl.SSLContext:
 
 
 class _PinnedStream(httpcore.AsyncNetworkStream):
-    def __init__(self, inner: httpcore.AsyncNetworkStream, machine: str) -> None:
-        self._inner, self._machine = inner, machine
+    def __init__(
+        self, inner: httpcore.AsyncNetworkStream, machine: str, table: TableSource
+    ) -> None:
+        self._inner, self._machine, self._table = inner, machine, table
 
     async def read(self, max_bytes: int, timeout: float | None = None) -> bytes:  # noqa: ASYNC109
         return await self._inner.read(max_bytes, timeout)
@@ -527,19 +534,20 @@ class _PinnedStream(httpcore.AsyncNetworkStream):
     ) -> httpcore.AsyncNetworkStream:
         stream = await self._inner.start_tls(ssl_context, server_hostname, timeout)
         try:
-            _check_pin(self._machine, stream.get_extra_info("ssl_object"))
+            _check_pin(self._machine, stream.get_extra_info("ssl_object"), self._table())
         except BaseException:
             await stream.aclose()
             raise
-        return _PinnedStream(stream, self._machine)
+        return _PinnedStream(stream, self._machine, self._table)
 
     def get_extra_info(self, info: str) -> Any:
         return self._inner.get_extra_info(info)
 
 
 class _PinnedBackend(httpcore.AsyncNetworkBackend):
-    def __init__(self) -> None:
+    def __init__(self, table: TableSource) -> None:
         self._inner = httpcore.AnyIOBackend()
+        self._table = table
 
     async def connect_tcp(
         self,
@@ -550,7 +558,7 @@ class _PinnedBackend(httpcore.AsyncNetworkBackend):
         socket_options: Any = None,
     ) -> httpcore.AsyncNetworkStream:
         stream = await self._inner.connect_tcp(host, port, timeout, local_address, socket_options)
-        return _PinnedStream(stream, _hostport(host, port))
+        return _PinnedStream(stream, _hostport(host, port), self._table)
 
     async def connect_unix_socket(
         self,
@@ -565,8 +573,8 @@ class _PinnedBackend(httpcore.AsyncNetworkBackend):
 
 
 class _SyncPinnedStream(httpcore.NetworkStream):
-    def __init__(self, inner: httpcore.NetworkStream, machine: str) -> None:
-        self._inner, self._machine = inner, machine
+    def __init__(self, inner: httpcore.NetworkStream, machine: str, table: TableSource) -> None:
+        self._inner, self._machine, self._table = inner, machine, table
 
     def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
         return self._inner.read(max_bytes, timeout)
@@ -585,19 +593,20 @@ class _SyncPinnedStream(httpcore.NetworkStream):
     ) -> httpcore.NetworkStream:
         stream = self._inner.start_tls(ssl_context, server_hostname, timeout)
         try:
-            _check_pin(self._machine, stream.get_extra_info("ssl_object"))
+            _check_pin(self._machine, stream.get_extra_info("ssl_object"), self._table())
         except BaseException:
             stream.close()
             raise
-        return _SyncPinnedStream(stream, self._machine)
+        return _SyncPinnedStream(stream, self._machine, self._table)
 
     def get_extra_info(self, info: str) -> Any:
         return self._inner.get_extra_info(info)
 
 
 class _SyncPinnedBackend(httpcore.NetworkBackend):
-    def __init__(self) -> None:
+    def __init__(self, table: TableSource) -> None:
         self._inner = httpcore.SyncBackend()
+        self._table = table
 
     def connect_tcp(
         self,
@@ -608,7 +617,7 @@ class _SyncPinnedBackend(httpcore.NetworkBackend):
         socket_options: Any = None,
     ) -> httpcore.NetworkStream:
         stream = self._inner.connect_tcp(host, port, timeout, local_address, socket_options)
-        return _SyncPinnedStream(stream, _hostport(host, port))
+        return _SyncPinnedStream(stream, _hostport(host, port), self._table)
 
     def connect_unix_socket(
         self, path: str, timeout: float | None = None, socket_options: Any = None
@@ -628,9 +637,8 @@ def _pool_options(limits: httpx.Limits) -> dict[str, Any]:
     }
 
 
-def _route(request: httpx.Request) -> MachineTable:
+def _route(request: httpx.Request, table: MachineTable) -> MachineTable:
     """Carry a plain request for another machine to its TLS address, in place."""
-    table = machine_table()
     if table.empty:
         return table
     try:
@@ -650,11 +658,19 @@ class MachineTransport(httpx.AsyncBaseTransport):
     pool built on a pin-checking network backend (`_pool` is the one private
     attribute this touches; a test fails when httpx moves it)."""
 
-    def __init__(self, *, verify: Any, limits: httpx.Limits, **options: Any) -> None:
+    def __init__(
+        self,
+        *,
+        verify: Any,
+        limits: httpx.Limits,
+        table: TableSource | None = None,
+        **options: Any,
+    ) -> None:
         self._plain = httpx.AsyncHTTPTransport(
             verify=verify, limits=limits, trust_env=False, **options
         )
         self._limits = limits
+        self._table: TableSource = table or machine_table
         self._pinned: httpx.AsyncHTTPTransport | None = None
 
     @property
@@ -666,13 +682,13 @@ class MachineTransport(httpx.AsyncBaseTransport):
         if self._pinned is None:
             transport = httpx.AsyncHTTPTransport(verify=_machine_context(), trust_env=False)
             transport._pool = httpcore.AsyncConnectionPool(
-                **_pool_options(self._limits), network_backend=_PinnedBackend()
+                **_pool_options(self._limits), network_backend=_PinnedBackend(self._table)
             )
             self._pinned = transport
         return self._pinned
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        table = _route(request)
+        table = _route(request, self._table())
         if table.pins(request.url) is not None:
             return await self._pinned_transport().handle_async_request(request)
         return await self._plain.handle_async_request(request)
@@ -686,9 +702,17 @@ class MachineTransport(httpx.AsyncBaseTransport):
 class SyncMachineTransport(httpx.BaseTransport):
     """`MachineTransport`, for the synchronous clients."""
 
-    def __init__(self, *, verify: Any, limits: httpx.Limits, **options: Any) -> None:
+    def __init__(
+        self,
+        *,
+        verify: Any,
+        limits: httpx.Limits,
+        table: TableSource | None = None,
+        **options: Any,
+    ) -> None:
         self._plain = httpx.HTTPTransport(verify=verify, limits=limits, trust_env=False, **options)
         self._limits = limits
+        self._table: TableSource = table or machine_table
         self._pinned: httpx.HTTPTransport | None = None
 
     @property
@@ -700,13 +724,13 @@ class SyncMachineTransport(httpx.BaseTransport):
         if self._pinned is None:
             transport = httpx.HTTPTransport(verify=_machine_context(), trust_env=False)
             transport._pool = httpcore.ConnectionPool(
-                **_pool_options(self._limits), network_backend=_SyncPinnedBackend()
+                **_pool_options(self._limits), network_backend=_SyncPinnedBackend(self._table)
             )
             self._pinned = transport
         return self._pinned
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
-        table = _route(request)
+        table = _route(request, self._table())
         if table.pins(request.url) is not None:
             return self._pinned_transport().handle_request(request)
         return self._plain.handle_request(request)
@@ -720,8 +744,12 @@ class SyncMachineTransport(httpx.BaseTransport):
 def _machine_transport(kwargs: dict[str, Any], *, sync: bool = False) -> None:
     """Give an internal client the machine transport, unless the caller
     brought a transport of its own (a test's mock, a Unix socket)."""
-    if "transport" in kwargs or "mounts" in kwargs or kwargs.get("proxy"):
+    # `transport=None` is a test seam left unset, not a transport: callers
+    # pass it through from `app.state`, and taking it as one sent their
+    # requests to other machines in plain HTTP (found by the LT1 capture).
+    if kwargs.get("transport") is not None or kwargs.get("mounts") or kwargs.get("proxy"):
         return
+    kwargs.pop("transport", None)
     options = {k: kwargs[k] for k in ("cert", "http1", "http2") if k in kwargs}
     cls = SyncMachineTransport if sync else MachineTransport
     limits = kwargs.get("limits") or httpx.Limits(max_connections=100, max_keepalive_connections=20)

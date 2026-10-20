@@ -90,7 +90,7 @@ from ._generated.models import (
 from ._generated.models import (
     Billing as SearchBilling,
 )
-from ._http import internal_client
+from ._http import internal_client, machine_pinned, machine_required
 from .affinity import HIT, MOVED, NEW, AffinityTable
 from .budget import Conversation, ConversationSizes, PoolLedger, TurnBudget
 from .capabilities import calls_tools, chats, said_tools
@@ -116,6 +116,32 @@ from .tool_client import ToolDriverClient, ToolDriverInfo
 _TOPOLOGY_TIMEOUT = 5.0
 
 log = logging.getLogger(__name__)
+
+
+def _remote_url(name: Any, entry: dict[str, Any]) -> str | None:
+    """Where this gateway reaches a driver on another machine.
+
+    Over TLS to that machine's machine port (`Component.machineUrl`, LT1)
+    when this process holds the machine's pin from the root's signed list;
+    otherwise at its plain advertised address, as before, which is how an
+    install with old and new machines keeps working. Once the install
+    requires encryption there is no plain fallback: a driver that cannot be
+    reached over TLS is left out, and the log says why.
+    """
+    machine_url = entry.get("machineUrl")
+    if isinstance(machine_url, str) and machine_url and machine_pinned(machine_url):
+        return machine_url
+    if machine_required():
+        log.warning(
+            "left out driver %s: encryption between machines is required and its machine "
+            "has no key this gateway holds%s",
+            name,
+            "" if machine_url else " (it runs a version without a machine port; update it)",
+        )
+        return None
+    plain = entry.get("advertiseUrl") or entry.get("url")
+    return plain if isinstance(plain, str) else None
+
 
 # Per-request collection of attempt rows (M8). A contextvar rather than
 # state on the table, because the table is shared and long-lived while
@@ -1531,9 +1557,7 @@ class RoutingTable:
             # routable from here (M7) -- and the second for this one.
             name = entry.get("name")
             url = (
-                entry.get("url") or entry.get("advertiseUrl")
-                if local
-                else entry.get("advertiseUrl") or entry.get("url")
+                entry.get("url") or entry.get("advertiseUrl") if local else _remote_url(name, entry)
             )
             if isinstance(name, str) and name and isinstance(url, str) and url:
                 # A search account (P8) is found the same way and kept apart:

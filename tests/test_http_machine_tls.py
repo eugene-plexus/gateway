@@ -242,6 +242,8 @@ def test_a_client_with_its_own_transport_keeps_it() -> None:
     client = _http.internal_client(transport=mock)
     assert client._transport is mock
     assert isinstance(_http.internal_client()._transport, _http.MachineTransport)
+    # A seam left unset is no transport: these went plain before the capture caught it.
+    assert isinstance(_http.internal_client(transport=None)._transport, _http.MachineTransport)
     assert not isinstance(_http.egress_client()._transport, _http.MachineTransport)
 
 
