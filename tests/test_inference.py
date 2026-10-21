@@ -11,9 +11,11 @@ from __future__ import annotations
 import json
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from eugene_plexus_gateway import admission
 from eugene_plexus_gateway._generated.driver_models import BackendKind, Usage
 from eugene_plexus_gateway.app import create_app
 from eugene_plexus_gateway.driver_client import DriverError
@@ -37,6 +39,46 @@ def _chat(model: str = MODEL, **extra: object) -> dict[str, object]:
     }
     body.update(extra)
     return body
+
+
+def test_a_role_with_no_model_says_where_to_set_it(client: TestClient) -> None:
+    response = client.post("/v1/chat/completions", json=_chat("role:reads-pages"))
+    assert response.status_code == 404
+    error = response.json()["error"]
+    assert error["type"] == "model_not_found"
+    assert error["message"] == (
+        "No model has the role Reads pages. Give one that role under Routing > Model roles. "
+        "/routing/roles"
+    )
+
+
+def test_an_assigned_role_with_missing_backends_names_that_cause(settings: Settings) -> None:
+    app = _app_with(settings)
+    app.state.routing = make_routing_table(
+        slots=[{"model": "role:reads-pages", "targets": ["offline-ocr"]}]
+    )
+    with TestClient(app) as client:
+        response = client.post("/v1/chat/completions", json=_chat("role:reads-pages"))
+    assert response.status_code == 404
+    message = response.json()["error"]["message"]
+    assert "No reachable driver lists" in message and "offline-ocr" in message
+    assert "No model has the role" not in message
+
+
+@pytest.mark.parametrize("allowed", [None, ["role:reads-pages"], ["another-model"]])
+def test_role_setup_hint_for_app_keys_respects_the_model_filter(allowed: list[str] | None) -> None:
+    from eugene_plexus_gateway.routes.inference import _no_such_model
+
+    context = admission.ClientRequest({"type": "http"})
+    context.key_id = "app"
+    context.access = {"limits": {"allowedModels": allowed}}
+    token = admission.current.set(context)
+    try:
+        failure = _no_such_model("role:reads-pages", make_routing_table())
+    finally:
+        admission.current.reset(token)
+    assert failure.code == 404 and failure.error_type == "model_not_found"
+    assert ("Routing > Model roles" in failure.message) is (allowed != ["another-model"])
 
 
 # --------------------------------------------------------------------------- #

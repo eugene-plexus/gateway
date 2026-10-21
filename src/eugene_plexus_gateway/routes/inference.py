@@ -488,11 +488,43 @@ def _control_root_hint(table: RoutingTable | None) -> str:
 
 
 def _no_such_model(model: str, table: RoutingTable | None) -> _Failure:
-    if (context := admission.current.get()) is not None and context.key_id is not None:
+    from ..model_patterns import permits
+    from ..model_roles import role_info
+
+    role = role_info(model)
+    context = admission.current.get()
+    unassigned_role = role is not None and (
+        table is None or (not table.resolve(model).configured and not table.serves(model))
+    )
+    if (
+        context is not None
+        and context.key_id is not None
+        and not (unassigned_role and permits(context.allowed_models, model))
+    ):
         return _Failure(
             code=404,
             message="The requested model is unavailable or not permitted.",
             error_type="model_not_found",
+        )
+    if role is not None:
+        label = "Reads pages" if role.role.value == "reads-pages" else role.label
+        assigned = (
+            [tier.target for tier in table.resolve(model).tiers if tier.target != model]
+            if table is not None
+            else []
+        )
+        message = (
+            f"No reachable driver lists the models assigned to the role {label}: "
+            f"{', '.join(assigned)}. Check their backends and Routing > Model roles. /routing/roles"
+            if assigned
+            else f"No model has the role {label}. Give one that role under "
+            "Routing > Model roles. /routing/roles"
+        )
+        return _Failure(
+            code=404,
+            message=message,
+            error_type="model_not_found",
+            param="model",
         )
     known = table.known_models() if table is not None else []
     if known:

@@ -33,6 +33,7 @@ from ._generated.models import (
     ConfigUpdateRequest,
     ConfigUpdateResult,
     ConfigValueType,
+    ModelRole,
 )
 
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 600.0
@@ -747,6 +748,9 @@ def _validate_model_slots(value: Any) -> str | None:
             return f"entry {index}: `model` must be a non-empty string"
         if model in seen:
             return f"entry {index}: model {model!r} is listed twice"
+        if model.startswith("role:") and model.removeprefix("role:") not in ModelRole:
+            roles = ", ".join(f"role:{role.value}" for role in ModelRole)
+            return f"entry {index}: unknown role slot {model!r}. Supported roles: {roles}"
         seen.add(model)
         targets = item.get("targets")
         if not isinstance(targets, list) or not targets:

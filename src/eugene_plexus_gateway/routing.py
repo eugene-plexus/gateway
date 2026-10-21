@@ -108,6 +108,7 @@ from .driver_client import Key as DriverKey
 from .image_doors import ImageAsk, rules_out
 from .metrics import AttemptRow, CandidateRow
 from .model_patterns import permits
+from .model_roles import role_info
 from .outbound import RECIPIENT_CONTROL, Outbound, token_refused_words
 from .tool_client import ToolDriverClient, ToolDriverInfo
 
@@ -2689,6 +2690,7 @@ class RoutingTable:
                     # provider, but only confirmed-local models say local.
                     owned_by=owner,
                     x_eugene_plexus=ModelRoutingInfo(
+                        role=role_info(model_id),
                         drivers=[b.name for b in backends],
                         backends=sorted({_backend_kind(b) for b in backends}),
                         surfaces=[Surface(value) for value in resolution.surfaces()],
