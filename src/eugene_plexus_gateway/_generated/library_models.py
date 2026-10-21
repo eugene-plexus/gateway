@@ -1697,7 +1697,9 @@ class ModelStatus(StrEnum):
       guesses that a file which vanished from one root and appeared
       in another is the same file, because a wrong guess silently
       applies one model's tuning to another. The profiles stay here
-      to be copied across by hand.
+      until the person moves them (`POST /v1/models/{id}/relocate`),
+      which needs a `fingerprint` that proves the new file has the
+      same contents, or an explicit confirmation when none was saved.
     * `unreadable` — the files are there and something about them
       did not work. `error` says what.
 
@@ -1785,6 +1787,41 @@ class ModelDeleted(BaseModel):
     deleted: list[str] = Field(..., description='Every file removed.')
     kept: list[str] = Field(..., description='Files kept for other models.')
     bytesFreed: int = Field(..., ge=0)
+
+
+class RelocateMatch(StrEnum):
+    """
+    How sure Eugene is that a `present` model is a `missing` model's
+    file at a new path.
+
+    * `same` — the `fingerprint`s are equal: the same contents.
+    * `likely` — the missing model has no `fingerprint`, and the
+      format, every file's size, the architecture, the parameters,
+      the quantization and the context length match. Eugene cannot
+      prove it; moving the profiles needs `confirmLikely`.
+
+    """
+
+    same = 'same'
+    likely = 'likely'
+
+
+class RelocateRequest(BaseModel):
+    to: str = Field(
+        ..., description='The `id` of the `present` model the file moved to.'
+    )
+    confirmLikely: bool | None = Field(
+        False,
+        description='The person confirmed moving the profiles to a file Eugene\ncannot prove is the same (`RelocateMatch` `likely`). Ignored\nfor a proven match; without it, a `likely` match is a 409.\n',
+    )
+
+
+class ProfileRename(BaseModel):
+    name: str = Field(..., description="The profile's name on the missing model.")
+    renamedTo: str = Field(
+        ...,
+        description='Its name on the model it moved to, because that model uses `name`.',
+    )
 
 
 class ModelFileRole(StrEnum):
@@ -4454,9 +4491,46 @@ class LibraryModel(BaseModel):
         None,
         description='Filesystem mtime of the weights. Part of the incremental-rescan key.',
     )
+    fingerprint: str | None = Field(
+        None,
+        description="What the contents were when the scan last read them: `v1:` and\na SHA-256 over the format, each file's role and size, the first\n1 MiB of each file (a safetensors file's whole JSON header\ninstead, up to 100 MiB), eight evenly spaced 64 KiB blocks and\nthe last 64 KiB. About 1.6 MiB is read per file, never the whole\nof a model.\n\nIt is **proof that two files are the same file**, which the\n`id` cannot be: it names no path and no date, so a file that\nmoved has the same fingerprint at its new path\n(`POST /v1/models/{id}/relocate`). Sampled, so two files agree\nonly when their sizes, headers and samples all agree. Kept on a\n`missing` entry, which is how a moved file is recognised.\nAbsent when the files could not be read, and on an entry no\nscan has read since fingerprints began.\n",
+    )
+    movedTo: str | None = Field(
+        None,
+        description='On a `missing` entry: the `id` of the one `present` entry with\nthe same `fingerprint`, which is where the file went. Absent\nwhen no entry matches, and when several do (then\n`GET /v1/models/{id}/relocate-candidates` lists them and the\nperson picks). Worked out when the list is read, never stored.\nNothing moves because of it: moving the profiles is\n`POST /v1/models/{id}/relocate`, after a click.\n',
+    )
     error: str | None = Field(
         None,
         description='Why this entry is `unreadable` — a header that would not\nparse, a permission error, a truncated file. Named rather\nthan dropped: a model the operator can see and we cannot\nexplain is the worst of the three states.\n',
+    )
+
+
+class RelocateCandidate(BaseModel):
+    model: LibraryModel
+    match: RelocateMatch
+    differences: list[str] = Field(
+        ...,
+        description='What Eugene could not confirm about this match, one plain\nsentence each. Empty for `same`. For `likely`: that the\nmissing file has no fingerprint, so its contents cannot be\ncompared.\n',
+    )
+
+
+class RelocateCandidateList(BaseModel):
+    candidates: list[RelocateCandidate]
+
+
+class ModelRelocated(BaseModel):
+    """
+    What a relocate did.
+    """
+
+    model: LibraryModel
+    moved: int = Field(..., description='How many profiles moved to `model`.', ge=0)
+    renamed: list[ProfileRename] = Field(
+        ..., description='The profiles that came with a new name; empty when none did.'
+    )
+    warnings: list[str] = Field(
+        ...,
+        description='A profile moved unchanged, but its `extraArgs` or `env` still\nnames the old path. One plain sentence each, naming the\nprofile; empty when none does.\n',
     )
 
 

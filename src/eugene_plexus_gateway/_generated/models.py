@@ -9,6 +9,30 @@ from typing import Any, Literal
 from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field, RootModel
 
 
+class WebSearchRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    query: str = Field(..., max_length=2000, min_length=1)
+    count: int | None = Field(
+        None,
+        description="Upper bound on the returned list. Does not raise or replace\nthe search account's own result count. Omitted, the account's\ncount applies, capped at 20.\n",
+        ge=1,
+        le=20,
+    )
+
+
+class WebSearchResult(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    link: AnyUrl = Field(..., description="The result's address.")
+    title: str
+    snippet: str = Field(
+        ..., description="The search provider's excerpt; no result page is fetched."
+    )
+
+
 class RuntimeSwitchRequest(BaseModel):
     node: str | None = Field(
         None, description="Node name; absent for the gateway's local node."
