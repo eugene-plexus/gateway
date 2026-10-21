@@ -2546,6 +2546,11 @@ async def _stream_text_completion(
             _record(prepared.rec, body, tries, door="completion")
             yield frame(
                 {
+                    **(
+                        {"finish_reason": "repetition_detected"}
+                        if isinstance(e, RepetitionStopped)
+                        else {}
+                    ),
                     "error": {
                         "message": str(e),
                         "type": "repetition_detected"
@@ -2553,7 +2558,7 @@ async def _stream_text_completion(
                         else "upstream_error",
                         "param": None,
                         "code": "repetition_detected" if isinstance(e, RepetitionStopped) else None,
-                    }
+                    },
                 }
             )
             yield "data: [DONE]\n\n"
@@ -5168,6 +5173,11 @@ async def _stream_completion(
                 "data: "
                 + json.dumps(
                     {
+                        **(
+                            {"finish_reason": "repetition_detected"}
+                            if isinstance(e, RepetitionStopped)
+                            else {}
+                        ),
                         "error": {
                             "message": str(e),
                             "type": "repetition_detected"
@@ -5177,7 +5187,7 @@ async def _stream_completion(
                             "code": "repetition_detected"
                             if isinstance(e, RepetitionStopped)
                             else None,
-                        }
+                        },
                     }
                 )
                 + "\n\n"

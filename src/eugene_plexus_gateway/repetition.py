@@ -17,28 +17,47 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 MODES = ("off", "observe", "stop")
+#: Row 19's labelled evaluation (specs/docs/acceptance/repetition-set) found
+#: five legitimate false stops at 100 characters x 4 copies. Zero-false-stop
+#: settings caught only 2/12 loops. Keep enforcement opt-in.
+DEFAULT_MODE = "observe"
 HEADER = "X-Eugene-Repetition-Mode"
-STOP_MESSAGE = (
-    "Stopped because the response appears to be repeating. "
-    "The partial answer has been kept. No automatic retry was made. "
-    "For intentional repetition, turn off repetition protection for this request."
-)
 MAX_PERIOD = 2048
 SCAN_EVERY = 64
 MAX_TOOL_CHANNELS = 8
 
 
+def stop_message(found: Detection | None = None) -> str:
+    """What a client reads when the gateway stops an answer for repeating.
+
+    It names the observed cause, says what was kept, and says how to turn the
+    stop off, for a caller (the header) and for the person who runs the
+    gateway (the setting).
+    """
+    what = (
+        f"repeated the same {found.period_chars}-character passage {found.repeats} times in a row"
+        if found is not None
+        else "was repeating"
+    )
+    return (
+        f"The answer was stopped because it {what}. "
+        "The text already sent is kept, and nothing was retried. "
+        f"To allow repeats, send the header {HEADER}: off with the request, "
+        "or set Repeated response protection to Off in the gateway settings."
+    )
+
+
 @dataclass(frozen=True)
 class Policy:
-    mode: str = "observe"
+    mode: str = DEFAULT_MODE
     min_chars: int = 100
     repeats: int = 4
 
     @classmethod
     def resolve(cls, get: Callable[[str], Any], model: str, override: str | None = None) -> Policy:
-        mode = get("repetitionMode") or "observe"
+        mode = get("repetitionMode") or DEFAULT_MODE
         if mode not in MODES:
-            mode = "observe"
+            mode = DEFAULT_MODE
         models = get("repetitionStopModels")
         if (
             mode == "stop"
@@ -148,6 +167,8 @@ class Guard:
         self.request_id = request_id
         self.channels: dict[str, Detector] = {}
         self.tool_seen = False
+        #: What the answer was stopped for, once `take` has returned True.
+        self.stopped: Detection | None = None
 
     def take(self, event: StreamEvent) -> bool:
         """Observe independently; only visible, unstructured text may stop."""
@@ -183,6 +204,8 @@ class Guard:
             and not self.structured
             and not self.tool_seen
         )
+        if stop:
+            self.stopped = found
         self._report(channel, found, stop=stop)
         return stop
 

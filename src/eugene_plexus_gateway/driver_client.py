@@ -57,7 +57,7 @@ from .affinity import EVICTED, HIT
 from .budget import Conversation, TurnBudget, request_chars
 from .circuit import Circuit
 from .execution import Executor, StreamPolicy
-from .repetition import STOP_MESSAGE, Guard, Policy
+from .repetition import Detection, Guard, Policy, stop_message
 
 log = logging.getLogger(__name__)
 
@@ -111,7 +111,10 @@ class DriverError(Exception):
 class RepetitionStopped(DriverError):
     """An intentional, terminal gateway stop, never a backend health failure."""
 
-    def __init__(self, candidate: DriverClient) -> None:
+    def __init__(self, candidate: DriverClient, found: Detection | None = None) -> None:
+        # Set first: `DriverError.__init__` asks `_summary` for the message.
+        self.found = found
+        self.message = stop_message(found)
         super().__init__(
             driver_name=candidate.name,
             driver_url=candidate.base_url,
@@ -120,14 +123,14 @@ class RepetitionStopped(DriverError):
                 type="urn:eugene-plexus:problem#repetition-detected",
                 title="Response repetition detected",
                 status=422,
-                detail=STOP_MESSAGE,
+                detail=self.message,
                 retryDisposition=RetryDisposition.terminal,
             ),
             raw_body="",
         )
 
     def _summary(self) -> str:
-        return STOP_MESSAGE
+        return self.message
 
 
 @dataclass(frozen=True)
@@ -1452,7 +1455,7 @@ class TieredClient:
                         await events.aclose()
                     yield event
                     if stopped:
-                        raise RepetitionStopped(candidate)
+                        raise RepetitionStopped(candidate, guard.stopped)
             finally:
                 await events.aclose()
 
