@@ -325,7 +325,9 @@ class MachineTable:
             return None
         base = self.routes[origin]
         if base is None:
-            if self.required:
+            # A loopback address never leaves this machine, so "required" has
+            # nothing to protect there: two agents on one host (gateway#17).
+            if self.required and not _is_loopback(url.host):
                 who = self.names.get(origin) or origin
                 raise MachineRefused(
                     f"Encryption between machines is required and {who} has no machine key "

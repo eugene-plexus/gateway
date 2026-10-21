@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import logging
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -58,6 +59,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -131,16 +133,32 @@ def _remote_url(name: Any, entry: dict[str, Any]) -> str | None:
     machine_url = entry.get("machineUrl")
     if isinstance(machine_url, str) and machine_url and machine_pinned(machine_url):
         return machine_url
-    if machine_required():
+    plain = entry.get("advertiseUrl") or entry.get("url")
+    plain = plain if isinstance(plain, str) else None
+    # A loopback address never leaves this host, so "required" has nothing to
+    # protect there: a second agent on the root's own host (gateway#17).
+    if machine_required() and not (plain and _loopback_url(plain)):
         log.warning(
             "left out driver %s: encryption between machines is required and its machine "
             "has no key this gateway holds%s",
             name,
-            "" if machine_url else " (it runs a version without a machine port; update it)",
+            ""
+            if machine_url
+            else " (its machine has no machine port: it runs an older version, or "
+            "advertises no address other machines reach)",
         )
         return None
-    plain = entry.get("advertiseUrl") or entry.get("url")
-    return plain if isinstance(plain, str) else None
+    return plain
+
+
+def _loopback_url(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 # Per-request collection of attempt rows (M8). A contextvar rather than

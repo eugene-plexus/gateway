@@ -192,6 +192,28 @@ async def test_required_refuses_a_machine_with_no_key_and_sends_nothing() -> Non
     assert _http.machine_table().carry(httpx.URL("http://10.9.9.8:8079/v1/node")) is None
 
 
+def test_required_lets_a_loopback_machine_go_plain() -> None:
+    """gateway#17: two agents on one host advertise loopback, so neither has a
+    machine key. Traffic to loopback never leaves the host; "required" has
+    nothing to protect there, and refusing it left the second agent's
+    drivers out."""
+    table = _http.parse_machine_table(
+        {
+            "machines": {},
+            "routes": {
+                "http://127.0.0.1:19101": None,
+                "http://[::1]:19102": None,
+                "http://10.9.9.8:8079": None,
+            },
+            "required": True,
+        }
+    )
+    assert table.carry(httpx.URL("http://127.0.0.1:19101/v1/node")) is None
+    assert table.carry(httpx.URL("http://[::1]:19102/v1/node")) is None
+    with pytest.raises(_http.MachineRefused):
+        table.carry(httpx.URL("http://10.9.9.8:8079/v1/node"))
+
+
 async def test_a_route_to_an_unpinned_machine_is_dropped() -> None:
     parsed = _http.parse_machine_table(
         {"machines": {}, "routes": {"http://10.9.9.9:8079": "https://10.9.9.9:8083/agent"}}
@@ -259,3 +281,18 @@ def test_threads_reading_the_table_agree() -> None:
     for thread in threads:
         thread.join()
     assert seen == [True] * 8
+
+
+def test_the_router_keeps_a_loopback_driver_under_required() -> None:
+    """gateway#17, the routing half: a driver whose agent advertises loopback
+    is reached plain under "required"; one on another machine with no key
+    is still left out."""
+    from eugene_plexus_gateway import routing
+
+    _http.set_machine_table(_http.parse_machine_table({"required": True}))
+    try:
+        here = {"advertiseUrl": "http://127.0.0.1:19105"}
+        assert routing._remote_url("same-host", here) == "http://127.0.0.1:19105"
+        assert routing._remote_url("far", {"advertiseUrl": "http://10.9.9.8:8091"}) is None
+    finally:
+        _http.set_machine_table(_http.parse_machine_table({}))
