@@ -343,18 +343,17 @@ FIELDS: list[ConfigField] = [
         key="escapeControlTokens",
         label="Treat control tokens in messages as text",
         description=(
-            "Breaks a model's own special-token spellings, such as `<|im_end|>`, in what "
-            "people and tools send, so text in a message cannot end a turn or start a "
-            "system turn.\n\n"
-            "llama.cpp reads those spellings as control tokens wherever they appear in the "
-            "prompt, so a web page, a file or a pasted document holding one can take over "
-            "the conversation. On (the default), each spelling the model's vocabulary lists "
-            "gets an invisible character after its first character in user and tool "
-            "content, tool-call arguments and tool descriptions; the model reads the same "
-            "text. System messages and the model's own answers are sent as written.\n\n"
-            "It covers local GGUF models the Library lists. A model it cannot cover is "
-            "named in the gateway's log. The cost: a model asked to copy such text back "
-            "copies the invisible character too. Off sends everything as written."
+            "Breaks a model's own control-token spellings, such as `<|im_end|>`, in what "
+            "people and tools send.\n\n"
+            "llama.cpp reads those spellings as control tokens anywhere in the prompt, so a "
+            "web page or file holding one can end a turn or start a system turn. On (the "
+            "default), each spelling the model's vocabulary lists gets an invisible "
+            "character after its first character in user and tool content, tool-call "
+            "arguments and tool descriptions; the model reads the same text. System "
+            "messages and the model's own answers are sent as written.\n\n"
+            "It covers local GGUF models the Library lists; any other is named in the "
+            "gateway's log. A model asked to copy such text back copies the invisible "
+            "character too. Off sends everything as written."
         ),
         category="generation",
         valueType=ConfigValueType.boolean,
