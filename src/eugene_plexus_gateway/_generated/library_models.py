@@ -10,6 +10,31 @@ from typing import Any, Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, RootModel
 
 
+class ModelRole(StrEnum):
+    """
+    An install-wide job assigned to models through the gateway's
+    `modelSlots`. A client requests `role:<ModelRole>` rather than
+    a particular model. The list is closed: a new role is a contract
+    change, and an unknown `role:` name is refused when saved.
+
+    These are routing roles, separate from a conversation's `Role`.
+    Capability checks warn; they never block role assignment.
+
+    """
+
+    chat = 'chat'
+    agentic = 'agentic'
+    vision = 'vision'
+    reads_pages = 'reads-pages'
+    image = 'image'
+    speech_to_text = 'speech-to-text'
+    text_to_speech = 'text-to-speech'
+    music = 'music'
+    embeddings = 'embeddings'
+    rerank = 'rerank'
+    decision = 'decision'
+
+
 class Role(StrEnum):
     """
     The speaker of a single message in a conversation. Matches the
@@ -1697,7 +1722,9 @@ class ModelStatus(StrEnum):
       guesses that a file which vanished from one root and appeared
       in another is the same file, because a wrong guess silently
       applies one model's tuning to another. The profiles stay here
-      to be copied across by hand.
+      until the person moves them (`POST /v1/models/{id}/relocate`),
+      which needs a `fingerprint` that proves the new file has the
+      same contents, or an explicit confirmation when none was saved.
     * `unreadable` — the files are there and something about them
       did not work. `error` says what.
 
@@ -1785,6 +1812,41 @@ class ModelDeleted(BaseModel):
     deleted: list[str] = Field(..., description='Every file removed.')
     kept: list[str] = Field(..., description='Files kept for other models.')
     bytesFreed: int = Field(..., ge=0)
+
+
+class RelocateMatch(StrEnum):
+    """
+    How sure Eugene is that a `present` model is a `missing` model's
+    file at a new path.
+
+    * `same` — the `fingerprint`s are equal: the same contents.
+    * `likely` — the missing model has no `fingerprint`, and the
+      format, every file's size, the architecture, the parameters,
+      the quantization and the context length match. Eugene cannot
+      prove it; moving the profiles needs `confirmLikely`.
+
+    """
+
+    same = 'same'
+    likely = 'likely'
+
+
+class RelocateRequest(BaseModel):
+    to: str = Field(
+        ..., description='The `id` of the `present` model the file moved to.'
+    )
+    confirmLikely: bool | None = Field(
+        False,
+        description='The person confirmed moving the profiles to a file Eugene\ncannot prove is the same (`RelocateMatch` `likely`). Ignored\nfor a proven match; without it, a `likely` match is a 409.\n',
+    )
+
+
+class ProfileRename(BaseModel):
+    name: str = Field(..., description="The profile's name on the missing model.")
+    renamedTo: str = Field(
+        ...,
+        description='Its name on the model it moved to, because that model uses `name`.',
+    )
 
 
 class ModelFileRole(StrEnum):
@@ -2380,6 +2442,52 @@ class StarterSetSource(StrEnum):
     configured = 'configured'
 
 
+class CpuProof(BaseModel):
+    """
+    A CPU measurement on the named test machine, using the recorded
+    engine build. These rates do not predict speed on the caller's
+    machine. The monthly review measures files up to 8 GiB and keeps
+    a proof only while the repo, file, size and engine tag are unchanged.
+    Larger files need a hand measurement. If those inputs change,
+    their proof returns to architecture-only with a note that a new
+    hand measurement is needed.
+
+    """
+
+    decodeTokensPerSecond: float = Field(
+        ..., description='Mean decode speed in tok/s across the benchmark runs.', ge=0.0
+    )
+    promptTokensPerSecond: float = Field(
+        ...,
+        description='Mean prompt processing speed in tok/s across the benchmark runs.',
+        ge=0.0,
+    )
+    promptTokens: int = Field(
+        ...,
+        description='Number of prompt tokens per benchmark run, normally 512.',
+        ge=1,
+    )
+    decodeTokens: int = Field(
+        ...,
+        description='Number of generated tokens per benchmark run, normally 128.',
+        ge=1,
+    )
+    threads: int = Field(
+        ..., description='Number of CPU threads used by llama-bench.', ge=1
+    )
+    machine: str = Field(
+        ...,
+        description='The machine on which the speed was measured, including its\nprocessor name and core count. The monthly review reads the\nprocessor name at run time.\n',
+        min_length=1,
+    )
+    engine: str = Field(
+        ...,
+        description='The pinned engine and build used, e.g. `llama_cpp b10948`.',
+        min_length=1,
+    )
+    measuredOn: date = Field(..., description='Date on which this speed was measured.')
+
+
 class StarterRecommendation(BaseModel):
     """
     Which entry this machine should take, and why -- or, when
@@ -2393,7 +2501,7 @@ class StarterRecommendation(BaseModel):
     )
     reason: str = Field(
         ...,
-        description='Prose naming the numbers, the same rule\n`CatalogueRecommendation` follows: the largest of the set\nthat runs entirely on this GPU with room for the scored\ncontext, said with the sizes that make it checkable.\n\nA mixture-of-experts entry may be recommended where it runs\nwith its experts in system memory: the card holds the rest\nand the cache, and system memory holds the experts. It wins\nonly over a dense entry of a smaller size class; between two\nentries of one class that both fit, the dense one is\nrecommended. The prose names what goes where. No speed is\npredicted.\n',
+        description="Prose naming the numbers, the same rule\n`CatalogueRecommendation` follows: the largest of the set\nthat runs entirely on this GPU with room for the scored\ncontext, said with the sizes that make it checkable.\n\nA mixture-of-experts entry may be recommended where it runs\nwith its experts in system memory: the card holds the rest\nand the cache, and system memory holds the experts. It wins\nonly over a dense entry of a smaller size class; between two\nentries of one class that both fit, the dense one is\nrecommended. The prose names what goes where.\n\nOn a machine with no graphics card, the largest entry that\nfits in memory and whose `cpuProof.decodeTokensPerSecond`\nis at or above `starterCpuFloorTokensPerSecond` (default 4 tok/s,\nconfigurable from 1 to 100). The speed is the test machine's,\nand the reason names that machine. No speed is predicted for this machine.\nIf no entry that fits has a proof at or above the floor,\nrecommend the smallest dense entry that fits and explain\nthe lack of qualifying measurements, using tokens and tok/s.\n",
     )
 
 
@@ -3999,6 +4107,10 @@ class StarterModel(BaseModel):
         None,
         description='The 30-day download count the ranking used, as of\n`reviewed`. A number with a date on it rather than a live\none, because this endpoint makes no upstream call.\n',
     )
+    cpuProof: CpuProof | None = Field(
+        None,
+        description='Measured CPU speed on the named test machine. Absent or null\nwhen only the architecture was checked. A mixture-of-experts\nentry without a proof is never recommended on a machine with\nno graphics card.\n',
+    )
     fit: Fit | None = None
     maxContextLength: int | None = Field(
         None,
@@ -4454,9 +4566,46 @@ class LibraryModel(BaseModel):
         None,
         description='Filesystem mtime of the weights. Part of the incremental-rescan key.',
     )
+    fingerprint: str | None = Field(
+        None,
+        description="What the contents were when the scan last read them: `v1:` and\na SHA-256 over the format, each file's role and size, the first\n1 MiB of each file (a safetensors file's whole JSON header\ninstead, up to 100 MiB), eight evenly spaced 64 KiB blocks and\nthe last 64 KiB. About 1.6 MiB is read per file, never the whole\nof a model.\n\nIt is **proof that two files are the same file**, which the\n`id` cannot be: it names no path and no date, so a file that\nmoved has the same fingerprint at its new path\n(`POST /v1/models/{id}/relocate`). Sampled, so two files agree\nonly when their sizes, headers and samples all agree. Kept on a\n`missing` entry, which is how a moved file is recognised.\nAbsent when the files could not be read, and on an entry no\nscan has read since fingerprints began.\n",
+    )
+    movedTo: str | None = Field(
+        None,
+        description='On a `missing` entry: the `id` of the one `present` entry with\nthe same `fingerprint`, which is where the file went. Absent\nwhen no entry matches, and when several do (then\n`GET /v1/models/{id}/relocate-candidates` lists them and the\nperson picks). Worked out when the list is read, never stored.\nNothing moves because of it: moving the profiles is\n`POST /v1/models/{id}/relocate`, after a click.\n',
+    )
     error: str | None = Field(
         None,
         description='Why this entry is `unreadable` — a header that would not\nparse, a permission error, a truncated file. Named rather\nthan dropped: a model the operator can see and we cannot\nexplain is the worst of the three states.\n',
+    )
+
+
+class RelocateCandidate(BaseModel):
+    model: LibraryModel
+    match: RelocateMatch
+    differences: list[str] = Field(
+        ...,
+        description='What Eugene could not confirm about this match, one plain\nsentence each. Empty for `same`. For `likely`: that the\nmissing file has no fingerprint, so its contents cannot be\ncompared.\n',
+    )
+
+
+class RelocateCandidateList(BaseModel):
+    candidates: list[RelocateCandidate]
+
+
+class ModelRelocated(BaseModel):
+    """
+    What a relocate did.
+    """
+
+    model: LibraryModel
+    moved: int = Field(..., description='How many profiles moved to `model`.', ge=0)
+    renamed: list[ProfileRename] = Field(
+        ..., description='The profiles that came with a new name; empty when none did.'
+    )
+    warnings: list[str] = Field(
+        ...,
+        description='A profile moved unchanged, but its `extraArgs` or `env` still\nnames the old path. One plain sentence each, naming the\nprofile; empty when none does.\n',
     )
 
 
