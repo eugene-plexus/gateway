@@ -5283,6 +5283,10 @@ class CompletionRoutingInfo(BaseModel):
         description='Name of the engine runtime behind that driver, when it is a\nlocal engine. Absent for hosted and CLI backends, which have\nno runtime of ours.\n',
     )
     backend: BackendKind | None = None
+    reported_model: str | None = Field(
+        None,
+        description='What the backend said served this request, verbatim. Provenance,\nnever a routing key. Only the decision door sets it today.\nAbsent from a decision answer when the backend reported none,\nand null on the doors whose envelope serializes its unset\nfields, as `runtime` is.\n',
+    )
     latency_ms: int | None = Field(
         None, description='Gateway-side wall-clock time, including any failed attempts.'
     )
@@ -5475,7 +5479,7 @@ class AnthropicCountTokensRequest(BaseModel):
 class SystemOneResponse(BaseModel):
     model: str = Field(
         ...,
-        description="The public alias that served the request — after a cascade\nit names what answered, exactly as the chat doors do. The\nbackend's own model revision is preserved on the driver's\n`reportedModel` for provenance and surfaced in\n`x_eugene_plexus`.\n",
+        description="The public alias that served the request — after a cascade\nit names what answered, exactly as the chat doors do. The\nbackend's own model revision is preserved on the driver's\n`reportedModel` for provenance and surfaced as\n`x_eugene_plexus.reported_model`.\n",
     )
     answers: dict[str, SystemOneAnswer]
     usage: SystemOneUsage | None = None

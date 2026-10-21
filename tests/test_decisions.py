@@ -81,6 +81,40 @@ def test_mixed_questions_come_back_in_the_pinned_shape(settings) -> None:  # typ
     assert driver.decide_calls == 1
 
 
+def test_the_backend_revision_rides_on_the_envelope(settings) -> None:  # type: ignore[no-untyped-def]
+    """The contract promised it: `SystemOneResponse.model` says the backend's own
+    model revision is surfaced as `x_eugene_plexus.reported_model` (B2-REV).
+    Provenance, so `model` stays the public alias that served the request."""
+    driver = _decider("jev", "tickets")
+    with TestClient(_app(driver, settings=settings)) as client:
+        response = client.post(
+            "/v1/systemone",
+            json={"model": "tickets", "state": "charged twice", "questions": _questions()},
+        )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["x_eugene_plexus"]["reported_model"] == "<jev reported>"
+    assert body["model"] == "tickets"
+
+
+def test_a_backend_that_reports_no_revision_leaves_the_field_out(settings) -> None:  # type: ignore[no-untyped-def]
+    class Silent(FakeDriverClient):
+        async def decide(self, request):  # type: ignore[no-untyped-def]
+            result = await super().decide(request)
+            return result.model_copy(update={"reportedModel": None})
+
+    driver = Silent(
+        name="jev", model_id="tickets", supports_decisions=True, decision_max_concurrent=1
+    )
+    with TestClient(_app(driver, settings=settings)) as client:
+        response = client.post(
+            "/v1/systemone",
+            json={"model": "tickets", "state": "charged twice", "questions": _questions()},
+        )
+    assert response.status_code == 200, response.text
+    assert "reported_model" not in response.json()["x_eugene_plexus"]
+
+
 def test_structured_state_rides_through_untouched(settings) -> None:  # type: ignore[no-untyped-def]
     driver = _decider("kev-driver", "tickets")
     with TestClient(_app(driver, settings=settings)) as client:

@@ -769,6 +769,18 @@ class _Serving:
     #: head to send early, so it is named after the call from the backend that
     #: served it (`not_honoured_by_answer`).
     not_honoured: tuple[str, ...] = ()
+    #: The model entry the first attempt goes to (what `not_honoured` was read from).
+    first_entry: DriverModel | None = None
+
+    def carries_cache_control(self, *, answered: bool = False) -> bool:
+        """Whether the backend lists the client's `cache_control` as carried (PC6): the
+        first attempt's for a stream's head, the one that answered for a whole answer
+        (`not_honoured_by_answer` says why the two differ)."""
+        entry = self.first_entry
+        if answered and (served := getattr(self.client, "served_candidate", None)) is not None:
+            entry = getattr(self.client, "entries", {}).get(served)
+        caps = getattr(entry, "capabilities", None)
+        return "cacheControl" in (getattr(caps, "supportedSettings", None) or [])
 
     def not_honoured_by_answer(self) -> tuple[str, ...]:
         """What the backend that ANSWERED does not honour, of what the caller sent.
@@ -1040,6 +1052,9 @@ async def _prepare(
         )
     generate = _to_generate_request(body, store, install_max_tokens=install_max_tokens)
     generate.localOnly = admission.local_only()
+    # PC6: a door that knows the client marked part of the prompt for caching (the
+    # Anthropic door) leaves the hint on the request; the body cannot carry it.
+    generate.cacheControl = getattr(request.state, "cache_control", None)
     # The cap each candidate is sent and where it came from, filled as
     # each is prepared: a profile belongs to one candidate's model file, so
     # a fallback can be capped differently from the primary.
@@ -1162,6 +1177,7 @@ async def _prepare(
     return _Serving(
         output_cap=output_cap,
         not_honoured=_not_honoured_by(first, generate),
+        first_entry=first,
         search_blocked=search_blocked,
         client=served,
         table=table,
@@ -1530,6 +1546,8 @@ async def create_anthropic_message(request: Request) -> Any:
         return refusal.response()
     # PC4: Claude Code names its session; the balancer keeps it on one replica.
     request.state.affinity_key = anthropic.session_of(raw)
+    # PC6: the client's `cache_control`, as a hint for the backend that can carry it.
+    request.state.cache_control = anthropic.cache_hint(raw)
 
     # P8: a `web_search_<date>` server tool runs here or is refused with the
     # reason. Refused rather than dropped: Claude Code's WebSearch request
@@ -1563,7 +1581,9 @@ async def create_anthropic_message(request: Request) -> Any:
             ),
             media_type="text/event-stream",
             headers=ignored_settings.added_to(
-                own, anthropic.backend_ignored(prepared.not_honoured, raw), "messages"
+                _less_carried_cache(own, prepared),
+                anthropic.backend_ignored(prepared.not_honoured, raw),
+                "messages",
             ),
         )
 
@@ -1611,7 +1631,7 @@ async def create_anthropic_message(request: Request) -> Any:
             ),
             headers={
                 **ignored_settings.added_to(
-                    own,
+                    _less_carried_cache(own, prepared, answered=True),
                     anthropic.backend_ignored(prepared.not_honoured_by_answer(), raw),
                     "messages",
                 ),
@@ -1628,6 +1648,22 @@ async def create_anthropic_message(request: Request) -> Any:
                 ),
             },
         )
+
+
+def _less_carried_cache(
+    headers: dict[str, str], prepared: _Serving, *, answered: bool = False
+) -> dict[str, str]:
+    """The door's own ignored-settings, without `cache_control` when the backend that
+    serves carried the client's mark (PC6): it was not ignored. Said only for a backend
+    that did not carry it, so the header never claims a drop that did not happen."""
+    named = headers.get(ignored_settings.HEADER)
+    if named is None or not prepared.carries_cache_control(answered=answered):
+        return headers
+    kept = [n for n in (part.strip() for part in named.split(",")) if n and n != "cache_control"]
+    out = {k: v for k, v in headers.items() if k != ignored_settings.HEADER}
+    if kept:
+        out[ignored_settings.HEADER] = ", ".join(kept)
+    return out
 
 
 #: A reason that already says nothing was sent: an admission refusal ends "Nothing was
@@ -4103,7 +4139,9 @@ async def create_decision(request: Request, body: SystemOneRequest) -> Any:
             for name, a in result.answers.items()
         },
         usage=usage,
-        x_eugene_plexus=_routing_info(client, table, body.model, started),
+        x_eugene_plexus=_routing_info(
+            client, table, body.model, started, reported_model=result.reportedModel
+        ),
     )
     # exclude_none: a TypeSafe answer carries exactly its kind's fields
     # -- a noul with five nulls beside it is not the pinned shape, and an
@@ -4654,6 +4692,7 @@ def _routing_info(
     swapped_in: bool = False,
     prompt_truncated: bool | None = None,
     output_cap: OutputCap | None = None,
+    reported_model: str | None = None,
 ) -> CompletionRoutingInfo:
     """Which backend actually served this, and whether failover fired.
 
@@ -4704,6 +4743,7 @@ def _routing_info(
         web_searches=_searches_run(client),
         search_suggestions=_search_suggestions(client),
         output_cap=output_cap,
+        reported_model=reported_model,
     )
 
 

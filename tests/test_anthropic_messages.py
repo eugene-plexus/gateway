@@ -215,6 +215,161 @@ def test_cache_control_is_dropped_wherever_it_appears(settings: Settings) -> Non
     assert r.status_code == 200, r.text
 
 
+def _ignored(response: httpx.Response) -> list[str]:
+    return response.headers.get("x-eugene-plexus-ignored-settings", "").split(", ")
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_cache_control_is_carried_when_the_answering_backend_takes_it(
+    settings: Settings, stream: bool
+) -> None:
+    """PC6: a backend that lists `cacheControl` is sent the client's mark as a
+    hint, and the header stops naming `cache_control` as ignored -- it was not."""
+    fake = FakeDriverClient(name="d1", model_id=MODEL)
+    fake.supported_settings = [*fake.supported_settings, "cacheControl"]
+    fake.responses = ["ok"]
+    with _client(_app_with(settings, fake)) as client:
+        r = client.post("/v1/messages?beta=true", json=body(stream=stream))
+    assert r.status_code == 200, r.text
+    assert fake.calls[0].cacheControl is not None
+    assert "cache_control" not in _ignored(r)
+    # What the backend still does not get is still named.
+    assert "context_management" in _ignored(r)
+    # A hint, never a setting the caller asked a backend to honour.
+    assert "cacheControl" not in (fake.calls[0].callerSettings or [])
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_cache_control_stays_named_when_the_answering_backend_does_not_carry_it(
+    settings: Settings, stream: bool
+) -> None:
+    fake = FakeDriverClient(name="d1", model_id=MODEL)
+    fake.responses = ["ok"]
+    with _client(_app_with(settings, fake)) as client:
+        r = client.post("/v1/messages?beta=true", json=body(stream=stream))
+    assert r.status_code == 200, r.text
+    assert "cache_control" in _ignored(r)
+
+
+def test_a_failover_to_a_backend_without_it_names_cache_control(settings: Settings) -> None:
+    """A whole answer is named after the call, from the backend that served it."""
+    from .test_failover_safety import pool_full
+
+    carrying = FakeDriverClient(name="d1", model_id=MODEL)
+    carrying.supported_settings = [*carrying.supported_settings, "cacheControl"]
+    carrying.generate_error = pool_full()
+    plain = FakeDriverClient(name="d2", model_id=MODEL)
+    plain.responses = ["ok"]
+    with _client(_app_with(settings, carrying, plain)) as client:
+        r = client.post("/v1/messages?beta=true", json=body())
+    assert r.status_code == 200, r.text
+    assert "cache_control" in _ignored(r)
+
+
+def _marked(ttl: str | None) -> dict[str, Any]:
+    mark: dict[str, Any] = {"type": "ephemeral"}
+    if ttl is not None:
+        mark["ttl"] = ttl
+    return {"type": "text", "text": "marked", "cache_control": mark}
+
+
+@pytest.mark.parametrize(
+    ("ttls", "longest"),
+    [
+        ([None], None),
+        (["5m"], "5m"),
+        (["5m", "1h"], "1h"),
+        (["1h", "5m", None], "1h"),
+        (["10m"], None),
+    ],
+    ids=["no-ttl", "five-minutes", "longest-wins", "order-does-not-matter", "unknown-is-ignored"],
+)
+def test_the_longest_cache_ttl_the_client_sent_is_the_one_carried(
+    settings: Settings, ttls: list[str | None], longest: str | None
+) -> None:
+    fake = FakeDriverClient(name="d1", model_id=MODEL)
+    fake.supported_settings = [*fake.supported_settings, "cacheControl"]
+    fake.responses = ["ok"]
+    request = body(
+        system=[_marked(ttls[0]), *[_marked(t) for t in ttls[1:]]],
+        messages=[{"role": "user", "content": [{"type": "text", "text": "go"}]}],
+    )
+    with _client(_app_with(settings, fake)) as client:
+        r = client.post("/v1/messages", json=request)
+    assert r.status_code == 200, r.text
+    hint = fake.calls[0].cacheControl
+    assert hint is not None
+    assert (hint.ttl.value if hint.ttl is not None else None) == longest
+
+
+@pytest.mark.parametrize(
+    "where",
+    ["top-level", "system", "message", "tool", "tool-result"],
+)
+def test_a_mark_anywhere_on_the_request_is_a_hint(settings: Settings, where: str) -> None:
+    fake = FakeDriverClient(name="d1", model_id=MODEL, supports_tools=True)
+    fake.supported_settings = [*fake.supported_settings, "cacheControl"]
+    fake.responses = ["ok"]
+    mark = {"type": "ephemeral", "ttl": "1h"}
+    request = body(
+        system="You are a Claude agent.",
+        messages=[
+            {"role": "user", "content": [{"type": "text", "text": "go"}]},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "Glob", "input": {"p": "*.py"}}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": "a.py"}],
+            },
+        ],
+        tools=[
+            {
+                "name": "Glob",
+                "description": "Find files.",
+                "input_schema": {"type": "object", "properties": {"p": {"type": "string"}}},
+            }
+        ],
+    )
+    if where == "top-level":
+        request["cache_control"] = mark
+    elif where == "system":
+        request["system"] = [
+            {"type": "text", "text": "You are a Claude agent.", "cache_control": mark}
+        ]
+    elif where == "message":
+        request["messages"][0]["content"][0]["cache_control"] = mark
+    elif where == "tool":
+        request["tools"][0]["cache_control"] = mark
+    else:
+        request["messages"][2]["content"][0]["cache_control"] = mark
+    with _client(_app_with(settings, fake)) as client:
+        r = client.post("/v1/messages", json=request)
+    assert r.status_code == 200, r.text
+    hint = fake.calls[0].cacheControl
+    assert hint is not None and hint.ttl is not None and hint.ttl.value == "1h"
+    assert "cache_control" not in _ignored(r)
+
+
+def test_a_request_that_marked_nothing_sends_no_hint(settings: Settings) -> None:
+    """Carry the client's, add none (prompt-cache.md call 4)."""
+    fake = FakeDriverClient(name="d1", model_id=MODEL)
+    fake.supported_settings = [*fake.supported_settings, "cacheControl"]
+    fake.responses = ["ok"]
+    request = body(
+        system="You are a Claude agent.",
+        messages=[{"role": "user", "content": [{"type": "text", "text": "go"}]}],
+    )
+    with _client(_app_with(settings, fake)) as client:
+        r = client.post("/v1/messages", json=request)
+    assert r.status_code == 200, r.text
+    assert fake.calls[0].cacheControl is None
+    assert "cache_control" not in _ignored(r)
+
+
 def test_metadata_and_context_management_are_dropped(settings: Settings) -> None:
     fake = FakeDriverClient(name="d1", model_id=MODEL)
     fake.responses = ["ok"]

@@ -27,7 +27,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 from fastapi import Request
@@ -35,6 +35,7 @@ from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from . import chat_contract, images, server_tools, tokens
+from ._generated.driver_models import CacheControlHint, CacheTtl
 from ._generated.models import (
     AnthropicMessagesRequest,
     ChatCompletionMessage,
@@ -374,6 +375,46 @@ def thinking_block(reasoning: str, display: str) -> dict[str, Any]:
     return {"type": "thinking", "thinking": reasoning, "signature": ""}
 
 
+def _block_marks(value: Any) -> Iterator[Any]:
+    """Every `cache_control` on a block, a list of blocks, or the content a block
+    nests (a `tool_result`'s). Does not walk tool JSON Schemas or user metadata
+    looking for coincidental property names."""
+    if isinstance(value, list):
+        for item in value:
+            yield from _block_marks(item)
+    elif isinstance(value, dict):
+        if value.get("cache_control") is not None:
+            yield value["cache_control"]
+        yield from _block_marks(value.get("content"))
+
+
+#: `cache_control.ttl` values, shortest first. Anthropic takes these two.
+_TTL_LENGTH = {CacheTtl.field_5m: 1, CacheTtl.field_1h: 2}
+_TTL_VALUES = {ttl.value for ttl in CacheTtl}
+
+
+def cache_hint(raw: Mapping[str, Any]) -> CacheControlHint | None:
+    """The client's `cache_control` as the driver's hint, or None when it sent none (PC6).
+
+    **Carry the client's, add none**: a request that marked nothing has no hint.
+    A mark on the request, the system prompt, a message, a tool or a tool result
+    counts; the hint says only that the client asked, and for how long. `ttl` is
+    the longest any mark named; one this door does not know is left out, so the
+    provider's own default applies rather than a value it may refuse.
+    """
+    marks = [raw["cache_control"]] if raw.get("cache_control") is not None else []
+    for name in ("system", "messages", "tools"):
+        marks.extend(_block_marks(raw.get(name)))
+    if not marks:
+        return None
+    named: list[CacheTtl] = []
+    for mark in marks:
+        ttl = mark.get("ttl") if isinstance(mark, Mapping) else None
+        if isinstance(ttl, str) and ttl in _TTL_VALUES:
+            named.append(CacheTtl(ttl))
+    return CacheControlHint(ttl=max(named, key=_TTL_LENGTH.__getitem__, default=None))
+
+
 def compatibility_headers(raw: Mapping[str, Any]) -> dict[str, str]:
     def not_honoured(name: str) -> bool:
         value = raw.get(name)
@@ -388,17 +429,10 @@ def compatibility_headers(raw: Mapping[str, Any]) -> dict[str, str]:
 
     ignored = [name for name in _DROPPED_TOP_LEVEL if not_honoured(name)]
 
-    # Cache hints also arrive on system, tool and message blocks. Do not walk
-    # tool JSON Schemas or user metadata looking for coincidental property names.
-    def has_cache(value: Any) -> bool:
-        if isinstance(value, list):
-            return any(has_cache(item) for item in value)
-        if isinstance(value, dict):
-            return value.get("cache_control") is not None or has_cache(value.get("content"))
-        return False
-
+    # Cache hints also arrive on system, tool and message blocks.
     if "cache_control" not in ignored and any(
-        has_cache(raw.get(name)) for name in ("system", "messages", "tools")
+        next(_block_marks(raw.get(name)), None) is not None
+        for name in ("system", "messages", "tools")
     ):
         ignored.append("cache_control")
     # MR9a: a local model cannot say which of a search result's blocks it
