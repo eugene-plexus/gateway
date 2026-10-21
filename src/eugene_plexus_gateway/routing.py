@@ -50,7 +50,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import ipaddress
 import logging
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -92,7 +91,7 @@ from ._generated.models import (
 from ._generated.models import (
     Billing as SearchBilling,
 )
-from ._http import internal_client, machine_pinned, machine_required
+from ._http import _is_loopback, internal_client, machine_pinned, machine_required
 from .affinity import HIT, MOVED, NEW, AffinityTable
 from .budget import Conversation, ConversationSizes, PoolLedger, TurnBudget
 from .capabilities import calls_tools, chats, said_tools
@@ -120,7 +119,7 @@ _TOPOLOGY_TIMEOUT = 5.0
 log = logging.getLogger(__name__)
 
 
-def _remote_url(name: Any, entry: dict[str, Any]) -> str | None:
+def _remote_url(name: Any, entry: dict[str, Any], *, same_host: bool = False) -> str | None:
     """Where this gateway reaches a driver on another machine.
 
     Over TLS to that machine's machine port (`Component.machineUrl`, LT1)
@@ -136,8 +135,10 @@ def _remote_url(name: Any, entry: dict[str, Any]) -> str | None:
     plain = entry.get("advertiseUrl") or entry.get("url")
     plain = plain if isinstance(plain, str) else None
     # A loopback address never leaves this host, so "required" has nothing to
-    # protect there: a second agent on the root's own host (gateway#17).
-    if machine_required() and not (plain and _loopback_url(plain)):
+    # protect there: a second agent on the root's own host (gateway#17). Only
+    # from an agent that is itself on this host: another machine's loopback
+    # is not this one's, and dialling it here would reach a local service.
+    if machine_required() and not (same_host and plain and _loopback_url(plain)):
         log.warning(
             "left out driver %s: encryption between machines is required and its machine "
             "has no key this gateway holds%s",
@@ -152,13 +153,7 @@ def _remote_url(name: Any, entry: dict[str, Any]) -> str | None:
 
 
 def _loopback_url(url: str) -> bool:
-    host = (urlsplit(url).hostname or "").lower()
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
+    return _is_loopback(urlsplit(url).hostname or "")
 
 
 # Per-request collection of attempt rows (M8). A contextvar rather than
@@ -1575,7 +1570,9 @@ class RoutingTable:
             # routable from here (M7) -- and the second for this one.
             name = entry.get("name")
             url = (
-                entry.get("url") or entry.get("advertiseUrl") if local else _remote_url(name, entry)
+                entry.get("url") or entry.get("advertiseUrl")
+                if local
+                else _remote_url(name, entry, same_host=_loopback_url(agent_url))
             )
             if isinstance(name, str) and name and isinstance(url, str) and url:
                 # A search account (P8) is found the same way and kept apart:

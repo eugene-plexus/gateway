@@ -292,7 +292,14 @@ def test_the_router_keeps_a_loopback_driver_under_required() -> None:
     _http.set_machine_table(_http.parse_machine_table({"required": True}))
     try:
         here = {"advertiseUrl": "http://127.0.0.1:19105"}
-        assert routing._remote_url("same-host", here) == "http://127.0.0.1:19105"
-        assert routing._remote_url("far", {"advertiseUrl": "http://10.9.9.8:8091"}) is None
+        assert routing._remote_url("same-host", here, same_host=True) == here["advertiseUrl"]
+        local = {"advertiseUrl": "http://localhost:19106"}
+        assert routing._remote_url("named", local, same_host=True) == local["advertiseUrl"]
+        far = {"advertiseUrl": "http://10.9.9.8:8091"}
+        assert routing._remote_url("far", far, same_host=True) is None
+        # Another machine's agent saying "loopback" is not this host's loopback.
+        assert routing._remote_url("lying", here, same_host=False) is None
+        spelled = {"advertiseUrl": "http://127.0.0.1.evil.example:8091"}
+        assert routing._remote_url("spelled", spelled, same_host=True) is None
     finally:
         _http.set_machine_table(_http.parse_machine_table({}))
