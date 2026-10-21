@@ -10,7 +10,7 @@
       "sha256": "291d6e51414837e02dc776428d9952f1b181440c7f3b2a20ce88f0f6fcdbeb53"
     },
     "src/eugene_plexus_gateway/_http.py": {
-      "sha256": "c90eab6e0f867ac8d76ce6a61383df433a38e2fac20784ca60c0b303b20ee942"
+      "sha256": "bb1c19018f1159882f000586a237bba08adbcaa1857de2f17bc841277c252dbb"
     },
     "src/eugene_plexus_gateway/body_limit.py": {
       "sha256": "99f1503ae159cc1e138ea51cd54c55b5231a179758fe1a86099b2c798edc408c"
