@@ -24,6 +24,8 @@ class Library:
         self.calls: list[httpx.Request] = []
         self.status = 200
         self.invalid = False
+        self.author: dict[str, Any] = {}
+        self.author_format = "gguf"
 
     async def request(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(request)
@@ -36,7 +38,12 @@ class Library:
             return httpx.Response(
                 200,
                 json={
-                    "models": [{"id": str(list(self.values).index(path))}]
+                    "models": [
+                        {
+                            "id": str(list(self.values).index(path)),
+                            self.author_format: {"recommendedSampling": self.author},
+                        }
+                    ]
                     if path in self.values
                     else []
                 },
@@ -202,9 +209,10 @@ def test_both_doors_preserve_caller_values_and_apply_profile(
         body["max_tokens"] = 41  # Anthropic requires it; never fill over it.
     if explicit:
         library.values["/models/a.gguf"]["temperature"] = 0.8
-        body.update(max_tokens=17, temperature=0, top_p=0)
+        body.update(max_tokens=17, temperature=0, top_p=0, top_k=0)
         if endpoint.endswith("completions"):
             body["seed"] = 0
+            body["min_p"] = 0
     with TestClient(app) as client:
         response = client.post(endpoint, json=body)
         assert response.status_code == 200, response.text
@@ -213,9 +221,102 @@ def test_both_doors_preserve_caller_values_and_apply_profile(
         assert got.temperature == 0
         assert got.topP == (0 if explicit else 0.25)
         if explicit:
-            assert not library.calls
+            assert got.topK == 0
             if endpoint.endswith("completions"):
+                assert got.minP == 0
+                assert not library.calls
                 assert got.seed == 0
+        client.portal.call(profiles.aclose)
+
+
+@pytest.mark.parametrize("author_format", ["gguf", "safetensors"])
+async def test_author_sampling_fills_what_the_profile_leaves(
+    library: Library, author_format: str
+) -> None:
+    library.author_format = author_format
+    library.author = {"temperature": 0.6, "topK": 20, "minP": 0.05, "topP": 0.95}
+    library.values["/models/a.gguf"] = {"topP": 0.9}
+    profiles = resolver(library)
+    try:
+        assert await profiles.get("/models/a.gguf") == {
+            "temperature": 0.6,
+            "topP": 0.9,
+            "topK": 20,
+            "minP": 0.05,
+        }
+    finally:
+        await profiles.aclose()
+
+
+@pytest.mark.parametrize("stream", [False, True])
+@pytest.mark.parametrize("disabled", [False, True])
+def test_author_sampling_off_keeps_gateway_default(
+    app: FastAPI, library: Library, stream: bool, disabled: bool
+) -> None:
+    library.author = {"temperature": 0.6, "topK": 20, "minP": 0.05}
+    library.values["/models/a.gguf"] = {"authorSampling": not disabled}
+    driver = FakeDriverClient(name="d", model_id="alias", runtime="run")
+    profiles = setup_routes(app, library, driver)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "alias",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": stream,
+            },
+        )
+        assert response.status_code == 200, response.text
+        got = driver.calls[-1]
+        assert got.temperature == (0.7 if disabled else 0.6)
+        assert got.topK == (None if disabled else 20)
+        assert got.minP == (None if disabled else 0.05)
+        assert "topK" not in (got.callerSettings or [])
+        assert "minP" not in (got.callerSettings or [])
+        client.portal.call(profiles.aclose)
+
+
+async def test_author_sampling_applies_without_a_profile(library: Library) -> None:
+    library.values["/models/a.gguf"] = {}
+    library.author = {"temperature": 0, "topK": 0, "minP": 0}
+    profiles = resolver(library)
+    try:
+        assert await profiles.get("/models/a.gguf") == {"temperature": 0, "topK": 0, "minP": 0}
+    finally:
+        await profiles.aclose()
+
+
+@pytest.mark.parametrize("unsupported", [False, True])
+def test_author_cuts_fill_when_other_values_are_explicit(
+    app: FastAPI, library: Library, unsupported: bool
+) -> None:
+    library.author = {"temperature": 0.6, "topK": 20, "minP": 0.05}
+    driver = FakeDriverClient(name="d", model_id="alias", runtime="run")
+    if unsupported:
+        driver.supported_settings = [
+            key for key in driver.supported_settings if key not in {"topK", "minP"}
+        ]
+    profiles = setup_routes(app, library, driver)
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "alias",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 17,
+                "temperature": 0,
+                "top_p": 0,
+            },
+        )
+        assert response.status_code == 200, response.text
+        got = driver.calls[-1]
+        assert got.temperature == got.topP == 0
+        # These are gateway-filled values at the driver boundary. A backend
+        # may drop them; they must never become caller requirements and refuse.
+        assert got.topK == 20
+        assert got.minP == 0.05
+        assert "topK" not in (got.callerSettings or [])
+        assert "minP" not in (got.callerSettings or [])
         client.portal.call(profiles.aclose)
 
 

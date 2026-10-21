@@ -1139,6 +1139,8 @@ async def _prepare(
                 body.max_tokens is not None
                 and body.temperature is not None
                 and body.top_p is not None
+                and body.top_k is not None
+                and body.min_p is not None
             ):
                 caps[(candidate.node, candidate.name)] = base_cap
                 return original
@@ -1146,7 +1148,7 @@ async def _prepare(
             caps[(candidate.node, candidate.name)] = _output_cap(
                 body, store, defaults, install_max_tokens=install_max_tokens
             )
-            # The profile's three defaults, copied onto the request this
+            # The profile and author's defaults, copied onto the request this
             # candidate is being handed -- never a request rebuilt from the
             # caller's body. A rebuild threw away whatever was added since:
             # the search loop's own turns (P8) arrived here with the model's
@@ -1161,6 +1163,8 @@ async def _prepare(
                     "maxTokens": filled.maxTokens,
                     "temperature": filled.temperature,
                     "topP": filled.topP,
+                    "topK": filled.topK,
+                    "minP": filled.minP,
                 }
             )
 
@@ -4351,8 +4355,8 @@ def _to_generate_request(
         # them, so an absent field stays absent -- and `parallel_tool_calls`
         # most of all, since llama.cpp and OpenAI disagree about its
         # default and filling one in would change what one of them does.
-        topK=body.top_k,
-        minP=body.min_p,
+        topK=body.top_k if body.top_k is not None else defaults.get("topK"),
+        minP=body.min_p if body.min_p is not None else defaults.get("minP"),
         frequencyPenalty=body.frequency_penalty,
         presencePenalty=body.presence_penalty,
         parallelToolCalls=body.parallel_tool_calls,

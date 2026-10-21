@@ -18,7 +18,7 @@ from urllib.parse import quote
 
 import httpx
 
-from ._generated.library_models import ModelProfileList
+from ._generated.library_models import ModelProfileList, RecommendedSampling
 from ._http import internal_client
 
 log = logging.getLogger(__name__)
@@ -132,11 +132,22 @@ class ProfileDefaults:
         defaults = [profile for profile in profiles if profile.default]
         if len(defaults) > 1:
             raise ValueError("Library returned more than one default profile")
-        if not defaults:
-            return {}
-        return defaults[0].model_dump(
-            include={"maxTokens", "temperature", "topP"}, exclude_none=True
-        )
+        profile = defaults[0] if defaults else None
+        values: dict[str, Any] = {}
+        if profile is None or profile.authorSampling is not False:
+            detail = models[0].get("gguf") or models[0].get("safetensors") or {}
+            author = detail.get("recommendedSampling")
+            if author is not None:
+                values = RecommendedSampling.model_validate(author).model_dump(
+                    include={"temperature", "topP", "topK", "minP"}, exclude_none=True
+                )
+        if profile is not None:
+            values.update(
+                profile.model_dump(
+                    include={"maxTokens", "temperature", "topP", "topK", "minP"}, exclude_none=True
+                )
+            )
+        return values
 
     async def aclose(self) -> None:
         pending = list(self._pending.values())
