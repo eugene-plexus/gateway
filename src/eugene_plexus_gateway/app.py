@@ -24,6 +24,7 @@ from . import __version__
 from .auth_state import AuthState, load_auth_state
 from .client_keys import ClientKeyGuard
 from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS, ConfigStore
+from .control_tokens import SpecialTokenSpellings
 from .cors import FrontDoorCors
 from .dependencies import require_operator
 from .lifecycle import AgentLifecycleClient, LifecycleManager
@@ -146,6 +147,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # lifespan otherwise builds the real one and owns its teardown.
     owns_routing = False
     profiles: ProfileDefaults | None = None
+    spellings: SpecialTokenSpellings | None = None
     lifecycle: LifecycleManager | None = None
     if not hasattr(app.state, "routing"):
         if settings.safe_mode:
@@ -178,6 +180,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             owns_routing = True
             profiles = ProfileDefaults(settings.agent_url, auth_state.service_token, store.get)
             app.state.profile_defaults = profiles
+            spellings = SpecialTokenSpellings(settings.agent_url, auth_state.service_token)
+            app.state.special_tokens = spellings
             # Awaited, so the gateway is routable the moment it serves.
             await table.start()
             # Lifecycle policy rides on the same table: idle unload and
@@ -196,6 +200,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         if profiles is not None:
             await profiles.aclose()
+        if spellings is not None:
+            await spellings.aclose()
         if lifecycle is not None:
             await lifecycle.aclose()
         if owns_routing and app.state.routing is not None:

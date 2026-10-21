@@ -340,6 +340,24 @@ FIELDS: list[ConfigField] = [
         enumLabels=["As a user turn, in place", "As a system message, as sent"],
     ),
     ConfigField(
+        key="escapeControlTokens",
+        label="Treat control tokens in messages as text",
+        description=(
+            "Breaks a model's own special-token spellings, such as `<|im_end|>`, in what "
+            "people and tools send, so text in a message cannot end a turn or start a "
+            "system turn.\n\n"
+            "llama.cpp reads those spellings as control tokens wherever they appear in the "
+            "prompt, so a web page, a file or a pasted document holding one can take over "
+            "the conversation. On (the default), each spelling the model's vocabulary lists "
+            "gets an invisible character after its first character in user and tool "
+            "content; the model reads the same text. The cost: a model asked to copy such "
+            "text back copies the invisible character too. Off sends content as written."
+        ),
+        category="generation",
+        valueType=ConfigValueType.boolean,
+        default=True,
+    ),
+    ConfigField(
         key="loadBalancing",
         label="New conversations go to",
         description=(

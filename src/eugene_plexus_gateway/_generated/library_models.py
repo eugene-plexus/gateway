@@ -10,41 +10,6 @@ from typing import Any, Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, RootModel
 
 
-class LibraryFolder(BaseModel):
-    """
-    One directory the library catalogues, and where other machines
-    find it (2026-09-14).
-
-    `path` is the directory as the library's own host spells it —
-    what the scanner walks, what a `ModelSummary.path` starts with,
-    the left-hand side of every rule that reaches it. `mounts` is
-    the same directory as **other** machines see it: a POSIX-shaped
-    entry is for Linux and macOS nodes, a Windows-shaped one (drive
-    letter or UNC) for Windows nodes, and a node takes the first
-    entry of its own shape. That is the whole of "how does node X
-    reach folder Y" for every node that mounts the share where the
-    folder says; a node that mounts it elsewhere carries one
-    override in its agent's `pathMappings`, and a node with no
-    mount of its shape opens `path` as written — the identical-mount
-    convention, and every single-host install.
-
-    The rule this replaces was per node per folder, on each node's
-    agent, and grew as nodes × folders with every row typed by hand.
-    This is per folder, stated once. Nothing is copied or cached:
-    the operator mounts the share, this says where.
-
-    """
-
-    path: str = Field(
-        ...,
-        description="Absolute, as the library's host spells it. Immutable in the\nsense that changing it is a different folder: models are\nidentified by their path under it.\n",
-    )
-    mounts: list[str] | None = Field(
-        [],
-        description='Absolute paths, each Windows- or POSIX-shaped; the shape\nsays which nodes it is for. Order matters only among entries\nof one shape, where the first wins. Empty means "reached at\n`path`, or not at all".\n',
-    )
-
-
 class Role(StrEnum):
     """
     The speaker of a single message in a conversation. Matches the
@@ -1673,6 +1638,22 @@ class PathMapping(BaseModel):
     )
 
 
+class LibraryFolderKind(StrEnum):
+    """
+    What the library reads in a folder (CX9, 2026-10-20). `folder`:
+    model files, walked as they are. `ollama`: an Ollama model store
+    (the directory holding `blobs/` and `manifests/` or
+    `manifests-v2/`), read through its manifests and **never written
+    to** -- no download, provenance, prepared file or delete lands
+    there. Its models are Ollama's: one that Ollama removes goes
+    `missing`.
+
+    """
+
+    folder = 'folder'
+    ollama = 'ollama'
+
+
 class DirectoryEntryKind(StrEnum):
     """
     Files appear only when a listing asked for `includeFiles`. A
@@ -1683,6 +1664,28 @@ class DirectoryEntryKind(StrEnum):
 
     directory = 'directory'
     file = 'file'
+
+
+class OllamaDetail(BaseModel):
+    """
+    A model read from an Ollama store (CX9): which of Ollama's names
+    point at this file. Present only for a model in a folder of kind
+    `ollama`. Its `name` is the first of `tags`, and is what
+    `Runtime.modelAlias` is set to, since the file's own name is a
+    hash. Ollama manages the file: the library never writes or
+    deletes it.
+
+    """
+
+    tags: list[str] = Field(
+        ...,
+        description="`model:tag` names, as `ollama list` shows them, sorted. Several\ntags can share one file. A model outside Ollama's own library\nkeeps its namespace (`user/model:tag`); one from another\nregistry keeps its host.\n",
+        min_length=1,
+    )
+    needsMigration: bool | None = Field(
+        None,
+        description='Its family is one Ollama rewrites for llama.cpp\n(`compatmigrate`) and this file is the older layout, so\nupstream llama.cpp may not load it until Ollama has updated\nit. Run is not refused for it.\n',
+    )
 
 
 class ModelStatus(StrEnum):
@@ -1916,6 +1919,13 @@ class RecommendedSampling(BaseModel):
     temperature: float | None = None
     topK: int | None = None
     topP: float | None = None
+
+
+class SpecialTokens(BaseModel):
+    tokens: list[str] = Field(
+        ...,
+        description='Each spelling once, longest first, so a matcher that tries them\nin order never breaks a long spelling at a shorter one inside it.\n',
+    )
 
 
 class ProfileMode(StrEnum):
@@ -2637,15 +2647,44 @@ class QuantTier(BaseModel):
     )
 
 
-class LibraryFolderList(BaseModel):
+class LibraryFolder(BaseModel):
     """
-    The folders the library catalogues, as `GET /v1/folders` answers
-    them — the same objects `modelRoots` holds, one shape on the
-    wire whatever shape the config was given in.
+    One directory the library catalogues, and where other machines
+    find it (2026-09-14).
+
+    `path` is the directory as the library's own host spells it —
+    what the scanner walks, what a `ModelSummary.path` starts with,
+    the left-hand side of every rule that reaches it. `mounts` is
+    the same directory as **other** machines see it: a POSIX-shaped
+    entry is for Linux and macOS nodes, a Windows-shaped one (drive
+    letter or UNC) for Windows nodes, and a node takes the first
+    entry of its own shape. That is the whole of "how does node X
+    reach folder Y" for every node that mounts the share where the
+    folder says; a node that mounts it elsewhere carries one
+    override in its agent's `pathMappings`, and a node with no
+    mount of its shape opens `path` as written — the identical-mount
+    convention, and every single-host install.
+
+    The rule this replaces was per node per folder, on each node's
+    agent, and grew as nodes × folders with every row typed by hand.
+    This is per folder, stated once. Nothing is copied or cached:
+    the operator mounts the share, this says where.
 
     """
 
-    folders: list[LibraryFolder]
+    path: str = Field(
+        ...,
+        description="Absolute, as the library's host spells it. Immutable in the\nsense that changing it is a different folder: models are\nidentified by their path under it.\n",
+    )
+    mounts: list[str] | None = Field(
+        [],
+        description='Absolute paths, each Windows- or POSIX-shaped; the shape\nsays which nodes it is for. Order matters only among entries\nof one shape, where the first wins. Empty means "reached at\n`path`, or not at all".\n',
+    )
+    kind: LibraryFolderKind | None = 'folder'
+    found: bool | None = Field(
+        None,
+        description='Not in `modelRoots`: the library found it on its own machine\n(an Ollama store, CX9) and lists it while `findOllama` is on.\nAbsent or false for a folder someone added.\n',
+    )
 
 
 class InputAudio(BaseModel):
@@ -3430,6 +3469,17 @@ class QuantTable(BaseModel):
     updatedAt: AwareDatetime | None = Field(
         None, description='When this table was last revised, since the families move.'
     )
+
+
+class LibraryFolderList(BaseModel):
+    """
+    The folders the library catalogues, as `GET /v1/folders` answers
+    them — the same objects `modelRoots` holds, one shape on the
+    wire whatever shape the config was given in.
+
+    """
+
+    folders: list[LibraryFolder]
 
 
 class InputAudioContentPart(BaseModel):
@@ -4343,7 +4393,7 @@ class LibraryModel(BaseModel):
     format: ModelFormat
     name: str = Field(
         ...,
-        description="The filename with its extension stripped, the directory\nname for safetensors, or the provenance file's name without\n`.eugene-prepared.json` for `prepared`. **Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to — so\nplainly-named files mean the obvious name is already the\nright one.\n",
+        description="The filename with its extension stripped, the directory\nname for safetensors, or the provenance file's name without\n`.eugene-prepared.json` for `prepared`, or the first Ollama tag\nfor a model in an Ollama store. **Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to — so\nplainly-named files mean the obvious name is already the\nright one.\n",
     )
     displayName: str | None = Field(
         None,
@@ -4387,6 +4437,7 @@ class LibraryModel(BaseModel):
     safetensors: SafetensorsDetail | None = None
     kev: KevCheckpointDetail | None = None
     prepared: PreparedDetail | None = None
+    ollama: OllamaDetail | None = None
     profileCount: int | None = Field(
         None,
         description='How many launch profiles are saved against this model. On\nthe list so the browser can badge a tuned model without\nfetching every profile collection.\n',

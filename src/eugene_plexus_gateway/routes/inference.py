@@ -46,6 +46,7 @@ from .. import (
     anthropic,
     chat_contract,
     completion_door,
+    control_tokens,
     decisions,
     ignored_settings,
     image_doors,
@@ -1050,6 +1051,10 @@ async def _prepare(
         generate.completion = completion
         generate.messages = []
     profiles = getattr(request.app.state, "profile_defaults", None)
+    spellings = getattr(request.app.state, "special_tokens", None)
+    escape = spellings is not None and (
+        store is None or store.get("escapeControlTokens") is not False
+    )
     if isinstance(client, TieredClient):
         # Capture the routing snapshot that selected these candidates. A later
         # topology refresh must not join this request to a replacement driver.
@@ -1077,6 +1082,12 @@ async def _prepare(
                         or None,
                     }
                 )
+            if escape and spellings is not None:
+                # DI4: this candidate's own model's spellings, so a fallback to
+                # another model is broken by its vocabulary, not the first one's.
+                pattern = await spellings.pattern(paths.get((candidate.node, candidate.name)))
+                if pattern is not None:
+                    original = control_tokens.escape_request(original, pattern)
             if profiles is None or (
                 body.max_tokens is not None
                 and body.temperature is not None
