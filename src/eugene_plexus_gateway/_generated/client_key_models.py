@@ -64,11 +64,15 @@ class Action(StrEnum):
 class Purpose(StrEnum):
     """
     Logs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.
+
+    Search is a web search that names no model (POST /v1/web_search, the door Open WebUI's external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key's `allowedModels` does not apply. The gateway checks the key's `allowedTools` and `localOnly`, as for every tool.
+
     """
 
     inference = 'inference'
     logs = 'logs'
     catalog = 'catalog'
+    search = 'search'
 
 
 class ClientAdmissionRequest(BaseModel):
@@ -80,7 +84,7 @@ class ClientAdmissionRequest(BaseModel):
     requestId: str = Field(..., max_length=128, min_length=1)
     purpose: Purpose | None = Field(
         'inference',
-        description='Logs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.',
+        description="Logs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.\n\nSearch is a web search that names no model (POST /v1/web_search, the door Open WebUI's external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key's `allowedModels` does not apply. The gateway checks the key's `allowedTools` and `localOnly`, as for every tool.\n",
     )
     model: str | None = Field(None, max_length=256, min_length=1)
     personToken: str | None = Field(

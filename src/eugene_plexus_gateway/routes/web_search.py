@@ -48,14 +48,7 @@ async def web_search(request: Request) -> JSONResponse:
             context.local_only or not permits(context.allowed_tools, "web_search")
         )
         return problem(403 if forbidden else 503, reason)
-    if context is not None and context.key_id is not None:
-        # The pinned authority only reserves inference for a named model.
-        # Never execute uncharged searches or invent a model to evade its policy.
-        return problem(
-            503,
-            "Web search needs shared tool admission, which this authority contract does not "
-            "support yet. Update the agent and gateway together.",
-        )
+    await admission.reserve_search()
     began = time.perf_counter()
     at = datetime.now(UTC)
     result, shaped, status, retry = await web_search_door.run(table, query, count)

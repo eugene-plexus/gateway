@@ -205,6 +205,20 @@ class ClientRequest:
         if model is not None:
             self.ready.set()
 
+    async def reserve_search(self) -> None:
+        """Hold the key's allowance for a web search, which names no model.
+
+        The authority counts it against the key's concurrency and rolling-minute limits
+        as it does an inference request (purpose `search`), and the middleware renews
+        and releases it with the request.
+        """
+        if self.key_id is None or self.guard is None or self.attempted:
+            return
+        self.purpose = "search"
+        self.attempted = True
+        self.access = await self.contact("acquire")
+        self.ready.set()
+
     async def renew(self) -> None:
         async with self.lease_lock:
             if self.ready.is_set() and not self.released:
@@ -268,6 +282,12 @@ async def authorize(request: Request, model: str | None = None, *, streamed: boo
     context = current.get()
     if context is not None:
         await context.authorize(request, model, streamed)
+
+
+async def reserve_search() -> None:
+    context = current.get()
+    if context is not None:
+        await context.reserve_search()
 
 
 def request_id() -> uuid.UUID | None:

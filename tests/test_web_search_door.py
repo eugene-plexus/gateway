@@ -26,7 +26,21 @@ def test_answers_in_open_webui_shape(setup):
         {"link": RESULTS[0]["url"], "title": RESULTS[0]["title"], "snippet": RESULTS[0]["snippet"]}
     ]
     assert len(search.asked) == 1
-    assert authority.calls
+    # Admitted under the key's limits as a search: no model, released when the answer is sent.
+    calls = [c for c in authority.calls if c["action"] != "check"]
+    assert [c["action"] for c in calls] == ["acquire", "release"]
+    assert all(c.get("purpose") == "search" and "model" not in c for c in calls)
+    assert calls[0]["requestId"] == calls[1]["requestId"]
+
+
+def test_search_is_refused_when_the_keys_allowance_is_used(setup):
+    app, authority, headers, search = configured(setup)
+    authority.refuse_acquire = 429
+    with TestClient(app) as client:
+        reply = client.post("/v1/web_search", headers=headers, json={"query": "Eugene"})
+    assert reply.status_code == 429, reply.text
+    assert reply.headers["Retry-After"] == "7"
+    assert not search.asked
 
 
 def test_local_only_key_refused(setup):
