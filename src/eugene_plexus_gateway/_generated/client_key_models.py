@@ -91,18 +91,18 @@ class ClientAdmissionRequest(BaseModel):
     )
 
 
-class ClientAdmissionResult(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    keyId: str
-    keyName: str
-    personId: str | None = Field(
-        None, description='Stable subject verified by the root, never caller supplied.'
-    )
-    appClientId: str | None = None
-    limits: ClientKeyLimits | None = None
-    leaseSeconds: float | None = Field(None, gt=0.0, le=30.0)
+class QueueBand(StrEnum):
+    """
+    Which requests wait or are turned away first when the machines are
+    busy. From highest to lowest: `interactive` (a person waiting at a
+    chat), `background` (work nobody watches), `sheddable` (refused first
+    under load). With no policy the install's default is `interactive`.
+
+    """
+
+    interactive = 'interactive'
+    background = 'background'
+    sheddable = 'sheddable'
 
 
 class ClientKeyPolicyEntry(BaseModel):
@@ -166,6 +166,24 @@ class ClientKeyCreateRequest(BaseModel):
     name: str = Field(..., max_length=64, min_length=1)
     ttlDays: int | None = Field(365, ge=1, le=3650)
     limits: ClientKeyLimits | None = None
+
+
+class ClientAdmissionResult(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    keyId: str
+    keyName: str
+    personId: str | None = Field(
+        None, description='Stable subject verified by the root, never caller supplied.'
+    )
+    appClientId: str | None = None
+    limits: ClientKeyLimits | None = None
+    leaseSeconds: float | None = Field(None, gt=0.0, le=30.0)
+    queueBand: QueueBand | None = Field(
+        None,
+        description="The verified person's queue band from their permission groups\n(row 70): the highest band any of their groups sets. Present only\nwhen the root verified a person (`personId`) and one of their\ngroups sets a band. Absent for a key with no person, a release, or\na person whose groups set none: the key's own band, or the\ninstall's default, applies. Never taken from the caller.\n",
+    )
 
 
 class ClientKeyCreated(BaseModel):

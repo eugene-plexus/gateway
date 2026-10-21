@@ -626,3 +626,13 @@ def test_a_key_denied_search_is_told_so_by_the_model_list(setup):
         )
         theirs = c.get("/v1/models", headers=operator).json()["x_eugene_plexus"]["web_search"]
         assert "tool scope" not in (theirs["reason"] or "")
+
+
+async def test_a_root_that_names_a_queue_band_is_understood():
+    """Row 70: a root answers a verified person's `queueBand`. A gateway whose
+    models predate it refuses the whole answer (`extra='forbid'`) as a 503;
+    this one keeps it, for row 11's queue to read."""
+    answer = await _contact(
+        httpx.Response(200, json={"keyId": "key-1", "keyName": "k", "queueBand": "background"})
+    )
+    assert answer["queueBand"] == "background"
