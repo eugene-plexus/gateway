@@ -5378,7 +5378,8 @@ class AnthropicMessagesRequest(BaseModel):
     Request body for `POST /v1/messages`, in Anthropic's shape.
 
     Measured Claude Code hints (`cache_control`, `context_management`)
-    are accepted with a response header naming ignored settings;
+    are accepted with a response header naming the ignored ones
+    (`cache_control` only when the answering backend did not carry it);
     `thinking` chooses whether reasoning is returned. Metadata is
     discarded. Claude Code's `safeguards`, `speed`, `thread` and
     `diagnostics` are accepted and named as ignored; any other unknown
@@ -5452,7 +5453,7 @@ class AnthropicMessagesRequest(BaseModel):
     )
     cache_control: dict[str, Any] | None = Field(
         None,
-        description='Prompt-cache hints, read and dropped wherever they appear —\non system blocks, on the last user content block, and on\n`tool_result` blocks. A local engine owns its own KV cache\nand there is nothing here to honour.\n',
+        description='Prompt-cache hints, read wherever they appear — on system\nblocks, on the last user content block, and on `tool_result`\nblocks. Carried to a hosted backend that caches on request\n(an OpenRouter `anthropic/*` model) and dropped, and named on\n`x-eugene-plexus-ignored-settings`, by any other. A local\nengine owns its own KV cache and there is nothing here to\nhonour.\n',
     )
 
 
