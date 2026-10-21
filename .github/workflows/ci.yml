@@ -4,8 +4,16 @@ on:
   pull_request:
     branches: [main]
   push:
-    branches: [main]
+    # Every branch, so a branch's result is ready by merge time (development
+    # plan P1). Dependabot branches are skipped: their pull request runs CI.
+    branches-ignore: ['dependabot/**']
   workflow_dispatch:
+
+# A new push cancels the older run on the same branch. A run on `main` is never
+# cancelled (and never replaced while queued): it gets a group of its own.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read

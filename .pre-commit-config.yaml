@@ -13,3 +13,20 @@ repos:
       - id: ruff-check
         args: [--fix]
       - id: ruff-format
+  # Fast checks that CI also runs, each well under a second (W0.6). CI's
+  # "Codegen freshness" job regenerates from the pinned specs over the network,
+  # so only its offline half runs here: the generated code must record SPECS_REF.
+  - repo: local
+    hooks:
+      - id: vendored-platform
+        name: vendored platform integrity
+        entry: python scripts/check-vendored.py
+        language: python
+        pass_filenames: false
+        always_run: true
+      - id: specs-ref-stamp
+        name: generated code records SPECS_REF
+        entry: python scripts/check-specs-ref.py
+        language: python
+        pass_filenames: false
+        always_run: true
