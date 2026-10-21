@@ -36,6 +36,7 @@ from .routes import config as config_routes
 from .routes import health as health_routes
 from .routes import inference as inference_routes
 from .routes import metrics as metrics_routes
+from .routes import web_search as web_search_routes
 from .routing import RoutingTable
 from .settings import Settings, load_settings
 
@@ -250,6 +251,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # and another component are both legitimate callers. Declared on the
     # router's own routes, so this is just the mount.
     app.include_router(inference_routes.router)
+    app.include_router(web_search_routes.router)
 
     # CORS on the three OpenAI-compatible paths, and on nothing else, so a
     # browser-based client -- the playground's direct mode among them --
@@ -270,6 +272,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         InferenceBodyLimit,
         paths={
             "/v1/chat/completions",
+            "/v1/web_search",
             "/v1/messages",
             # The counts check a client key in their own bodies and read a whole JSON body
             # like their parents do. Left out, a key holder could post unbounded JSON to

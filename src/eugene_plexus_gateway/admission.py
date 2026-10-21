@@ -795,6 +795,7 @@ async def before_attempt() -> None:
 #: set and every check downstream read "no client, nothing to limit".
 CLIENT_ADMISSION_PATHS = frozenset(
     {
+        "/v1/web_search",
         "/v1/models",
         "/v1/chat/completions",
         "/v1/messages",

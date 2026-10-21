@@ -80,6 +80,7 @@ ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 FRONT_DOOR_PATHS: frozenset[str] = frozenset(
     {
         "/v1/models",
+        "/v1/web_search",
         "/v1/chat/completions",
         "/v1/embeddings",
         # MR6: a document search that sorts its results in a page.
