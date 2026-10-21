@@ -1085,9 +1085,9 @@ async def _prepare(
             if escape and spellings is not None:
                 # DI4: this candidate's own model's spellings, so a fallback to
                 # another model is broken by its vocabulary, not the first one's.
-                pattern = await spellings.pattern(paths.get((candidate.node, candidate.name)))
-                if pattern is not None:
-                    original = control_tokens.escape_request(original, pattern)
+                found = await spellings.get(paths.get((candidate.node, candidate.name)))
+                if found is not None:
+                    original = await control_tokens.escape_request_async(original, found)
             if profiles is None or (
                 body.max_tokens is not None
                 and body.temperature is not None

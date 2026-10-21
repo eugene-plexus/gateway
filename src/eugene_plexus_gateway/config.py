@@ -350,8 +350,11 @@ FIELDS: list[ConfigField] = [
             "prompt, so a web page, a file or a pasted document holding one can take over "
             "the conversation. On (the default), each spelling the model's vocabulary lists "
             "gets an invisible character after its first character in user and tool "
-            "content; the model reads the same text. The cost: a model asked to copy such "
-            "text back copies the invisible character too. Off sends content as written."
+            "content, tool-call arguments and tool descriptions; the model reads the same "
+            "text. System messages and the model's own answers are sent as written.\n\n"
+            "It covers local GGUF models the Library lists. A model it cannot cover is "
+            "named in the gateway's log. The cost: a model asked to copy such text back "
+            "copies the invisible character too. Off sends everything as written."
         ),
         category="generation",
         valueType=ConfigValueType.boolean,
