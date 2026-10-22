@@ -84,6 +84,7 @@ _DOOR_OF_PATH = {
     "/v1/messages/count_tokens": "messages",
     "/v1/responses": "responses",
     "/v1/responses/input_tokens": "responses",
+    "/v1/responses/compact": "responses",
 }
 
 _CAMEL = re.compile(r"(?<=[a-z0-9])([A-Z])")

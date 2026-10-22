@@ -833,6 +833,7 @@ CLIENT_ADMISSION_PATHS = frozenset(
         # rule and its attribution applied to nothing here, and a refusal admission
         # raised was an unhandled exception (a 500).
         "/v1/responses/input_tokens",
+        "/v1/responses/compact",
         # P3a, 2026-09-28. Shipped without this row for one commit, and a
         # scoped key could speak through any model it was not allowed:
         # the rule above, broken exactly as it describes.
