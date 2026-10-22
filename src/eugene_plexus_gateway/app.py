@@ -36,6 +36,7 @@ from .routes import config as config_routes
 from .routes import health as health_routes
 from .routes import inference as inference_routes
 from .routes import metrics as metrics_routes
+from .routes import roles as roles_routes
 from .routes import web_search as web_search_routes
 from .routing import RoutingTable
 from .settings import Settings, load_settings
@@ -241,6 +242,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # component has no business restarting the gateway.
     operator_only = [Depends(require_operator)]
     app.include_router(config_routes.router, dependencies=operator_only)
+    app.include_router(roles_routes.router, dependencies=operator_only)
     app.include_router(admin_routes.router, dependencies=operator_only)
     # Metrics are operator-only too, and unlike other reads they do not
     # accept a service token: no component needs them, and model names

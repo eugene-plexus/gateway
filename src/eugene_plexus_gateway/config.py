@@ -33,6 +33,7 @@ from ._generated.models import (
     ConfigUpdateRequest,
     ConfigUpdateResult,
     ConfigValueType,
+    ModelRole,
 )
 
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 600.0
@@ -67,9 +68,12 @@ FIELDS: list[ConfigField] = [
         key="repetitionMode",
         label="Repeated response protection",
         description=(
-            "Observe records repeated passages without stopping. Stop cancels streaming "
-            "plain-text loops. Reasoning, tool arguments, structured output and whole "
-            "responses are observation-only. A request can override this setting."
+            "Observe records repeated passages and keeps the full answer.\n\n"
+            "Stop ends a streamed answer that keeps repeating the same long passage. "
+            "Stop is opt-in: evaluation also stopped intentional copies. "
+            "The client is told why and keeps what it has. Off disables detection. "
+            "Reasoning, tool arguments, structured output and non-streamed answers "
+            "are never stopped. A request can override this setting."
         ),
         category="generation",
         valueType=ConfigValueType.enum,
@@ -93,8 +97,9 @@ FIELDS: list[ConfigField] = [
         label="Minimum repeated passage length",
         description=(
             "Minimum whitespace-normalized characters per repeated passage. "
-            "Initial evaluation threshold: 100. Patterns above 2048 characters "
-            "are outside this detector's bounded window. This is not a token cap."
+            "Default: 100. A shorter passage also stops answers you want, such as "
+            "repeated table rows or empty grids. Passages above 2048 characters "
+            "are outside this detector's window. This is not a token cap."
         ),
         category="generation",
         valueType=ConfigValueType.integer,
@@ -105,7 +110,7 @@ FIELDS: list[ConfigField] = [
     ConfigField(
         key="repetitionRepeats",
         label="Consecutive passage copies",
-        description="Copies required before detection. Initial evaluation threshold: four.",
+        description="Copies in a row required before the answer is stopped. Default: four.",
         category="generation",
         valueType=ConfigValueType.integer,
         default=4,
@@ -630,6 +635,20 @@ log = logging.getLogger(__name__)
 _LOAD_BALANCING_DEFAULT_MARKER = ".load-balancing-default"
 
 
+def _enum_word_for_yaml_bool(field: ConfigField, value: Any) -> Any:
+    """A bare `off` or `on` in YAML 1.1 is a boolean, not the word.
+
+    A person who edits the file by hand and writes `repetitionMode: off`
+    would otherwise get a setting that reads False and means Observe. The
+    console writes the word quoted, so only a hand edit comes here.
+    """
+    if isinstance(value, bool) and field.key == "repetitionMode":
+        word = "on" if value else "off"
+        if word in (field.enumValues or []):
+            return word
+    return value
+
+
 def _validate_value(field: ConfigField, value: Any) -> str | None:
     if value is None:
         return None
@@ -729,6 +748,9 @@ def _validate_model_slots(value: Any) -> str | None:
             return f"entry {index}: `model` must be a non-empty string"
         if model in seen:
             return f"entry {index}: model {model!r} is listed twice"
+        if model.startswith("role:") and model.removeprefix("role:") not in ModelRole:
+            roles = ", ".join(f"role:{role.value}" for role in ModelRole)
+            return f"entry {index}: unknown role slot {model!r}. Supported roles: {roles}"
         seen.add(model)
         targets = item.get("targets")
         if not isinstance(targets, list) or not targets:
@@ -770,7 +792,16 @@ class ConfigStore:
                     # default, as a PATCH of null is. `metricsEnabled: null`
                     # used to turn metrics off while GET said null and the
                     # schema said the default was on.
-                    merged[k] = field.default if v is None and field.default is not None else v
+                    merged[k] = (
+                        field.default
+                        if v is None and field.default is not None
+                        else _enum_word_for_yaml_bool(field, v)
+                    )
+                    # The console and serving policy must agree, including
+                    # after an invalid hand edit. Bad repetition settings use
+                    # their defaults, just as Policy.resolve does.
+                    if k.startswith("repetition") and _validate_value(field, merged[k]):
+                        merged[k] = field.default
                 self._values = merged
                 self._settle_load_balancing_locked(raw.get("loadBalancing"))
             else:

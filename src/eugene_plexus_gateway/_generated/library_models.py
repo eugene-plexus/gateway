@@ -2417,6 +2417,52 @@ class StarterSetSource(StrEnum):
     configured = 'configured'
 
 
+class CpuProof(BaseModel):
+    """
+    A CPU measurement on the named test machine, using the recorded
+    engine build. These rates do not predict speed on the caller's
+    machine. The monthly review measures files up to 8 GiB and keeps
+    a proof only while the repo, file, size and engine tag are unchanged.
+    Larger files need a hand measurement. If those inputs change,
+    their proof returns to architecture-only with a note that a new
+    hand measurement is needed.
+
+    """
+
+    decodeTokensPerSecond: float = Field(
+        ..., description='Mean decode speed in tok/s across the benchmark runs.', ge=0.0
+    )
+    promptTokensPerSecond: float = Field(
+        ...,
+        description='Mean prompt processing speed in tok/s across the benchmark runs.',
+        ge=0.0,
+    )
+    promptTokens: int = Field(
+        ...,
+        description='Number of prompt tokens per benchmark run, normally 512.',
+        ge=1,
+    )
+    decodeTokens: int = Field(
+        ...,
+        description='Number of generated tokens per benchmark run, normally 128.',
+        ge=1,
+    )
+    threads: int = Field(
+        ..., description='Number of CPU threads used by llama-bench.', ge=1
+    )
+    machine: str = Field(
+        ...,
+        description='The machine on which the speed was measured, including its\nprocessor name and core count. The monthly review reads the\nprocessor name at run time.\n',
+        min_length=1,
+    )
+    engine: str = Field(
+        ...,
+        description='The pinned engine and build used, e.g. `llama_cpp b10948`.',
+        min_length=1,
+    )
+    measuredOn: date = Field(..., description='Date on which this speed was measured.')
+
+
 class StarterRecommendation(BaseModel):
     """
     Which entry this machine should take, and why -- or, when
@@ -2430,7 +2476,7 @@ class StarterRecommendation(BaseModel):
     )
     reason: str = Field(
         ...,
-        description='Prose naming the numbers, the same rule\n`CatalogueRecommendation` follows: the largest of the set\nthat runs entirely on this GPU with room for the scored\ncontext, said with the sizes that make it checkable.\n\nA mixture-of-experts entry may be recommended where it runs\nwith its experts in system memory: the card holds the rest\nand the cache, and system memory holds the experts. It wins\nonly over a dense entry of a smaller size class; between two\nentries of one class that both fit, the dense one is\nrecommended. The prose names what goes where. No speed is\npredicted.\n',
+        description="Prose naming the numbers, the same rule\n`CatalogueRecommendation` follows: the largest of the set\nthat runs entirely on this GPU with room for the scored\ncontext, said with the sizes that make it checkable.\n\nA mixture-of-experts entry may be recommended where it runs\nwith its experts in system memory: the card holds the rest\nand the cache, and system memory holds the experts. It wins\nonly over a dense entry of a smaller size class; between two\nentries of one class that both fit, the dense one is\nrecommended. The prose names what goes where.\n\nOn a machine with no graphics card, the largest entry that\nfits in memory and whose `cpuProof.decodeTokensPerSecond`\nis at or above `starterCpuFloorTokensPerSecond` (default 4 tok/s,\nconfigurable from 1 to 100). The speed is the test machine's,\nand the reason names that machine. No speed is predicted for this machine.\nIf no entry that fits has a proof at or above the floor,\nrecommend the smallest dense entry that fits and explain\nthe lack of qualifying measurements, using tokens and tok/s.\n",
     )
 
 
@@ -4035,6 +4081,10 @@ class StarterModel(BaseModel):
     downloads30d: int | None = Field(
         None,
         description='The 30-day download count the ranking used, as of\n`reviewed`. A number with a date on it rather than a live\none, because this endpoint makes no upstream call.\n',
+    )
+    cpuProof: CpuProof | None = Field(
+        None,
+        description='Measured CPU speed on the named test machine. Absent or null\nwhen only the architecture was checked. A mixture-of-experts\nentry without a proof is never recommended on a machine with\nno graphics card.\n',
     )
     fit: Fit | None = None
     maxContextLength: int | None = Field(
