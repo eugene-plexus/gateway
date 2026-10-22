@@ -10,6 +10,31 @@ from typing import Any, Literal
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, RootModel
 
 
+class ModelRole(StrEnum):
+    """
+    An install-wide job assigned to models through the gateway's
+    `modelSlots`. A client requests `role:<ModelRole>` rather than
+    a particular model. The list is closed: a new role is a contract
+    change, and an unknown `role:` name is refused when saved.
+
+    These are routing roles, separate from a conversation's `Role`.
+    Capability checks warn; they never block role assignment.
+
+    """
+
+    chat = 'chat'
+    agentic = 'agentic'
+    vision = 'vision'
+    reads_pages = 'reads-pages'
+    image = 'image'
+    speech_to_text = 'speech-to-text'
+    text_to_speech = 'text-to-speech'
+    music = 'music'
+    embeddings = 'embeddings'
+    rerank = 'rerank'
+    decision = 'decision'
+
+
 class Role(StrEnum):
     """
     The speaker of a single message in a conversation. Matches the
@@ -1670,9 +1695,11 @@ class OllamaDetail(BaseModel):
     """
     A model read from an Ollama store (CX9): which of Ollama's names
     point at this file. Present only for a model in a folder of kind
-    `ollama`. Its `name` is the first of `tags`, and is what
-    `Runtime.modelAlias` is set to, since the file's own name is a
-    hash. Ollama manages the file: the library never writes or
+    `ollama`. Its `name` is the tag it was first listed under,
+    while that tag exists. If it disappears, take the first remaining
+    tag and log the change. Adding a tag never renames a model.
+    `Runtime.modelAlias` is set to `name`, since the file's own name
+    is a hash. Ollama manages the file: the library never writes or
     deletes it.
 
     """
@@ -1685,6 +1712,162 @@ class OllamaDetail(BaseModel):
     needsMigration: bool | None = Field(
         None,
         description='Its family is one Ollama rewrites for llama.cpp\n(`compatmigrate`) and this file is the older layout, so\nupstream llama.cpp may not load it until Ollama has updated\nit. Run is not refused for it.\n',
+    )
+
+
+class Method(StrEnum):
+    link = 'link'
+    copy = 'copy'
+
+
+class OllamaKept(BaseModel):
+    """
+    Provenance stored against the kept file's path and reapplied on
+    scans. The ordinary Library model keeps `servedName` as `name`
+    and `Runtime.modelAlias`, even if Ollama removes every tag.
+    The Library never opens a kept file for writing: a link shares
+    Ollama's bytes. A node only holds a copy of this Library file.
+
+    """
+
+    servedName: str
+    tags: list[str] = Field(..., min_length=1)
+    digest: str = Field(
+        ...,
+        description="Ollama's weights digest, used to verify copies and match a node's blob.",
+        pattern='^sha256:[0-9a-f]{64}$',
+    )
+    store: str = Field(
+        ..., description='Absolute path of the source Ollama store on its machine.'
+    )
+    node: str | None = Field(
+        None,
+        description="Source machine for a remote Keep; absent for the Library's own machine.",
+    )
+    keptAt: AwareDatetime
+    method: Method
+
+
+class KeepRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    folder: str | None = Field(
+        None,
+        description="A configured writable Library folder's path. Omit for the\nfirst writable folder. Neither its lexical path nor its\nreal path, including the target's existing parents, may be\ninside an Ollama store.\n",
+    )
+
+
+class NodeOllamaKeepRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    digest: str = Field(
+        ...,
+        description="The weights digest from this machine's reported model.",
+        pattern='^sha256:[0-9a-f]{64}$',
+    )
+    folder: str | None = Field(
+        None,
+        description='Configured writable Library folder; omitted means the first writable folder.',
+    )
+
+
+class State(StrEnum):
+    running = 'running'
+    done = 'done'
+    failed = 'failed'
+    cancelled = 'cancelled'
+
+
+class Method1(StrEnum):
+    """
+    Actual method; copy if any file needs copying, including every remote Keep.
+    """
+
+    link = 'link'
+    copy = 'copy'
+
+
+class Role1(StrEnum):
+    """
+    A file selected by the job's accepted report, never a supplied path.
+    """
+
+    weights = 'weights'
+    projector = 'projector'
+
+
+class KeepFileRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    role: Role1 = Field(
+        ...,
+        description="A file selected by the job's accepted report, never a supplied path.",
+    )
+
+
+class Role2(StrEnum):
+    weights = 'weights'
+    projector = 'projector'
+
+
+class KeepFileState(BaseModel):
+    role: Role2
+    receivedBytes: int = Field(
+        ..., description='Contiguous partial bytes received; 0 after completion.', ge=0
+    )
+    sizeBytes: int | None = Field(
+        ...,
+        description="Complete verified file's size; null while still arriving.",
+        ge=0,
+    )
+    sha256: str | None = Field(
+        ...,
+        description="Complete verified file's SHA-256, without the prefix; null while arriving.",
+        pattern='^[0-9a-f]{64}$',
+    )
+
+
+class OllamaReportedModel(BaseModel):
+    """
+    Metadata from a worker's manifest. This is not a Library model
+    and cannot be run until Keep creates one. Size is the weights
+    blob alone; add projectorSizeBytes for the whole transfer.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    tags: list[str] = Field(
+        ...,
+        description='Sorted Ollama tags for this blob, including namespace or registry when present.',
+        min_length=1,
+    )
+    digest: str = Field(..., pattern='^sha256:[0-9a-f]{64}$')
+    sizeBytes: int = Field(..., ge=0)
+    runner: str = Field(..., description="The manifest reader's runner classification.")
+    projectorDigest: str | None = Field(None, pattern='^sha256:[0-9a-f]{64}$')
+    projectorSizeBytes: int | None = Field(None, ge=0)
+    architecture: str | None = Field(
+        None, description='Architecture read from the GGUF header, when available.'
+    )
+    needsMigration: bool | None = None
+    libraryModel: str | None = Field(
+        None,
+        description='Added by the Library on reads when it already holds this\ndigest; the id of that Library model. Not trusted from a report.\n',
+    )
+
+
+class OllamaSkippedModel(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str
+    detail: str = Field(
+        ..., description='The observed cause for skipping this manifest or model.'
     )
 
 
@@ -3068,6 +3251,29 @@ class DirectoryEntry(BaseModel):
     )
 
 
+class OllamaReportedStore(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    path: str
+    models: list[OllamaReportedModel] = Field(..., max_length=2000)
+    skipped: list[OllamaSkippedModel]
+    error: str | None = Field(
+        None,
+        description='Why this store could not be read. Keep it listed with empty models and this cause.',
+    )
+
+
+class NodeOllamaReport(BaseModel):
+    node: str
+    readAt: AwareDatetime
+    stores: list[OllamaReportedStore]
+
+
+class NodeOllamaList(BaseModel):
+    nodes: list[NodeOllamaReport]
+
+
 class ModelFile(BaseModel):
     """
     One file belonging to a model, and what part it plays.
@@ -3540,15 +3746,19 @@ class QuantTable(BaseModel):
     )
 
 
-class LibraryFolderList(BaseModel):
-    """
-    The folders the library catalogues, as `GET /v1/folders` answers
-    them — the same objects `modelRoots` holds, one shape on the
-    wire whatever shape the config was given in.
-
-    """
-
-    folders: list[LibraryFolder]
+class LibraryFolderStatus(LibraryFolder):
+    readOnly: bool | None = Field(
+        None,
+        description='Effective write protection. True for Ollama stores and\nfolders whose real path resolves inside a store,\nincluding symlinks and Windows junctions. They are\nexcluded from the writable folder list.\n',
+    )
+    readOnlyReason: str | None = Field(
+        None,
+        description="The same sentence as ReadOnlyFolder's detail: names\nthe configured path, the Ollama store it resolves into,\nand says to choose another folder. Ollama manages its\nfiles and the Library never writes there.\n",
+    )
+    error: str | None = Field(
+        None,
+        description='Observed cause when a detected store cannot be read; it stays listed.',
+    )
 
 
 class InputAudioContentPart(BaseModel):
@@ -3779,6 +3989,20 @@ class DirectoryListing(BaseModel):
     entries: list[DirectoryEntry] = Field(
         ...,
         description='Sorted by name, directories first. Entries this component\nmay not read are omitted rather than failing the listing.\n',
+    )
+
+
+class OllamaReport(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    stores: list[OllamaReportedStore] = Field(
+        ...,
+        description='All detected stores; at most 2,000 models in total across this list.',
+    )
+    readAt: AwareDatetime = Field(
+        ...,
+        description='When the agent read this listing, never when the UI last fetched it.',
     )
 
 
@@ -4255,6 +4479,18 @@ class Download(BaseModel):
     )
 
 
+class LibraryFolderList(BaseModel):
+    """
+    The folders the library catalogues, as `GET /v1/folders` answers
+    them: `modelRoots` and detected stores, with effective read-only
+    status and any observed read error. Derived status is never saved
+    in config.
+
+    """
+
+    folders: list[LibraryFolderStatus]
+
+
 class EngineFitModel(BaseModel):
     """
     How one engine uses memory, declared by its adapter beside `accepts`
@@ -4520,7 +4756,7 @@ class LibraryModel(BaseModel):
     format: ModelFormat
     name: str = Field(
         ...,
-        description="The filename with its extension stripped, the directory\nname for safetensors, or the provenance file's name without\n`.eugene-prepared.json` for `prepared`, or the first Ollama tag\nfor a model in an Ollama store. **Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to — so\nplainly-named files mean the obvious name is already the\nright one.\n",
+        description="The filename with its extension stripped, the directory\nname for safetensors, or the provenance file's name without\n`.eugene-prepared.json` for `prepared`. An Ollama model keeps\nthe tag it was first listed under while that tag exists;\nif it disappears, use the first remaining tag and log the\nchange. A kept copy retains `keptFrom.servedName`.\n**Not derived from metadata**: the\nfile's own name is what the operator downloaded, what they\ncall it, and what `Runtime.modelAlias` defaults to — so\nplainly-named files mean the obvious name is already the\nright one.\n",
     )
     displayName: str | None = Field(
         None,
@@ -4565,6 +4801,7 @@ class LibraryModel(BaseModel):
     kev: KevCheckpointDetail | None = None
     prepared: PreparedDetail | None = None
     ollama: OllamaDetail | None = None
+    keptFrom: OllamaKept | None = None
     profileCount: int | None = Field(
         None,
         description='How many launch profiles are saved against this model. On\nthe list so the browser can badge a tuned model without\nfetching every profile collection.\n',
@@ -4592,6 +4829,46 @@ class LibraryModel(BaseModel):
     error: str | None = Field(
         None,
         description='Why this entry is `unreadable` — a header that would not\nparse, a permission error, a truncated file. Named rather\nthan dropped: a model the operator can see and we cannot\nexplain is the worst of the three states.\n',
+    )
+
+
+class KeepJob(BaseModel):
+    """
+    One Keep, with progress across the weights and any projector.
+    `done` means the files are verified, scanned and have `keptFrom`.
+    Local profiles move automatically only after a `same` fingerprint
+    match; Keep is the consent, and the served name stays unchanged.
+    Failure names its observed cause in `error`; a failed or cancelled
+    job never removes Ollama's file. Records contain no credentials.
+
+    """
+
+    id: str
+    model: LibraryModel | None = Field(
+        ...,
+        description='The ordinary Library model when done; null before it has been listed.',
+    )
+    state: State
+    method: Method1 = Field(
+        ...,
+        description='Actual method; copy if any file needs copying, including every remote Keep.',
+    )
+    bytesDone: int = Field(..., ge=0)
+    bytesTotal: int = Field(..., ge=0)
+    target: str = Field(
+        ..., description="Absolute destination weights path on the Library's machine."
+    )
+    error: str | None = Field(
+        ..., description='Observed cause when failed; null otherwise.'
+    )
+    note: str | None = Field(
+        None,
+        description='Why a copy was needed after a link failed; names the observed cause.',
+    )
+    digest: str = Field(..., pattern='^sha256:[0-9a-f]{64}$')
+    node: str | None = Field(
+        None,
+        description='Source agent assigned to a remote transfer; absent for a local Keep.',
     )
 
 

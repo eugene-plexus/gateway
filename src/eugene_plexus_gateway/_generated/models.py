@@ -81,6 +81,31 @@ class BackendKind(StrEnum):
     gemini_api = 'gemini_api'
 
 
+class ModelRole(StrEnum):
+    """
+    An install-wide job assigned to models through the gateway's
+    `modelSlots`. A client requests `role:<ModelRole>` rather than
+    a particular model. The list is closed: a new role is a contract
+    change, and an unknown `role:` name is refused when saved.
+
+    These are routing roles, separate from a conversation's `Role`.
+    Capability checks warn; they never block role assignment.
+
+    """
+
+    chat = 'chat'
+    agentic = 'agentic'
+    vision = 'vision'
+    reads_pages = 'reads-pages'
+    image = 'image'
+    speech_to_text = 'speech-to-text'
+    text_to_speech = 'text-to-speech'
+    music = 'music'
+    embeddings = 'embeddings'
+    rerank = 'rerank'
+    decision = 'decision'
+
+
 class Role(StrEnum):
     """
     The speaker of a single message in a conversation. Matches the
@@ -1689,6 +1714,53 @@ class DirectoryEntryKind(StrEnum):
 
     directory = 'directory'
     file = 'file'
+
+
+class ModelRoleCapability(StrEnum):
+    """
+    The capability a role needs, using the driver's capability or
+    surface names. `chat` needs chat; `agentic` needs chat with
+    `toolCalling`; `vision` and `reads-pages` need chat with
+    `imageInput`; `image` needs image generation; `speech-to-text`
+    needs transcription; `text-to-speech` needs speech; `music`
+    needs audio generation (`audioOutput`); `embeddings` needs
+    embeddings; `rerank` needs rerank; `decision` needs a decision
+    backend. These findings advise the owner, never gate assignment.
+
+    """
+
+    chat = 'chat'
+    toolCalling = 'toolCalling'
+    imageInput = 'imageInput'
+    image = 'image'
+    transcription = 'transcription'
+    speech = 'speech'
+    audioOutput = 'audioOutput'
+    embeddings = 'embeddings'
+    rerank = 'rerank'
+    decision = 'decision'
+
+
+class ModelRoleCapabilityStatus(StrEnum):
+    """
+    `yes` means the required capability is supported; `no` means
+    evidence says it is not; `unknown` means it has not been
+    established. All three allow the owner to assign the role.
+
+    """
+
+    yes = 'yes'
+    no = 'no'
+    unknown = 'unknown'
+
+
+class ModelRoleInfo(BaseModel):
+    """
+    The role represented by a role:<name> model-list entry.
+    """
+
+    role: ModelRole
+    label: str = Field(..., description='The same display label returned by /v1/roles.')
 
 
 class WebSearchAvailability(BaseModel):
@@ -4027,6 +4099,17 @@ class DirectoryEntry(BaseModel):
     )
 
 
+class ModelRoleModel(BaseModel):
+    model: str = Field(
+        ..., description="The assigned model id, as stored in the role slot's targets."
+    )
+    capability: ModelRoleCapabilityStatus
+    reason: str | None = Field(
+        ...,
+        description="Null for `yes`. For `no`, the observed cause: a backend's\nrefusal or an explicit capability listing, in words. For\n`unknown`, why the capability could not be established,\nsuch as an unreachable driver or a listing that does not say.\nAn untested capability alone is never reported as `no`.\n",
+    )
+
+
 class ModelListInfo(BaseModel):
     """
     Namespaced extension: what this install can do for this caller
@@ -4051,6 +4134,10 @@ class ModelRoutingInfo(BaseModel):
 
     """
 
+    role: ModelRoleInfo | None = Field(
+        None,
+        description='Present on role:<name> entries only; absent on ordinary model entries.',
+    )
     drivers: list[str] | None = Field(
         None, description='Names of the inference-drivers currently serving this model.'
     )
@@ -5210,6 +5297,18 @@ class DirectoryListing(BaseModel):
     )
 
 
+class ModelRoleDefinition(BaseModel):
+    role: ModelRole
+    label: str = Field(
+        ..., description="The role's display label, as listed in the /v1/roles example."
+    )
+    requiredCapability: ModelRoleCapability
+    models: list[ModelRoleModel] = Field(
+        ...,
+        description="Models from the effective role slot's targets in configured\norder, including models with negative or unknown capability\nfindings. An unassigned role has an empty list.\n",
+    )
+
+
 class Model(BaseModel):
     """
     One routable model, in OpenAI's shape plus one namespaced
@@ -5221,7 +5320,7 @@ class Model(BaseModel):
 
     id: str = Field(
         ...,
-        description="What the client puts in `ChatCompletionRequest.model`. For a\nlocal runtime this is its `modelAlias`, which defaults to\nthe model's own filename — so the name a user sees is the\nname of the file they downloaded. For a provider account\nit is `<driver name>/<the provider's id>`\n(`openrouter/anthropic/claude-opus-5.5`, `ollama/qwen3:8b`),\nso two accounts never collide and one model through two\nproviders stays two ids.\n\nListed only when a door serves one of the model's surfaces\n(P1-4): an account's speech, image, video and transcription\nmodels appear as their doors are built, under the ids they\nalready have.\n",
+        description="What the client puts in `ChatCompletionRequest.model`. For a\nlocal runtime this is its `modelAlias`, which defaults to\nthe model's own filename — so the name a user sees is the\nname of the file they downloaded. For a provider account\nit is `<driver name>/<the provider's id>`\n(`openrouter/anthropic/claude-opus-5.5`, `ollama/qwen3:8b`),\nso two accounts never collide and one model through two\nproviders stays two ids.\n\nAn assigned model role is listed as `role:<ModelRole>`, with\nits role and label in `x_eugene_plexus.role`. It resolves\nthrough the role's model slot.\n\nListed only when a door serves one of the model's surfaces\n(P1-4): an account's speech, image, video and transcription\nmodels appear as their doors are built, under the ids they\nalready have.\n",
     )
     object: Literal['model']
     created: int | None = Field(
@@ -5508,6 +5607,13 @@ class EngineFitModel(BaseModel):
     table: list[EngineTableFit] | None = Field(
         None,
         description="`engine_table`: the engine's answer for each model it runs, on\nthe node that reported it.\n",
+    )
+
+
+class ModelRoleList(BaseModel):
+    roles: list[ModelRoleDefinition] = Field(
+        ...,
+        description='Every ModelRole in enum order, including roles with no assigned models.',
     )
 
 
