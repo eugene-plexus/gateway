@@ -50,7 +50,6 @@ from ._generated.models import (
     ReasoningEffort,
     ResponseFormat,
     ResponseJsonSchema,
-    Role1,
     Stop,
     TextContentPart,
     Tool,
@@ -58,8 +57,9 @@ from ._generated.models import (
     ToolChoice,
 )
 from ._generated.models import (
-    FunctionCall as OpenAIFunctionCall,
+    FunctionCallModel as OpenAIFunctionCall,
 )
+from ._generated.models import Role2 as Role1
 
 log = logging.getLogger(__name__)
 

@@ -75,7 +75,23 @@ _RESPONSES: dict[str, str] = {
     "responseFormat": "text.format",
 }
 
-_DOORS: dict[str, dict[str, str]] = {"chat": {}, "messages": _MESSAGES, "responses": _RESPONSES}
+_GEMINI = {
+    "reasoningEffort": "generationConfig.thinkingConfig",
+    "maxTokens": "generationConfig.maxOutputTokens",
+    "temperature": "generationConfig.temperature",
+    "topP": "generationConfig.topP",
+    "topK": "generationConfig.topK",
+    "responseFormat": "generationConfig.responseJsonSchema",
+    "toolChoice": "toolConfig.functionCallingConfig",
+    "webSearchOptions": "tools.googleSearch",
+    "stop": "generationConfig.stopSequences",
+}
+_DOORS: dict[str, dict[str, str]] = {
+    "chat": {},
+    "messages": _MESSAGES,
+    "responses": _RESPONSES,
+    "gemini": _GEMINI,
+}
 
 #: The doors a path is, where it is not the chat door's: the Messages door and its
 #: count, the Responses door and its count.
@@ -92,6 +108,8 @@ _CAMEL = re.compile(r"(?<=[a-z0-9])([A-Z])")
 def door_of(path: str) -> str:
     """The door a request to `path` came in by, for `spelled`: `messages`, `responses`, or
     the chat door (`chat`), whose words every other front-door path is spelled in."""
+    if path.startswith(("/v1beta/models/", "/v1/models/")) and ":" in path:
+        return "gemini"
     return _DOOR_OF_PATH.get(path, "chat")
 
 

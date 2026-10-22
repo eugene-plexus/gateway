@@ -38,7 +38,6 @@ from ._generated.models import (
     ChatCompletionRequest,
     FileContentPart,
     Function,
-    FunctionCall,
     FunctionDefinition,
     ImageContentPart,
     ImageUrl,
@@ -49,12 +48,13 @@ from ._generated.models import (
     NamedToolChoice,
     ResponseFormat,
     ResponseJsonSchema,
-    Role1,
     TextContentPart,
     Tool,
     ToolCall,
     ToolChoice,
 )
+from ._generated.models import FunctionCallModel as FunctionCall
+from ._generated.models import Role2 as Role1
 from .anthropic import decode_signature, encode_signature
 
 log = logging.getLogger(__name__)

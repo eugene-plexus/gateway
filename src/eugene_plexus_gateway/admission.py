@@ -18,7 +18,7 @@ from fastapi import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from . import door_paths
+from . import door_paths, gemini
 from ._generated.client_key_models import ClientAdmissionResult
 from .capabilities import TOOL_SETTINGS, calls_tools, chats, said_tools, tools_refused
 from .driver_client import credential_refused_next_step, each_named
@@ -813,7 +813,7 @@ async def before_attempt() -> None:
 #: acceptance run's scoped key served a model outside its allowedModels
 #: because this middleware never saw the path, so `current` was never
 #: set and every check downstream read "no client, nothing to limit".
-CLIENT_ADMISSION_PATHS = frozenset(
+CLIENT_ADMISSION_PATHS = gemini.PATHS | frozenset(
     {
         "/v1/web_search",
         "/v1/models",
@@ -921,6 +921,8 @@ class ClientAdmissionMiddleware:
                 error["error"]["param"] = exc.param
             if anthropic:
                 error["type"] = "error"
+            if gemini.is_request(scope):
+                error = gemini.error_body(status, exc.message)
             if not response_started:
                 await JSONResponse(
                     error,
