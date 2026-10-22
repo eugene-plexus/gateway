@@ -28,6 +28,15 @@ The checks, in the order `verify` makes them, each one a line of RFC
 6. The token lives no longer than its class allows.
 7. A session is not signed out, and every machine it names, as a
    console or as the one that exchanged it, is still in the bundle.
+8. A token the control root signed (anything but a client key) was
+   minted at the epoch of the root this verifier follows, or later
+   (`ep`, row 4). A root that was replaced by a promotion keeps the token
+   key, so without this its commands would still verify everywhere.
+
+**Bundles are ordered by epoch first** (row 4): a bundle from a root at a
+higher epoch replaces one at a lower epoch whatever their versions, since
+a root promoted from a copy that was behind numbers its log below what the
+root it replaced wrote.
 """
 
 from __future__ import annotations
@@ -256,6 +265,11 @@ class TrustBundle:
     revoked_sessions: frozenset[str]
     jws: str
     payload: Mapping[str, Any] = field(repr=False)
+    token_epochs: tuple[int, int] | None = None
+    """`(since, epoch)`: since `since` (unix seconds), at epoch `epoch`,
+    every token the root signs carries `ep` (row 4). A root token without
+    `ep` is then accepted only if it was minted before `since` and this
+    bundle is still at `epoch`. None from a root older than row 4."""
 
     @property
     def members(self) -> frozenset[str]:
@@ -275,6 +289,7 @@ def build_bundle(
     keys: Collection[TrustKey],
     revoked_sessions: Collection[tuple[str, int]] = (),
     now: int | None = None,
+    token_epochs: tuple[int, int] | None = None,
 ) -> TrustBundle:
     """Sign a bundle. Expired sign-outs are pruned; nothing else is decided here."""
     issued = int(time.time()) if now is None else now
@@ -293,6 +308,8 @@ def build_bundle(
             if exp + LEEWAY_SECONDS >= issued
         ],
     }
+    if token_epochs is not None:
+        payload["tokenEpochs"] = {"since": int(token_epochs[0]), "epoch": int(token_epochs[1])}
     jws = jwt.encode(payload, authority, algorithm="EdDSA", headers={"typ": TYP_BUNDLE})
     return parse_bundle(jws, authority=public_b64(authority))
 
@@ -339,6 +356,13 @@ def parse_bundle(jws: str, *, authority: str) -> TrustBundle:
                 grants=frozenset(str(g) for g in raw["grants"]),
             )
         revoked = frozenset(str(r["jti"]) for r in claims["revokedSessions"])
+        token_epochs: tuple[int, int] | None = None
+        marked = claims.get("tokenEpochs")
+        if marked is not None:
+            since, at = marked["since"], marked["epoch"]
+            if any(type(v) is not int for v in (since, at)):
+                raise BundleError("malformed bundle: tokenEpochs holds no integers")
+            token_epochs = (since, at)
         return TrustBundle(
             version=int(claims["version"]),
             epoch=int(claims["epoch"]),
@@ -348,6 +372,7 @@ def parse_bundle(jws: str, *, authority: str) -> TrustBundle:
             revoked_sessions=revoked,
             jws=jws,
             payload=claims,
+            token_epochs=token_epochs,
         )
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, BundleError):
@@ -358,13 +383,18 @@ def parse_bundle(jws: str, *, authority: str) -> TrustBundle:
 def accepts_replacement(held: TrustBundle | None, offered: TrustBundle) -> str | None:
     """None when `offered` may replace `held`; otherwise why not.
 
-    An equal version replaces: two builds at one log index differ only
-    in `iat` and in pruned, already-expired sign-outs.
+    **Epoch first** (row 4): a higher epoch replaces whatever its version,
+    because a root promoted from a copy that was behind numbers its log
+    below what the root it replaced wrote; a lower epoch never does. At
+    one epoch an equal version replaces: two builds at one log index differ
+    only in `iat` and in pruned, already-expired sign-outs.
     """
     if held is None:
         return None
     if offered.epoch < held.epoch:
         return f"epoch {offered.epoch} is below the {held.epoch} already held"
+    if offered.epoch > held.epoch:
+        return None
     if offered.version < held.version:
         return f"version {offered.version} is below the {held.version} already held"
     return None
@@ -452,6 +482,10 @@ class Signer:
     # A type annotation, not a secret; the scanner's generic rule reads it as one.
     key: Ed25519PrivateKey  # gitleaks:allow
     issuer: str
+    epoch: int | None = None
+    """The control root's epoch (row 4): every token it signs but a client
+    key carries it as `ep`, so a verifier can refuse a root it no longer
+    follows. None for any other issuer."""
 
     @property
     def kid(self) -> str:
@@ -492,6 +526,8 @@ class Signer:
             "exp": issued + ttl_seconds,
             "jti": jti or secrets.token_urlsafe(12),
         }
+        if self.epoch is not None and typ != TYP_CLIENT:
+            claims["ep"] = self.epoch
         if extra:
             claims.update(extra)
         token = jwt.encode(
@@ -523,6 +559,9 @@ class Claims:
     """Optional parent shared sign-in for a named administration token."""
     sid: str | None = None
     """On an exchanged session: the `jti` of the session it came from."""
+    epoch: int | None = None
+    """`ep`: the epoch of the control root that signed it (row 4). None on a
+    token from any other issuer, a client key, or a root older than row 4."""
 
     @property
     def is_session(self) -> bool:
@@ -669,6 +708,7 @@ def verify(
 
     _check_grants(key, str(typ), sub, aud)
     _check_lifetime(str(typ), iss, aud, exp - iat, act_claim)
+    epoch = _check_epoch(claims, bundle, str(typ), iss, iat)
 
     browser_session = claims.get("eugene_browser_session")
     if browser_session is not None and (
@@ -711,4 +751,40 @@ def verify(
         sid=sid_claim,
         administration_version=administration_version,
         browser_session=browser_session,
+        epoch=epoch,
     )
+
+
+def no_longer_followed(minted: int | str, follows: int) -> str:
+    """The refusal of a token from a superseded root, in one sentence."""
+    return (
+        f"This command came from a root this machine no longer follows "
+        f"(epoch {minted}; it follows epoch {follows})."
+    )
+
+
+def _check_epoch(
+    claims: Mapping[str, Any], bundle: TrustBundle, typ: str, iss: str, iat: int
+) -> int | None:
+    """Check 8: a root token was minted at the epoch of the root this
+    verifier follows, or later. Returns its `ep`.
+
+    A promotion keeps the root's token key, so the root it replaced could
+    otherwise go on signing commands every machine accepts. A client key is
+    left alone: it outlives any root, and is revoked one by one. A root
+    token with no `ep` came from a root older than row 4; once the bundle
+    says since when the install's roots mark their tokens (`tokenEpochs`),
+    one minted after that, or held across a promotion since, is refused."""
+    if iss != ISSUER_CONTROL or typ == TYP_CLIENT:
+        return None
+    ep = claims.get("ep")
+    if ep is None:
+        marked = bundle.token_epochs
+        if marked is not None and (iat >= marked[0] or bundle.epoch > marked[1]):
+            raise TokenError(no_longer_followed("unknown", bundle.epoch))
+        return None
+    if type(ep) is not int or ep < 0:
+        raise TokenError("ep must be a whole number")
+    if ep < bundle.epoch:
+        raise TokenError(no_longer_followed(ep, bundle.epoch))
+    return ep
