@@ -479,9 +479,13 @@ def _validation_refusal(exc: ValidationError) -> Refusal:
     and a missing `max_tokens`, which the contract says is a 400 naming
     the field, would arrive as exactly that.
     """
-    first = exc.errors()[0]
-    where = ".".join(str(p) for p in first.get("loc", ()) if p != "body") or "body"
-    return Refusal(f"{where}: {first.get('msg', 'invalid')}")
+    errors = exc.errors(include_input=False, include_context=False)
+    parts = chat_contract._most_specific(errors)
+    where = (
+        ".".join(chat_contract._field_name(p) if isinstance(p, str) else str(p) for p in parts)
+        or "body"
+    )
+    return Refusal(f"{where}: has an invalid or missing value.")
 
 
 def _blocks(content: Any) -> list[Any]:
