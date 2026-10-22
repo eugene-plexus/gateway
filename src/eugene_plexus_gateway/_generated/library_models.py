@@ -4948,6 +4948,11 @@ class Message(BaseModel):
 
 class LibraryModelList(BaseModel):
     models: list[LibraryModel]
+    nextCursor: str | None = Field(
+        None,
+        description='Opaque continuation token to pass as `cursor` for the next\npage. Present only when more models remain. Omitted on the\nlast page, on an unpaginated response, and for a `path`\nlookup.\n',
+        min_length=1,
+    )
     lastScanAt: AwareDatetime | None = Field(
         None,
         description='When the walk that produced this list finished. Omitted\nbefore the first scan. Present here as well as on `Scan` so\na browser rendering the list can say how stale it is\nwithout a second call.\n',

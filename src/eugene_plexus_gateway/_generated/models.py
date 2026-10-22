@@ -5405,6 +5405,10 @@ class CompletionRoutingInfo(BaseModel):
         None,
         description='Name of the engine runtime behind that driver, when it is a\nlocal engine. Absent for hosted and CLI backends, which have\nno runtime of ours.\n',
     )
+    node: str | None = Field(
+        None,
+        description="Name of the machine whose runtime answered, as the root's node\nregistry names it. Null when the backend is not a machine's\nruntime, such as a cloud provider. Where the `x_eugene_plexus`\nenvelope rides on headers, this field rides as the\n`x-eugene-plexus-node` header.\n",
+    )
     backend: BackendKind | None = None
     reported_model: str | None = Field(
         None,
