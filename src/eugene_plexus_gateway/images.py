@@ -15,6 +15,8 @@ from typing import Any
 from PIL import Image
 from pydantic import RootModel
 
+from ._generated.models import ChatCompletionMessage, Role1
+
 #: The default for the gateway's `maxImagesPerRequest`. It was a fixed four
 #: until 2026-09-23, when it was measured to refuse a Claude Code session on
 #: every turn after its fifth screenshot: a client resends its history, so the
@@ -104,6 +106,7 @@ class ImageBudget:
         self.total = 0
         self.attached = 0
         self.max_images = max_images
+        self.tool_fields: dict[str, str] = {}
 
     def admit(self, url: str, field: str) -> None:
         self.count += 1
@@ -168,6 +171,9 @@ def validate_messages(messages: Any, max_images: int = DEFAULT_MAX_IMAGES) -> No
             if kind is None:
                 continue
             field = f"messages[{index}].content[{part_index}].{part['type']}"
+            if getattr(message.role, "value", message.role) == "tool" and kind == "image":
+                contains_attachment = True
+                continue
             if getattr(message.role, "value", message.role) != "user":
                 raise ImageRefusal(
                     field,
@@ -188,6 +194,102 @@ def validate_messages(messages: Any, max_images: int = DEFAULT_MAX_IMAGES) -> No
                     typed[part_index].file.file_data = url
         if not contains_attachment:
             message.content = "".join(part["text"] for part in content)
+    move_tool_pictures(messages, budget)
+
+
+def move_tool_pictures(messages: list[ChatCompletionMessage], budget: ImageBudget) -> None:
+    """All three doors keep newest tool pictures after reserving the person's inputs.
+
+    Tool messages remain contiguous. Their pictures follow with call labels on
+    the next user message, or a new user message before the next assistant turn.
+    Invalid images still fail validation; only an observed size/count limit drops one.
+    """
+    candidates = []
+    for index, message in enumerate(messages):
+        content = content_wire(message.content)
+        if message.role == Role1.tool and isinstance(content, list):
+            for position, part in enumerate(content):
+                if part["type"] == "image_url":
+                    candidates.append((index, position, part))
+    decisions: dict[tuple[int, int], tuple[Any, str | None]] = {}
+    for index, position, part in reversed(candidates):
+        url = part["image_url"]["url"]
+        field = budget.tool_fields.get(url, f"messages[{index}].content[{position}].image_url")
+        reason = None
+        try:
+            header, separator, encoded = url.partition(",")
+            if separator and header in {"data:image/webp;base64", "data:image/gif;base64"}:
+                url = data_url_from_base64(header[5:-7], encoded, field)
+            size = _validate_image(url, field)
+        except ImageRefusal as exc:
+            if "5 MiB" not in exc.reason:
+                raise
+            reason = "a picture may hold at most 5 MiB"
+        else:
+            if budget.count >= budget.max_images:
+                reason = f"this request holds at most {budget.max_images} pictures"
+            elif budget.total + size > MAX_TOTAL_BYTES:
+                reason = "this request holds at most 10 MiB of pictures"
+            elif budget.attached + size > MAX_ATTACHMENTS_TOTAL:
+                reason = "this request holds at most 11 MiB of attachments"
+            else:
+                budget.count += 1
+                budget.total += size
+                budget.attached += size
+        decisions[index, position] = (
+            {**part, "image_url": {**part["image_url"], "url": url}},
+            reason,
+        )
+
+    out: list[ChatCompletionMessage] = []
+    pending: list[Any] = []
+    for index, message in enumerate(messages):
+        if message.role == Role1.tool:
+            content = content_wire(message.content)
+            if isinstance(content, list):
+                texts, pictures = [], []
+                for position, part in enumerate(content):
+                    if part["type"] == "image_url":
+                        picture, reason = decisions[index, position]
+                        if reason:
+                            texts.append(
+                                f"[A picture this tool returned is not attached: {reason}.]"
+                            )
+                        else:
+                            pictures.append(picture)
+                    else:
+                        texts.append(part["text"])
+                if pictures:
+                    note, label = moved_note(["image"] * len(pictures))
+                    texts.append(note)
+                    pending.append(
+                        {
+                            "type": "text",
+                            "text": f"{label} returned by tool call {message.tool_call_id}:",
+                        }
+                    )
+                    pending.extend(pictures)
+                message.content = "\n".join(t for t in texts if t)
+        elif pending:
+            if message.role == Role1.user:
+                content = content_wire(message.content)
+                parts = (
+                    content
+                    if isinstance(content, list)
+                    else ([{"type": "text", "text": content}] if content else [])
+                )
+                message = ChatCompletionMessage.model_validate(
+                    {**message.model_dump(), "content": pending + parts}
+                )
+            else:
+                out.append(
+                    ChatCompletionMessage.model_validate({"role": "user", "content": pending})
+                )
+            pending = []
+        out.append(message)
+    if pending:
+        out.append(ChatCompletionMessage.model_validate({"role": "user", "content": pending}))
+    messages[:] = out
 
 
 def validate_audio(data: str, fmt: str, field: str) -> int:
@@ -257,6 +359,16 @@ def validate_file(file: Any, field: str) -> tuple[str, int]:
 # (captured 2026-09-23) and a refusal would fail its `Read` of either.
 # PNG is lossless, so the model sees the same pixels the caller sent.
 _REENCODED = {"image/gif": "GIF", "image/webp": "WEBP"}
+
+
+def tool_picture_url(media_type: Any, data: Any, field: str) -> str:
+    """Normalize a tool image, leaving a byte overflow for the shared omission rule."""
+    try:
+        return data_url_from_base64(media_type, data, field)
+    except ImageRefusal as exc:
+        if "5 MiB" not in exc.reason:
+            raise
+        return f"data:{media_type};base64,{data}"
 
 
 def data_url_from_base64(media_type: Any, data: Any, field: str) -> str:

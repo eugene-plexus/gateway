@@ -666,7 +666,9 @@ def _tool_result_text(block: Any, where: str = "", numbering: _Numbering | None 
     return text
 
 
-def _image_part(block: Any, where: str, budget: images.ImageBudget) -> ImageContentPart:
+def _image_part(
+    block: Any, where: str, budget: images.ImageBudget, *, tool: bool = False
+) -> ImageContentPart:
     """An Anthropic `image` block as the part the OpenAI door already carries.
 
     From there it is the shared path's: the same limits, the same
@@ -687,8 +689,15 @@ def _image_part(block: Any, where: str, budget: images.ImageBudget) -> ImageCont
             "file references cannot be resolved here."
         )
     try:
-        url = images.data_url_from_base64(source.get("media_type"), source.get("data"), field)
-        budget.admit(url, field)
+        url = (
+            images.tool_picture_url(source.get("media_type"), source.get("data"), field)
+            if tool
+            else images.data_url_from_base64(source.get("media_type"), source.get("data"), field)
+        )
+        if tool:
+            budget.tool_fields[url] = field
+        else:
+            budget.admit(url, field)
     except images.ImageRefusal as e:
         raise Refusal(str(e)) from None
     return ImageContentPart(type="image_url", image_url=ImageUrl(url=url))
@@ -769,7 +778,7 @@ def _tool_result_attachments(
         at = f"{where}.content.{i}"
         kind = _field(inner, "type")
         if kind == "image":
-            parts.append(_image_part(inner, at, budget))
+            parts.append(_image_part(inner, at, budget, tool=True))
             kinds.append("image")
         elif kind == "document":
             document = _document_part(inner, at, budget)
@@ -1192,6 +1201,9 @@ def translate_request(
                 moved, kinds = _tool_result_attachments(block, where, budget)
                 if moved and role != "user":
                     raise Refusal(f"{where}: a tool result belongs on a user turn.")
+                pictures = [part for part in moved if isinstance(part, ImageContentPart)]
+                moved = [part for part in moved if not isinstance(part, ImageContentPart)]
+                kinds = [kind for kind in kinds if kind != "image"]
                 if kinds:
                     # The tool message still answers its call and says where
                     # the attachment went (see `images.moved_note`).
@@ -1205,7 +1217,13 @@ def translate_request(
                 if moved:
                     hoisted.extend(moved)
                 results.append(
-                    ChatCompletionMessage(role=Role1.tool, content=text, tool_call_id=call_id)
+                    ChatCompletionMessage(
+                        role=Role1.tool,
+                        content=_joined([TextContentPart(type="text", text=text), *pictures])
+                        if pictures
+                        else text,
+                        tool_call_id=call_id,
+                    )
                 )
 
         # Results first: they answer the assistant turn above them, and
@@ -1226,6 +1244,11 @@ def translate_request(
 
     if not messages:
         raise Refusal("messages: nothing to send -- every block was empty.")
+
+    try:
+        images.move_tool_pictures(messages, budget)
+    except images.ImageRefusal as exc:
+        raise Refusal(str(exc)) from None
 
     return ChatCompletionRequest(
         model=body.model,

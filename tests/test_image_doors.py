@@ -19,7 +19,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from eugene_plexus_gateway import image_doors
+from eugene_plexus_gateway import anthropic, image_doors, images, responses
 from eugene_plexus_gateway._generated.driver_models import (
     GeneratedImage,
     ImageCapabilities,
@@ -31,10 +31,143 @@ from eugene_plexus_gateway._generated.driver_models import (
     RetryDisposition,
 )
 from eugene_plexus_gateway.app import create_app
+from eugene_plexus_gateway.chat_contract import Refusal as ChatRefusal
+from eugene_plexus_gateway.chat_contract import parse_request
 from eugene_plexus_gateway.driver_client import DriverError
 from eugene_plexus_gateway.settings import Settings
 
 from .conftest import FakeDriverClient, make_routing_table
+
+
+def tool_pictures(door: str, urls: list[str], *, own: int = 0, limit: int = 4) -> Any:
+    """The same history through every public adapter."""
+
+    def picture(url: str) -> dict[str, Any]:
+        return {"type": "image_url", "image_url": {"url": url}}
+
+    if door == "chat":
+        messages = [
+            {"role": "tool", "tool_call_id": str(i), "content": [picture(url)]}
+            for i, url in enumerate(urls)
+        ]
+        messages.append({"role": "user", "content": [picture(urls[0])] * own or "Next"})
+        return parse_request({"model": "fixture", "messages": messages}, max_images=limit)
+    if door == "anthropic":
+
+        def block(url: str) -> dict[str, Any]:
+            return {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": url.split(",", 1)[1],
+                },
+            }
+
+        return anthropic.translate_request(
+            {
+                "model": "fixture",
+                "max_tokens": 1,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            *[
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": str(i),
+                                    "content": [block(url)],
+                                }
+                                for i, url in enumerate(urls)
+                            ],
+                            *[block(urls[0])] * own,
+                            {"type": "text", "text": "Next"},
+                        ],
+                    }
+                ],
+            },
+            max_images=limit,
+        )
+    items = [
+        {
+            "type": "function_call_output",
+            "call_id": str(i),
+            "output": [{"type": "input_image", "image_url": url}],
+        }
+        for i, url in enumerate(urls)
+    ]
+    items.append(
+        {
+            "role": "user",
+            "content": [
+                *[{"type": "input_image", "image_url": urls[0]}] * own,
+                {"type": "input_text", "text": "Next"},
+            ],
+        }
+    )
+    return responses.translate_request(
+        {"model": "fixture", "input": items}, max_images=limit
+    ).request
+
+
+def test_a_tool_message_picture_moves_to_the_next_user_message() -> None:
+    from .test_images import picture
+
+    wire = tool_pictures("chat", [picture()]).model_dump(mode="json")
+    tool, user = wire["messages"]
+    assert "attached to the next user message" in tool["content"]
+    assert user["content"][0]["text"] == "The image returned by tool call 0:"
+    assert user["content"][1]["image_url"]["url"] == picture()
+
+
+@pytest.mark.parametrize("door", ["chat", "anthropic", "responses"])
+@pytest.mark.parametrize("budget", ["count", "bytes", "attachment_bytes", "per_picture"])
+def test_older_tool_pictures_over_the_limit_become_notes(
+    door: str, budget: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from .test_images import picture
+
+    urls = [picture(size=(i + 1, 1)) for i in range(6)]
+    if budget == "bytes":
+        monkeypatch.setattr(
+            images, "MAX_TOTAL_BYTES", 2 * len(base64.b64decode(urls[-1].split(",")[1]))
+        )
+    elif budget == "attachment_bytes":
+        monkeypatch.setattr(
+            images, "MAX_ATTACHMENTS_TOTAL", 2 * len(base64.b64decode(urls[-1].split(",")[1]))
+        )
+    elif budget == "per_picture":
+        monkeypatch.setattr(images, "MAX_IMAGE_BYTES", 1)
+    wire = tool_pictures(door, urls, limit=2 if budget == "count" else 6).model_dump(mode="json")
+    kept = [
+        p["image_url"]["url"]
+        for m in wire["messages"]
+        if isinstance(m["content"], list)
+        for p in m["content"]
+        if p["type"] == "image_url"
+    ]
+    assert kept == ([] if budget == "per_picture" else urls[-2:])
+    tools = [m for m in wire["messages"] if m["role"] == "tool"]
+    assert all("not attached:" in m["content"] for m in tools[:4])
+
+
+@pytest.mark.parametrize("door", ["chat", "anthropic", "responses"])
+def test_a_persons_pictures_are_never_dropped(door: str) -> None:
+    from .test_images import picture
+
+    urls = [picture(size=(i + 1, 1)) for i in range(3)]
+    wire = tool_pictures(door, urls, own=1, limit=2).model_dump(mode="json")
+    kept = [
+        p["image_url"]["url"]
+        for m in wire["messages"]
+        if isinstance(m["content"], list)
+        for p in m["content"]
+        if p["type"] == "image_url"
+    ]
+    assert kept == [urls[-1], urls[0]]
+    with pytest.raises((ChatRefusal, anthropic.Refusal, responses.Refusal)):
+        tool_pictures(door, urls, own=3, limit=2)
+
 
 PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
