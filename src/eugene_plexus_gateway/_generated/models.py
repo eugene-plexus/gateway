@@ -3245,8 +3245,10 @@ class ResponsesInputTokens(BaseModel):
 
 class ToolChoice1(StrEnum):
     """
-    `auto`, `none`, `required`, or `{"type": "function", "name": …}`.
-    Forcing any other tool type is refused.
+    `auto`, `none`, `required`, or an object forcing a declared
+    client-run tool: `function` or `custom` with `name`, or
+    `local_shell`, `shell` or `apply_patch` by `type`. An
+    undeclared or refused tool is a 400 naming the cause.
 
     """
 
@@ -3261,28 +3263,13 @@ class Truncation(Enum):
     NoneType_None = None
 
 
-class ResponsesInputItem(BaseModel):
+class ResponsesToolAction(BaseModel):
     """
-    One conversation item. **Modelled loosely on purpose**, as
-    `AnthropicContentBlock` is: the variants differ by `type`, and a
-    strict union would reject the next item type on a wire we do not
-    own.
-
-    Carried: `message` (`role` user, assistant, system or developer;
-    `content` a string or parts; `type` may be omitted), `function_call`
-    (`call_id`, `name`, `arguments` as a JSON string, and `namespace`
-    when the call was to a member of a `namespace` tool),
-    `function_call_output` (`call_id`, `output` as a string or a list
-    of `input_text` / `input_image` parts), and `reasoning`
-    (`content` of `reasoning_text` parts, `encrypted_content`), and a
-    `web_search_call` handed back (P8), which becomes a line of the
-    assistant's history naming the search and its sources, and an
-    `image_generation_call` handed back (P8e), which becomes a line
-    naming the prompt the image was made for -- its base64 is not
-    sent to the model.
-    Codex drops `id` and `status` when it sends items back
-    (measured), so neither is required. Refused: `item_reference` and
-    any other type.
+    A local-shell `exec` action has `type: exec`, `command`, `env`,
+    and optional `working_directory`, `timeout_ms` and `user`.
+    A shell action has `commands`, `timeout_ms` and
+    `max_output_length`. The gateway returns these for the client to
+    execute. Other action fields remain open for existing search items.
 
     """
 
@@ -3290,20 +3277,76 @@ class ResponsesInputItem(BaseModel):
         extra='allow',
     )
     type: str | None = None
-    role: str | None = None
-    content: Any | None = Field(None, description='A string, or a list of parts.')
-    call_id: str | None = None
-    name: str | None = None
-    namespace: str | None = Field(
-        None,
-        description='The `namespace` tool a `function_call` was to (Codex 0.133 and later).',
+    command: list[str] | None = None
+    commands: list[str] | None = None
+    working_directory: str | None = None
+    env: dict[str, str] | None = None
+    user: str | None = None
+    timeout_ms: int | None = None
+    max_output_length: int | None = None
+
+
+class Type6(StrEnum):
+    create_file = 'create_file'
+    delete_file = 'delete_file'
+    update_file = 'update_file'
+
+
+class ResponsesPatchOperation(BaseModel):
+    """
+    OpenAI's file operation for a client-run apply-patch call.
+    `create_file` and `update_file` include a V4A `diff`;
+    `delete_file` needs only `path`. The client applies the operation
+    and reports completed or failed with its observed cause.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
     )
-    arguments: str | None = None
-    output: Any | None = Field(
-        None, description='A string, or a list of `input_text` / `input_image` parts.'
+    type: Type6
+    path: str
+    diff: str | None = None
+
+
+class Type7(StrEnum):
+    text = 'text'
+    grammar = 'grammar'
+
+
+class Syntax(StrEnum):
+    lark = 'lark'
+    regex = 'regex'
+
+
+class Format(BaseModel):
+    """
+    A custom tool's free-text format, or grammar (Lark or regex).
+    Grammars are not enforced: they are included in the function
+    description and named as `tools[i].format` on
+    `x-eugene-plexus-ignored-settings`. No constrained output is claimed.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
     )
-    summary: list[dict[str, Any]] | None = None
-    encrypted_content: str | None = None
+    type: Type7
+    syntax: Syntax | None = None
+    definition: str | None = None
+
+
+class Environment(BaseModel):
+    """
+    A shell tool's execution environment. Only the client's local
+    environment is supported; hosted containers are refused.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    type: str | None = None
 
 
 class ResponsesTool(BaseModel):
@@ -3315,7 +3358,19 @@ class ResponsesTool(BaseModel):
     endpoint). `web_search` runs on this install's search account, or
     is removed and named when it cannot (see the endpoint);
     `image_generation` runs on this install's image models, or is
-    refused naming why (P8e); any other `type` is refused.
+    refused naming why (P8e).
+
+    `custom` (`name`, `description`, `format`) maps to a function with
+    one string parameter `input`; `local_shell` maps to a function
+    with `command`, `workdir`, `timeout_ms` and `env`; `shell` maps
+    to a function with `commands`, `timeout_ms` and
+    `max_output_length`; `apply_patch` maps to a function with one
+    string parameter `input`, the patch. The client executes their
+    calls; the gateway translates them into their Responses item
+    types. A shell's `environment` may be absent or `type: local`;
+    hosted containers are refused because no shell execution service
+    exists here. Other tool types are refused with the causes and
+    alternatives on `/v1/responses`.
 
     """
 
@@ -3330,6 +3385,14 @@ class ResponsesTool(BaseModel):
     description: str | None = None
     parameters: dict[str, Any] | None = None
     strict: bool | None = None
+    format: Format | None = Field(
+        None,
+        description="A custom tool's free-text format, or grammar (Lark or regex).\nGrammars are not enforced: they are included in the function\ndescription and named as `tools[i].format` on\n`x-eugene-plexus-ignored-settings`. No constrained output is claimed.\n",
+    )
+    environment: Environment | None = Field(
+        None,
+        description="A shell tool's execution environment. Only the client's local\nenvironment is supported; hosted containers are refused.\n",
+    )
 
 
 class Object2(StrEnum):
@@ -3350,12 +3413,17 @@ class Status1(StrEnum):
     in_progress = 'in_progress'
 
 
-class Type6(StrEnum):
+class Type8(StrEnum):
     reasoning = 'reasoning'
     message = 'message'
     function_call = 'function_call'
     web_search_call = 'web_search_call'
     image_generation_call = 'image_generation_call'
+    custom_tool_call = 'custom_tool_call'
+    local_shell_call = 'local_shell_call'
+    shell_call = 'shell_call'
+    apply_patch_call = 'apply_patch_call'
+    compaction = 'compaction'
 
 
 class ResponsesOutputItem(BaseModel):
@@ -3377,13 +3445,32 @@ class ResponsesOutputItem(BaseModel):
     "background", "output_format", "action": "generate"}` -- `result`
     the base64 image, null and `status: failed` when none was made.
 
+    Client-run calls are `custom_tool_call` (`id`, `call_id`, `name`,
+    `input`), `local_shell_call` and `shell_call` (`id`, `call_id`,
+    `status`, `action`), and `apply_patch_call` (`id`, `call_id`,
+    `status`, `operation`). Standalone compact returns a `compaction`
+    item (`id`, `encrypted_content`, the encrypted and authenticated
+    summary); it can be passed back unchanged to any model here.
+
     """
 
     model_config = ConfigDict(
         extra='allow',
     )
-    type: Type6
+    type: Type8
     id: str | None = None
+    call_id: str | None = None
+    name: str | None = None
+    input: str | None = Field(
+        None, description='Free-text input of a custom tool call.'
+    )
+    status: str | None = None
+    action: ResponsesToolAction | None = None
+    operation: ResponsesPatchOperation | None = None
+    encrypted_content: str | None = Field(
+        None,
+        description='An opaque compaction summary or the existing reasoning carrier.',
+    )
 
 
 class ResponsesUsage(BaseModel):
@@ -3401,7 +3488,7 @@ class ResponsesUsage(BaseModel):
     output_tokens_details: dict[str, Any] | None = None
 
 
-class Type7(StrEnum):
+class Type9(StrEnum):
     response_created = 'response.created'
     response_in_progress = 'response.in_progress'
     response_output_item_added = 'response.output_item.added'
@@ -3414,12 +3501,17 @@ class Type7(StrEnum):
     response_reasoning_text_done = 'response.reasoning_text.done'
     response_function_call_arguments_delta = 'response.function_call_arguments.delta'
     response_function_call_arguments_done = 'response.function_call_arguments.done'
+    response_custom_tool_call_input_delta = 'response.custom_tool_call_input.delta'
+    response_custom_tool_call_input_done = 'response.custom_tool_call_input.done'
+    response_shell_call_command_added = 'response.shell_call_command.added'
+    response_shell_call_command_delta = 'response.shell_call_command.delta'
+    response_shell_call_command_done = 'response.shell_call_command.done'
     response_completed = 'response.completed'
     response_incomplete = 'response.incomplete'
     response_failed = 'response.failed'
 
 
-class Type8(StrEnum):
+class Type10(StrEnum):
     noul = 'noul'
     choice = 'choice'
     score = 'score'
@@ -3436,7 +3528,7 @@ class SystemOneQuestion(BaseModel):
 
     """
 
-    type: Type8
+    type: Type10
     instructions: str | dict[str, Any] | list[Any]
     criteria: Any | None = Field(
         None, description='Shape depends on `type`; see above.'
@@ -3454,7 +3546,7 @@ class SystemOneAnswer(BaseModel):
 
     """
 
-    type: Type8
+    type: Type10
     noul: float | None = Field(None, ge=0.0, le=1.0)
     choice: str | None = None
     score: float | None = None
@@ -4737,85 +4829,96 @@ class AnthropicMessageResponse(BaseModel):
     usage: AnthropicUsage | None = None
 
 
-class ResponsesRequest(BaseModel):
+class ResponsesCompactResponse(BaseModel):
     """
-    Request body for `POST /v1/responses`, in OpenAI's shape. Like
-    `AnthropicMessagesRequest`, **this schema is what the gateway
-    reads, not what it refuses**: the refusals are enforced against
-    the raw body by the implementation, with a 400 naming the field,
-    and the endpoint description lists them. A top-level field not
-    named here is refused.
+    OpenAI's compacted response, with output items ending with a
+    `compaction` item (`id`, `type: compaction`, `encrypted_content`).
+    Send the whole output array back as the next input window.
 
     """
 
     model_config = ConfigDict(
         extra='allow',
     )
-    model: str = Field(
-        ...,
-        description="A model id from `GET /v1/models`, resolved against this install's slots.",
+    id: str
+    object: Literal['response.compaction']
+    created_at: int = Field(..., description='Unix timestamp in seconds.')
+    output: list[ResponsesOutputItem] = Field(..., min_length=1)
+    usage: ResponsesUsage
+
+
+class ResponsesInputItem(BaseModel):
+    """
+    One conversation item. **Modelled loosely on purpose**, as
+    `AnthropicContentBlock` is: the variants differ by `type`, and a
+    strict union would reject the next item type on a wire we do not
+    own.
+
+    Carried: `message` (`role` user, assistant, system or developer;
+    `content` a string or parts; `type` may be omitted), `function_call`
+    (`call_id`, `name`, `arguments` as a JSON string, and `namespace`
+    when the call was to a member of a `namespace` tool),
+    `function_call_output` (`call_id`, `output` as a string or a list
+    of `input_text` / `input_image` parts), `custom_tool_call`
+    (`call_id`, `name`, `input`), `local_shell_call` and `shell_call`
+    (`call_id`, `action`), and `apply_patch_call` (`call_id`,
+    `operation`). Their `custom_tool_call_output`,
+    `local_shell_call_output`, `shell_call_output` and
+    `apply_patch_call_output` become tool results by `call_id`
+    (a legacy local-shell output may use `id` instead).
+    A `compaction` item's authenticated `encrypted_content` is
+    expanded into a developer message with the summary; an
+    unauthenticated item is a 400 (see `/v1/responses/compact`).
+    Also carried: `reasoning`
+    (`content` of `reasoning_text` parts, `encrypted_content`), and a
+    `web_search_call` handed back (P8), which becomes a line of the
+    assistant's history naming the search and its sources, and an
+    `image_generation_call` handed back (P8e), which becomes a line
+    naming the prompt the image was made for -- its base64 is not
+    sent to the model.
+    Codex drops `id` and `status` when it sends items back
+    (measured), so neither is required. Refused: `item_reference` and
+    any other type.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
     )
-    input: str | list[ResponsesInputItem] = Field(
-        ...,
-        description='A string (one user message), or the conversation as a list of\nitems. Codex resends the whole conversation on every turn.\n',
-    )
-    instructions: str | None = Field(None, description='The leading system message.')
-    tools: list[ResponsesTool] | None = None
-    tool_choice: ToolChoice1 | dict[str, Any] | None = Field(
+    type: str | None = None
+    id: str | None = Field(
         None,
-        description='`auto`, `none`, `required`, or `{"type": "function", "name": …}`.\nForcing any other tool type is refused.\n',
+        description="Optional item id; also the legacy local-shell output's call id.",
     )
-    parallel_tool_calls: bool | None = None
-    stream: bool | None = Field(None, description='Codex sets this on every request.')
-    temperature: float | None = Field(None, ge=0.0, le=2.0)
-    top_p: float | None = Field(None, ge=0.0, le=1.0)
-    max_output_tokens: int | None = Field(
+    role: str | None = None
+    content: Any | None = Field(None, description='A string, or a list of parts.')
+    call_id: str | None = None
+    name: str | None = None
+    namespace: str | None = Field(
         None,
-        description='Absent means no cap here -- see "No cap from the install\ndefault" on the endpoint. The model\'s settings profile still\napplies.\n',
-        ge=1,
+        description='The `namespace` tool a `function_call` was to (Codex 0.133 and later).',
     )
-    text: dict[str, Any] | None = Field(
+    arguments: str | None = None
+    input: str | None = Field(
+        None, description='Free-text input of a custom tool call.'
+    )
+    action: ResponsesToolAction | None = None
+    operation: ResponsesPatchOperation | None = None
+    status: str | None = Field(
         None,
-        description="`format` (`text`, `json_object`, or `json_schema` with `name`,\n`schema`, `strict`, `description`) is carried as the backend's\nresponse format. `verbosity` is accepted and not honoured.\n",
+        description="A call's status; an apply-patch output reports completed or failed.",
     )
-    reasoning: dict[str, Any] | None = Field(
+    max_output_length: int | None = Field(
+        None, description='Carried on shell output when present on its call.'
+    )
+    output: Any | None = Field(
         None,
-        description='`effort` is carried to supporting backends, otherwise omitted and\nnamed as `reasoning.effort` on the ignored-settings header. `summary`\nis accepted and not honoured, and named when set. Codex sends null\nfor a model id it does not know.\n',
+        description='A function or custom result is a string or a list of\n`input_text` / `input_image` parts. A local-shell result is a\nstring. A shell result is a list of objects with `stdout`,\n`stderr` and `outcome` (`type: exit` with `exit_code`, or\n`type: timeout`). An apply-patch result is an optional string;\nits status and observed failure text are carried to the model.\n',
     )
-    include: list[str] | None = Field(
+    summary: list[dict[str, Any]] | None = None
+    encrypted_content: str | None = Field(
         None,
-        description='`reasoning.encrypted_content` is honoured. The server-side tool\nincludes are accepted (nothing here produces those items).\n`message.output_text.logprobs` is refused.\n',
-    )
-    store: bool | None = Field(
-        None,
-        description='Nothing is ever stored; `true` is named on the ignored-settings header.',
-    )
-    previous_response_id: str | None = Field(
-        None, description='Refused when set. This gateway keeps no response store.'
-    )
-    truncation: Truncation | None = None
-    metadata: dict[str, Any] | None = None
-    client_metadata: dict[str, Any] | None = Field(
-        None, description='Sent by Codex (`x-codex-installation-id`). Discarded.'
-    )
-    prompt_cache_key: str | None = Field(
-        None,
-        description='Sent by Codex (the session id). A local engine keeps its own cache.',
-    )
-    user: str | None = None
-    safety_identifier: str | None = None
-    service_tier: str | None = None
-    max_tool_calls: int | None = None
-    top_logprobs: int | None = None
-    background: bool | None = None
-    stream_options: dict[str, Any] | None = None
-    prompt_cache_retention: str | None = None
-    conversation: Any | None = Field(
-        None, description='Refused when set. Conversations are stored objects.'
-    )
-    prompt: Any | None = Field(
-        None,
-        description='Refused when set. A stored prompt template exists only at OpenAI.',
+        description="Reasoning's existing carrier, or a compaction item's encrypted\nand authenticated summary. A compaction requires a nonempty\nstring that this gateway can authenticate before using it.\n",
     )
 
 
@@ -4823,7 +4926,9 @@ class ResponsesResponse(BaseModel):
     """
     A response object. `output` holds a `reasoning` item first when
     the model reasoned, then a `message` with one `output_text` part,
-    then one `function_call` item per tool call. The request's settings
+    then one call item per tool call, using the declared tool's type
+    (`function_call`, `custom_tool_call`, `local_shell_call`,
+    `shell_call` or `apply_patch_call`). The request's settings
     are echoed as OpenAI echoes them; `store` is always false.
 
     """
@@ -4854,14 +4959,32 @@ class ResponsesStreamEvent(BaseModel):
     and `data.type` always agree, and every frame has a
     `sequence_number`.
 
+    Custom input uses `response.custom_tool_call_input.delta` (`delta`)
+    and `.done` (`input`), with `item_id` and `output_index`. Shell
+    commands use `response.shell_call_command.added`, `.delta` and
+    `.done`, with `command_index` and `output_index`; added and done
+    carry `command`, delta carries `delta`. All client call types,
+    including `local_shell_call` and `apply_patch_call`, also use
+    `response.output_item.added` and `response.output_item.done` with
+    their Responses `item`, including the complete action or operation
+    on done. Internal function-adapter arguments are not exposed as
+    function-call events for these client-run tools.
+
     """
 
     model_config = ConfigDict(
         extra='allow',
     )
-    type: Type7
+    type: Type9
     sequence_number: int
     response: ResponsesResponse | None = None
+    item: ResponsesOutputItem | None = None
+    item_id: str | None = None
+    output_index: int | None = Field(None, ge=0)
+    command_index: int | None = Field(None, ge=0)
+    delta: str | None = None
+    input: str | None = None
+    command: str | None = None
 
 
 class SystemOneRequest(BaseModel):
@@ -5598,6 +5721,117 @@ class AnthropicCountTokensRequest(BaseModel):
     system: str | list[AnthropicSystemBlock] | None = None
     tools: list[AnthropicToolDefinition] | None = None
     tool_choice: AnthropicToolChoice | None = None
+
+
+class ResponsesRequest(BaseModel):
+    """
+    Request body for `POST /v1/responses`, in OpenAI's shape. Like
+    `AnthropicMessagesRequest`, **this schema is what the gateway
+    reads, not what it refuses**: the refusals are enforced against
+    the raw body by the implementation, with a 400 naming the field,
+    and the endpoint description lists them. A top-level field not
+    named here is refused.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    model: str = Field(
+        ...,
+        description="A model id from `GET /v1/models`, resolved against this install's slots.",
+    )
+    input: str | list[ResponsesInputItem] = Field(
+        ...,
+        description='A string (one user message), or the conversation as a list of\nitems. Codex resends the whole conversation on every turn.\n',
+    )
+    instructions: str | None = Field(None, description='The leading system message.')
+    tools: list[ResponsesTool] | None = None
+    tool_choice: ToolChoice1 | dict[str, Any] | None = Field(
+        None,
+        description='`auto`, `none`, `required`, or an object forcing a declared\nclient-run tool: `function` or `custom` with `name`, or\n`local_shell`, `shell` or `apply_patch` by `type`. An\nundeclared or refused tool is a 400 naming the cause.\n',
+    )
+    parallel_tool_calls: bool | None = None
+    stream: bool | None = Field(None, description='Codex sets this on every request.')
+    temperature: float | None = Field(None, ge=0.0, le=2.0)
+    top_p: float | None = Field(None, ge=0.0, le=1.0)
+    max_output_tokens: int | None = Field(
+        None,
+        description='Absent means no cap here -- see "No cap from the install\ndefault" on the endpoint. The model\'s settings profile still\napplies.\n',
+        ge=1,
+    )
+    text: dict[str, Any] | None = Field(
+        None,
+        description="`format` (`text`, `json_object`, or `json_schema` with `name`,\n`schema`, `strict`, `description`) is carried as the backend's\nresponse format. `verbosity` is accepted and not honoured.\n",
+    )
+    reasoning: dict[str, Any] | None = Field(
+        None,
+        description='`effort` is carried to supporting backends, otherwise omitted and\nnamed as `reasoning.effort` on the ignored-settings header. `summary`\nis accepted and not honoured, and named when set. Codex sends null\nfor a model id it does not know.\n',
+    )
+    include: list[str] | None = Field(
+        None,
+        description='`reasoning.encrypted_content` is honoured. The server-side tool\nincludes are accepted (nothing here produces those items).\n`message.output_text.logprobs` is refused.\n',
+    )
+    store: bool | None = Field(
+        None,
+        description='Nothing is ever stored; `true` is named on the ignored-settings header.',
+    )
+    previous_response_id: str | None = Field(
+        None, description='Refused when set. This gateway keeps no response store.'
+    )
+    truncation: Truncation | None = None
+    metadata: dict[str, Any] | None = None
+    client_metadata: dict[str, Any] | None = Field(
+        None, description='Sent by Codex (`x-codex-installation-id`). Discarded.'
+    )
+    prompt_cache_key: str | None = Field(
+        None,
+        description='Sent by Codex (the session id). A local engine keeps its own cache.',
+    )
+    user: str | None = None
+    safety_identifier: str | None = None
+    service_tier: str | None = None
+    max_tool_calls: int | None = None
+    top_logprobs: int | None = None
+    background: bool | None = None
+    stream_options: dict[str, Any] | None = None
+    prompt_cache_retention: str | None = None
+    conversation: Any | None = Field(
+        None, description='Refused when set. Conversations are stored objects.'
+    )
+    prompt: Any | None = Field(
+        None,
+        description='Refused when set. A stored prompt template exists only at OpenAI.',
+    )
+
+
+class ResponsesCompactRequest(BaseModel):
+    """
+    Request for standalone compaction. The model and conversation are
+    required while no response store exists. Unknown top-level fields
+    are refused with a 400 naming the field.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    model: str = Field(
+        ...,
+        description="A model id from `GET /v1/models`, resolved against this install's slots.",
+    )
+    input: str | list[ResponsesInputItem] = Field(
+        ...,
+        description='A string (one user message), or the conversation as a list of\nitems. Codex resends the whole conversation on every turn.\n',
+    )
+    instructions: str | None = Field(
+        None,
+        description='Summary guidance carried alongside the fixed compaction prompt.',
+    )
+    previous_response_id: str | None = Field(
+        None,
+        description='Refused when set until row 54 supplies chain loading; send input instead.',
+    )
 
 
 class SystemOneResponse(BaseModel):
