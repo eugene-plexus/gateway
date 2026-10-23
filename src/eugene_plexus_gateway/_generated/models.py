@@ -9,6 +9,34 @@ from typing import Any, Literal
 from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field, RootModel
 
 
+class GatewayLibraryStatus(BaseModel):
+    """
+    Library reachability observed by profile and special-token reads.
+    Loading saved caches after a restart does not establish whether
+    the Library can answer. A successful Library answer clears the
+    outage time and cause, including an answer with no profile.
+
+    """
+
+    reachable: bool | None = Field(
+        ...,
+        description='True after a successful Library answer. False after a\ntransport error, a proxy 502/503/504, or a timeout. Null\nbefore the first check, including after a gateway restart.\n',
+    )
+    since: AwareDatetime | None = Field(
+        ...,
+        description='When the current outage was first observed, in UTC. Further\nfailed checks keep this time. Null while reachable or before\nthe first check.\n',
+    )
+    cause: str | None = Field(
+        ...,
+        description='The latest observed cause of the failed Library check, such\nas connection refused, proxy HTTP 502/503/504, or a timeout.\nNull while reachable or before the first check.\n',
+    )
+    modelsOnSavedSettings: int = Field(
+        ...,
+        description='Number of distinct model paths currently using saved profile\ndefaults after cache expiry, including values loaded after a restart.\nCounts each path once. Excludes fresh profiles, saved values\nthat are not in effect, and values excluded by an explicit\nprofileMaxStaleSeconds limit.\n',
+        ge=0,
+    )
+
+
 class SafetySetting(BaseModel):
     category: str | None = None
     threshold: str | None = None
@@ -4072,6 +4100,14 @@ class ClientUsageSummary(BaseModel):
     truncated: bool
     rowsDropped: int
     clients: list[ClientUsageGroup]
+
+
+class GatewayInfo(BaseModel):
+    """
+    The gateway's observed Library state and use of saved model settings.
+    """
+
+    library: GatewayLibraryStatus
 
 
 class ToolConfig(BaseModel):

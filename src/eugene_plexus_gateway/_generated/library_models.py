@@ -4635,6 +4635,10 @@ class LibraryFolderList(BaseModel):
 
     """
 
+    safeMode: bool | None = Field(
+        False,
+        description='True when the Library ignores its saved config and runs in\nsafe mode. These folders may be defaults with no saved mounts.\nAgents keep their saved folder list instead of saving this\nanswer. Absent means false for older Libraries.\n',
+    )
     folders: list[LibraryFolderStatus]
 
 
