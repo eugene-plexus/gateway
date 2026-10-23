@@ -27,6 +27,28 @@ from eugene_plexus_gateway.driver_client import DriverError
 from .conftest import FakeDriverClient, install_snapshot, make_routing_table
 
 
+def test_dimensions_are_forwarded_and_not_called_ignored_for_gemini(settings) -> None:
+    from eugene_plexus_gateway._generated.driver_models import BackendKind
+
+    driver = _embedder("gemini", "embed")
+    driver.backend = BackendKind.gemini_api
+    sent = []
+    original = driver.embed
+
+    async def capture(request):
+        sent.append(request)
+        return await original(request)
+
+    driver.embed = capture
+    with TestClient(_app(driver, settings=settings)) as client:
+        response = client.post(
+            "/v1/embeddings", json={"model": "embed", "input": "a", "dimensions": 4}
+        )
+    assert response.status_code == 200, response.text
+    assert sent[0].dimensions == 4
+    assert "dimensions" not in response.headers.get("x-eugene-plexus-ignored-settings", "")
+
+
 def _embedder(name: str, model_id: str) -> FakeDriverClient:
     """A driver that reports the embeddings surface. Vectors derive from
     the driver name, so a test can tell WHICH backend answered from the

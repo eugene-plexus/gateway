@@ -25,7 +25,7 @@ from typing import Any, Protocol
 from urllib.parse import quote
 
 import httpx
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
 from ._generated.driver_models import (
     DecisionRequest,
@@ -60,6 +60,13 @@ from .execution import Executor, StreamPolicy
 from .repetition import Detection, Guard, Policy, stop_message
 
 log = logging.getLogger(__name__)
+
+
+class EmbeddingResult(EmbedResponse):
+    """Per-response transport metadata, kept through replica failover."""
+
+    ignored_settings: list[str] = Field(default_factory=list)
+
 
 # A count is two small calls to the backend beside its slots, never a
 # prefill, so it does not get a generation's minutes.
@@ -439,7 +446,14 @@ class HttpDriverClient:
                 raw_body=response.text,
             )
         try:
-            return EmbedResponse.model_validate(response.json())
+            return EmbeddingResult(
+                **response.json(),
+                ignored_settings=[
+                    s.strip()
+                    for s in response.headers.get("x-eugene-plexus-ignored-settings", "").split(",")
+                    if s.strip()
+                ],
+            )
         except ValueError as exc:
             raise self._invalid_reply() from exc
 

@@ -9,6 +9,218 @@ from typing import Any, Literal
 from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field, RootModel
 
 
+class SafetySetting(BaseModel):
+    category: str | None = None
+    threshold: str | None = None
+
+
+class Role(StrEnum):
+    """
+    Omitted for systemInstruction; otherwise defaults to user.
+    """
+
+    user = 'user'
+    model = 'model'
+
+
+class InlineData(BaseModel):
+    mimeType: str
+    data: str
+
+
+class FunctionCall(BaseModel):
+    id: str | None = Field(
+        None,
+        description='Preserved when supplied; otherwise the shared path assigns one.',
+    )
+    name: str
+    args: dict[str, Any]
+
+
+class FunctionResponse(BaseModel):
+    """
+    Matched to the preceding call by id, or by name in call order when ids are absent. An
+    ambiguous or missing call is a 400 naming functionResponse; its content is never lost.
+    """
+
+    id: str | None = None
+    name: str
+    response: dict[str, Any]
+
+
+class GeminiPart(BaseModel):
+    """
+    Text, inline image/audio/PDF, function call or result. Existing attachment size and MIME
+    limits apply. Backend reasoning returns as text with thought true only when requested.
+    """
+
+    text: str | None = None
+    inlineData: InlineData | None = None
+    functionCall: FunctionCall | None = None
+    functionResponse: FunctionResponse | None = Field(
+        None,
+        description='Matched to the preceding call by id, or by name in call order when ids are absent. An\nambiguous or missing call is a 400 naming functionResponse; its content is never lost.',
+    )
+    thought: bool | None = None
+    thoughtSignature: str | None = Field(
+        None,
+        description='Opaque client data, never invented by the door. The Gemini provider retains its own\nrequired signatures on the shared path (G2).',
+    )
+
+
+class GeminiFunctionDeclaration(BaseModel):
+    name: str
+    description: str | None = None
+    parameters: dict[str, Any] | None = Field(
+        None,
+        description='Gemini schema form, translated to the shared function schema.',
+    )
+    parametersJsonSchema: Any | None = Field(
+        None,
+        description='JSON Schema form used by Gemini CLI; mutually exclusive with parameters.',
+    )
+    parameters_json_schema: Any | None = Field(
+        None,
+        description='Measured google-genai dictionary spelling of parametersJsonSchema. Same translation;\nconflicting spellings are refused naming the field.',
+    )
+
+
+class Mode(StrEnum):
+    """
+    Maps to tool_choice auto, required or none.
+    """
+
+    AUTO = 'AUTO'
+    ANY = 'ANY'
+    NONE = 'NONE'
+
+
+class GeminiFunctionCallingConfig(BaseModel):
+    mode: Mode | None = Field(
+        None, description='Maps to tool_choice auto, required or none.'
+    )
+    allowedFunctionNames: list[str] | None = Field(
+        None,
+        description='Restricts declarations offered to the shared path. A single name in ANY selects that\nfunction. Unknown names are a 400 naming allowedFunctionNames.',
+    )
+
+
+class GeminiThinkingConfig(BaseModel):
+    """
+    thinkingLevel LOW, MEDIUM, HIGH maps to reasoning_effort low, medium, high (case
+    insensitive). thinkingBudget maps 0 to none, 1..1024 to low, 1025..8192 to medium, larger
+    values to high; -1 leaves the backend default. An exact positive budget is not promised:
+    thinkingConfig.thinkingBudget is named in ignored-settings when reduced to effort. A level
+    and budget together are a 400 naming thinkingConfig. includeThoughts controls returning
+    thought parts independently of effort; omitted means false. Unsupported effort is refused
+    with the backend's observed cause, never guessed from a name.
+    """
+
+    thinkingLevel: str | None = None
+    thinkingBudget: int | None = Field(None, ge=-1)
+    includeThoughts: bool | None = False
+    thinking_level: str | None = Field(
+        None,
+        description='Measured google-genai dictionary spelling of thinkingLevel; conflicting spellings are\nrefused naming the field.',
+    )
+    thinking_budget: int | None = Field(
+        None,
+        description='Measured google-genai dictionary spelling of thinkingBudget; conflicting spellings are\nrefused naming the field.',
+        ge=-1,
+    )
+    include_thoughts: bool | None = Field(
+        None,
+        description='Measured google-genai dictionary spelling of includeThoughts; conflicting spellings are\nrefused naming the field.',
+    )
+
+
+class FinishReason(StrEnum):
+    """
+    STOP for stop or tool calls, MAX_TOKENS for length, SAFETY only for observed
+    content_filter. Never invent a safety refusal.
+    """
+
+    STOP = 'STOP'
+    MAX_TOKENS = 'MAX_TOKENS'
+    SAFETY = 'SAFETY'
+
+
+class GeminiUsageMetadata(BaseModel):
+    """
+    Counts from the shared path; omit unavailable counts rather than invent them.
+    candidatesTokenCount excludes thoughtsTokenCount; totalTokenCount includes prompt, candidate
+    and thought tokens, with cachedContentTokenCount already included in promptTokenCount.
+    """
+
+    promptTokenCount: int | None = Field(None, ge=0)
+    candidatesTokenCount: int | None = Field(None, ge=0)
+    totalTokenCount: int | None = Field(None, ge=0)
+    thoughtsTokenCount: int | None = Field(None, ge=0)
+    cachedContentTokenCount: int | None = Field(None, ge=0)
+
+
+class GeminiCountTokensResponse(BaseModel):
+    totalTokens: int = Field(..., ge=0)
+    cachedContentTokenCount: int | None = Field(None, ge=0)
+
+
+class GeminiModel(BaseModel):
+    name: str = Field(
+        ...,
+        description='models/<Eugene id or configured Gemini alias>; slashes in ids are preserved.',
+    )
+    version: str | None = None
+    displayName: str | None = None
+    description: str | None = None
+    inputTokenLimit: int | None = Field(
+        None,
+        description='Effective reported input limit; omitted when unknown, never guessed.',
+        ge=1,
+    )
+    outputTokenLimit: int | None = Field(
+        None,
+        description='Effective reported output limit; omitted when unknown, never guessed.',
+        ge=1,
+    )
+    supportedGenerationMethods: list[str] = Field(
+        ...,
+        description='Door methods the serving path reports, such as generateContent, streamGenerateContent\nand countTokens. Unknown capability is not a refusal; requests may still try it.',
+    )
+
+
+class Target(RootModel[str]):
+    root: str = Field(..., min_length=1)
+
+
+class GeminiModelNameMapping(BaseModel):
+    """
+    One geminiModelNames entry using the existing model_slots config renderer. model is the
+    requested Gemini name without models/; targets holds one Eugene model id or
+    role:<ModelRole>. A role uses its existing slot and failover. No capability allowlist blocks
+    an untested target. Duplicate names and empty targets are rejected by field name; a bad file
+    keeps config endpoints reachable.
+    """
+
+    model: str = Field(..., min_length=1)
+    targets: list[Target] = Field(..., max_length=1, min_length=1)
+
+
+class Error(BaseModel):
+    code: int = Field(..., description='HTTP status code.', ge=0)
+    message: str = Field(
+        ...,
+        description="Names the field or model and the observed cause. Upstream credentials are identified\nas the backend's, not the caller's. No query key or other secret appears here.",
+    )
+    status: str = Field(
+        ...,
+        description="Google's status word: INVALID_ARGUMENT (400), UNAUTHENTICATED (401),\nPERMISSION_DENIED (403), NOT_FOUND (404), RESOURCE_EXHAUSTED (429), CANCELLED (499),\nINTERNAL (502), UNAVAILABLE (503), DEADLINE_EXCEEDED (504).",
+    )
+
+
+class GeminiErrorResponse(BaseModel):
+    error: Error
+
+
 class WebSearchRequest(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -130,7 +342,7 @@ class ModelRole(StrEnum):
     decision = 'decision'
 
 
-class Role(StrEnum):
+class Role1(StrEnum):
     """
     The speaker of a single message in a conversation. Matches the
     OpenAI / Anthropic chat roles so adapters never re-shape on a hop.
@@ -2336,7 +2548,7 @@ class ChatCompletionAudioDelta(BaseModel):
     expires_at: int | None = None
 
 
-class Role1(StrEnum):
+class Role2(StrEnum):
     """
     `function` is the deprecated role for a function's result,
     answering the assistant's `function_call` before it; it is
@@ -2359,7 +2571,7 @@ class Role1(StrEnum):
     function = 'function'
 
 
-class FinishReason(StrEnum):
+class FinishReason1(StrEnum):
     """
     `function_call` only when the request used the deprecated
     `functions`, in place of `tool_calls` (P2c).
@@ -2395,11 +2607,11 @@ class FinishReason(StrEnum):
     function_call = 'function_call'
 
 
-class Role2(StrEnum):
+class Role3(StrEnum):
     assistant = 'assistant'
 
 
-class FinishReason1(Enum):
+class FinishReason2(Enum):
     """
     Null until the terminal chunk.
     """
@@ -2441,7 +2653,7 @@ class NamedToolChoice(BaseModel):
     function: Function
 
 
-class FunctionCall(BaseModel):
+class FunctionCallModel(BaseModel):
     name: str
     arguments: str = Field(
         ...,
@@ -2696,7 +2908,7 @@ class EmbeddingRequest(BaseModel):
     )
     dimensions: int | None = Field(
         None,
-        description="**Accepted and ignored.** The vectors come back at the\nmodel's own width, whatever is asked here. No backend is sent\nthis field (the driver's `EmbedRequest` has none), and this\nlayer does not emulate truncation, because a silently\ntruncated vector is a wrong answer that looks like a right\none. A request that carries one is answered with\n`x-eugene-plexus-ignored-settings: dimensions` (`dimensions,\nuser` when both are sent). Before 2026-10-11 this said it was\npassed through to the backend unchanged; it never was.\n",
+        description='Requested vector width, forwarded in EmbedRequest.dimensions.\nGemini applies it as outputDimensionality. A backend that\ndoes not apply it returns its native width and names\ndimensions in x-eugene-plexus-ignored-settings; Gemini does\nnot call an applied value ignored. No layer truncates or\npads vectors, and an untested capability never blocks an\nattempt. A provider refusal names the field and its cause.\n',
         ge=1,
     )
 
@@ -2928,7 +3140,7 @@ class AnthropicTokenCount(BaseModel):
     )
 
 
-class Role3(StrEnum):
+class Role4(StrEnum):
     user = 'user'
     assistant = 'assistant'
     system = 'system'
@@ -3089,7 +3301,7 @@ class Type3(StrEnum):
     message = 'message'
 
 
-class Role4(StrEnum):
+class Role5(StrEnum):
     assistant = 'assistant'
 
 
@@ -3212,7 +3424,7 @@ class Type5(StrEnum):
     error = 'error'
 
 
-class Error(BaseModel):
+class Error1(BaseModel):
     type: str = Field(
         ...,
         description='`invalid_request_error`, `authentication_error`,\n`permission_error`, `not_found_error`,\n`rate_limit_error`, `api_error`, `overloaded_error`.\n',
@@ -3235,7 +3447,7 @@ class AnthropicErrorResponse(BaseModel):
     """
 
     type: Type5
-    error: Error
+    error: Error1
 
 
 class ResponsesInputTokens(BaseModel):
@@ -3566,7 +3778,7 @@ class SystemOneUsage(BaseModel):
     output_tokens: int | None = Field(None, ge=0)
 
 
-class Error1(BaseModel):
+class Error2(BaseModel):
     message: str = Field(
         ...,
         description='Human-readable failure. Names the model and, on a\ncascade, that every backend was tried — the operator\nreading it is usually the person who configured the\nthing.\n',
@@ -3590,7 +3802,7 @@ class OpenAIErrorResponse(BaseModel):
 
     """
 
-    error: Error1
+    error: Error2
 
 
 class Percentiles(BaseModel):
@@ -3816,6 +4028,68 @@ class ClientUsageSummary(BaseModel):
     truncated: bool
     rowsDropped: int
     clients: list[ClientUsageGroup]
+
+
+class ToolConfig(BaseModel):
+    functionCallingConfig: GeminiFunctionCallingConfig | None = None
+
+
+class GeminiContent(BaseModel):
+    role: Role | None = Field(
+        None, description='Omitted for systemInstruction; otherwise defaults to user.'
+    )
+    parts: list[GeminiPart] = Field(..., min_length=1)
+
+
+class GeminiTool(BaseModel):
+    functionDeclarations: list[GeminiFunctionDeclaration] | None = None
+    googleSearch: dict[str, Any] | None = Field(
+        None,
+        description="Runs the hub's web search through web_search_options, with the same key tool/locality\nlimits and observed-cause refusals.",
+    )
+
+
+class GeminiGenerationConfig(BaseModel):
+    temperature: float | None = None
+    topP: float | None = Field(None, ge=0.0, le=1.0)
+    topK: int | None = Field(None, ge=0)
+    maxOutputTokens: int | None = Field(None, ge=1)
+    stopSequences: list[str] | None = None
+    seed: int | None = None
+    candidateCount: int | None = Field(
+        None,
+        description='Only one candidate; larger values are refused naming candidateCount.',
+        ge=1,
+        le=1,
+    )
+    responseMimeType: str | None = Field(
+        None,
+        description='text/plain or application/json; other types are refused naming this field.',
+    )
+    responseSchema: dict[str, Any] | None = Field(
+        None,
+        description='Gemini schema form; used with application/json for structured output.',
+    )
+    responseJsonSchema: Any | None = Field(
+        None, description='JSON Schema form; mutually exclusive with responseSchema.'
+    )
+    thinkingConfig: GeminiThinkingConfig | None = None
+
+
+class GeminiCandidate(BaseModel):
+    index: Literal[0] = Field(0, ge=0)
+    content: GeminiContent | None = None
+    finishReason: FinishReason | None = Field(
+        None,
+        description='STOP for stop or tool calls, MAX_TOKENS for length, SAFETY only for observed\ncontent_filter. Never invent a safety refusal.',
+    )
+
+
+class GeminiListModelsResponse(BaseModel):
+    models: list[GeminiModel]
+    nextPageToken: str | None = Field(
+        None, description='Omitted on the last page, so SDK iteration terminates.'
+    )
 
 
 class DriverHealth(BaseModel):
@@ -4577,7 +4851,7 @@ class Delta(BaseModel):
 
     """
 
-    role: Role2 | None = None
+    role: Role3 | None = None
     content: str | None = None
     reasoning_content: str | None = Field(
         None,
@@ -4617,7 +4891,7 @@ class ToolCall(BaseModel):
         description='Correlation id. The caller echoes it as `tool_call_id` on\nthe message carrying the result.\n',
     )
     type: Literal['function']
-    function: FunctionCall
+    function: FunctionCallModel
 
 
 class ResponseFormat(BaseModel):
@@ -4790,7 +5064,7 @@ class AnthropicInputMessage(BaseModel):
     model_config = ConfigDict(
         extra='allow',
     )
-    role: Role3
+    role: Role4
     content: str | list[AnthropicContentBlock] = Field(
         ...,
         description='A plain string, or a list of blocks. Both forms arrive from\nreal clients in the same conversation.\n',
@@ -4809,7 +5083,7 @@ class AnthropicMessageResponse(BaseModel):
 
     id: str
     type: Type3
-    role: Role4
+    role: Role5
     model: str = Field(
         ...,
         description='The model that actually answered, which after a cascade is\nnot necessarily the one that was asked for.\n',
@@ -5206,6 +5480,89 @@ class MetricRequestPage(BaseModel):
     nextCursor: str | None = Field(None, description='Absent or null on the last page.')
 
 
+class GeminiGenerateContentRequest(BaseModel):
+    """
+    Native Gemini request translated onto the shared chat path. Unsupported settings are refused
+    by field name. Untested capabilities are attempted rather than blocked by an unmeasured
+    allowlist.
+    """
+
+    contents: list[GeminiContent] = Field(..., min_length=1)
+    systemInstruction: GeminiContent | None = None
+    tools: list[GeminiTool] | None = None
+    toolConfig: ToolConfig | None = None
+    generationConfig: GeminiGenerationConfig | None = None
+    safetySettings: list[SafetySetting] | None = Field(
+        None,
+        description='Accepted; named as ignored because no local safety filter runs.',
+    )
+    model: str | None = Field(
+        None,
+        description='Used inside countTokens.generateContentRequest only. When present it must resolve to the\nsame model as the URL; a mismatch is a 400 naming generateContentRequest.model.',
+    )
+
+
+class GeminiStreamGenerateContentResponse(BaseModel):
+    """
+    One SSE data object. Each frame carries Gemini response fields as available; text and tool
+    parts are deltas, usageMetadata may arrive only at the end, and finishReason appears only
+    when observed. No synthetic usage or finish reason.
+    """
+
+    candidates: list[GeminiCandidate] | None = Field(None, max_length=1)
+    usageMetadata: GeminiUsageMetadata | None = None
+    modelVersion: str | None = Field(
+        None,
+        description='The Eugene model id that actually answered, after role routing and failover.',
+    )
+    responseId: str | None = None
+
+
+class GeminiGenerateContentResponse(BaseModel):
+    """
+    A complete answer. SSE uses the same fields but may omit candidates in a usage-only frame
+    and usageMetadata until the final frame. Required fields here apply to a complete
+    non-streamed response.
+    """
+
+    candidates: list[GeminiCandidate] = Field(..., max_length=1)
+    usageMetadata: GeminiUsageMetadata
+    modelVersion: str = Field(
+        ...,
+        description='The Eugene model id that actually answered, after role routing and failover.',
+    )
+    responseId: str | None = None
+
+
+class GeminiCountTokensRequest1(BaseModel):
+    """
+    Either contents or a full generateContentRequest including system instructions and tools,
+    never both. The SDK sends contents for an ordinary count_tokens call.
+    """
+
+    contents: list[GeminiContent] = Field(..., min_length=1)
+    generateContentRequest: GeminiGenerateContentRequest | None = None
+
+
+class GeminiCountTokensRequest2(BaseModel):
+    """
+    Either contents or a full generateContentRequest including system instructions and tools,
+    never both. The SDK sends contents for an ordinary count_tokens call.
+    """
+
+    contents: list[GeminiContent] | None = Field(None, min_length=1)
+    generateContentRequest: GeminiGenerateContentRequest
+
+
+class GeminiCountTokensRequest(
+    RootModel[GeminiCountTokensRequest1 | GeminiCountTokensRequest2]
+):
+    root: GeminiCountTokensRequest1 | GeminiCountTokensRequest2 = Field(
+        ...,
+        description='Either contents or a full generateContentRequest including system instructions and tools,\nnever both. The SDK sends contents for an ordinary count_tokens call.',
+    )
+
+
 class DriversInfo(BaseModel):
     drivers: list[DriverHealth] = Field(
         ...,
@@ -5463,6 +5820,9 @@ class Model(BaseModel):
     is what makes it safe to answer "which of my backends is behind
     this name" without breaking compatibility.
 
+    Gemini clients read name, displayName, supportedGenerationMethods and known token limits;
+    OpenAI clients retain id, object and the namespaced extension.
+
     """
 
     id: str = Field(
@@ -5478,6 +5838,26 @@ class Model(BaseModel):
         description='OpenAI sends an organisation here. We send `local` only when\nevery backend reports local inference, otherwise the provider\nkey when there is one, `mixed` for multiple providers, or\n`unknown` when no provider or local inference is confirmed.\n',
     )
     x_eugene_plexus: ModelRoutingInfo | None = None
+    name: str = Field(
+        ...,
+        description='models/<Eugene id or configured Gemini alias>; slashes in ids are preserved.',
+    )
+    version: str | None = None
+    displayName: str | None = None
+    inputTokenLimit: int | None = Field(
+        None,
+        description='Effective reported input limit; omitted when unknown, never guessed.',
+        ge=1,
+    )
+    outputTokenLimit: int | None = Field(
+        None,
+        description='Effective reported output limit; omitted when unknown, never guessed.',
+        ge=1,
+    )
+    supportedGenerationMethods: list[str] = Field(
+        ...,
+        description='Door methods the serving path reports, such as generateContent, streamGenerateContent\nand countTokens. Unknown capability is not a refusal; requests may still try it.',
+    )
 
 
 class ModerationParts(RootModel[list[ModerationInputPart]]):
@@ -5502,7 +5882,7 @@ class ChatCompletionChunkChoice(BaseModel):
         None,
         description="The log probabilities of this frame's tokens, with `logprobs` true.",
     )
-    finish_reason: FinishReason1 | None = Field(
+    finish_reason: FinishReason2 | None = Field(
         None, description='Null until the terminal chunk.'
     )
 
@@ -5879,6 +6259,13 @@ class ModelList(BaseModel):
     object: Literal['list']
     data: list[Model]
     x_eugene_plexus: ModelListInfo | None = None
+    models: list[GeminiModel] = Field(
+        ...,
+        description='Gemini projection of this same page; existing OpenAI clients continue reading data.',
+    )
+    nextPageToken: str | None = Field(
+        None, description='Opaque token for the next page; omitted on the last page.'
+    )
 
 
 class CompletionResponse(BaseModel):
@@ -6064,7 +6451,7 @@ class ChatCompletionMessage(BaseModel):
 
     """
 
-    role: Role1 = Field(
+    role: Role2 = Field(
         ...,
         description="`function` is the deprecated role for a function's result,\nanswering the assistant's `function_call` before it; it is\ncarried as a `tool` message answering that call (P2c).\n\n`developer` is OpenAI's newer name for the instruction role,\nsent by current SDKs and frameworks when they target a\nreasoning model. It reaches the backend as `system`, in\nplace -- local chat templates know only `system`, and the\ntwo mean the same thing to a model that is not OpenAI's.\nRefused with a 400 until 2026-09-23.\n",
     )
@@ -6093,7 +6480,7 @@ class ChatCompletionMessage(BaseModel):
         None,
         description='On a response: the spoken answer (P2b). On a request:\nrefused with a 400, since it would name stored audio.\n',
     )
-    function_call: FunctionCall | None = Field(
+    function_call: FunctionCallModel | None = Field(
         None,
         description="The deprecated single function call (P2c). On a response, only\nwhen the request used `functions`. On a request's assistant\nmessage, it is carried as that turn's one tool call.\n",
     )
@@ -6109,7 +6496,7 @@ class ChatCompletionChoice(BaseModel):
     logprobs: ChatLogprobs | None = Field(
         None, description="With `logprobs` true, the answer's; otherwise null."
     )
-    finish_reason: FinishReason = Field(
+    finish_reason: FinishReason1 = Field(
         ...,
         description='`function_call` only when the request used the deprecated\n`functions`, in place of `tool_calls` (P2c).\n\n`stop` for a natural end or a matched stop sequence,\n`length` for hitting the token cap, `tool_calls` when the\nmodel stopped because it wants one or more tools run,\n`content_filter` when a safety classifier stopped it.\n\n**`content_filter` is OpenAI\'s own value and is carried\nsince 2026-09-19.** Before that the chain was\n`content_filter` → the driver\'s `error` → `stop`, so a\nfiltered answer arrived as a natural end and a caller had\nno way to tell a refusal from a reply. The same mistake as\n`tool_calls` → `stop` before 2026-09-11, one value along:\na state with no row of its own reported as its nearest\nneighbour.\n\nUntil 2026-09-11 this enum was `stop` and `length` only, and\nits description said so in as many words — "OpenAI\'s two\nvalues for a completion **without** tool calls". That\nsentence was the single occurrence of the string "tool"\nanywhere in this contract or the driver\'s, and it was an\naccurate description of a control plane no agent harness\ncould use.\n',
     )
@@ -6123,7 +6510,7 @@ class Message(BaseModel):
 
     """
 
-    role: Role
+    role: Role1
     content: str | MessageContent1 | None = Field(
         None,
         description="Text, null for an assistant tool-call turn, or ordered user content parts.\nImages are inline PNG/JPEG only: the gateway's `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Attachments ride on user messages\nonly. Remote URLs are never fetched, and a `file_id` is refused:\neach names a store this install does not have.\n",

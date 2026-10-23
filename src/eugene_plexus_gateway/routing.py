@@ -2684,6 +2684,12 @@ class RoutingTable:
             eligible = resolution.eligible_backends()
             out.append(
                 Model(
+                    name=f"models/{model_id}",
+                    supportedGenerationMethods=[
+                        "generateContent",
+                        "streamGenerateContent",
+                        "countTokens",
+                    ],
                     id=model_id,
                     object="model",
                     # OpenAI sends an organisation here; we send the
