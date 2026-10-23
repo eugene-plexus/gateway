@@ -91,6 +91,7 @@ FRONT_DOOR_PATHS: frozenset[str] = frozenset(
         # Anthropic's browser path announces itself on a count as on a message.
         "/v1/messages/count_tokens",
         "/v1/responses/input_tokens",
+        "/v1/responses/compact",
         # P3a: a page that reads text aloud is the plainest browser client.
         "/v1/audio/speech",
         # P3b, and the one that refuses, so a browser reads why.

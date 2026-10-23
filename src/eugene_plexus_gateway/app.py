@@ -286,6 +286,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "/v1/systemone",
             "/v1/responses",
             "/v1/responses/input_tokens",
+            "/v1/responses/compact",
             "/v1/audio/speech",
             # P4: a generation is a small JSON body; variations only refuse.
             "/v1/images/generations",

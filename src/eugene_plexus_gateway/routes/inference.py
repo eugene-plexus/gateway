@@ -45,6 +45,7 @@ from .. import (
     affinity,
     anthropic,
     chat_contract,
+    compaction,
     completion_door,
     control_tokens,
     decisions,
@@ -1922,6 +1923,7 @@ async def _stream_responses(
         echo=translated.echo,
         include_reasoning=translated.include_reasoning,
         namespaces=translated.namespaces,
+        client_tools=translated.client_tools,
     )
     for chunk in translator.start():
         yield chunk
@@ -1957,6 +1959,11 @@ async def _stream_responses(
                 if event.text:
                     for chunk in translator.text(event.text):
                         yield chunk
+        except responses.Refusal as refusal:
+            _record(prepared.rec, body, tries)
+            for chunk in translator.failed(refusal.message, code="server_error"):
+                yield chunk
+            return
         except (DriverError, httpx.HTTPError) as e:
             log.warning("responses stream for %r failed: %s", body.model, e)
             _record(prepared.rec, body, tries)
@@ -1997,10 +2004,109 @@ async def _stream_responses(
         _warn_if_truncated(
             truncated, body, response.usage, getattr(prepared.client, "served_by", None), window
         )
-        for chunk in translator.finish(
-            model=served_model, finish=response.finishReason, usage=response.usage
-        ):
+        try:
+            frames = translator.finish(
+                model=served_model, finish=response.finishReason, usage=response.usage
+            )
+        except responses.Refusal as refusal:
+            frames = translator.failed(refusal.message, code="server_error")
+        for chunk in frames:
             yield chunk
+
+
+def _compaction_sealer(request: Request) -> compaction.Sealer:
+    settings = request.app.state.settings
+    return compaction.Sealer(settings.config_file.resolve().parent / "compaction.key")
+
+
+@router.post("/v1/responses/compact")
+async def compact_response(request: Request) -> Any:
+    """Summarize through the shared routing and admission path, then seal the result."""
+    try:
+        await responses.authorize(request)
+        try:
+            raw = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            raise responses.Refusal("body: must be valid JSON.", param="body") from None
+        if not isinstance(raw, dict):
+            raise responses.Refusal("body: must be a JSON object.", param="body")
+        for name in raw:
+            if name not in {"model", "input", "instructions", "previous_response_id"}:
+                field = chat_contract._field_name(name)
+                raise responses.Refusal(f"{field}: unsupported setting.", param=field)
+        sealer = _compaction_sealer(request)
+        translated = await run_in_threadpool(
+            lambda: responses.translate_request(
+                raw, max_images=max_images(_store(request)), sealer=sealer
+            )
+        )
+        # Check the key before asking a model to do work. Failure leaves config reachable.
+        await run_in_threadpool(sealer.cipher)
+    except responses.Refusal as refusal:
+        return refusal.response()
+    except compaction.KeyUnavailable as exc:
+        return responses.error_response(503, str(exc), error_type="server_error")
+    body = translated.request
+    body.messages.append(ChatCompletionMessage(role=Role1.developer, content=compaction.PROMPT))
+    body.max_tokens = compaction.BUDGET
+    store = _store(request)
+    prepared = await _prepare(
+        request, body, surface="chat", instead="/v1/embeddings", install_max_tokens=False
+    )
+    if isinstance(prepared, _Failure):
+        return prepared.as_responses()
+    with collect_attempts() as tries:
+        try:
+            response = await serve_while_connected(
+                request, prepared.client.generate(prepared.generate), what="a compaction"
+            )
+        except (ClientGone, DriverError, httpx.HTTPError) as exc:
+            _record(prepared.rec, body, tries)
+            return _serve_failure(exc, body, store).as_responses()
+        _record(
+            prepared.rec,
+            body,
+            tries,
+            served_model=response.modelId or body.model,
+            usage=response.usage,
+            backend_ms=response.latencyMs,
+            client=prepared.client,
+        )
+        if response.finishReason != "stop" or not response.content or response.toolCalls:
+            return responses.error_response(
+                502,
+                "The backend did not complete a compaction summary "
+                f"(finish reason: {response.finishReason}); send the conversation instead.",
+                error_type="server_error",
+            )
+        summary = response.content
+        if response.usage is None:
+            return responses.error_response(
+                502,
+                "The backend did not report token usage for compaction; "
+                "send the conversation instead.",
+                error_type="server_error",
+            )
+        try:
+            encrypted = await run_in_threadpool(lambda: sealer.seal(summary))
+        except compaction.KeyUnavailable as exc:
+            return responses.error_response(503, str(exc), error_type="server_error")
+    return JSONResponse(
+        content={
+            "id": "cmp_" + uuid.uuid4().hex,
+            "object": "response.compaction",
+            "created_at": int(time.time()),
+            "output": [
+                {
+                    "id": "cmp_" + uuid.uuid4().hex,
+                    "type": "compaction",
+                    "encrypted_content": encrypted,
+                }
+            ],
+            "usage": responses.usage_block(response.usage),
+        },
+        headers=ignored_settings.added_to({}, prepared.not_honoured_by_answer(), "responses"),
+    )
 
 
 @router.post("/v1/responses/input_tokens")
@@ -2026,7 +2132,9 @@ async def count_response_input_tokens(request: Request) -> Any:
     raw = {k: v for k, v in raw.items() if k != "stream"}
     try:
         translated = await run_in_threadpool(
-            lambda: responses.translate_request(raw, max_images=max_images(_store(request)))
+            lambda: responses.translate_request(
+                raw, max_images=max_images(_store(request)), sealer=_compaction_sealer(request)
+            )
         )
     except responses.Refusal as refusal:
         return refusal.response()
@@ -2067,7 +2175,9 @@ async def create_response(request: Request) -> Any:
     store = _store(request)
     try:
         translated = await run_in_threadpool(
-            lambda: responses.translate_request(raw, max_images=max_images(store))
+            lambda: responses.translate_request(
+                raw, max_images=max_images(store), sealer=_compaction_sealer(request)
+            )
         )
     except responses.Refusal as refusal:
         return refusal.response()
@@ -2157,6 +2267,10 @@ async def create_response(request: Request) -> Any:
                 namespaces=translated.namespaces,
             )
         )
+        try:
+            output = responses.client_tool_items(output, translated.client_tools)
+        except responses.Refusal as refusal:
+            return refusal.response()
         return JSONResponse(
             content=responses.response_object(
                 response_id=response_id,
