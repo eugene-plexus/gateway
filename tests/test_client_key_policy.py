@@ -155,3 +155,26 @@ async def test_clock_rollback_preserves_known_revocation(tmp_path):
     assert await restarted.decision("key-1") == "revoked"
     assert await restarted.decision("key-2") == "unavailable"
     await restarted.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_replaced_key_is_refused_as_replaced() -> None:
+    """The root serves a replaced key's `retiresAt` as its `expiresAt`. A token
+    whose own expiry is later says which cause it is; one that simply expired
+    stays "not registered"."""
+    agent = FakeAgent()
+    guard = agent.as_guard(ttl_seconds=0)
+    own_exp = time.time() + 3600
+    assert await guard.decision("key-1", token_exp=own_exp) == "allowed"
+    agent.retired["key-1"] = time.time() - 5
+    agent.revision += 1
+    assert await guard.decision("key-1", token_exp=own_exp) == "replaced"
+    # Before the retirement the old token still works.
+    agent.retired["key-2"] = time.time() + 60
+    agent.revision += 1
+    assert await guard.decision("key-2", token_exp=own_exp) == "allowed"
+    # A key past its own expiry is not "replaced".
+    agent.retired["key-3"] = time.time() - 5
+    agent.revision += 1
+    assert await guard.decision("key-3", token_exp=agent.retired["key-3"]) == "unregistered"
+    await guard.aclose()
