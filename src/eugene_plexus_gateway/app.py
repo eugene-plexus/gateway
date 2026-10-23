@@ -27,6 +27,7 @@ from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS, ConfigStore
 from .control_tokens import SpecialTokenSpellings
 from .cors import FrontDoorCors
 from .dependencies import require_operator
+from .library_cache import LibraryCache
 from .lifecycle import AgentLifecycleClient, LifecycleManager
 from .metrics import MetricsStore
 from .outbound import Outbound
@@ -35,6 +36,7 @@ from .routes import admin as admin_routes
 from .routes import config as config_routes
 from .routes import health as health_routes
 from .routes import inference as inference_routes
+from .routes import info as info_routes
 from .routes import metrics as metrics_routes
 from .routes import roles as roles_routes
 from .routes import web_search as web_search_routes
@@ -151,6 +153,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     profiles: ProfileDefaults | None = None
     spellings: SpecialTokenSpellings | None = None
     lifecycle: LifecycleManager | None = None
+    saved = LibraryCache(settings.config_file.parent / "library-cache.json")
+    app.state.library_cache = saved
     if not hasattr(app.state, "routing"):
         if settings.safe_mode:
             # No table at all in safe mode, rather than an empty one:
@@ -180,9 +184,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             app.state.routing = table
             owns_routing = True
-            profiles = ProfileDefaults(settings.agent_url, auth_state.service_token, store.get)
+            profiles = ProfileDefaults(
+                settings.agent_url, auth_state.service_token, store.get, saved=saved
+            )
             app.state.profile_defaults = profiles
-            spellings = SpecialTokenSpellings(settings.agent_url, auth_state.service_token)
+            spellings = SpecialTokenSpellings(
+                settings.agent_url, auth_state.service_token, saved=saved
+            )
             app.state.special_tokens = spellings
             # Awaited, so the gateway is routable the moment it serves.
             await table.start()
@@ -204,6 +212,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await profiles.aclose()
         if spellings is not None:
             await spellings.aclose()
+        await saved.aclose()
         if lifecycle is not None:
             await lifecycle.aclose()
         if owns_routing and app.state.routing is not None:
@@ -244,6 +253,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(config_routes.router, dependencies=operator_only)
     app.include_router(roles_routes.router, dependencies=operator_only)
     app.include_router(admin_routes.router, dependencies=operator_only)
+    app.include_router(info_routes.router, dependencies=operator_only)
     # Metrics are operator-only too, and unlike other reads they do not
     # accept a service token: no component needs them, and model names
     # plus traffic volumes are not nothing on a shared tailnet.

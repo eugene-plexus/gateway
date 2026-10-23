@@ -20,6 +20,7 @@ import httpx
 
 from ._generated.library_models import ModelProfileList, RecommendedSampling
 from ._http import internal_client
+from .library_cache import LibraryCache, failure_cause
 
 log = logging.getLogger(__name__)
 _MAX_ENTRIES = 256
@@ -43,6 +44,7 @@ class ProfileDefaults:
         *,
         transport: httpx.AsyncBaseTransport | None = None,
         clock: Callable[[], float] = time.perf_counter,
+        saved: LibraryCache | None = None,
     ) -> None:
         self._base = agent_url.rstrip("/") + "/api/proxy/library"
         self._config = get_config
@@ -53,6 +55,32 @@ class ProfileDefaults:
         )
         self._cache: OrderedDict[str, _Entry] = OrderedDict()
         self._pending: dict[str, asyncio.Task[_Entry]] = {}
+        self.library = saved or LibraryCache()
+        for path, raw in self.library.profiles.items():
+            try:
+                values = raw["value"]
+                if not isinstance(values, dict):
+                    continue
+                # Validate disk data by the same wire field constraints.
+                from ._generated.library_models import ModelProfile
+
+                profile = ModelProfile.model_validate(
+                    {
+                        "id": "saved",
+                        "name": "saved",
+                        "default": True,
+                        "engine": "llama_cpp",
+                        **values,
+                    }
+                )
+                values = profile.model_dump(
+                    include={"maxTokens", "temperature", "topP", "topK", "minP"}, exclude_none=True
+                )
+                age = max(0.0, time.time() - float(raw["fetchedAt"]))
+                fetched = self._clock() - max(age, self._seconds("profileCacheSeconds", 30))
+                self._cache[path] = _Entry(values, fetched, failed=True)
+            except (ValueError, TypeError, KeyError):
+                continue
 
     def _seconds(self, key: str, default: float) -> float:
         value = self._config(key)
@@ -63,8 +91,14 @@ class ProfileDefaults:
             return {}
         age = self._clock() - entry.fetched_at
         fresh = self._seconds("profileCacheSeconds", 30)
-        stale = self._seconds("profileMaxStaleSeconds", 300)
+        limit = self._config("profileMaxStaleSeconds")
+        if limit is None:
+            return dict(entry.values)
+        stale = max(0.0, float(limit))
         return dict(entry.values) if age < fresh + stale else {}
+
+    def models_on_saved_settings(self) -> int:
+        return sum(bool(entry.failed and self._usable(entry)) for entry in self._cache.values())
 
     async def get(self, model_path: str | None) -> dict[str, Any]:
         if not model_path:
@@ -94,7 +128,13 @@ class ProfileDefaults:
         try:
             values = await self._read(path)
             entry = _Entry(values, self._clock())
+            self.library.observe()
+            self.library.update("profiles", path, values)
         except (httpx.HTTPError, ValueError, TypeError, KeyError) as exc:
+            # Only a successful answer replaces saved values. A refusal (a
+            # credential the proxy rejects, a Library error) says nothing
+            # about the model's settings, so they stay as they were.
+            self.library.observe(exc)
             entry = _Entry(
                 previous.values if previous else {},
                 previous.fetched_at if previous else None,
@@ -104,7 +144,7 @@ class ProfileDefaults:
             log.warning(
                 "Library profile lookup failed for %s (%s); using %s",
                 path,
-                type(exc).__name__,
+                failure_cause(exc),
                 "cached profile defaults" if self._usable(entry) else "gateway defaults",
             )
         self._cache[path] = entry
