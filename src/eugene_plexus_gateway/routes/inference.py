@@ -5123,22 +5123,23 @@ def _routing_info(
     served_node = getattr(client, "served_by_node", None)
     attempts = getattr(client, "attempts", 1)
     tier = getattr(client, "tier", 1)
-    # inference-driver.yaml and gateway.yaml each generate their own
-    # BackendKind with the same wire values; cross via `.value`.
-    backend_kind = next(
+    served_backend = next(
         (
-            BackendKind(b.info.backend.value)
+            b
             for b in table.backends_for(model)
             if b.name == served_by and (served_node is None or b.node == served_node)
         ),
         None,
     )
+    runtime = served_backend.runtime if served_backend is not None else None
     return CompletionRoutingInfo(
         driver=served_by,
-        # The engine process behind the driver that answered, when the
-        # agent supervises one — by name, so replicas are attributed too.
-        runtime=table.runtime_for(model, served_by, served_node),
-        backend=backend_kind,
+        # The serving driver's node is the root registry's machine name.
+        # Cloud and CLI drivers have a node too, but no supervised runtime.
+        runtime=runtime.name if runtime is not None else None,
+        node=served_backend.node if served_backend is not None and runtime is not None else None,
+        # The two contracts generate their own BackendKind; cross via its value.
+        backend=BackendKind(served_backend.info.backend.value) if served_backend else None,
         latency_ms=int((time.perf_counter() - started) * 1000),
         attempts=attempts if isinstance(attempts, int) and attempts >= 1 else 1,
         tier=tier if isinstance(tier, int) and tier >= 1 else 1,

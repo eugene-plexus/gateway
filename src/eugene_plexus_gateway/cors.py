@@ -218,6 +218,7 @@ EXPOSED_HEADERS = b", ".join(
         b"X-Eugene-Plexus-Driver",
         b"X-Eugene-Plexus-Model",
         b"X-Eugene-Plexus-Runtime",
+        b"X-Eugene-Plexus-Node",
         b"X-Eugene-Plexus-Backend",
         b"X-Eugene-Plexus-Latency-Ms",
         b"X-Eugene-Plexus-Attempts",
