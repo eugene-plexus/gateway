@@ -1925,7 +1925,7 @@ class StoreOwner(BaseModel):
         extra='forbid',
     )
     owner: str = Field(
-        ..., description='`install`, `person:<id>`, `key:<id>` or `service:<sub>`.'
+        ..., description='`install`, `person:<id>`, `key:<id>` or `component:<sub>`.'
     )
     files: int
     bytes: int = Field(

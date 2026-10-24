@@ -284,7 +284,7 @@ def test_a_file_id_resolves_for_its_owner_only(setup, store, reader):  # noqa: F
         assert c.get("/v1/files", headers=ben).json()["data"] == []
 
 
-def test_the_owner_is_never_taken_from_the_request(setup, store):  # noqa: F811
+def test_the_owner_is_never_taken_from_the_request(setup, store, install):  # noqa: F811
     app, _, _, _, headers, operator = setup
     with TestClient(app) as c:
         forged = {**headers, "X-Eugene-Plexus-Owner": "person:someone-else"}
@@ -292,6 +292,10 @@ def test_the_owner_is_never_taken_from_the_request(setup, store):  # noqa: F811
         assert store.owners_seen[-1] == "key:key-1"
         assert _upload(c, operator, PDF).status_code == 200
         assert store.owners_seen[-1] == "install"
+        # One of this machine's own components keeps files of its own.
+        agent = {"Authorization": f"Bearer {install.service('agent')}"}
+        assert _upload(c, agent, PDF).status_code == 200
+        assert store.owners_seen[-1] == "component:agent"
 
 
 def test_a_key_with_a_lineage_keeps_its_files_after_rotation(setup, store):  # noqa: F811

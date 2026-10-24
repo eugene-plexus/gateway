@@ -9,7 +9,7 @@ what this gateway verified and never from the request's words:
   when the authority reports one (row 24), so a rotated key keeps its
   files, else the key's id;
 * `install` for the owner's own console session;
-* `service:<sub>` for a service token of this machine.
+* `component:<sub>` for a service token of one of this machine's components.
 
 The store believes that name only beside this gateway's service token,
 and answers another owner's id exactly as a missing one.
@@ -190,7 +190,7 @@ async def owner_for(request: Request, *, anthropic: bool) -> str:
             raise DoorRefusal(401, "A person token must accompany exactly one app key.")
         return "install"
     if claims.is_service:
-        return f"service:{claims.sub}"
+        return f"component:{claims.sub}"
     context = admission.current.get()
     own = None
     if context is None:
