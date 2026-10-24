@@ -417,6 +417,47 @@ def test_a_file_named_twice_counts_twice_against_one_budget(setup, store, reader
         assert store.content_reads == downloads + 1, "the second copy was downloaded"
 
 
+def test_file_id_text_and_inline_attachments_share_one_budget(setup, store, reader):  # noqa: F811
+    """Second review of row 53: a 6 MiB text file named by id plus a 6 MiB PDF sent
+    inline is 12 MiB against the 11 MiB limit. Each alone passes its own check."""
+    import base64
+
+    app, _, _, _, headers, _ = setup
+    with TestClient(app) as c:
+        big = c.post(
+            "/v1/files",
+            files={"file": ("big.txt", b"a" * (6 * 1024 * 1024), "text/plain")},
+            data={"purpose": "user_data"},
+            headers=headers,
+        )
+        assert big.status_code == 200, big.text
+        ident = big.json()["id"]
+        pdf = base64.b64encode(b"%PDF-1.4\n" + b"x" * (6 * 1024 * 1024)).decode()
+        inline = {"type": "file", "file": {"filename": "x.pdf", "file_data": pdf}}
+
+        def ask(parts):
+            return c.post(
+                "/v1/chat/completions",
+                json=body("allowed", messages=[{"role": "user", "content": parts}]),
+                headers=headers,
+            )
+
+        # Each alone is within the limit.
+        before = len(reader.calls)
+        assert ask([{"type": "file", "file": {"file_id": ident}}]).status_code == 200
+        assert ask([inline]).status_code == 200
+        assert len(reader.calls) == before + 2
+        # Together they are not, in either order, and no backend is asked.
+        for parts in (
+            [{"type": "file", "file": {"file_id": ident}}, inline],
+            [inline, {"type": "file", "file": {"file_id": ident}}],
+        ):
+            refused = ask(parts)
+            assert refused.status_code == 400, refused.text
+            assert "11 MiB" in refused.json()["error"]["message"]
+        assert len(reader.calls) == before + 2
+
+
 def test_bytes_that_are_not_utf8_are_not_text_whatever_they_were_called(setup, store, reader):  # noqa: F811
     app, _, _, _, headers, _ = setup
     with TestClient(app) as c:

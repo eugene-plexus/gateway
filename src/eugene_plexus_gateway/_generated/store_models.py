@@ -2087,9 +2087,13 @@ class RemovalCheck(BaseModel):
         ...,
         description='Removed people whose objects were deleted for good: their date\npassed, `removedPeopleRetention` is `none`, or Delete now.\n',
     )
+    lateRestored: int = Field(
+        ...,
+        description='People the root has again whose date had already passed: they\nwere not restored, and what they kept was deleted.\n',
+    )
     error: str | None = Field(
         None,
-        description='Why the root could not be asked; then nobody was hidden or\nrestored. A date that had passed was still kept to.\n',
+        description='Why a step could not finish: the root could not be asked (then\nnobody was hidden or restored; a date that had passed was still\nkept to), or a copy kept before a migration could not be purged\n(named, and retried at the next sweep).\n',
     )
 
 

@@ -730,6 +730,9 @@ class _Resolving:
         self.request = request
         self.owner = owner
         self.used = 0
+        #: Bytes of stored text read in place of a file id: the inline checks never
+        #: see them, so they are handed on to the request's one budget.
+        self.text = 0
 
     def take(self, size: int, ident: str, where: str) -> int:
         """Room for `size` more bytes, or the refusal; returns what is left after."""
@@ -773,7 +776,10 @@ async def _fetch(ctx: _Resolving, ident: str, where: str) -> _Found:
                 400, f"{where}: {ident} is larger than its record says.", param=where
             ) from exc
         raise _refused(exc, kind="file", ident=ident) from exc
-    return _Found(ident, str(kept["filename"]), _sniff(data, media), data)
+    found = _Found(ident, str(kept["filename"]), _sniff(data, media), data)
+    if found.media == "text/plain":
+        ctx.text += len(data)
+    return found
 
 
 def _unreadable(found: _Found, where: str, door: str) -> DoorRefusal:
@@ -890,7 +896,12 @@ async def resolve_file_ids(request: Request, raw: Any, *, door: str) -> Any | Re
     anthropic = door == "messages"
     try:
         owner = await owner_for(request, anthropic=anthropic)
-        return await _resolve(_Resolving(request, owner), raw, door)
+        ctx = _Resolving(request, owner)
+        resolved = await _resolve(ctx, raw, door)
+        # One budget per request: the text just read counts with the inline attachments
+        # the validators count next.
+        images.carried_attachment_bytes.set(ctx.text)
+        return resolved
     except DoorRefusal as refusal:
         return error_response(anthropic, refusal)
     except StoreUnavailable as exc:
