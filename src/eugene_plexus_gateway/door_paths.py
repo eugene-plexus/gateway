@@ -13,6 +13,7 @@ segment `{name:path}` stands for the rest of the path, one segment or more.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
 
 
@@ -29,6 +30,11 @@ def matches(path: str, doors: Iterable[str]) -> bool:
     parts = path.split("/")
     for door in doors:
         if "{" not in door:
+            continue
+        if ":path}:" in door:
+            pattern = re.sub(r"\\\{[^{}]+\\\}", ".+", re.escape(door))
+            if re.fullmatch(pattern, path):
+                return True
             continue
         template = door.split("/")
         if template[-1].endswith(":path}"):

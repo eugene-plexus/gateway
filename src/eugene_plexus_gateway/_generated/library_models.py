@@ -7,7 +7,7 @@ from datetime import date
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, RootModel
+from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field, RootModel
 
 
 class ModelRole(StrEnum):
@@ -370,6 +370,50 @@ class ComponentKind(StrEnum):
     inference_driver = 'inference-driver'
     library = 'library'
     tool_driver = 'tool-driver'
+
+
+class Peer(RootModel[str]):
+    root: str = Field(..., min_length=1)
+
+
+class ComputeDevicePcieLink(BaseModel):
+    """
+    Current and supported PCIe link measurements for one card. Each
+    measurement is null independently when its probe fails, so a
+    readable width survives an unreadable generation.
+
+    """
+
+    generation: int | None = Field(
+        ..., description='Current PCIe generation. Null when unreadable.', ge=1
+    )
+    width: int | None = Field(
+        ..., description='Current PCIe lane count. Null when unreadable.', ge=1
+    )
+    maxGeneration: int | None = Field(
+        ...,
+        description='Maximum PCIe generation the card supports. Null when unreadable.',
+        ge=1,
+    )
+    maxWidth: int | None = Field(
+        ...,
+        description='Maximum PCIe lane count the card supports. Null when unreadable.',
+        ge=1,
+    )
+
+
+class ComputeDeviceThrottleReason(StrEnum):
+    """
+    An observed reason a card is slowing down. `thermal` is a heat
+    limit, `power-cap` a power limit, `hardware-slowdown` another
+    hardware slowdown signal, and `other` another active NVML reason.
+
+    """
+
+    thermal = 'thermal'
+    power_cap = 'power-cap'
+    hardware_slowdown = 'hardware-slowdown'
+    other = 'other'
 
 
 class ComputeDeviceKind(StrEnum):
@@ -1921,7 +1965,7 @@ class ModelCapabilities(BaseModel):
     )
     chatTemplate: bool | None = Field(
         None,
-        description='The file embeds its own chat template. When false, something\nhas to supply one at launch, and a model answering strangely\nwith no template is a common and confusing failure.\n',
+        description='The file embeds its own chat template. When false, something\nhas to supply one at launch, and a model answering strangely\nwith no template is a common and confusing failure.\n\nAn available Eugene fallback (`GgufDetail.chatTemplateFallback`\nor `CataloguePreflight.chatTemplateFallback`) never changes\nthis to true. Unknown metadata leaves this field absent.\n',
     )
     decision: bool | None = Field(
         None,
@@ -2033,6 +2077,51 @@ class ModelFileRole(StrEnum):
     tokenizer = 'tokenizer'
     index = 'index'
     other = 'other'
+
+
+class ChatTemplateFallback(BaseModel):
+    """
+    A reviewed template Eugene can supply for this model family when
+    its header confirms both the architecture and that it has no
+    embedded chat template. Absent when that evidence is unknown,
+    when the file embeds a template, or when Eugene has no reviewed
+    fallback for this variant. A filename or a catalogue name alone
+    is not evidence.
+
+    This is availability, not the template in effect. The model page
+    can say "This model ships no chat template; Eugene supplies
+    DeepSeek V4's" and name the engines below, while keeping
+    `ModelCapabilities.chatTemplate` false. The running agent reports
+    the effective template separately as `Runtime.chatTemplate`.
+
+    Default precedence is an explicit operator override, then the
+    file's embedded template, then this fallback on an engine listed
+    below, then the engine's own behaviour. The override is exposed
+    through the engine's GUI flag schema. Missing fallback information
+    does not block a launch: engine eligibility is still decided by
+    the existing eligibility API, and untested engines remain eligible
+    under that API's rules.
+
+    """
+
+    id: str = Field(
+        ...,
+        description="Eugene's template identifier; distinct variants have distinct ids.",
+        min_length=1,
+    )
+    name: str = Field(
+        ...,
+        description='Human-readable template name for the model page.',
+        min_length=1,
+    )
+    engines: list[EngineKind] = Field(
+        ...,
+        description='Engines whose Eugene adapters can apply this fallback. This\nis not a list of engines proved to load the model; consult\neligibility for that. No engine is rejected because it is\nabsent from this list.\n',
+        min_length=1,
+    )
+    sourceUrl: AnyUrl = Field(
+        ..., description='Published upstream format or template used for the review.'
+    )
 
 
 class DraftKind(StrEnum):
@@ -3044,6 +3133,11 @@ class ComputeDevice(BaseModel):
     because a host with two cards is the case that makes replicas of
     one model possible.
 
+    Health readings are observations, never estimates. Each optional
+    health field is null when the platform cannot read it. The agent
+    refreshes these with its device list every 600 seconds and on
+    each `GET /v1/node` (row 43).
+
     """
 
     kind: ComputeDeviceKind
@@ -3053,8 +3147,45 @@ class ComputeDevice(BaseModel):
     )
     index: int | None = Field(
         None,
-        description="Device ordinal on its own host — what `CUDA_VISIBLE_DEVICES`\nor `HIP_VISIBLE_DEVICES` in a runtime's `env` selects to pin\nthat runtime to one card. For a `vulkan` device it is the\norder the operating system lists its adapters in, which is\nnot promised to be the order `GGML_VK_VISIBLE_DEVICES`\ncounts in.\n",
+        description='Current device ordinal on its own host. It can change when\nanother card disappears; `uuid`, when readable, identifies\nthe same card across that renumbering. NVIDIA launches use\nthe UUID in `CUDA_VISIBLE_DEVICES`, falling back to an index\nwhen no UUID was read. For a `vulkan` device the index is the\norder the operating system lists its adapters in, which is\nnot promised to be the order `GGML_VK_VISIBLE_DEVICES` counts\nin.\n',
         ge=0,
+    )
+    uuid: str | None = Field(
+        None,
+        description="Stable vendor device identifier, used to keep a runtime on\nthe same card when indices change. NVIDIA's NVML UUID (for\nexample `GPU-...`) or AMD's sysfs `unique_id`, kept as the\nvendor reports it; not necessarily an RFC UUID. Null when\nthe platform cannot read it.\n",
+        min_length=1,
+    )
+    pciBusId: str | None = Field(
+        None,
+        description='PCI bus address from NVML or the Linux sysfs device path.\nNull when unreadable. A location, not a stable card identity.\n',
+        min_length=1,
+    )
+    pcieLink: ComputeDevicePcieLink | None = Field(
+        None,
+        description="Observed PCIe link against the card's supported link. Null\nwhen no link measurements can be read. A lower generation\nis a warning only when this card's utilisation exceeded 50%\nin the last minute of host history: an idle card can lower\nits generation to save power. A narrower width is a warning\nat any time. Compare only measurements that are known.\n",
+    )
+    powerLimitWatts: float | None = Field(
+        None,
+        description="Power cap in effect, in watts, from NVML's enforced power\nlimit or Linux hwmon `power1_cap`. Null when unreadable.\n",
+        ge=0.0,
+    )
+    powerDefaultLimitWatts: float | None = Field(
+        None,
+        description="The card's default power cap in watts, from NVML or Linux\nhwmon `power1_cap_default`. Null when unreadable.\n",
+        ge=0.0,
+    )
+    throttleReasons: list[ComputeDeviceThrottleReason] | None = Field(
+        None,
+        description='Reasons the card is currently slowing down, read from NVML.\nAn empty list means it reported no throttling. Null when\nunreadable, including AMD and other unsupported platforms.\n',
+    )
+    uncorrectedMemoryErrors: int | None = Field(
+        None,
+        description="Volatile uncorrected ECC memory-error count from NVML, since\nthe device's counter was reset. Zero is a measured result.\nNull when ECC is off, unsupported or unreadable.\n",
+        ge=0,
+    )
+    peers: list[Peer] | None = Field(
+        None,
+        description='UUIDs of other cards this card can reach directly by P2P\nreads, as NVML reports it. Directional: the reverse path is\nreported on the other card. An empty list means no peers\nwere reachable; null means the peer check was unreadable or\nunsupported. Unknown checks never claim that P2P is absent.\n',
     )
     memoryTotalBytes: int | None = None
     memoryFreeBytes: int | None = Field(
@@ -4429,6 +4560,7 @@ class CataloguePreflight(BaseModel):
     dtype: str | None = None
     vocabSize: int | None = Field(None, ge=0)
     capabilities: ModelCapabilities | None = None
+    chatTemplateFallback: ChatTemplateFallback | None = None
     recommendedSampling: RecommendedSampling | None = None
     fit: Fit | None = None
     shardCount: int | None = Field(
@@ -4572,6 +4704,7 @@ class GgufDetail(BaseModel):
         description='Absolute path to the vision projector found beside this\nmodel, if any. Becomes `--mmproj` on the launch line.\nllama-server can also find it unaided, but it is reported\nbecause "this model can see" is a fact the browser should\nshow and a profile should be able to override.\n',
     )
     speculation: GgufSpeculation | None = None
+    chatTemplateFallback: ChatTemplateFallback | None = None
     recommendedSampling: RecommendedSampling | None = None
     metadata: dict[str, Any] | None = Field(
         None,

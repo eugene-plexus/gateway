@@ -261,6 +261,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Configured live from the store; see `cors.py`.
     from .admission import ClientAdmissionMiddleware
     from .body_limit import InferenceBodyLimit
+    from .gemini import BODY_PATHS, QueryKeyRedaction
+    from .gemini_body_limit import GeminiBodyLimit
 
     app.add_middleware(ClientAdmissionMiddleware)
     app.add_middleware(FrontDoorCors)
@@ -272,7 +274,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # belongs here.
     app.add_middleware(
         InferenceBodyLimit,
-        paths={
+        paths=set(BODY_PATHS)
+        | {
             "/v1/chat/completions",
             "/v1/web_search",
             "/v1/messages",
@@ -309,4 +312,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "/v1/videos": 36 * 1024 * 1024,
         },
     )
+    app.add_middleware(GeminiBodyLimit)
+    app.add_middleware(QueryKeyRedaction)
     return app
