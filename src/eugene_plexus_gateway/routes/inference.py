@@ -49,6 +49,7 @@ from .. import (
     completion_door,
     control_tokens,
     decisions,
+    files_door,
     gemini,
     ignored_settings,
     image_doors,
@@ -1490,6 +1491,10 @@ async def create_chat_completion(request: Request) -> Any:
             error_type="invalid_request_error",
             param="body",
         )
+    resolved = await files_door.resolve_file_ids(request, raw, door="chat")
+    if isinstance(resolved, Response):
+        return resolved
+    raw = resolved
     try:
         body = await run_in_threadpool(
             lambda: chat_contract.parse_request(raw, max_images=max_images(_store(request)))
@@ -1817,6 +1822,10 @@ async def create_anthropic_message(request: Request) -> Any:
         return anthropic.error_response(400, "The request body is not valid JSON.")
     if not isinstance(raw, dict):
         return anthropic.error_response(400, "The request body must be a JSON object.")
+    resolved = await files_door.resolve_file_ids(request, raw, door="messages")
+    if isinstance(resolved, Response):
+        return resolved
+    raw = resolved
 
     try:
         body = anthropic.translate_request(raw, max_images=max_images(_store(request)))
@@ -2025,6 +2034,10 @@ async def count_anthropic_message_tokens(request: Request) -> Any:
         return anthropic.error_response(400, "The request body is not valid JSON.")
     if not isinstance(raw, dict):
         return anthropic.error_response(400, "The request body must be a JSON object.")
+    resolved = await files_door.resolve_file_ids(request, raw, door="messages")
+    if isinstance(resolved, Response):
+        return resolved
+    raw = resolved
     try:
         body = anthropic.translate_count_request(raw, max_images=max_images(_store(request)))
     except anthropic.Refusal as refusal:
@@ -2376,6 +2389,10 @@ async def count_response_input_tokens(request: Request) -> Any:
         return responses.error_response(400, "body: must be valid JSON.", param="body")
     if not isinstance(raw, dict):
         return responses.error_response(400, "body: must be a JSON object.", param="body")
+    resolved = await files_door.resolve_file_ids(request, raw, door="responses")
+    if isinstance(resolved, Response):
+        return resolved
+    raw = resolved
     raw = {k: v for k, v in raw.items() if k != "stream"}
     try:
         translated = await run_in_threadpool(
@@ -2418,6 +2435,10 @@ async def create_response(request: Request) -> Any:
         return responses.error_response(400, "body: must be valid JSON.", param="body")
     if not isinstance(raw, dict):
         return responses.error_response(400, "body: must be a JSON object.", param="body")
+    resolved = await files_door.resolve_file_ids(request, raw, door="responses")
+    if isinstance(resolved, Response):
+        return resolved
+    raw = resolved
 
     store = _store(request)
     try:

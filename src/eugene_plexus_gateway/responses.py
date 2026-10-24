@@ -625,7 +625,7 @@ def _image_part(
     """
     if part.get("file_id"):
         raise Refusal(
-            f"{where}.file_id: file ids name a store that exists only at OpenAI; send the image "
+            f"{where}.file_id: this door does not read stored files; send the image "
             "inline as a data URL.",
             param="input",
         )
@@ -651,7 +651,7 @@ def _file_part(
     """
     if part.get("file_id"):
         raise Refusal(
-            f"{where}.file_id: file ids name a store that exists only at OpenAI; send the file "
+            f"{where}.file_id: this door does not read stored files; send the file "
             "inline as file_data.",
             param="input",
         )

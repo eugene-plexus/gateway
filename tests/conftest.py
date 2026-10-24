@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import httpx
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -563,6 +564,40 @@ def install_snapshot(
     for backends in snapshot.by_model.values():
         backends.sort(key=lambda b: (b.node or "", b.name))
     table._snapshot = snapshot
+
+
+@pytest.fixture(autouse=True)
+def _no_store_on_this_machine(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test reaches a real agent's store (the settings' agent URL is this
+    machine's 8079). A store call a test did not script answers as a store
+    that has no such file; `tests/test_files_door.py` scripts its own."""
+    from eugene_plexus_gateway import store_client
+
+    def no_such_file(request: httpx.Request) -> httpx.Response:
+        ident = request.url.path.rstrip("/").split("/")[-1]
+        return httpx.Response(
+            404,
+            json={
+                "detail": {
+                    "title": "Not found",
+                    "status": 404,
+                    "detail": f"No such file: {ident}",
+                    "component": "store",
+                }
+            },
+        )
+
+    original = store_client.StoreClient.__init__
+
+    def scripted(self: Any, agent_url: Any, service_token: Any, *, transport: Any = None) -> None:
+        original(
+            self,
+            agent_url,
+            service_token,
+            transport=transport or httpx.MockTransport(no_such_file),
+        )
+
+    monkeypatch.setattr(store_client.StoreClient, "__init__", scripted)
 
 
 @pytest.fixture

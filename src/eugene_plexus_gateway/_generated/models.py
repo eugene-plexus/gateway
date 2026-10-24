@@ -422,7 +422,7 @@ class InputFile(BaseModel):
     )
     file_id: str | None = Field(
         None,
-        description="Refused with a 400. It names a file uploaded to one\nprovider's store, which this install does not have; send\n`file_data`.\n",
+        description="A file kept in this install's store (`POST /v1/files`, row\n53). The gateway reads it for the caller, from the caller's\nown files only, and carries it as `file_data` (a PDF), an\nimage or text, within the limits above; it never reaches a\nbackend as an id. Another owner's id is refused as one that\ndoes not exist.\n",
     )
 
 
@@ -615,6 +615,11 @@ class ComponentKind(StrEnum):
     calls a tool-driver when the model uses it. `library` scans the operator's model
     directories and holds per-model launch profiles; there is
     exactly one, and it is deliberately not in the request path.
+    `store` (row 53, 2026-10-23) keeps what the gateway's platform
+    doors keep for people -- uploaded files first, then stored
+    responses, batches and vector stores -- each object with an owner
+    and an end; there is exactly one, on the root by default, and the
+    gateway is its only caller (`openapi/store.yaml`).
 
     **The agent is not in this list**, for the same reason engine
     runtimes are not: it supervises, it is not supervised. Its
@@ -630,6 +635,7 @@ class ComponentKind(StrEnum):
     gateway = 'gateway'
     inference_driver = 'inference-driver'
     library = 'library'
+    store = 'store'
     tool_driver = 'tool-driver'
 
 
@@ -1854,6 +1860,43 @@ class MasterKeyEnvelope(BaseModel):
         description='Base64-encoded 24-byte nonce. Generated per-encryption,\nnever reused with the same key.\n',
     )
     ciphertext: str = Field(..., description='Base64-encoded ciphertext + auth tag.')
+
+
+class Subject(RootModel[str]):
+    root: str = Field(..., max_length=200, min_length=1)
+
+
+class PeopleKnownRequest(BaseModel):
+    """
+    Which of these people the root still has (row 53). A component
+    that keeps people's objects (the store) asks its agent, which asks
+    the root with its own node token. Only the ids sent are answered,
+    so it cannot list people.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subjects: list[Subject] = Field(
+        ...,
+        description="People's ids, as a person token's `personId` names them.",
+        max_length=500,
+        min_length=1,
+    )
+
+
+class PeopleKnownResult(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    known: list[str] = Field(
+        ..., description="Ids the root has a person for (on or off), or the owner's."
+    )
+    unknown: list[str] = Field(
+        ...,
+        description="Ids the root has no person for. Each one was deleted, or never was the root's.",
+    )
 
 
 class RestartResult(BaseModel):
@@ -4072,6 +4115,153 @@ class ClientUsageSummary(BaseModel):
     truncated: bool
     rowsDropped: int
     clients: list[ClientUsageGroup]
+
+
+class OpenAIFilePurpose(StrEnum):
+    """
+    OpenAI's upload purposes. Kept as given; nothing here processes a file by its purpose.
+    """
+
+    assistants = 'assistants'
+    batch = 'batch'
+    fine_tune = 'fine-tune'
+    vision = 'vision'
+    user_data = 'user_data'
+    evals = 'evals'
+
+
+class OpenAIExpiresAfter(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    anchor: Literal['created_at']
+    seconds: int = Field(
+        ...,
+        description='Seconds after upload. OpenAI takes 3,600 to 2,592,000; this\ninstall takes any number up to its maximum (30 days by\ndefault, `fileMaxDays` in Settings -> Store).\n',
+        ge=1,
+    )
+
+
+class FileUploadForm(BaseModel):
+    """
+    `POST /v1/files`, as the OpenAI SDK sends it. `purpose` is
+    required on the OpenAI door and absent on Anthropic's.
+    `expires_after` arrives as the two form fields the SDK writes.
+
+    """
+
+    file: bytes
+    purpose: OpenAIFilePurpose | None = None
+    expires_after_anchor_: Literal['created_at'] = Field(
+        'created_at', alias='expires_after[anchor]'
+    )
+    expires_after_seconds_: int | None = Field(
+        None, alias='expires_after[seconds]', ge=1
+    )
+
+
+class Status2(StrEnum):
+    processed = 'processed'
+
+
+class OpenAIFile(BaseModel):
+    id: str
+    object: Literal['file']
+    bytes: int
+    created_at: int
+    expires_at: int | None = Field(None, description='Every file kept here has an end.')
+    filename: str
+    purpose: OpenAIFilePurpose
+    status: Status2
+    status_details: str | None = None
+
+
+class OpenAIFileList(BaseModel):
+    object: Literal['list']
+    data: list[OpenAIFile]
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool
+
+
+class OpenAIFileDeleted(BaseModel):
+    id: str
+    object: Literal['file']
+    deleted: bool
+
+
+class OpenAIUploadRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    bytes: int = Field(..., ge=1)
+    filename: str = Field(..., max_length=255, min_length=1)
+    mime_type: str = Field(..., max_length=255)
+    purpose: OpenAIFilePurpose
+    expires_after: OpenAIExpiresAfter | None = None
+
+
+class Status3(StrEnum):
+    pending = 'pending'
+    completed = 'completed'
+    cancelled = 'cancelled'
+    expired = 'expired'
+
+
+class OpenAIUpload(BaseModel):
+    id: str
+    object: Literal['upload']
+    bytes: int
+    created_at: int
+    filename: str
+    purpose: OpenAIFilePurpose
+    status: Status3
+    expires_at: int
+    file: OpenAIFile | None = None
+
+
+class OpenAIUploadPart(BaseModel):
+    id: str
+    object: Literal['upload.part']
+    created_at: int
+    upload_id: str
+
+
+class OpenAIUploadComplete(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    part_ids: list[str] = Field(..., min_length=1)
+    md5: str | None = Field(
+        None, description="The joined file's MD5, checked before it becomes a file."
+    )
+    sha256: str | None = Field(
+        None, description="Eugene's own check, the joined file's SHA-256."
+    )
+
+
+class AnthropicFileMetadata(BaseModel):
+    id: str
+    type: Literal['file']
+    filename: str
+    mime_type: str
+    size_bytes: int
+    created_at: AwareDatetime
+    downloadable: bool | None = Field(
+        None, description='Always true here; the owner may read back what it kept.'
+    )
+
+
+class AnthropicFileList(BaseModel):
+    data: list[AnthropicFileMetadata]
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool
+
+
+class AnthropicFileDeleted(BaseModel):
+    id: str
+    type: Literal['file_deleted']
 
 
 class ToolConfig(BaseModel):

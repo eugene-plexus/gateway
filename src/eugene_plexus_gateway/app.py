@@ -200,6 +200,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        store_client = getattr(app.state, "store_client", None)
+        if store_client is not None:
+            await store_client.aclose()
         if profiles is not None:
             await profiles.aclose()
         if spellings is not None:
@@ -254,6 +257,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # router's own routes, so this is just the mount.
     app.include_router(inference_routes.router)
     app.include_router(web_search_routes.router)
+    # Row 53: OpenAI's Files and Uploads, and Anthropic's Files API, over the
+    # install's store. Each verifies its caller in its own body (`files_door`).
+    from . import files_door
+
+    app.include_router(files_door.router)
 
     # CORS on the three OpenAI-compatible paths, and on nothing else, so a
     # browser-based client -- the playground's direct mode among them --
@@ -313,5 +321,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         },
     )
     app.add_middleware(GeminiBodyLimit)
+    # The files doors carry an id in their paths, which the shared limit
+    # (exact paths) cannot match.
+    app.add_middleware(files_door.FilesBodyLimit)
     app.add_middleware(QueryKeyRedaction)
     return app

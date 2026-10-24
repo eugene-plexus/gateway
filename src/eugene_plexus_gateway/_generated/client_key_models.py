@@ -213,6 +213,12 @@ class ClientAdmissionResult(BaseModel):
     )
     keyId: str
     keyName: str
+    lineage: str | None = Field(
+        None,
+        description="The id of the first key of this key's rotations (row 24): a\nreplacement shares its predecessor's lineage. The store names a\nkey's objects by it, so a rotated key keeps its files (row 53).\nReaders take it when present and use `keyId` when absent; the\nauthority starts sending it once every reader knows the field,\nbecause an older reader refuses an unknown one.\n",
+        max_length=128,
+        min_length=1,
+    )
     personId: str | None = Field(
         None, description='Stable subject verified by the root, never caller supplied.'
     )

@@ -223,7 +223,7 @@ def validate_file(file: Any, field: str) -> tuple[str, int]:
     if file.get("file_id"):
         raise ImageRefusal(
             f"{field}.file_id",
-            "names an uploaded file, and this install has no file store; send file_data",
+            "names a stored file, which this door does not read; send file_data",
         )
     data = file.get("file_data")
     if not isinstance(data, str) or not data:
