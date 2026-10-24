@@ -4152,8 +4152,9 @@ class OpenAIExpiresAfter(BaseModel):
     anchor: Literal['created_at']
     seconds: int = Field(
         ...,
-        description='Seconds after upload. OpenAI takes 3,600 to 2,592,000; this\ninstall takes any number up to its maximum (30 days by\ndefault, `fileMaxDays` in Settings -> Store).\n',
-        ge=1,
+        description='Seconds after upload, one hour to 30 days, as OpenAI takes them.',
+        ge=3600,
+        le=2592000,
     )
 
 
@@ -4171,7 +4172,7 @@ class FileUploadForm(BaseModel):
         'created_at', alias='expires_after[anchor]'
     )
     expires_after_seconds_: int | None = Field(
-        None, alias='expires_after[seconds]', ge=1
+        None, alias='expires_after[seconds]', ge=3600, le=2592000
     )
 
 
@@ -4180,7 +4181,10 @@ class OpenAIFile(BaseModel):
     object: Literal['file']
     bytes: int
     created_at: int
-    expires_at: int | None = Field(None, description='Every file kept here has an end.')
+    expires_at: int | None = Field(
+        None,
+        description="Null when the file is kept until it is deleted (OpenAI's default).",
+    )
     filename: str
     purpose: OpenAIFilePurpose
     status: OpenAIFileStatus

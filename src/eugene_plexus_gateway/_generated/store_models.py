@@ -1820,7 +1820,9 @@ class StoredFile(BaseModel):
     mimeType: str = Field(..., max_length=255)
     sha256: str = Field(..., pattern='^[0-9a-f]{64}$')
     createdAt: int = Field(..., description='Unix seconds.')
-    expiresAt: int = Field(..., description='Unix seconds. Every kept file has an end.')
+    expiresAt: int | None = Field(
+        None, description='Unix seconds. Absent, the file is kept until it is deleted.'
+    )
     status: StoredFileStatus
 
 
@@ -1860,7 +1862,10 @@ class StoredUploadRequest(BaseModel):
     )
     mimeType: str | None = Field(None, max_length=255)
     expiresAfterSeconds: int | None = Field(
-        None, description="The file's end once completed, as on `POST /v1/files`.", ge=1
+        None,
+        description="The file's end once completed, as on `POST /v1/files`.",
+        ge=1,
+        le=2592000,
     )
 
 

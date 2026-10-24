@@ -11,6 +11,7 @@ import base64
 import hashlib
 import json
 import secrets
+import time
 from typing import Any
 
 import httpx
@@ -34,6 +35,7 @@ class FakeStore:
         self.parts: dict[str, tuple[str, str, bytes]] = {}
         self.owners_seen: list[str] = []
         self.down: Exception | None = None
+        self.content_reads = 0
         self.proxy_problem: tuple[int, str] | None = None
 
     def _missing(self, kind: str, ident: str) -> httpx.Response:
@@ -83,9 +85,12 @@ class FakeStore:
                 "mimeType": request.url.params.get("mimeType") or "application/octet-stream",
                 "sha256": hashlib.sha256(data).hexdigest(),
                 "createdAt": now,
-                "expiresAt": now + int(request.url.params.get("expiresAfterSeconds") or 2592000),
                 "status": "processed",
             }
+            if request.url.params.get("expiresAfterSeconds"):
+                self.files[ident]["expiresAt"] = now + int(
+                    request.url.params["expiresAfterSeconds"]
+                )
             self.content[ident] = data
             return httpx.Response(201, json=self._public(ident))
         if path == "/v1/files" and request.method == "GET":
@@ -97,6 +102,7 @@ class FakeStore:
             if found is None or found["owner"] != owner:
                 return self._missing("file", ident)
             if len(parts) == 4 and parts[3] == "content":
+                self.content_reads += 1
                 return httpx.Response(
                     200, content=self.content[ident], headers={"content-type": found["mimeType"]}
                 )
@@ -315,16 +321,143 @@ def test_a_key_with_a_lineage_keeps_its_files_after_rotation(setup, store):  # n
         assert store.owners_seen[-1] == "key:key-0"
 
 
-def test_a_revoked_key_or_an_unverified_person_keeps_nothing(setup, store):  # noqa: F811
-    app, authority, _, _, headers, _ = setup
+def test_the_files_doors_admit_only_who_the_inference_doors_admit(setup, store, install):  # noqa: F811
+    """The admission matrix (review of row 53): every credential that may not
+    keep a file is refused before the store is asked."""
+    app, authority, _, _, headers, operator = setup
+    previous = authority._handle
+
+    def judged(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        if request.url.path.endswith("/admission") and body.get("personToken"):
+            if body["personToken"] == "REMOVED_PERSON":
+                return httpx.Response(401)
+            response = previous(request)
+            return httpx.Response(
+                200, json={**response.json(), "personId": "ada", "appClientId": "workbench"}
+            )
+        return previous(request)
+
+    authority._handle = judged
+    app.state.client_key_guard = authority.as_guard(ttl_seconds=0)
+    refused = {
+        "no credential": {},
+        "an expired client key": {
+            "Authorization": "Bearer "
+            + install.client_key(jti="key-1", ttl=60, now=int(time.time()) - 7200)
+        },
+        "a session addressed to another machine": {
+            "Authorization": "Bearer " + install.session(aud=["node:elsewhere", "control"])
+        },
+        "another machine's service token": {
+            "Authorization": "Bearer " + install.foreign_service("gateway")
+        },
+        "a person token beside the owner's session": {
+            **operator,
+            "X-Eugene-Person-Token": "PRIVATE_PROOF",
+        },
+        "a person the root no longer knows": {
+            **headers,
+            "X-Eugene-Person-Token": "REMOVED_PERSON",
+        },
+    }
     with TestClient(app) as c:
-        authority.refuse_acquire = None
-        no_person = c.get(
-            "/v1/files", headers={**headers, "X-Eugene-Person-Token": "PRIVATE_PROOF"}
-        )
-        # The authority did not verify the person (no personId): refused, not kept as the key's.
-        assert no_person.status_code == 503
+        for label, sent in refused.items():
+            answer = c.get("/v1/files", headers=sent)
+            assert answer.status_code == 401, (label, answer.status_code, answer.text)
         assert store.owners_seen == []
+
+        # The app key alone keeps the key's files; with a verified person, the person's.
+        assert c.get("/v1/files", headers=headers).status_code == 200
+        assert store.owners_seen[-1] == "key:key-1"
+        person = {**headers, "X-Eugene-Person-Token": "PRIVATE_PROOF"}
+        assert c.get("/v1/files", headers=person).status_code == 200
+        assert store.owners_seen[-1] == "person:ada"
+
+        # Revoked for real: the policy says so and the authority refuses it.
+        authority.revoke("key-1")
+        seen = len(store.owners_seen)
+        for sent in (headers, person):
+            answer = c.get("/v1/files", headers=sent)
+            assert answer.status_code == 401, answer.text
+        assert len(store.owners_seen) == seen
+
+
+def test_a_file_named_twice_counts_twice_against_one_budget(setup, store, reader):  # noqa: F811
+    """Review of row 53: a 6 MiB text file named twice is 12 MiB of attachments.
+    Refused before the second copy is downloaded, and no backend is asked."""
+    app, _, _, _, headers, _ = setup
+    with TestClient(app) as c:
+        big = c.post(
+            "/v1/files",
+            files={"file": ("big.txt", b"a" * (6 * 1024 * 1024), "text/plain")},
+            data={"purpose": "user_data"},
+            headers=headers,
+        )
+        assert big.status_code == 200, big.text
+        ident = big.json()["id"]
+        before = len(reader.calls)
+        downloads = store.content_reads
+        twice = body(
+            "allowed",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "file", "file": {"file_id": ident}},
+                        {"type": "file", "file": {"file_id": ident}},
+                    ],
+                }
+            ],
+        )
+        refused = c.post("/v1/chat/completions", json=twice, headers=headers)
+        assert refused.status_code == 400, refused.text
+        assert "11 MiB" in refused.json()["error"]["message"]
+        assert len(reader.calls) == before
+        assert store.content_reads == downloads + 1, "the second copy was downloaded"
+
+
+def test_bytes_that_are_not_utf8_are_not_text_whatever_they_were_called(setup, store, reader):  # noqa: F811
+    app, _, _, _, headers, _ = setup
+    with TestClient(app) as c:
+        odd = c.post(
+            "/v1/files",
+            files={"file": ("odd.txt", b"\xff\x00", "text/plain")},
+            data={"purpose": "user_data"},
+            headers=headers,
+        )
+        ident = odd.json()["id"]
+        answer = c.post("/v1/chat/completions", json=_chat_with(ident), headers=headers)
+        assert answer.status_code == 400, answer.text
+        assert "application/octet-stream" in answer.json()["error"]["message"]
+
+
+def test_an_end_is_the_apps_choice_within_openais_bounds(setup, store):  # noqa: F811
+    app, _, _, _, headers, _ = setup
+    with TestClient(app) as c:
+        kept = _upload(c, headers, PDF)
+        assert kept.json()["expires_at"] is None, "a file is kept until deleted, as OpenAI keeps"
+        for seconds, status in (
+            ("1", 400),
+            ("3599", 400),
+            ("3600", 200),
+            ("2592000", 200),
+            ("2592001", 400),
+        ):
+            answer = _upload(
+                c,
+                headers,
+                PDF,
+                **{"expires_after[anchor]": "created_at", "expires_after[seconds]": seconds},
+            )
+            assert answer.status_code == status, (seconds, answer.text)
+        ended = _upload(
+            c,
+            headers,
+            PDF,
+            **{"expires_after[anchor]": "created_at", "expires_after[seconds]": "3600"},
+        ).json()
+        assert ended["expires_at"] == ended["created_at"] + 3600
 
 
 def test_anthropics_files_api_is_the_same_door(setup, store):  # noqa: F811

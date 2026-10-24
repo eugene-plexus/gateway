@@ -61,6 +61,9 @@ MAX_FILE_BYTES = 16 * 1024 * 1024
 _FORM_ROOM = 256 * 1024
 _JSON_BYTES = 1024 * 1024
 PURPOSES = ("assistants", "batch", "fine-tune", "vision", "user_data", "evals")
+#: OpenAI's bounds on `expires_after.seconds`. A file with none is kept until
+#: deleted, as OpenAI keeps it.
+EXPIRES_MIN, EXPIRES_MAX = 3600, 30 * 24 * 3600
 
 #: Every path these doors answer, as `door_paths` templates, with the most
 #: a body may be.
@@ -247,7 +250,7 @@ def openai_file(kept: dict[str, Any]) -> dict[str, Any]:
         "object": "file",
         "bytes": kept["bytes"],
         "created_at": kept["createdAt"],
-        "expires_at": kept["expiresAt"],
+        "expires_at": kept.get("expiresAt"),
         "filename": kept["filename"],
         "purpose": kept["purpose"],
         "status": "processed",
@@ -316,8 +319,13 @@ def _expires_after(form: Any) -> int | None:
         raise DoorRefusal(
             400, "expires_after.seconds: a whole number of seconds.", param="expires_after"
         ) from None
-    if value < 1:
-        raise DoorRefusal(400, "expires_after.seconds: at least 1.", param="expires_after")
+    if not EXPIRES_MIN <= value <= EXPIRES_MAX:
+        raise DoorRefusal(
+            400,
+            f"expires_after.seconds: from {EXPIRES_MIN} (an hour) to {EXPIRES_MAX} (30 days), "
+            "as OpenAI allows. Without it a file is kept until it is deleted.",
+            param="expires_after",
+        )
     return value
 
 
@@ -674,7 +682,8 @@ class FilesBodyLimit:
 
 
 def _sniff(data: bytes, said: str) -> str:
-    """What the bytes are, from their first bytes; the recorded type only for text."""
+    """What the bytes are, from their first bytes. Text only when they are
+    UTF-8 indeed: a caller's `text/plain` on bytes that are not is not text."""
     if data.startswith(b"%PDF-"):
         return "application/pdf"
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
@@ -689,7 +698,10 @@ def _sniff(data: bytes, said: str) -> str:
         if b"\x00" not in data:
             data.decode("utf-8")
             return "text/plain"
-    return said.split(";", 1)[0].strip() or "application/octet-stream"
+    recorded = said.split(";", 1)[0].strip().lower()
+    if not recorded or recorded.startswith("text/"):
+        return "application/octet-stream"
+    return recorded
 
 
 class _Found:
@@ -704,28 +716,62 @@ class _Found:
         return self.data.decode("utf-8")
 
 
-async def _fetch(request: Request, owner: str, ident: str, where: str) -> _Found:
-    store = _store(request)
+class _Resolving:
+    """One request's file ids: whose they are, and the one budget they share.
+
+    **Every file a request names counts against one total** (review of row
+    53): a file named twice expands twice, and text becomes text, which the
+    attachment checks after this one never see. So the total is checked
+    from each file's recorded size before its bytes are read, and the
+    download is cut at what is left.
+    """
+
+    def __init__(self, request: Request, owner: str) -> None:
+        self.request = request
+        self.owner = owner
+        self.used = 0
+
+    def take(self, size: int, ident: str, where: str) -> int:
+        """Room for `size` more bytes, or the refusal; returns what is left after."""
+        if size > images.MAX_ATTACHMENT_BYTES:
+            raise DoorRefusal(
+                400,
+                f"{where}: {ident} is {size} bytes; a request carries at most 10 MiB "
+                "from one file.",
+                param=where,
+            )
+        if self.used + size > images.MAX_ATTACHMENTS_TOTAL:
+            raise DoorRefusal(
+                400,
+                f"{where}: the files this request names come to more than "
+                f"{images.MAX_ATTACHMENTS_TOTAL // (1024 * 1024)} MiB together "
+                f"({self.used + size} bytes, each named file counted each time).",
+                param=where,
+            )
+        self.used += size
+        return size
+
+
+async def _fetch(ctx: _Resolving, ident: str, where: str) -> _Found:
+    store = _store(ctx.request)
     try:
-        kept = await store.call("GET", f"/v1/files/{_safe(ident)}", owner)
+        kept = await store.call("GET", f"/v1/files/{_safe(ident)}", ctx.owner)
     except StoreRefusal as exc:
         if exc.status == 404:
             raise DoorRefusal(400, f"{where}: no such file: {ident}.", param=where) from exc
         raise _refused(exc, kind="file", ident=ident) from exc
-    if int(kept["bytes"]) > images.MAX_ATTACHMENT_BYTES:
-        raise DoorRefusal(
-            400,
-            f"{where}: {ident} is {kept['bytes']} bytes; a request carries at most 10 MiB "
-            "from one file.",
-            param=where,
-        )
+    allowed = ctx.take(int(kept["bytes"]), ident, where)
     try:
         data, media = await store.read(
-            f"/v1/files/{_safe(ident)}/content", owner, limit=images.MAX_ATTACHMENT_BYTES
+            f"/v1/files/{_safe(ident)}/content", ctx.owner, limit=allowed
         )
     except StoreRefusal as exc:
         if exc.status == 404:
             raise DoorRefusal(400, f"{where}: no such file: {ident}.", param=where) from exc
+        if exc.status == 413:
+            raise DoorRefusal(
+                400, f"{where}: {ident} is larger than its record says.", param=where
+            ) from exc
         raise _refused(exc, kind="file", ident=ident) from exc
     return _Found(ident, str(kept["filename"]), _sniff(data, media), data)
 
@@ -746,7 +792,7 @@ def _image_url(found: _Found, where: str) -> str:
         raise DoorRefusal(400, str(exc), param=where) from None
 
 
-async def _chat_part(request: Request, owner: str, part: dict, where: str) -> dict:
+async def _chat_part(ctx: _Resolving, part: dict, where: str) -> dict:
     file = part.get("file")
     if part.get("type") != "file" or not isinstance(file, dict):
         return part
@@ -755,7 +801,7 @@ async def _chat_part(request: Request, owner: str, part: dict, where: str) -> di
         return part
     if file.get("file_data"):
         raise DoorRefusal(400, f"{where}.file: send file_id or file_data, not both.", param=where)
-    found = await _fetch(request, owner, ident, f"{where}.file.file_id")
+    found = await _fetch(ctx, ident, f"{where}.file.file_id")
     name = file.get("filename") or found.filename
     if found.media == "application/pdf":
         return {
@@ -769,12 +815,12 @@ async def _chat_part(request: Request, owner: str, part: dict, where: str) -> di
     raise _unreadable(found, where, "a chat request")
 
 
-async def _responses_part(request: Request, owner: str, part: dict, where: str) -> dict:
+async def _responses_part(ctx: _Resolving, part: dict, where: str) -> dict:
     kind = part.get("type")
     ident = part.get("file_id")
     if kind not in ("input_file", "input_image") or not isinstance(ident, str):
         return part
-    found = await _fetch(request, owner, ident, f"{where}.file_id")
+    found = await _fetch(ctx, ident, f"{where}.file_id")
     name = part.get("filename") or found.filename
     if found.media == "application/pdf" and kind == "input_file":
         out: dict[str, Any] = {
@@ -793,7 +839,7 @@ async def _responses_part(request: Request, owner: str, part: dict, where: str) 
     return out
 
 
-async def _anthropic_block(request: Request, owner: str, block: dict, where: str) -> dict:
+async def _anthropic_block(ctx: _Resolving, block: dict, where: str) -> dict:
     kind = block.get("type")
     source = block.get("source")
     if (
@@ -803,9 +849,7 @@ async def _anthropic_block(request: Request, owner: str, block: dict, where: str
     ):
         if kind == "tool_result" and isinstance(block.get("content"), list):
             inner = [
-                await _anthropic_block(request, owner, b, f"{where}.content.{i}")
-                if isinstance(b, dict)
-                else b
+                await _anthropic_block(ctx, b, f"{where}.content.{i}") if isinstance(b, dict) else b
                 for i, b in enumerate(block["content"])
             ]
             return {**block, "content": inner}
@@ -813,7 +857,7 @@ async def _anthropic_block(request: Request, owner: str, block: dict, where: str
     ident = source.get("file_id")
     if not isinstance(ident, str):
         raise DoorRefusal(400, f"{where}.source.file_id: required.")
-    found = await _fetch(request, owner, ident, f"{where}.source.file_id")
+    found = await _fetch(ctx, ident, f"{where}.source.file_id")
     out = dict(block)
     if kind == "image" and found.media.startswith("image/"):
         out["source"] = {"type": "base64", "media_type": found.media, "data": found.b64}
@@ -846,49 +890,46 @@ async def resolve_file_ids(request: Request, raw: Any, *, door: str) -> Any | Re
     anthropic = door == "messages"
     try:
         owner = await owner_for(request, anthropic=anthropic)
-        return await _resolve(request, raw, owner, door)
+        return await _resolve(_Resolving(request, owner), raw, door)
     except DoorRefusal as refusal:
         return error_response(anthropic, refusal)
     except StoreUnavailable as exc:
         return error_response(anthropic, _unavailable(exc))
 
 
-async def _resolve(request: Request, raw: dict, owner: str, door: str) -> dict:
+async def _resolve(ctx: _Resolving, raw: dict, door: str) -> dict:
     out = dict(raw)
     if door == "chat":
         messages = raw.get("messages")
         if isinstance(messages, list):
             out["messages"] = [
-                await _message(request, owner, m, f"messages.{i}", _chat_part)
-                for i, m in enumerate(messages)
+                await _message(ctx, m, f"messages.{i}", _chat_part) for i, m in enumerate(messages)
             ]
     elif door == "responses":
         items = raw.get("input")
         if isinstance(items, list):
             out["input"] = [
-                await _message(request, owner, m, f"input[{i}]", _responses_part, brackets=True)
+                await _message(ctx, m, f"input[{i}]", _responses_part, brackets=True)
                 for i, m in enumerate(items)
             ]
     elif door == "messages":
         messages = raw.get("messages")
         if isinstance(messages, list):
             out["messages"] = [
-                await _message(request, owner, m, f"messages.{i}", _anthropic_block)
+                await _message(ctx, m, f"messages.{i}", _anthropic_block)
                 for i, m in enumerate(messages)
             ]
     return out
 
 
 async def _message(
-    request: Request, owner: str, message: Any, where: str, part: Any, *, brackets: bool = False
+    ctx: _Resolving, message: Any, where: str, part: Any, *, brackets: bool = False
 ) -> Any:
     """Each content part of one message; `where` names it as the door names fields."""
     if not isinstance(message, dict) or not isinstance(message.get("content"), list):
         return message
     content = [
-        await part(
-            request, owner, p, f"{where}.content[{j}]" if brackets else f"{where}.content.{j}"
-        )
+        await part(ctx, p, f"{where}.content[{j}]" if brackets else f"{where}.content.{j}")
         if isinstance(p, dict)
         else p
         for j, p in enumerate(message["content"])
