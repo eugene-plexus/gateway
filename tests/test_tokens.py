@@ -534,3 +534,125 @@ def test_a_future_issued_token_is_logged_at_most_once_a_minute() -> None:
     assert tokens.note_clock_skew(1000, now=910.0) is False
     assert tokens.note_clock_skew(2000, now=1000.0) is True
     assert tokens.note_clock_skew(1000, now=999.5) is False
+
+
+# --------------------------------------------------------------------------- row 4: epochs
+
+
+def _at(
+    install: dict[str, object], *, version: int, epoch: int, **kwargs: object
+) -> tokens.TrustBundle:
+    held = install["bundle"]
+    authority = install["authority"]
+    assert isinstance(held, tokens.TrustBundle) and isinstance(authority, Ed25519PrivateKey)
+    return tokens.build_bundle(
+        authority=authority,
+        version=version,
+        epoch=epoch,
+        keys=list(held.keys.values()),
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def test_a_bundle_at_a_higher_epoch_replaces_one_with_a_higher_version(
+    tmp_path: Path, install: dict[str, object]
+) -> None:
+    """A root promoted from a copy that was behind numbers its log below
+    what the root it replaced wrote: epoch first, then version (row 4)."""
+    old_root = _at(install, version=100, epoch=2)
+    promoted = _at(install, version=50, epoch=3)
+    assert tokens.accepts_replacement(old_root, promoted) is None
+    assert tokens.accepts_replacement(promoted, old_root) is not None
+    authority = install["authority"]
+    assert isinstance(authority, Ed25519PrivateKey)
+    path = tmp_path / "trust_bundle.json"
+    tokens.write_bundle_file(path, old_root)
+    source = tokens.BundleFile(path, authority=tokens.public_b64(authority), check_interval=0.0)
+    assert source.get() == old_root
+    tokens.write_bundle_file(path, promoted)
+    got = source.get()
+    assert got is not None and (got.epoch, got.version) == (3, 50)
+    tokens.write_bundle_file(path, old_root)
+    got = source.get()
+    assert got is not None and got.epoch == 3, "the old root's bundle does not come back"
+
+
+def test_a_root_token_from_an_older_epoch_is_refused(install: dict[str, object]) -> None:
+    """A promotion keeps the root's token key: the root it replaced could
+    otherwise go on commanding every machine (row 4)."""
+    root = install["root"]
+    assert isinstance(root, tokens.Signer)
+    now = _at(install, version=50, epoch=3)
+    old = tokens.Signer(key=root.key, issuer=root.issuer, epoch=2)
+    new = tokens.Signer(key=root.key, issuer=root.issuer, epoch=3)
+    command, _ = old.mint(typ=tokens.TYP_SERVICE, sub="control", aud=["node:nas"], ttl_seconds=300)
+    session, _ = old.mint(
+        typ=tokens.TYP_SESSION, sub="operator", aud=["node:nas"], ttl_seconds=3600
+    )
+    for token in (command, session):
+        with pytest.raises(
+            tokens.TokenError, match=r"no longer follows \(epoch 2; it follows epoch 3\)"
+        ):
+            tokens.verify(
+                token, bundle=now, recipient="node:nas",
+                classes=(tokens.TYP_SESSION, tokens.TYP_SERVICE),
+            )  # fmt: skip
+    fresh, _ = new.mint(typ=tokens.TYP_SERVICE, sub="control", aud=["node:nas"], ttl_seconds=300)
+    claims = tokens.verify(fresh, bundle=now, recipient="node:nas", classes=(tokens.TYP_SERVICE,))
+    assert claims.epoch == 3
+    # A client key carries no epoch and outlives any root.
+    key, _ = old.mint(typ=tokens.TYP_CLIENT, sub="app", aud=["gateway"], ttl_seconds=3600)
+    assert jwt.decode(key, options={"verify_signature": False}).get("ep") is None
+    assert tokens.verify(key, bundle=now, recipient="node:nas", classes=(tokens.TYP_CLIENT,))
+    # A node's own token is not the root's, and carries none.
+    nas = install["nas"]
+    assert isinstance(nas, tokens.Signer)
+    own, _ = nas.mint(typ=tokens.TYP_SERVICE, sub="agent", aud=["node:nas"], ttl_seconds=60)
+    assert tokens.verify(own, bundle=now, recipient="node:nas", classes=(tokens.TYP_SERVICE,))
+
+
+def test_a_root_token_with_no_epoch_is_refused_once_roots_say_theirs(
+    install: dict[str, object],
+) -> None:
+    """A token from a root older than row 4 has no `ep`. It is accepted
+    while the bundle does not say since when roots mark theirs, and after
+    that only if minted before then and no promotion has happened since."""
+    root = install["root"]
+    assert isinstance(root, tokens.Signer)
+    since = _now() - 100
+    legacy_before, _ = root.mint(
+        typ=tokens.TYP_SESSION, sub="operator", aud=["node:nas"], ttl_seconds=3600,
+        now=since - 50,
+    )  # fmt: skip
+    legacy_after, _ = root.mint(
+        typ=tokens.TYP_SESSION, sub="operator", aud=["node:nas"], ttl_seconds=3600,
+        now=since + 10,
+    )  # fmt: skip
+
+    def verify(token: str, bundle: tokens.TrustBundle) -> tokens.Claims:
+        return tokens.verify(
+            token, bundle=bundle, recipient="node:nas", classes=(tokens.TYP_SESSION,)
+        )
+
+    unmarked = _at(install, version=11, epoch=2)
+    assert verify(legacy_after, unmarked).epoch is None
+    marked = _at(install, version=12, epoch=2, token_epochs=(since, 2))
+    assert marked.token_epochs == (since, 2)
+    assert verify(legacy_before, marked)
+    with pytest.raises(tokens.TokenError, match="no longer follows"):
+        verify(legacy_after, marked)
+    promoted = _at(install, version=13, epoch=3, token_epochs=(since, 2))
+    with pytest.raises(tokens.TokenError, match="no longer follows"):
+        verify(legacy_before, promoted)
+
+
+def test_a_bundle_with_a_malformed_token_epoch_mark_is_refused(
+    install: dict[str, object],
+) -> None:
+    authority = install["authority"]
+    held = install["bundle"]
+    assert isinstance(authority, Ed25519PrivateKey) and isinstance(held, tokens.TrustBundle)
+    payload = dict(held.payload) | {"tokenEpochs": {"since": "soon", "epoch": 2}}
+    jws = jwt.encode(payload, authority, algorithm="EdDSA", headers={"typ": tokens.TYP_BUNDLE})
+    with pytest.raises(tokens.BundleError, match="tokenEpochs"):
+        tokens.parse_bundle(jws, authority=tokens.public_b64(authority))
