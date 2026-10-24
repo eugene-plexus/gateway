@@ -112,14 +112,14 @@ async def test_cache_outage_expiry_deletion_and_recovery(library: Library) -> No
         now[0] = 63
         assert await profiles.get("/models/a.gguf")
         assert len(library.calls) == calls
-        now[0] = 362
-        assert await profiles.get("/models/a.gguf") == {}
+        now[0] = 462
+        assert (await profiles.get("/models/a.gguf"))["temperature"] == 0.9
         library.status = 200
-        now[0] = 368
+        now[0] = 468
         library.values["/models/a.gguf"] = {"maxTokens": 999}
         assert await profiles.get("/models/a.gguf") == {"maxTokens": 999}
         library.values["/models/a.gguf"] = {}
-        now[0] = 399
+        now[0] = 499
         assert await profiles.get("/models/a.gguf") == {}
         assert await profiles.get("/models/missing.gguf") == {}
     finally:

@@ -51,6 +51,7 @@ from ._generated.driver_models import (
     TextContentPart,
 )
 from ._http import internal_client
+from .library_cache import LibraryCache
 
 log = logging.getLogger(__name__)
 
@@ -270,6 +271,7 @@ class SpecialTokenSpellings:
         *,
         transport: httpx.AsyncBaseTransport | None = None,
         clock: Callable[[], float] = time.perf_counter,
+        saved: LibraryCache | None = None,
     ) -> None:
         self._base = agent_url.rstrip("/") + "/api/proxy/library"
         self._clock = clock
@@ -280,6 +282,12 @@ class SpecialTokenSpellings:
         self._cache: OrderedDict[str, _Entry] = OrderedDict()
         self._pending: dict[str, asyncio.Task[_Entry]] = {}
         self._said: set[str] = set()
+        self.library = saved or LibraryCache()
+        for path, raw in self.library.special_tokens.items():
+            if isinstance(raw, dict):
+                words = raw.get("value")
+                if isinstance(words, list) and all(isinstance(word, str) for word in words):
+                    self._cache[path] = _Entry(compile_spellings(words), None)
 
     async def get(self, model_path: str | None) -> Spellings | None:
         """This model file's spellings; None when it has none or none could be
@@ -312,6 +320,8 @@ class SpecialTokenSpellings:
         try:
             listed = await self._read(path)
         except (httpx.HTTPError, ValueError, TypeError, KeyError) as exc:
+            # Only a successful answer replaces saved spellings (as profiles).
+            self.library.observe(exc)
             entry = _Entry(
                 held.spellings if held else None,
                 held.fetched_at if held else None,
@@ -323,6 +333,8 @@ class SpecialTokenSpellings:
                     f"the Library could not list its special tokens ({type(exc).__name__}: {exc})",
                 )
         else:
+            self.library.observe()
+            self.library.update("specialTokens", path, listed or [])
             if listed is None:
                 self._say(path, "the Library lists no model at that path")
                 entry = _Entry(None, self._clock())

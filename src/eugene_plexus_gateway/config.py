@@ -216,15 +216,15 @@ FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="profileMaxStaleSeconds",
-        label="Profile outage grace period",
+        label="Use saved settings during a Library outage",
         description=(
-            "Seconds after cache expiry to keep the last profile defaults when Library "
-            "cannot answer. Then gateway defaults apply. Zero disables stale reuse. "
-            "Lookup failures and fallback choices are logged."
+            "Blank, the default, keeps the last known settings with no time limit while "
+            "the Library cannot answer. A number limits seconds after cache expiry, "
+            "then gateway defaults apply. Zero never uses saved settings."
         ),
         category="generation",
         valueType=ConfigValueType.duration,
-        default=300.0,
+        default=None,
         minimum=0,
         maximum=86400,
     ),
