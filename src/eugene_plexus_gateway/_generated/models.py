@@ -4130,6 +4130,21 @@ class OpenAIFilePurpose(StrEnum):
     evals = 'evals'
 
 
+class OpenAIFileStatus(StrEnum):
+    """
+    OpenAI's (deprecated) file status. A file kept here is ready at once.
+    """
+
+    processed = 'processed'
+
+
+class OpenAIUploadStatus(StrEnum):
+    pending = 'pending'
+    completed = 'completed'
+    cancelled = 'cancelled'
+    expired = 'expired'
+
+
 class OpenAIExpiresAfter(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -4160,10 +4175,6 @@ class FileUploadForm(BaseModel):
     )
 
 
-class Status2(StrEnum):
-    processed = 'processed'
-
-
 class OpenAIFile(BaseModel):
     id: str
     object: Literal['file']
@@ -4172,7 +4183,7 @@ class OpenAIFile(BaseModel):
     expires_at: int | None = Field(None, description='Every file kept here has an end.')
     filename: str
     purpose: OpenAIFilePurpose
-    status: Status2
+    status: OpenAIFileStatus
     status_details: str | None = None
 
 
@@ -4201,13 +4212,6 @@ class OpenAIUploadRequest(BaseModel):
     expires_after: OpenAIExpiresAfter | None = None
 
 
-class Status3(StrEnum):
-    pending = 'pending'
-    completed = 'completed'
-    cancelled = 'cancelled'
-    expired = 'expired'
-
-
 class OpenAIUpload(BaseModel):
     id: str
     object: Literal['upload']
@@ -4215,7 +4219,7 @@ class OpenAIUpload(BaseModel):
     created_at: int
     filename: str
     purpose: OpenAIFilePurpose
-    status: Status3
+    status: OpenAIUploadStatus
     expires_at: int
     file: OpenAIFile | None = None
 
