@@ -32,13 +32,12 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import ValidationError
 
-from . import chat_contract, images, server_tools
+from . import chat_contract, compaction, images, response_tools, server_tools
 from ._generated.models import (
     ChatCompletionMessage,
     ChatCompletionRequest,
     FileContentPart,
     Function,
-    FunctionCall,
     FunctionDefinition,
     ImageContentPart,
     ImageUrl,
@@ -49,12 +48,13 @@ from ._generated.models import (
     NamedToolChoice,
     ResponseFormat,
     ResponseJsonSchema,
-    Role1,
     TextContentPart,
     Tool,
     ToolCall,
     ToolChoice,
 )
+from ._generated.models import FunctionCallModel as FunctionCall
+from ._generated.models import Role2 as Role1
 from .anthropic import decode_signature, encode_signature
 
 log = logging.getLogger(__name__)
@@ -354,6 +354,7 @@ class Translated:
     #: The `namespace` tool each offered member function came from, by the
     #: function's name, so a call to one goes back carrying it.
     namespaces: dict[str, str] = field(default_factory=dict)
+    client_tools: dict[str, str] = field(default_factory=dict)
 
     def headers(self) -> dict[str, str]:
         out: dict[str, str] = {}
@@ -487,6 +488,7 @@ def _tools(
     searches: list[Mapping[str, Any]] | None = None,
     images: list[Mapping[str, Any]] | None = None,
     namespaces: dict[str, str] | None = None,
+    client_tools: dict[str, str] | None = None,
 ) -> list[Tool] | None:
     """Function tools as the chat shape; `web_search` set aside and named.
 
@@ -510,6 +512,8 @@ def _tools(
         if not isinstance(definition, Mapping):
             raise Refusal(f"tools[{index}]: must be an object.", param="tools")
         kind = definition.get("type")
+        if not isinstance(kind, str):
+            raise Refusal(f"tools[{index}].type: must be a string.", param="tools")
         if isinstance(kind, str) and kind.startswith("web_search"):
             ignored.append("tools.web_search")
             if searches is not None:
@@ -521,6 +525,19 @@ def _tools(
         if kind == "namespace":
             out += _namespace_members(definition, f"tools[{index}]", ignored, namespaces)
             continue
+        if kind in response_tools.KINDS:
+            try:
+                adapted = response_tools.definition(definition, f"tools[{index}]", ignored)
+            except response_tools.InvalidTool as exc:
+                raise Refusal(str(exc), param="tools") from exc
+            out.append(_function_tool(adapted, f"tools[{index}]"))
+            if client_tools is not None:
+                client_tools[adapted["name"]] = kind
+            continue
+        if kind in response_tools.REFUSALS:
+            raise Refusal(
+                f"tools[{index}]: {_name(kind)}: {response_tools.REFUSALS[kind]}.", param="tools"
+            )
         if kind != "function":
             raise Refusal(
                 f"tools[{index}]: {_name(kind)} is a tool this gateway cannot run. It routes to "
@@ -547,7 +564,7 @@ def _tools(
     return out or None
 
 
-def _tool_choice(choice: Any) -> Any:
+def _tool_choice(choice: Any, client_tools: Mapping[str, str] | None = None) -> Any:
     if choice is None:
         return None
     if isinstance(choice, str):
@@ -561,6 +578,18 @@ def _tool_choice(choice: Any) -> Any:
         name = choice.get("name")
         if not isinstance(name, str) or not name:
             raise Refusal("tool_choice.name: required for a function.", param="tool_choice")
+        return NamedToolChoice(type="function", function=Function(name=name))
+    if (
+        isinstance(choice, Mapping)
+        and isinstance(choice.get("type"), str)
+        and choice["type"] in response_tools.KINDS
+    ):
+        kind = choice["type"]
+        name = choice.get("name") if kind == "custom" else kind
+        if not isinstance(name, str) or (client_tools or {}).get(name) != kind:
+            raise Refusal(
+                "tool_choice: the client-run tool must be declared in tools.", param="tool_choice"
+            )
         return NamedToolChoice(type="function", function=Function(name=name))
     kind = choice.get("type") if isinstance(choice, Mapping) else choice
     raise Refusal(
@@ -1010,7 +1039,10 @@ class _Conversation:
 
 
 def _messages(
-    raw: Mapping[str, Any], budget: images.ImageBudget, ignored: list[str]
+    raw: Mapping[str, Any],
+    budget: images.ImageBudget,
+    ignored: list[str],
+    sealer: compaction.Sealer | None = None,
 ) -> list[ChatCompletionMessage]:
     conversation = _Conversation(budget, ignored)
     instructions = raw.get("instructions")
@@ -1028,6 +1060,36 @@ def _messages(
         if not isinstance(item, Mapping):
             raise Refusal(f"{where}: must be an object.", param="input")
         kind = item.get("type") or ("message" if "role" in item else None)
+        if kind == "compaction":
+            try:
+                if sealer is None:
+                    raise compaction.InvalidCompaction(compaction.FOREIGN)
+                summary = sealer.expand(item.get("encrypted_content"))
+            except compaction.InvalidCompaction as exc:
+                raise Refusal(str(exc), param=f"{where}.encrypted_content") from exc
+            except compaction.KeyUnavailable as exc:
+                raise Refusal(str(exc), status=503, error_type="server_error") from exc
+            conversation._flush_assistant()
+            conversation._flush_hoisted()
+            conversation.messages.append(
+                ChatCompletionMessage(role=Role1.developer, content=summary)
+            )
+            continue
+        if kind in {
+            "custom_tool_call",
+            "local_shell_call",
+            "shell_call",
+            "apply_patch_call",
+            "custom_tool_call_output",
+            "local_shell_call_output",
+            "shell_call_output",
+            "apply_patch_call_output",
+        }:
+            try:
+                item = response_tools.input_item(item)
+            except response_tools.InvalidTool as exc:
+                raise Refusal(f"{where}: {exc}", param="input") from exc
+            kind = item["type"]
         if kind == "message":
             conversation.message(item, where)
         elif kind == "function_call":
@@ -1064,7 +1126,10 @@ def _number(raw: Mapping[str, Any], name: str, low: float, high: float) -> float
 
 
 def translate_request(
-    raw: Mapping[str, Any], *, max_images: int = images.DEFAULT_MAX_IMAGES
+    raw: Mapping[str, Any],
+    *,
+    max_images: int = images.DEFAULT_MAX_IMAGES,
+    sealer: compaction.Sealer | None = None,
 ) -> Translated:
     """A Responses body as the request the shared path serves."""
     for name in raw:
@@ -1140,11 +1205,12 @@ def translate_request(
         )
 
     budget = images.ImageBudget(max_images)
-    messages = _messages(raw, budget, ignored)
+    messages = _messages(raw, budget, ignored, sealer)
     searches: list[Mapping[str, Any]] = []
     image_tools: list[Mapping[str, Any]] = []
     namespaces: dict[str, str] = {}
-    tools = _tools(raw.get("tools"), ignored, searches, image_tools, namespaces)
+    client_tools: dict[str, str] = {}
+    tools = _tools(raw.get("tools"), ignored, searches, image_tools, namespaces, client_tools)
     search: server_tools.SearchPlan | None = None
     search_reason: str | None = None
     max_tool_calls = raw.get("max_tool_calls")
@@ -1178,7 +1244,7 @@ def translate_request(
             top_p=_number(raw, "top_p", 0, 1),
             stream=bool(raw.get("stream")),
             tools=tools,
-            tool_choice=_tool_choice(raw.get("tool_choice")),
+            tool_choice=_tool_choice(raw.get("tool_choice"), client_tools),
             parallel_tool_calls=raw.get("parallel_tool_calls"),
             response_format=_response_format(text),
             reasoning_effort=reasoning.get("effort"),
@@ -1198,6 +1264,7 @@ def translate_request(
         search_reason=search_reason,
         image=image,
         namespaces=namespaces,
+        client_tools=client_tools,
         echo={
             "instructions": raw.get("instructions"),
             "tools": raw.get("tools") or [],
@@ -1464,6 +1531,29 @@ def output_items(
     return items
 
 
+def client_tool_items(
+    items: list[dict[str, Any]], kinds: Mapping[str, str]
+) -> list[dict[str, Any]]:
+    """Restore the declared client tool's wire type on a whole answer."""
+    out = []
+    for item in items:
+        kind = kinds.get(item.get("name", "")) if item["type"] == "function_call" else None
+        if kind:
+            try:
+                item = response_tools.item(
+                    kind,
+                    item["call_id"],
+                    item["name"],
+                    item["arguments"],
+                    item_id=item["id"],
+                    status=item["status"],
+                )
+            except response_tools.InvalidTool as exc:
+                raise Refusal(str(exc), status=502, error_type="server_error") from exc
+        out.append(item)
+    return out
+
+
 def response_object(
     *,
     response_id: str,
@@ -1559,6 +1649,7 @@ class StreamTranslator:
         echo: Mapping[str, Any],
         include_reasoning: bool = False,
         namespaces: Mapping[str, str] | None = None,
+        client_tools: Mapping[str, str] | None = None,
     ) -> None:
         self.response_id = response_id
         self.model = model
@@ -1566,6 +1657,7 @@ class StreamTranslator:
         self.include_reasoning = include_reasoning
         #: The `namespace` tool each offered member function came from.
         self.namespaces: Mapping[str, str] = namespaces or {}
+        self.client_tools: Mapping[str, str] = client_tools or {}
         self.created_at = int(time.time())
         self.output: list[dict[str, Any]] = []
         self._sequence = 0
@@ -1696,6 +1788,58 @@ class StreamTranslator:
             if call_index == keep:
                 continue
             arguments = "".join(call["arguments"])
+            kind = self.client_tools.get(call["name"])
+            if kind:
+                try:
+                    done = response_tools.item(
+                        kind,
+                        call["call_id"],
+                        call["name"],
+                        arguments,
+                        item_id=call["id"],
+                        status=status,
+                    )
+                except response_tools.InvalidTool as exc:
+                    del self._calls[call_index]
+                    if status == "incomplete":
+                        partial = {**call["item"], "status": "incomplete"}
+                        if kind == "custom":
+                            partial["input"] = call.get("input", "")
+                        self.output.append(partial)
+                        events.append(
+                            self.frame(
+                                "response.output_item.done",
+                                {"output_index": call["output_index"], "item": partial},
+                            )
+                        )
+                        continue
+                    raise Refusal(str(exc), status=502, error_type="server_error") from exc
+                events += self._client_deltas(call, done)
+                common = {"item_id": call["id"], "output_index": call["output_index"]}
+                if kind == "custom":
+                    events.append(
+                        self.frame(
+                            "response.custom_tool_call_input.done",
+                            {**common, "input": done["input"]},
+                        )
+                    )
+                elif kind == "shell":
+                    for index, command in enumerate(done["action"]["commands"]):
+                        events.append(
+                            self.frame(
+                                "response.shell_call_command.done",
+                                {**common, "command_index": index, "command": command},
+                            )
+                        )
+                events.append(
+                    self.frame(
+                        "response.output_item.done",
+                        {"output_index": call["output_index"], "item": done},
+                    )
+                )
+                self.output.append(done)
+                del self._calls[call_index]
+                continue
             done = call_item(
                 call["call_id"],
                 call["name"],
@@ -1723,6 +1867,51 @@ class StreamTranslator:
             )
             self.output.append(done)
             del self._calls[call_index]
+        return events
+
+    def _client_deltas(
+        self, call: dict[str, Any], done: Mapping[str, Any] | None = None
+    ) -> list[str]:
+        kind = self.client_tools.get(call["name"])
+        if kind not in ("custom", "shell"):
+            return []
+        data = response_tools.partial("".join(call["arguments"]))
+        common = {"item_id": call["id"], "output_index": call["output_index"]}
+        events = []
+        if kind == "custom":
+            value = done["input"] if done is not None else data.get("input", "")
+            if isinstance(value, str):
+                previous = call.get("input", "")
+                if value.startswith(previous) and len(value) > len(previous):
+                    events.append(
+                        self.frame(
+                            "response.custom_tool_call_input.delta",
+                            {**common, "delta": value[len(previous) :]},
+                        )
+                    )
+                    call["input"] = value
+        elif kind == "shell":
+            commands = done["action"]["commands"] if done is not None else data.get("commands", [])
+            previous_commands = call.setdefault("commands", [])
+            if isinstance(commands, list):
+                for index, command in enumerate(commands):
+                    if not isinstance(command, str):
+                        continue
+                    at = {**common, "command_index": index}
+                    if index == len(previous_commands):
+                        previous_commands.append("")
+                        events.append(
+                            self.frame("response.shell_call_command.added", {**at, "command": ""})
+                        )
+                    previous = previous_commands[index]
+                    if command.startswith(previous) and len(command) > len(previous):
+                        events.append(
+                            self.frame(
+                                "response.shell_call_command.delta",
+                                {**at, "delta": command[len(previous) :]},
+                            )
+                        )
+                        previous_commands[index] = command
         return events
 
     def _next_index(self) -> int:
@@ -1805,7 +1994,7 @@ class StreamTranslator:
                 call_index = position
             function = fragment.get("function") or {}
             if call_index not in self._calls:
-                events += self._close_open() + self._close_calls(keep=call_index)
+                events += self._close_open()
                 call: dict[str, Any] = {
                     "id": _item_id("fc"),
                     "output_index": self._next_index(),
@@ -1822,6 +2011,25 @@ class StreamTranslator:
                     item_id=call["id"],
                     namespace=self.namespaces.get(call["name"]),
                 )
+                kind = self.client_tools.get(call["name"])
+                if kind:
+                    item = {
+                        "id": call["id"],
+                        "call_id": call["call_id"],
+                        "status": "in_progress",
+                        "type": "custom_tool_call" if kind == "custom" else kind + "_call",
+                    }
+                    if kind == "custom":
+                        item.update(name=call["name"], input="")
+                    elif kind != "apply_patch":
+                        item["action"] = (
+                            {"type": "exec", "command": [], "env": {}}
+                            if kind == "local_shell"
+                            else {"commands": []}
+                        )
+                    else:
+                        item["operation"] = {"type": "update_file", "path": "", "diff": ""}
+                call["item"] = item
                 events.append(
                     self.frame(
                         "response.output_item.added",
@@ -1832,6 +2040,9 @@ class StreamTranslator:
             arguments = function.get("arguments")
             if arguments:
                 call["arguments"].append(arguments)
+                if call["name"] in self.client_tools:
+                    events += self._client_deltas(call)
+                    continue
                 events.append(
                     self.frame(
                         "response.function_call_arguments.delta",

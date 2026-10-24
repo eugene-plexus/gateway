@@ -54,6 +54,8 @@ class FakeAgent:
 
     def __init__(self) -> None:
         self.revoked: list[str] = []
+        # A rotated key's policy entry carries its retirement as `expiresAt`.
+        self.retired: dict[str, float] = {}
         self.registered: list[str] = []
         self.revision = 0
         self.fail = False
@@ -76,7 +78,9 @@ class FakeAgent:
         keys = [
             {
                 "id": key,
-                "expiresAt": datetime.fromtimestamp(time.time() + 3600, UTC).isoformat(),
+                "expiresAt": datetime.fromtimestamp(
+                    self.retired.get(key, time.time() + 3600), UTC
+                ).isoformat(),
                 **({"revokedAt": datetime.now(UTC).isoformat()} if key in self.revoked else {}),
             }
             for key in set(["a", "key-1", "key-2", *self.revoked, *self.registered])
@@ -445,6 +449,20 @@ def test_revoked_and_unknown_anthropic_keys_are_403(authed_client, client_key, a
     unknown = install.client_key(name="app", jti="not-in-registry")
     response = authed_client.post("/v1/messages", json=body, headers={"x-api-key": unknown})
     assert response.status_code == 403 and "not registered" in response.text.lower()
+
+
+def test_a_replaced_key_is_refused_as_replaced_on_both_doors(authed_client, agent, install):
+    token = install.client_key(name="Continue", jti="key-1", ttl=3600)
+    agent.retired["key-1"] = time.time() - 5
+    agent.revision += 1
+    chat = {"model": FAKE_MODEL, "messages": [{"role": "user", "content": "hi"}]}
+    openai = authed_client.post(
+        "/v1/chat/completions", json=chat, headers={"Authorization": f"Bearer {token}"}
+    )
+    assert openai.status_code == 401 and "was replaced" in openai.text
+    body = {"model": FAKE_MODEL, "max_tokens": 10, **{"messages": chat["messages"]}}
+    anthropic = authed_client.post("/v1/messages", json=body, headers={"x-api-key": token})
+    assert anthropic.status_code == 403 and "was replaced" in anthropic.text
 
 
 # --------------------------------------------------------------------- #

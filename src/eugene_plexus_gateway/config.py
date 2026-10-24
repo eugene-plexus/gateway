@@ -325,6 +325,18 @@ FIELDS: list[ConfigField] = [
         default=[],
     ),
     ConfigField(
+        key="geminiModelNames",
+        label="Gemini model names",
+        description=(
+            "Map a Gemini client model name to one model id or role. "
+            "Known Eugene model ids are used directly. Other names use the Chat role. "
+            "Each entry has a model name and one target, such as role:chat."
+        ),
+        category="routing",
+        valueType=ConfigValueType.model_slots,
+        default=[],
+    ),
+    ConfigField(
         key="inConversationSystem",
         label="System messages after the first",
         description=(
@@ -728,6 +740,16 @@ def _validate_value(field: ConfigField, value: Any) -> str | None:
         return None
 
     if vt == ConfigValueType.model_slots:
+        if field.key == "geminiModelNames":
+            if reason := _validate_model_slots(value):
+                return reason
+            for item in value:
+                if len(item["targets"]) != 1:
+                    return "geminiModelNames: each model must have exactly one target"
+                target = item["targets"][0]
+                if target.startswith("role:") and target.removeprefix("role:") not in ModelRole:
+                    return f"geminiModelNames: unknown role {target!r}"
+            return None
         return _validate_model_slots(value)
 
     return f"unsupported valueType: {vt}"
@@ -801,6 +823,9 @@ class ConfigStore:
                     # after an invalid hand edit. Bad repetition settings use
                     # their defaults, just as Policy.resolve does.
                     if k.startswith("repetition") and _validate_value(field, merged[k]):
+                        merged[k] = field.default
+                    if k == "geminiModelNames" and (cause := _validate_value(field, merged[k])):
+                        log.warning("geminiModelNames: %s; using the empty mapping", cause)
                         merged[k] = field.default
                 self._values = merged
                 self._settle_load_balancing_locked(raw.get("loadBalancing"))

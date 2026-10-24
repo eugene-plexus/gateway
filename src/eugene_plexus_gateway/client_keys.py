@@ -28,7 +28,7 @@ CLOCK_TOLERANCE_SECONDS = 5.0
 # from a policy up to a refresh old; one re-read settles it. Bounded, so a
 # stream of unknown keys cannot turn into a stream of reads.
 MISS_REFRESH_SECONDS = 1.0
-type Decision = Literal["allowed", "revoked", "unregistered", "unavailable"]
+type Decision = Literal["allowed", "revoked", "replaced", "unregistered", "unavailable"]
 
 
 class ClientKeyGuard:
@@ -117,7 +117,7 @@ class ClientKeyGuard:
         elapsed = 0.0 if self._fetched_at is None else time.perf_counter() - self._fetched_at
         return max(wall_age, self._initial_age + elapsed)
 
-    async def decision(self, key_id: str | None) -> Decision:
+    async def decision(self, key_id: str | None, token_exp: float | None = None) -> Decision:
         arrived = time.perf_counter()
         if not key_id:
             return "unregistered"
@@ -130,6 +130,8 @@ class ClientKeyGuard:
             return "unavailable"
         if self._registered(key_id):
             return "allowed"
+        if self._replaced(key_id, token_exp):
+            return "replaced"
         # Not listed: most likely made a moment ago, after the policy this
         # gateway holds. Ask once before refusing; the 401 says "make a new
         # one", which would only be refused the same way.
@@ -139,7 +141,25 @@ class ClientKeyGuard:
             return "revoked"
         if self._policy is None or self._age() >= self._max_age:
             return "unavailable"
-        return "allowed" if self._registered(key_id) else "unregistered"
+        if self._registered(key_id):
+            return "allowed"
+        return "replaced" if self._replaced(key_id, token_exp) else "unregistered"
+
+    def _replaced(self, key_id: str, token_exp: float | None) -> bool:
+        """Listed, past its served expiry, and that expiry is earlier than the token's own.
+
+        The root serves a replaced key's retirement as its `expiresAt` (the policy
+        entry is `extra=forbid`, so older gateways need no new field). A token that
+        simply reached its own expiry has the same instant in both places.
+        """
+        if self._policy is None or token_exp is None:
+            return False
+        return any(
+            k.id == key_id
+            and k.expiresAt.timestamp() <= time.time()
+            and k.expiresAt.timestamp() < token_exp - 1.0
+            for k in self._policy.keys
+        )
 
     def _registered(self, key_id: str) -> bool:
         assert self._policy is not None

@@ -59,7 +59,7 @@ from typing import Any
 from starlette.datastructures import Headers
 from starlette.responses import JSONResponse, Response
 
-from . import door_paths
+from . import door_paths, gemini
 from ._generated.models import Problem
 
 Scope = MutableMapping[str, Any]
@@ -77,7 +77,7 @@ ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 # `anthropic-dangerous-direct-browser-access`, which Claude Code sends
 # on every request, so a browser client of that door is a shape its
 # authors expect.
-FRONT_DOOR_PATHS: frozenset[str] = frozenset(
+FRONT_DOOR_PATHS: frozenset[str] = gemini.PATHS | frozenset(
     {
         "/v1/models",
         "/v1/web_search",
@@ -91,6 +91,7 @@ FRONT_DOOR_PATHS: frozenset[str] = frozenset(
         # Anthropic's browser path announces itself on a count as on a message.
         "/v1/messages/count_tokens",
         "/v1/responses/input_tokens",
+        "/v1/responses/compact",
         # P3a: a page that reads text aloud is the plainest browser client.
         "/v1/audio/speech",
         # P3b, and the one that refuses, so a browser reads why.
@@ -215,6 +216,7 @@ EXPOSED_HEADERS = b", ".join(
         b"Retry-After",
         b"X-Request-ID",
         b"X-Eugene-Plexus-Driver",
+        b"X-Eugene-Plexus-Model",
         b"X-Eugene-Plexus-Runtime",
         b"X-Eugene-Plexus-Node",
         b"X-Eugene-Plexus-Backend",
