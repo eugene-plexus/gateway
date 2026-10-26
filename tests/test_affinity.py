@@ -315,3 +315,17 @@ def test_claude_codes_session_stays_on_its_replica_through_the_door(settings: Se
             )
             assert r.status_code == 200, r.text
     assert sorted([len(a.calls), len(b.calls)]) == [0, 3]
+
+
+# --- row 54: the chain's first response, before every other key -------------------
+
+
+def test_the_chain_root_keys_affinity_before_the_hash() -> None:
+    opening = _chat({"role": "user", "content": "fix the bug"}, prompt_cache_key="codex-1")
+    # Two chats that open the same way are two conversations when each is a
+    # chain of its own; the chain wins over the client's key and the hash.
+    assert affinity.key_for(opening, "claude-session", chain="resp_a") == "c:resp_a"
+    assert affinity.key_for(opening, chain="resp_a") != affinity.key_for(opening, chain="resp_b")
+    plain = _chat({"role": "user", "content": "fix the bug"})
+    assert affinity.key_for(plain) == affinity.key_for(plain)
+    assert affinity.key_for(plain, chain=None) == affinity.key_for(plain)

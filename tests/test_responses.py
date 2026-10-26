@@ -815,7 +815,11 @@ def test_an_unknown_top_level_field_is_refused_and_the_opaque_ones_are_not(
     assert served.status_code == 200, served.text
 
 
-def test_store_true_is_accepted_and_named_but_nothing_is_kept(settings: Settings) -> None:
+def test_store_true_from_the_console_session_is_named_and_nothing_is_kept(
+    settings: Settings,
+) -> None:
+    """Without sign-in every request is the owner's console session, which keeps
+    no responses (row 54): `store: true` is named, and the response says false."""
     with serve(settings, driver()) as client:
         r = client.post("/v1/responses", json=codex_request(stream=False, store=True))
         stored = client.get(f"/v1/responses/{r.json()['id']}")
@@ -823,7 +827,7 @@ def test_store_true_is_accepted_and_named_but_nothing_is_kept(settings: Settings
     assert r.json()["store"] is False
     assert "store" in r.headers["x-eugene-plexus-ignored-settings"].split(", ")
     assert stored.status_code == 404
-    assert "no response store" in stored.json()["error"]["message"]
+    assert stored.json()["error"]["message"] == f"Response with id '{r.json()['id']}' not found."
 
 
 def test_a_model_nothing_serves_is_400_here_and_404_on_the_chat_door(settings: Settings) -> None:

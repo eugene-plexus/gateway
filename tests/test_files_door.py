@@ -68,6 +68,9 @@ class FakeStore:
                 },
             )
         assert request.headers["authorization"] == f"Bearer {self.gateway_token}"
+        if request.url.path.endswith("/v1/store/status"):
+            # Row 54: a Responses request asks whether answers are kept; this store keeps none.
+            return httpx.Response(200, json={"parts": {"files": True, "responses": False}})
         owner = request.headers["x-eugene-plexus-owner"]
         self.owners_seen.append(owner)
         path = request.url.path.removeprefix("/api/proxy/store")
