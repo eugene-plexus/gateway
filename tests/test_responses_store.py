@@ -407,3 +407,36 @@ def test_a_stream_the_client_left_is_kept_with_what_was_sent(setup, response_sto
     assert kept["output"][0]["content"][0]["text"] == "partial answer"
     assert kept["output"][0]["status"] == "incomplete"
     assert [p["text"] for i in kept["input"] for p in i["content"]] == ["one"]
+
+
+def test_a_client_that_resends_its_history_keeps_its_replica(setup, response_store):  # noqa: F811
+    """OpenAI's default `store` is true, and many clients resend their whole history
+    rather than chain. Each turn is a new response, so its own id cannot be the key:
+    after the opening, the history's own key holds the chat to one replica."""
+    from tests.conftest import FakeDriverClient, make_routing_table, runtime_facts
+
+    app, _, _, _, headers, _ = setup
+    a = FakeDriverClient(name="a-driver", base_url="http://a", model_id="allowed", runtime="ra")
+    b = FakeDriverClient(name="b-driver", base_url="http://b", model_id="allowed", runtime="rb")
+    a.responses = ["ok"] * 10
+    b.responses = ["ok"] * 10
+    app.state.routing = make_routing_table(
+        a, b, runtimes=[runtime_facts("ra"), runtime_facts("rb")], strategy="round_robin"
+    )
+    history: list[dict[str, Any]] = [{"role": "user", "content": "fix the bug"}]
+    served = []
+    with TestClient(app) as c:
+        for turn in range(4):
+            before = (len(a.calls), len(b.calls))
+            answer = c.post(
+                "/v1/responses", json={"model": "allowed", "input": history}, headers=headers
+            )
+            assert answer.status_code == 200, answer.text
+            assert answer.json()["store"] is True
+            served.append("a" if len(a.calls) > before[0] else "b")
+            history += [
+                {"role": "assistant", "content": "ok"},
+                {"role": "user", "content": f"and turn {turn}"},
+            ]
+    # The opening is placed as a chat of its own; every turn after it goes home.
+    assert len(set(served[1:])) == 1, served

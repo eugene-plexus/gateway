@@ -218,6 +218,26 @@ class Plan:
             echo["conversation"] = {"id": self.conversation}
 
 
+#: What a client sends at the start of a conversation: what it says, and the rules.
+_OPENING_ROLES = frozenset({"user", "system", "developer"})
+
+
+def starts_a_conversation(value: Any) -> bool:
+    """Whether `input` opens a conversation: one string, or messages from the user
+    and the instructions only -- no answer, call or result of an earlier turn."""
+    if isinstance(value, str):
+        return True
+    if not isinstance(value, list):
+        return False
+    for item in value:
+        if not isinstance(item, Mapping):
+            return False
+        kind = item.get("type") or ("message" if "role" in item else None)
+        if kind != "message" or item.get("role") not in _OPENING_ROLES:
+            return False
+    return True
+
+
 def _conversation_id(value: Any) -> str | None:
     if value is None:
         return None
@@ -335,8 +355,11 @@ async def prepare(
             plan.keep = plan.owner != "install"
         if not plan.keep and flag is True:
             plan.ignored.append("store")
-        if plan.keep and plan.chain is None:
-            # The first response of a chain to come: its own id is the key.
+        if plan.keep and plan.chain is None and starts_a_conversation(raw.get("input")):
+            # The first response of a chain to come: its own id is the key, so a
+            # chat that opens like another is placed on its own. Only at a start: a
+            # client that resends its history with OpenAI's default `store` keeps
+            # the key its history gives it, turn after turn.
             plan.chain = response_id
     elif flag is True:
         plan.ignored.append("store")
