@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -139,16 +140,35 @@ _PREFIX = {
 }
 
 
+#: OpenAI's item ids: a short prefix and hex digits. An id in any other shape is
+#: given a new one, so no id carries words into a path, a log line or an error
+#: (second-model review).
+ITEM_ID = re.compile(r"^[a-z]{1,16}_[0-9a-f]{16,64}$")
+
+
 def _item_id(kind: Any) -> str:
     return f"{_PREFIX.get(kind if isinstance(kind, str) else '', 'item')}_{uuid.uuid4().hex}"
+
+
+def _own_ids(items: list[dict[str, Any]], seen: set[str]) -> list[dict[str, Any]]:
+    """Each item with an id of OpenAI's shape, its own in `seen`."""
+    out = []
+    for given in items:
+        item = dict(given)
+        ident = item.get("id")
+        if not isinstance(ident, str) or not ITEM_ID.match(ident) or ident in seen:
+            item["id"] = _item_id(item.get("type"))
+        seen.add(item["id"])
+        out.append(item)
+    return out
 
 
 def normalized(value: Any, *, taken: set[str] | None = None) -> list[dict[str, Any]]:
     """A request's input as OpenAI keeps it: a string as one user message, a
     message's string content as one text part, every item with an `id` of its
-    own (a new one when it has none, or one already `taken`). An item that is
-    not an object is left out: the translation refuses it before anything is
-    kept."""
+    own in OpenAI's shape (a new one when it has none, has another shape, or has
+    one already `taken`). An item that is not an object is left out: the
+    translation refuses it before anything is kept."""
     if isinstance(value, str):
         value = [{"type": "message", "role": "user", "content": value}]
     if not isinstance(value, list):
@@ -175,12 +195,8 @@ def normalized(value: Any, *, taken: set[str] | None = None) -> list[dict[str, A
                     part = {"type": "input_text", "text": content}
                 item["content"] = [part]
             item.setdefault("status", "completed")
-        ident = item.get("id")
-        if not isinstance(ident, str) or not ident or len(ident) > 128 or ident in seen:
-            item["id"] = _item_id(kind)
-        seen.add(item["id"])
         out.append(item)
-    return out
+    return _own_ids(out, seen)
 
 
 # --------------------------------------------------------------------------- #
@@ -205,6 +221,10 @@ class Plan:
     own_input: list[dict[str, Any]] = field(default_factory=list)
     #: For the ignored-settings header.
     ignored: list[str] = field(default_factory=list)
+    #: Where the conversation stood when it was read: what this turn was given.
+    read_at: int | None = None
+    #: Keeping, started once, by the last event or by the client leaving.
+    final: asyncio.Task[bool] | None = None
 
     @property
     def writes(self) -> bool:
@@ -344,6 +364,9 @@ async def prepare(
                 code="store_unavailable",
             )
         plan.chain = conversation if conversation is not None else context.get("rootId")
+        position = context.get("position")
+        if conversation is not None and isinstance(position, int):
+            plan.read_at = position
         if previous is not None and context.get("hadInstructions") and not raw.get("instructions"):
             # OpenAI's rule: instructions are not carried along a chain.
             plan.ignored.append("previous_response_id.instructions")
@@ -376,6 +399,9 @@ async def prepare(
     }
     if context is not None:
         given = raw.get("input")
+        # OpenAI's `input` is optional with a conversation or a chain: none is none.
+        if given is None:
+            given = []
         if isinstance(given, str):
             given = [{"type": "message", "role": "user", "content": given}]
         if isinstance(given, list):
@@ -398,7 +424,10 @@ async def keep(plan: Plan, response: dict[str, Any]) -> bool:
     if not plan.writes or plan.store is None or plan.owner is None:
         response["store"] = False
         return False
-    output = [item for item in response.get("output") or [] if isinstance(item, Mapping)]
+    output = _own_ids(
+        [dict(item) for item in response.get("output") or [] if isinstance(item, Mapping)],
+        {str(item["id"]) for item in plan.own_input},
+    )
     status = response.get("status")
     status = (
         status if status in ("completed", "incomplete", "failed", "cancelled") else "incomplete"
@@ -416,6 +445,11 @@ async def keep(plan: Plan, response: dict[str, Any]) -> bool:
                     "status": status,
                     **({"previousResponseId": plan.previous} if plan.previous else {}),
                     **({"conversationId": plan.conversation} if plan.conversation else {}),
+                    **(
+                        {"conversationPosition": plan.read_at}
+                        if plan.conversation and plan.read_at is not None
+                        else {}
+                    ),
                     "input": plan.own_input,
                     "output": output,
                     "response": {**response, "store": True},
@@ -424,16 +458,15 @@ async def keep(plan: Plan, response: dict[str, Any]) -> bool:
             )
             kept = True
         else:
-            # `store: false` in a conversation: its items are added all the same.
-            items = [*plan.own_input, *output]
-            for start in range(0, len(items), MAX_ADDED_ITEMS):
-                await plan.store.call(
-                    "POST",
-                    f"/v1/conversations/{files_door._safe(plan.conversation or '')}/items",
-                    plan.owner,
-                    json={"items": items[start : start + MAX_ADDED_ITEMS]},
-                    time_limit=CALL_TIMEOUT,
-                )
+            # `store: false` in a conversation: its items are added all the same, in
+            # one call, so a turn is in it whole or not at all (review).
+            await plan.store.call(
+                "POST",
+                f"/v1/conversations/{files_door._safe(plan.conversation or '')}/items",
+                plan.owner,
+                json={"items": [*plan.own_input, *output]},
+                time_limit=CALL_TIMEOUT,
+            )
     except StoreRefusal as exc:
         log.warning("an answer was not kept: the store answered %d %s", exc.status, exc.title)
     except StoreUnavailable:
@@ -444,17 +477,32 @@ async def keep(plan: Plan, response: dict[str, Any]) -> bool:
     return kept
 
 
-def keep_later(plan: Plan, response: dict[str, Any]) -> None:
-    """Keep the answer of a stream whose client left, in a task of its own: the
-    request's task is being cancelled and can await nothing more."""
+def finalize(plan: Plan, response: dict[str, Any]) -> asyncio.Task[bool] | None:
+    """Keep the answer once, whoever asks first (second-model review): the last
+    event, which waits for it, or the client leaving, which does not. Keeping runs
+    in a task of its own, so a request cancelled while it waits still keeps what
+    was started, and the second caller gets the first's task, never a second
+    save. None when nothing is written for this request."""
     if not plan.writes:
-        return
-    try:
-        task = asyncio.get_running_loop().create_task(keep(plan, response))
-    except RuntimeError:
-        return
-    _LATE.add(task)
-    task.add_done_callback(_LATE.discard)
+        response["store"] = False
+        return None
+    if plan.final is None:
+        try:
+            plan.final = asyncio.get_running_loop().create_task(keep(plan, response))
+        except RuntimeError:
+            return None
+        _LATE.add(plan.final)
+        plan.final.add_done_callback(_LATE.discard)
+    return plan.final
+
+
+async def finish(plan: Plan, response: dict[str, Any]) -> bool:
+    """`finalize`, waited for: True when the answer was kept. The wait is shielded,
+    so a client that leaves now does not stop the keeping already under way."""
+    task = finalize(plan, response)
+    if task is None:
+        return False
+    return await asyncio.shield(task)
 
 
 # --------------------------------------------------------------------------- #
@@ -510,7 +558,8 @@ def _paging(request: Request) -> dict[str, Any]:
     if order not in ("asc", "desc"):
         raise DoorRefusal(400, "order: asc or desc.", param="order")
     after = request.query_params.get("after")
-    if after is not None and (not after or len(after) > 128):
+    if after is not None and not ITEM_ID.match(after):
+        # Not repeated: a cursor in another shape names no item kept here.
         raise DoorRefusal(400, "after: an item id.", param="after")
     return {"limit": _limit(request), "order": order, "after": after}
 
@@ -810,9 +859,7 @@ async def delete_conversation_item(
 def _safe_item(ident: str) -> str:
     """An item id as one path segment: one of OpenAI's shapes, else a name that
     matches nothing (the store answers it as a missing item)."""
-    if ident and len(ident) <= 128 and all(c.isalnum() or c in "-_" for c in ident):
-        return ident
-    return "not-an-id"
+    return ident if ITEM_ID.match(ident) else "not-an-id"
 
 
 @router.api_route("/v1/responses/{rest:path}", methods=["GET", "POST", "DELETE"])

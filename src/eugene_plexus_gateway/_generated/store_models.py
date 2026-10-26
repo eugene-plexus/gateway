@@ -2026,13 +2026,17 @@ class StoredItem(BaseModel):
     One item in OpenAI's shape (a message, a function call, its
     output, reasoning, ...), as the gateway sent it. The store reads
     only `id`, which is unique within its response or conversation.
+    An id has OpenAI's shape, a short prefix and hex digits, so no id
+    carries words into a path, a log line or an error: the gateway
+    gives a new one to an item whose id has another shape, and the
+    store refuses one (400, the id not repeated).
 
     """
 
     model_config = ConfigDict(
         extra='allow',
     )
-    id: str = Field(..., max_length=128, min_length=1)
+    id: str = Field(..., pattern='^[a-z]{1,16}_[0-9a-f]{16,64}$')
     type: str | None = None
 
 
@@ -2067,6 +2071,11 @@ class StoredResponseRequest(BaseModel):
         None,
         description='The conversation this response belongs to; its items are added to it.',
         max_length=64,
+    )
+    conversationPosition: int | None = Field(
+        None,
+        description="With `conversationId`: the conversation's `position` when its\ncontext was read for this request (`StoredContext.position`).\nThe items before it are what the response was given, whatever\nanother turn added meanwhile; absent, the conversation's end\nwhen the response is kept.\n",
+        ge=0,
     )
     input: list[StoredItem] = Field(
         ...,
@@ -2128,8 +2137,8 @@ class StoredItemsRequest(BaseModel):
     )
     items: list[StoredItem] = Field(
         ...,
-        description="Added at the end, in order (OpenAI's 20 at a time).",
-        max_length=20,
+        description="Added at the end, in order, in one transaction. The gateway\ntakes OpenAI's 20 at a time from a client; a turn kept with\n`store: false` adds all its items in one call.\n",
+        max_length=10000,
         min_length=1,
     )
 
@@ -2146,6 +2155,11 @@ class StoredContext(BaseModel):
     bytes: int
     rootId: str | None = Field(None, description='For a chain, its first response.')
     conversationId: str | None = Field(None, description='For a conversation, its id.')
+    position: int | None = Field(
+        None,
+        description='For a conversation, the place after its last item when it was\nread: sent back as `conversationPosition` when the response is\nkept.\n',
+        ge=0,
+    )
     hadInstructions: bool | None = Field(
         None,
         description="For a chain, whether the response named was made with\n`instructions`, which are not carried to the next (OpenAI's\nrule), so the door can say so.\n",
@@ -2173,8 +2187,9 @@ class StoredConversation(BaseModel):
     )
     id: str = Field(..., pattern='^conv_[0-9a-f]{48}$')
     createdAt: int
-    expiresAt: int = Field(
-        ..., description='Unix seconds, `responseDays` after its last use.'
+    expiresAt: int | None = Field(
+        None,
+        description='Unix seconds, `conversationDays` after its last use. Absent,\nthe conversation is kept until it is deleted (the default, as\nOpenAI keeps one).\n',
     )
     metadata: dict[str, str]
     items: int = Field(..., description='How many items it holds.')

@@ -6628,7 +6628,10 @@ class ResponsesRequest(BaseModel):
     reads, not what it refuses**: the refusals are enforced against
     the raw body by the implementation, with a 400 naming the field,
     and the endpoint description lists them. A top-level field not
-    named here is refused.
+    named here is refused. `input` is optional, as on OpenAI, with
+    `previous_response_id` or `conversation` (row 54): absent, the
+    stored conversation is continued as it stands. Without either it
+    is required.
 
     """
 
@@ -6639,8 +6642,8 @@ class ResponsesRequest(BaseModel):
         ...,
         description="A model id from `GET /v1/models`, resolved against this install's slots.",
     )
-    input: str | list[ResponsesInputItem] = Field(
-        ...,
+    input: str | list[ResponsesInputItem] | None = Field(
+        None,
         description='A string (one user message), or the conversation as a list of\nitems. Codex resends the whole conversation on every turn.\n',
     )
     instructions: str | None = Field(None, description='The leading system message.')

@@ -2191,7 +2191,9 @@ async def _stream_responses(
         ended = True
     finally:
         if not ended and plan is not None and plan.writes:
-            stored_responses.keep_later(plan, translator.partial())
+            # The client left: what was sent is kept, unless the last event's keeping
+            # already began (one keeping per answer, `stored_responses.finalize`).
+            stored_responses.finalize(plan, translator.partial())
 
 
 async def _end_responses(
@@ -2204,7 +2206,7 @@ async def _end_responses(
     for chunk in events:
         yield chunk
     if plan is not None:
-        await stored_responses.keep(plan, response)
+        await stored_responses.finish(plan, response)
     yield translator.terminal(response)
 
 
@@ -2617,7 +2619,7 @@ async def create_response(request: Request) -> Any:
             incomplete_details=details,
         )
         # Kept before it is sent, so the client's next request finds it (row 54).
-        if plan.writes and not await stored_responses.keep(plan, answer) and plan.keep:
+        if plan.writes and not await stored_responses.finish(plan, answer) and plan.keep:
             translated.ignored.append("store")
             own = translated.headers()
         return JSONResponse(

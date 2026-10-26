@@ -44,6 +44,9 @@ class FakeResponseStore:
         self.calls: list[tuple[str, str, str]] = []
         self.on = True
         self.down: Exception | None = None
+        #: Every keep's body, and the size of every append to a conversation.
+        self.bodies: list[dict[str, Any]] = []
+        self.appends: list[int] = []
 
     # -- helpers ------------------------------------------------------------
 
@@ -177,7 +180,13 @@ class FakeResponseStore:
                 if not self.on:
                     return self._off()
                 return httpx.Response(
-                    200, json={"items": row["items"], "bytes": 1, "conversationId": row["id"]}
+                    200,
+                    json={
+                        "items": row["items"],
+                        "bytes": 1,
+                        "conversationId": row["id"],
+                        "position": len(row["items"]),
+                    },
                 )
             if len(parts) == 4 and request.method == "GET":
                 return httpx.Response(200, json=_page(row["items"], request.url.params))
@@ -185,6 +194,7 @@ class FakeResponseStore:
                 if not self.on:
                     return self._off()
                 row["items"] += body["items"]
+                self.appends.append(len(body["items"]))
                 return httpx.Response(201, json={"data": body["items"], "hasMore": False})
             item = next((i for i in row["items"] if i["id"] == parts[4]), None)
             if item is None:
@@ -196,6 +206,7 @@ class FakeResponseStore:
         raise AssertionError(f"unexpected store call {request.method} {path}")
 
     def _keep(self, owner: str, body: dict[str, Any]) -> httpx.Response:
+        self.bodies.append(body)
         if not self.on:
             return self._off()
         ident = body["id"]
