@@ -4167,8 +4167,8 @@ class ClientKeyLimits(BaseModel):
         description="The key's queue band (row 11): which of its requests wait or are\nturned away first when the machines are busy. Absent means\n`interactive`. A verified person's band from their permission\ngroups (`ClientAdmissionResult.queueBand`) replaces it, and a\nrequest's `X-Eugene-Band` header can only lower it. Not part of\nthe policy a running request is bound to: changing it never cuts\na request that is already running.\n",
     )
     maxQueuedRequests: int | None = Field(
-        8,
-        description="How many of this key's requests may wait in one gateway's queue\nfor each person (row 11): Workbench's one app key serves\neveryone, so each verified person has a line of their own. A\nrequest past it is refused with `key_queue_full` and\n`Retry-After`. `0` refuses at once, as before the queue. Not part\nof the policy a running request is bound to.\n",
+        None,
+        description="How many of this key's requests may wait in one gateway's queue\nfor each person (row 11): Workbench's one app key serves\neveryone, so each verified person has a line of their own. A\nrequest past it is refused with `key_queue_full` and\n`Retry-After`. `0` refuses at once, as before the queue. Not part\nof the policy a running request is bound to.\n\n**Absent means 8**, and no default is declared here on purpose:\na declared default is filled into every answer a generated model\nwrites, and a reader a release behind refuses the field\n(`extra='forbid'`), so the authority and the agent send it only\nwhen it was set to something else, as `band` and row 70's\n`queueBand`.\n",
         ge=0,
         le=64,
     )
