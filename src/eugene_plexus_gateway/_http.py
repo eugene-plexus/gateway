@@ -41,7 +41,13 @@ install's machine table, from a list the root signs, to the file named by
   pins the table lists for it, after the handshake and before the first
   request byte, with no certificate chain and no name check;
 * when the install requires encryption, refuses plain HTTP to a machine
-  the table names but cannot carry.
+  the table names but cannot carry;
+* never sends one of this install's tokens to another machine in plain
+  HTTP unless the table says that machine runs a version with no machine
+  port. A machine the table does not name yet (it has just joined, and this
+  process has not read the root's list since) is refused, not sent the
+  token in clear; the caller tries again after the table names it
+  (agent#38).
 
 With no table, behaviour is exactly what it was.
 
@@ -53,6 +59,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import functools
 import hashlib
 import ipaddress
 import json
@@ -253,8 +260,10 @@ _REFUSAL_LOG_SECONDS = 300.0
 
 
 class MachineRefused(httpx.ConnectError):
-    """Plain HTTP to another machine, refused because the install requires
-    encryption and that machine has no key on record. Nothing was sent."""
+    """Plain HTTP to another machine, refused: the install requires
+    encryption and that machine has no key on record, or the request carries
+    a token of this install to a machine not known to speak plain HTTP only.
+    Nothing was sent."""
 
 
 class PinRefused(httpcore.ConnectError):
@@ -304,10 +313,29 @@ class MachineTable:
     local: frozenset[str] = frozenset()
     """Origins that are this machine under a LAN address (its own agent),
     which a request may reach in plain HTTP whatever `required` says."""
+    present: bool = True
+    """False only for `NO_TABLE`: this process was given no table at all (no
+    agent of a version with machine ports started it), so nothing is carried
+    or refused. A table that names no machine yet is present, and empty."""
 
     @property
     def empty(self) -> bool:
         return not self.machines and not self.routes
+
+    @functools.cached_property
+    def _plain_hosts(self) -> frozenset[str]:
+        hosts: set[str] = set()
+        for origin, target in self.routes.items():
+            if target is None:
+                with contextlib.suppress(httpx.InvalidURL):
+                    hosts.add(_host(httpx.URL(origin).host))
+        return frozenset(hosts)
+
+    def speaks_plain(self, url: httpx.URL) -> bool:
+        """Whether the table says the machine at `url` runs a version with no
+        machine port (its agent's route is null), so plain HTTP is the only
+        way to reach it, its drivers included."""
+        return _host(url.host) in self._plain_hosts
 
     def pins(self, url: httpx.URL) -> frozenset[str] | None:
         if url.scheme != "https":
@@ -339,6 +367,8 @@ class MachineTable:
 
 
 EMPTY_TABLE = MachineTable()
+#: No table at all: behaviour is exactly what it was before machine ports.
+NO_TABLE = MachineTable(present=False)
 
 #: Where a transport reads its table: `machine_table`, unless a caller with a
 #: table of its own (an enrolment that pins the root from its join token)
@@ -412,13 +442,14 @@ def set_machine_table(table: MachineTable | None) -> None:
 def machine_table() -> MachineTable:
     """The table in effect: one installed in-process, else the file, re-read
     when it changes (checked at most once a second). A file that becomes
-    unreadable keeps the last table read from it; a file removed is none."""
+    unreadable keeps the last table read from it; a file removed is an empty
+    table. Without a file named at all there is no table (`NO_TABLE`)."""
     global _TABLE_FILE, _TABLE_FROM_FILE, _TABLE_CHECKED
     if _TABLE_OVERRIDE is not None:
         return _TABLE_OVERRIDE
     path = os.environ.get(MACHINE_PINS_ENV)
     if not path:
-        return EMPTY_TABLE
+        return NO_TABLE
     now = time.perf_counter()
     if (
         _TABLE_FILE is not None
@@ -649,8 +680,22 @@ def _pool_options(limits: httpx.Limits) -> dict[str, Any]:
 
 
 def _route(request: httpx.Request, table: MachineTable) -> MachineTable:
-    """Carry a plain request for another machine to its TLS address, in place."""
-    if table.empty and not table.required:
+    """Carry a plain request for another machine to its TLS address, in place,
+    or refuse it with nothing sent (`MachineRefused`).
+
+    **A token of this install never crosses to another machine in plain HTTP**
+    unless the table says that machine speaks nothing else (its route is
+    null: it runs a version with no machine port) and the install allows that
+    (`automatic` or `off`). A machine the table does not name may be one that
+    joined a moment ago, whose machine port this process has not read about
+    yet: the root records the key at once, but its agent writes the table for
+    its children a moment later, and they read it at most once a second. Two
+    plain reads with a token slipped through that gap (agent#38). Now such a
+    request is refused and the caller tries again, by then over TLS. A
+    request without a token (a model server on the LAN) is not this rule's
+    business, and neither is this machine itself.
+    """
+    if not table.present:
         return table
     try:
         carried = table.carry(request.url)
@@ -660,18 +705,45 @@ def _route(request: httpx.Request, table: MachineTable) -> MachineTable:
     if carried is not None:
         request.url = carried
         request.headers["Host"] = carried.netloc.decode("ascii")
-    elif table.required and request.url.scheme == "http" and _eugene_token(request.headers):
-        # An address the table does not name (a node just enrolled, another
-        # spelling of a machine's name): under required, a token of this
-        # install never crosses to another machine in plain HTTP. A request
-        # without one (a model server on the LAN) is not this rule's business.
-        if not _is_loopback(request.url.host) and _origin(request.url) not in table.local:
-            raise MachineRefused(
-                "Encryption between machines is required, and this request would carry "
-                f"an Eugene Plexus token to {request.url.host} in plain HTTP; it was not sent.",
-                request=request,
-            )
-    return table
+        return table
+    url = request.url
+    if url.scheme != "http" or _is_loopback(url.host) or _origin(url) in table.local:
+        return table
+    if not table.required and table.speaks_plain(url):
+        return table
+    if not _eugene_token(request.headers):
+        return table
+    origin = _origin(url)
+    if table.required:
+        why = (
+            "Encryption between machines is required, and this request would carry "
+            f"an Eugene Plexus token to {url.host} in plain HTTP; it was not sent."
+        )
+    else:
+        who = table.names.get(origin) or origin
+        why = (
+            f"Not sent to {who}: this machine does not know yet whether {url.host} takes "
+            "TLS, and the request carries an Eugene Plexus token, which never crosses to "
+            "another machine in plain HTTP. The next try after the install's machine list "
+            "names that machine goes over TLS."
+        )
+    _log_held_back(origin, why)
+    raise MachineRefused(why, request=request)
+
+
+_HELD_BACK_LOGGED: dict[str, float] = {}
+
+
+def _log_held_back(origin: str, why: str) -> None:
+    """Say it once in a while per address, not on every refresh."""
+    now = time.perf_counter()
+    if now - _HELD_BACK_LOGGED.get(origin, -_REFUSAL_LOG_SECONDS) >= _REFUSAL_LOG_SECONDS:
+        _HELD_BACK_LOGGED[origin] = now
+        log.info("held back a request to %s: %s", origin, why)
+
+
+def _host(host: str) -> str:
+    return host.strip().strip("[]").lower()
 
 
 def _is_loopback(host: str) -> bool:
@@ -811,6 +883,7 @@ def _machine_transport(kwargs: dict[str, Any], *, sync: bool = False) -> None:
 __all__ = [
     "EMPTY_TABLE",
     "MACHINE_PINS_ENV",
+    "NO_TABLE",
     "MachineRefused",
     "MachineTable",
     "MachineTransport",

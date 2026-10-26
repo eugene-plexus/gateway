@@ -283,6 +283,140 @@ def test_threads_reading_the_table_agree() -> None:
     assert seen == [True] * 8
 
 
+def _ep_token() -> str:
+    """A token of this install in form: a JWS whose header says `typ: ep-...`."""
+    import base64
+
+    def part(value: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(value).encode()).rstrip(b"=").decode()
+
+    return f"{part({'alg': 'EdDSA', 'typ': 'ep-service+jwt'})}.{part({'sub': 'x'})}.c2ln"
+
+
+def _recording_client(
+    sent: list[httpx.Request],
+) -> httpx.AsyncClient:
+    """An internal client with the real machine transport, whose plain leg
+    records what it would put on the wire instead of sending it. (A mock
+    handed to `internal_client` as its transport would bypass the rule.)"""
+
+    def plain(request: httpx.Request) -> httpx.Response:
+        sent.append(request)
+        return httpx.Response(200, json={})
+
+    client = _http.internal_client(timeout=2)
+    transport = client._transport
+    assert isinstance(transport, _http.MachineTransport)
+    transport._plain = httpx.MockTransport(plain)  # type: ignore[assignment]
+    return client
+
+
+@pytest.mark.parametrize(
+    "known",
+    [
+        {},  # the table names no machine yet (the root before its first worker)
+        {"http://10.9.9.5:8079": "https://10.9.9.5:8083/agent"},  # names others only
+    ],
+)
+async def test_automatic_never_sends_a_token_in_plain_to_a_machine_not_named_yet(
+    known: dict,
+) -> None:
+    """agent#38: in automatic mode the root's gateway read a worker that had
+    just joined in plain HTTP, with its token, because its table (written by
+    the root's agent a moment after the root recorded the worker's key) did
+    not name the worker yet. Such a request is refused, with nothing sent."""
+    machines = {"10.9.9.5:8083": ["p"]} if known else {}
+    _http.set_machine_table(
+        _http.parse_machine_table({"machines": machines, "routes": known, "required": False})
+    )
+    sent: list[httpx.Request] = []
+    async with _recording_client(sent) as client:
+        for path in ("/v1/components", "/v1/runtimes"):
+            with pytest.raises(_http.MachineRefused) as caught:
+                await client.get(
+                    f"http://10.9.9.7:8079{path}",
+                    headers={"Authorization": f"Bearer {_ep_token()}"},
+                )
+            assert "does not know yet whether 10.9.9.7 takes TLS" in str(caught.value)
+        with pytest.raises(_http.MachineRefused):
+            await client.get("http://10.9.9.7:8090/v1/info", headers={"x-api-key": _ep_token()})
+    assert sent == [], "a token went to a machine in plain HTTP"
+
+
+async def test_automatic_still_reaches_what_it_should_in_plain() -> None:
+    """The rule is about tokens to machines not known to speak plain HTTP
+    only. A machine that runs an older version (its route is null) is reached
+    in plain HTTP, its drivers too, as LT1 allows for mixed versions; a
+    request with no token of this install goes as before; and so does this
+    machine under its own LAN address."""
+    _http.set_machine_table(
+        _http.parse_machine_table(
+            {
+                "routes": {"http://10.9.9.8:8079": None},
+                "required": False,
+                "local": ["http://10.9.9.2:8079"],
+            }
+        )
+    )
+    token = {"Authorization": f"Bearer {_ep_token()}"}
+    sent: list[httpx.Request] = []
+    async with _recording_client(sent) as client:
+        await client.get("http://10.9.9.8:8079/v1/components", headers=token)
+        await client.get("http://10.9.9.8:8091/v1/info", headers=token)  # its driver
+        await client.get("http://10.9.9.7:8000/v1/models")  # no token: a model server
+        await client.get("http://10.9.9.7:8079/v1/node", headers={"Authorization": "Bearer sk-1"})
+        await client.get("http://10.9.9.2:8079/v1/node", headers=token)  # this machine
+        await client.get("http://127.0.0.1:8081/v1/info", headers=token)
+    assert [str(r.url) for r in sent] == [
+        "http://10.9.9.8:8079/v1/components",
+        "http://10.9.9.8:8091/v1/info",
+        "http://10.9.9.7:8000/v1/models",
+        "http://10.9.9.7:8079/v1/node",
+        "http://10.9.9.2:8079/v1/node",
+        "http://127.0.0.1:8081/v1/info",
+    ]
+    # Under required the older machine is refused, as before.
+    _http.set_machine_table(
+        _http.parse_machine_table({"routes": {"http://10.9.9.8:8079": None}, "required": True})
+    )
+    sent.clear()
+    async with _recording_client(sent) as client:
+        for url in ("http://10.9.9.8:8079/v1/components", "http://10.9.9.8:8091/v1/info"):
+            with pytest.raises(_http.MachineRefused):
+                await client.get(url, headers=token)
+    assert sent == []
+
+
+async def test_with_no_table_at_all_nothing_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A process no machine-port agent started has no table: as before LT1."""
+    monkeypatch.delenv(_http.MACHINE_PINS_ENV, raising=False)
+    _http.set_machine_table(None)
+    sent: list[httpx.Request] = []
+    async with _recording_client(sent) as client:
+        await client.get(
+            "http://10.9.9.7:8079/v1/node", headers={"Authorization": f"Bearer {_ep_token()}"}
+        )
+    assert len(sent) == 1
+
+
+async def test_a_table_file_named_but_not_written_yet_refuses_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The agent names the file for its children; until it holds a machine,
+    that machine is not known, so no token goes to it in plain HTTP."""
+    monkeypatch.setenv(_http.MACHINE_PINS_ENV, str(tmp_path / "machine_pins.json"))
+    monkeypatch.setattr(_http, "_TABLE_RECHECK_SECONDS", 0.0)
+    _http.set_machine_table(None)
+    sent: list[httpx.Request] = []
+    async with _recording_client(sent) as client:
+        with pytest.raises(_http.MachineRefused):
+            await client.get(
+                "http://10.9.9.7:8079/v1/node",
+                headers={"Authorization": f"Bearer {_ep_token()}"},
+            )
+    assert sent == []
+
+
 def test_the_router_keeps_a_loopback_driver_under_required() -> None:
     """gateway#17, the routing half: a driver whose agent advertises loopback
     is reached plain under "required"; one on another machine with no key
