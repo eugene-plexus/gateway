@@ -46,7 +46,7 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -217,6 +217,11 @@ class Seat:
     model: str | None = None
     node: str | None = None
 
+    @property
+    def gated(self) -> bool:
+        """Whether anything here is counted: slots or a pool."""
+        return self.slots is not None or self.pool is not None
+
 
 @dataclass(eq=False)
 class Entry:
@@ -253,6 +258,8 @@ class Entry:
     future: asyncio.Future[Ticket] | None = None
     blocked_by_room: bool = False
     ahead: int = 0
+    #: The runtime it waits to finish starting (WAKE): no pass lets it go.
+    starting: Key | None = None
 
     @property
     def what(self) -> str:
@@ -298,16 +305,6 @@ class Ticket:
     def runtime(self) -> Key | None:
         return self._runtime
 
-    def move(self, runtime: Key | None) -> None:
-        """An attempt went to another runtime (a cascade): hold its slot, and
-        only its."""
-        if runtime == self._runtime:
-            return
-        self.release_seat()
-        if runtime is not None:
-            self._queue._take_seat(runtime)
-            self._runtime = runtime
-
     def release_seat(self) -> None:
         if self._runtime is not None:
             runtime, self._runtime = self._runtime, None
@@ -326,13 +323,24 @@ class Ticket:
 class FairQueue:
     """One per routing table (`of`). All bookkeeping is synchronous on the
     event loop, so a check and the reservation that follows it cannot be split
-    by another request."""
+    by another request.
+
+    What waits is kept in arrival order with counters beside it (by key, by
+    key and person, by runtime), so joining, leaving and the bounds cost the
+    same however long the line is, and a request that competes with nobody
+    leaves without a pass over it (`_free_now`).
+    """
 
     def __init__(self) -> None:
-        self._waiting: list[Entry] = []
+        self._waiting: dict[Entry, None] = {}
+        #: Waiting entries by key, by key and person, and by the runtimes they wait on.
+        self._waiting_keys: dict[str, int] = {}
+        self._waiting_flows: dict[tuple[str, str], int] = {}
+        self._waiting_runtimes: dict[Key, int] = {}
         self._key_running: dict[str, int] = {}
         self._seat_running: dict[Key, int] = {}
-        #: Keys the root refused for `concurrency`, until when.
+        #: Keys the root refused for `concurrency`, until when. Only while some
+        #: entry of the key waits: forgotten when the last one leaves.
         self._root_full: dict[str, float] = {}
         #: `(band, fairness)` -> the number of the turn it last had.
         self._turns: dict[tuple[str, str], int] = {}
@@ -385,6 +393,22 @@ class FairQueue:
 
     # --- waiting ----------------------------------------------------------
 
+    def _join(self, entry: Entry) -> asyncio.Future[Ticket]:
+        """Put `entry` in line, under both bounds. Raises `Refused`."""
+        if self._closed:
+            raise Refused(shutting_down())
+        future: asyncio.Future[Ticket] = asyncio.get_running_loop().create_future()
+        entry.future = future
+        if entry.joined is None:
+            self._seq += 1
+            entry.seq = self._seq
+            entry.joined = time.perf_counter()
+        self._add(entry)
+        # Every join is bounded, a return after a root refusal too: five that
+        # left together and came back together are five waiting.
+        self._bound(entry)
+        return future
+
     async def wait(self, entry: Entry) -> Ticket:
         """Wait until `entry` may leave, and answer what it holds then.
 
@@ -396,36 +420,65 @@ class FairQueue:
         """
         if self._closed:
             raise Refused(shutting_down())
-        loop = asyncio.get_running_loop()
-        entry.future = loop.create_future()
-        first = entry.joined is None
-        if first:
-            self._seq += 1
-            entry.seq = self._seq
-            entry.joined = time.perf_counter()
         started = time.perf_counter()
-        self._waiting.append(entry)
+        if entry.joined is None and self._free_now(entry):
+            # It competes with nobody waiting: no pass over the line.
+            entry.future = asyncio.get_running_loop().create_future()
+            self._seq += 1
+            entry.seq, entry.joined = self._seq, started
+            self._go(entry, self._room_now(entry))
+            return entry.future.result()
+        future = self._join(entry)
         try:
             self._dispatch()
-            if first and not entry.future.done():
-                self._bound(entry)
             joined = entry.joined if entry.joined is not None else started
             deadline = joined + entry.wait_seconds
-            while not entry.future.done():
+            while not future.done():
                 remaining = deadline - time.perf_counter()
                 if remaining <= 0:
                     break
-                await asyncio.wait({entry.future}, timeout=remaining)
+                await asyncio.wait({future}, timeout=remaining)
         except BaseException:
             entry.queued_s += time.perf_counter() - started
             self._withdraw(entry)
             raise
         entry.queued_s += time.perf_counter() - started
-        if not entry.future.done():
+        if not future.done():
             self._remove(entry)
             self.kick()
             raise Waited(entry)
-        return entry.future.result()
+        return future.result()
+
+    async def wait_for_start(
+        self,
+        entry: Entry,
+        runtime: Key,
+        poll: Callable[[], Awaitable[str | None]],
+        seconds: float,
+    ) -> str | None:
+        """Wait in line for a runtime that is coming up (WAKE).
+
+        The entry is counted by both bounds and by the Metrics page, and a
+        stop refuses it `shutting_down`; no pass lets it go, because what it
+        waits for is the one poll this runtime shares (`starting`). Answers the
+        runtime's last status. Raises `Refused`.
+        """
+        entry.starting = runtime
+        started = time.perf_counter()
+        future = self._join(entry)
+        polled = self.starting(runtime, poll, seconds)
+        try:
+            either: set[asyncio.Future[Any]] = {future, polled}
+            await asyncio.wait(either, return_when=asyncio.FIRST_COMPLETED)
+            if future.done():
+                future.result()  # set aside, or the gateway stopping: raises `Refused`
+            return await polled
+        finally:
+            entry.queued_s += time.perf_counter() - started
+            if entry in self._waiting:
+                self._remove(entry)
+            if not polled.done():
+                polled.cancel()  # the shield: the shared poll goes on for the others
 
     def undo(self, entry: Entry, ticket: Ticket) -> None:
         """An entry that was let go returns what it was given (its lease was
@@ -462,7 +515,8 @@ class FairQueue:
         self._dispatch()
 
     def close(self) -> None:
-        """Refuse every waiter `shutting_down`, and every later arrival."""
+        """Refuse every waiter `shutting_down`, those waiting for a starting
+        runtime too, and every later arrival."""
         self._closed = True
         for entry in list(self._waiting):
             self._remove(entry)
@@ -490,7 +544,7 @@ class FairQueue:
 
     def starting(
         self, runtime: Key, poll: Callable[[], Awaitable[str | None]], seconds: float
-    ) -> Awaitable[str | None]:
+    ) -> asyncio.Future[str | None]:
         """Wait for a runtime that is coming up: one poll for each runtime,
         shared by every request that meets it, until `poll` answers a status
         that is not coming up or `seconds` pass. Answers the last status."""
@@ -519,25 +573,80 @@ class FairQueue:
                 return status
             await asyncio.sleep(min(1.0, max(0.0, deadline - time.perf_counter())))
 
+    # --- the line's bookkeeping ---------------------------------------------
+
+    @staticmethod
+    def _gated(entry: Entry) -> list[Key]:
+        return [s.runtime for s in entry.seats if s.runtime is not None and s.gated]
+
+    def _add(self, entry: Entry) -> None:
+        self._waiting[entry] = None
+        if entry.key is not None:
+            self._waiting_keys[entry.key] = self._waiting_keys.get(entry.key, 0) + 1
+            flow = (entry.key, entry.fairness)
+            self._waiting_flows[flow] = self._waiting_flows.get(flow, 0) + 1
+        for runtime in self._gated(entry):
+            self._waiting_runtimes[runtime] = self._waiting_runtimes.get(runtime, 0) + 1
+
+    def _remove(self, entry: Entry) -> None:
+        if entry not in self._waiting:
+            return
+        del self._waiting[entry]
+        if entry.key is not None:
+            _drop(self._waiting_keys, entry.key)
+            _drop(self._waiting_flows, (entry.key, entry.fairness))
+            if entry.key not in self._waiting_keys:
+                # Nobody of this key waits: what the root said of it is moot.
+                self._root_full.pop(entry.key, None)
+        for runtime in self._gated(entry):
+            _drop(self._waiting_runtimes, runtime)
+
+    def _free_now(self, entry: Entry) -> bool:
+        """Whether `entry` may leave at once with no pass: nothing waiting
+        competes with it, for its key or for any runtime it may use."""
+        if self._closed or entry.starting is not None:
+            return False
+        competes = entry.key is not None and not entry.holds_key
+        if competes and (
+            self._waiting_keys.get(str(entry.key)) or not self._key_ok(entry, time.perf_counter())
+        ):
+            return False
+        seat = self._room_now(entry)
+        if entry.seats and seat is None:
+            return False
+        return seat is None or seat.runtime is None or not self._waiting_runtimes.get(seat.runtime)
+
+    def _room_now(self, entry: Entry) -> Seat | None:
+        """The first seat of `entry` with room now that nobody waiting claims."""
+        for seat in entry.seats:
+            if seat.runtime is not None and seat.gated and self._waiting_runtimes.get(seat.runtime):
+                continue
+            if self._has_room(seat, entry):
+                return seat
+        return None
+
     # --- the pass ---------------------------------------------------------
 
     def _ordered(self) -> list[Entry]:
         """By band; within a band, persons in turns (served longest ago
-        first); within a person, by arrival."""
+        first); within a person, by arrival. Work follows the entries: each
+        round takes one entry from each person who still has one."""
         flows: dict[tuple[str, str], list[Entry]] = {}
-        for entry in self._waiting:
+        for entry in sorted(self._waiting, key=lambda e: (e.arrived, e.seq)):
             flows.setdefault((entry.band, entry.fairness), []).append(entry)
         order: list[Entry] = []
         for band in sorted({flow[0] for flow in flows}, key=rank):
             mine = [(flow, entries) for flow, entries in flows.items() if flow[0] == band]
-            for _flow, entries in mine:
-                entries.sort(key=lambda e: (e.arrived, e.seq))
             mine.sort(key=lambda f: (self._turns.get(f[0], -1), f[1][0].arrived, f[1][0].seq))
-            depth = max(len(entries) for _flow, entries in mine)
-            for index in range(depth):
-                for _flow, entries in mine:
-                    if index < len(entries):
-                        order.append(entries[index])
+            active = [iter(entries) for _flow, entries in mine]
+            while active:
+                still: list[Iterator[Entry]] = []
+                for line in active:
+                    nxt = next(line, None)
+                    if nxt is not None:
+                        order.append(nxt)
+                        still.append(line)
+                active = still
         return order
 
     def _key_ok(self, entry: Entry, now: float) -> bool:
@@ -572,7 +681,7 @@ class FairQueue:
         waiting_on: dict[Key, int] = {}
         held_back: list[float] = []
         for entry in self._ordered():
-            if entry.future is None or entry.future.done():
+            if entry.future is None or entry.future.done() or entry.starting is not None:
                 continue
             if not self._key_ok(entry, now):
                 entry.blocked_by_room = False
@@ -597,6 +706,9 @@ class FairQueue:
             for runtime in gated:
                 claimed.add(runtime)
                 waiting_on[runtime] = waiting_on.get(runtime, 0) + 1
+        # What the root refused is kept only for keys still waiting, until due.
+        for key in [k for k, until in self._root_full.items() if k not in self._waiting_keys]:
+            del self._root_full[key]
         if held_back:
             self._arm(min(held_back))
         if len(self._turns) > TURNS_KEPT:
@@ -604,27 +716,41 @@ class FairQueue:
             self._turns = {flow: n for flow, n in self._turns.items() if flow in keep}
 
     def _go(self, entry: Entry, seat: Seat | None) -> None:
+        """Let `entry` leave on `seat`: count its key and its slot, take its
+        room, and hand it the ticket. A reservation that fails gives back what
+        was taken, and the entry's wait ends with that failure."""
         self._remove(entry)
+        assert entry.future is not None
         key = None
-        if entry.key is not None and not entry.holds_key:
-            key = entry.key
-            self._key_running[key] = self._key_running.get(key, 0) + 1
-        if seat is not None and seat.runtime is not None:
-            self._take_seat(seat.runtime)
-        if seat is not None and entry.reserve is not None:
-            entry.reserve(seat)
+        took_seat = False
+        try:
+            if entry.key is not None and not entry.holds_key:
+                self._key_running[entry.key] = self._key_running.get(entry.key, 0) + 1
+                key = entry.key
+            if seat is not None and seat.runtime is not None:
+                self._take_seat(seat.runtime)
+                took_seat = True
+            if seat is not None and entry.reserve is not None:
+                entry.reserve(seat)
+        except Exception as exc:
+            if took_seat and seat is not None and seat.runtime is not None:
+                self._give_seat(seat.runtime)
+            if key is not None:
+                self._give_key(key)
+            if not entry.future.done():
+                entry.future.set_exception(exc)
+            return
         self._turn += 1
         self._turns[(entry.band, entry.fairness)] = self._turn
-        assert entry.future is not None
         entry.future.set_result(Ticket(self, seat, key))
 
     def _bound(self, entry: Entry) -> None:
-        """The two bounds, for an entry that could not leave at once."""
+        """The two bounds, for an entry that has just joined the line."""
         if entry.key is not None and entry.max_queued is not None:
-            mine = [e for e in self._waiting if e.key == entry.key and e.fairness == entry.fairness]
-            if len(mine) > entry.max_queued:
+            mine = self._waiting_flows.get((entry.key, entry.fairness), 0)
+            if mine > entry.max_queued:
                 self._remove(entry)
-                raise Refused(key_queue_full(self._key_running.get(entry.key, 0), len(mine) - 1))
+                raise Refused(key_queue_full(self._key_running.get(entry.key, 0), mine - 1))
         if len(self._waiting) > entry.max_requests:
             others = [e for e in self._waiting if e is not entry]
             lowest = max(rank(e.band) for e in others)
@@ -639,10 +765,6 @@ class FairQueue:
             else:
                 self._remove(entry)
                 raise Refused(queue_full(len(others)))
-
-    def _remove(self, entry: Entry) -> None:
-        with contextlib.suppress(ValueError):
-            self._waiting.remove(entry)
 
     def _withdraw(self, entry: Entry) -> None:
         if entry in self._waiting:
@@ -659,22 +781,22 @@ class FairQueue:
         self._seat_running[runtime] = self._seat_running.get(runtime, 0) + 1
 
     def _give_seat(self, runtime: Key) -> None:
-        left = self._seat_running.get(runtime, 0) - 1
-        if left > 0:
-            self._seat_running[runtime] = left
-        else:
-            self._seat_running.pop(runtime, None)
+        _drop(self._seat_running, runtime)
         self.kick()
 
     def _give_key(self, key: str) -> None:
-        left = self._key_running.get(key, 0) - 1
-        if left > 0:
-            self._key_running[key] = left
-        else:
-            self._key_running.pop(key, None)
+        _drop(self._key_running, key)
         # A request of this key ended here, so a key the root refused asks again.
         self._root_full.pop(key, None)
         self.kick()
+
+
+def _drop[T](counts: dict[T, int], key: T) -> None:
+    left = counts.get(key, 0) - 1
+    if left > 0:
+        counts[key] = left
+    else:
+        counts.pop(key, None)
 
 
 def of(owner: Any) -> FairQueue:

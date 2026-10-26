@@ -448,11 +448,12 @@ async def test_an_empty_first_tier_is_passed_over_by_the_read_and_by_admit_alike
     client.budget.close()
 
 
-async def test_the_budget_is_read_for_the_front_tier_and_no_other():
-    """`_admit` orders the front tier and leaves the others in the balancer's order,
-    so when the front tier's only backend is cooling the walk goes to the next tier's
-    usual first, whoever has room there. A read that looked at room in every tier
-    would name the replica `_admit` never moves up. Checked against the real attempt."""
+async def test_a_fallback_tier_is_read_and_walked_to_its_replica_with_room():
+    """Rewritten for row 11's review (blocker 2). When the front tier's only backend
+    is cooling, the walk reaches the next tier as a fallback, and a fallback is let
+    go on a replica of its tier with room, as the first turn is: never into the
+    usual first, whose pool is full. The read that names who is asked first says
+    the same replica. Checked against the real attempt."""
     table, fakes = _slot_table("cooling")
     client = table.pick(table.resolve(SLOT), affinity="k:new")
     (ahead,) = client._tiers[0]
@@ -461,10 +462,10 @@ async def test_the_budget_is_read_for_the_front_tier_and_no_other():
     table._ledger.take(_pool(usual_first), 9_000)
 
     named = client.model_asked_first(_turn())
-    assert named is client.entries[usual_first], "the second tier is in its usual order"
+    assert named is client.entries[roomy], "the fallback tier's replica with room"
 
     await client.generate(_turn())
-    assert fakes[usual_first.name].calls and not fakes[roomy.name].calls, "and the attempt agrees"
+    assert fakes[roomy.name].calls and not fakes[usual_first.name].calls, "and the attempt agrees"
 
 
 def test_reading_who_is_asked_first_leaves_the_tiers_as_they_were():

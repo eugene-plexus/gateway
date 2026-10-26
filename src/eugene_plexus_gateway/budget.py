@@ -314,6 +314,12 @@ class TurnBudget:
         _chars, prompt, tokens = self._sized(request)
         return self._with_room(self.waiting_on(tier), prompt, tokens)
 
+    def first_in(self, request: Any, candidates: Sequence[Any]) -> Any | None:
+        """The first of `candidates` with room for this turn now, whatever its
+        conversation holds: a fallback tier, where no replica is its home. A read."""
+        _chars, prompt, tokens = self._sized(request)
+        return self._with_room(list(candidates), prompt, tokens)
+
     async def admit(self, request: Any, tier: Sequence[Any]) -> list[Any]:
         """A turn no queue holds: sized, put first where it fits now and its
         room reserved there; the usual order when nothing has room."""

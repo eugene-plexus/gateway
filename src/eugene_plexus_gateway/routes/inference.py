@@ -716,16 +716,30 @@ def _swap_wait_seconds(request: Request) -> float:
 async def _await_starting(
     request: Request, table: RoutingTable, facts: Any
 ) -> tuple[str | None, int]:
-    """Wait for a runtime that is coming up, up to `swapWaitSeconds`: one poll
-    of the routing table each second, shared by every request that meets it
-    (`fair_queue.FairQueue.starting`). Answers its last status and the wait."""
+    """Wait in line for a runtime that is coming up, up to `swapWaitSeconds`: one
+    poll of the routing table each second, shared by every request that meets it
+    (`fair_queue.FairQueue.starting`). In line, so both bounds count it and a stop
+    refuses it `shutting_down` (row 11 review, blocker 4). Answers the runtime's
+    last status and the wait."""
     began = time.perf_counter()
 
     async def poll() -> str | None:
         await table.refresh_if_stale(1.0)
         return next((r.status for r in table.runtimes() if r.key == facts.key), None)
 
-    status = await fair_queue.of(table).starting(facts.key, poll, _swap_wait_seconds(request))
+    seat = fair_queue.Seat(runtime=facts.key, model=facts.alias or facts.name, node=facts.node)
+    context = admission.current.get()
+    entry = (
+        context.entry(seats=[seat], model=facts.alias or facts.name)
+        if context is not None
+        else fair_queue.Entry(seats=[seat], model=facts.alias or facts.name)
+    )
+    try:
+        status = await fair_queue.of(table).wait_for_start(
+            entry, facts.key, poll, _swap_wait_seconds(request)
+        )
+    except fair_queue.Refused as exc:
+        raise admission.refused(exc.refusal) from None
     return status, int((time.perf_counter() - began) * 1000)
 
 
@@ -1371,7 +1385,10 @@ async def _prepare(
             # Row 11: a wake starts only when the key has its turn here, so a
             # key at its limit cannot start or stop runtimes. The lease taken
             # now is held through the wake and the turn that follows it.
-            await admission.take_turn(fair_queue.of(table), model=body.model)
+            try:
+                await admission.take_turn(fair_queue.of(table), model=body.model)
+            except fair_queue.Waited as timed_out:
+                raise admission.refused(timed_out.refusal) from None
             resolution = await resolve()
             client = table.pick(resolution, needs=needs, surface=only, affinity=conversation)
         if client is None and lifecycle is not None:

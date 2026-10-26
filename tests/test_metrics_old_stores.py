@@ -395,3 +395,40 @@ def test_a_store_that_cannot_be_set_aside_costs_the_metrics_and_nothing_else(
         assert client.get("/v1/metrics").status_code == 200
     assert requests_in(path.with_suffix(".v2.bak")) == [("qwen", "served")]
     assert schema_of(path) == str(SCHEMA_VERSION)
+
+
+async def test_an_interrupted_migration_is_finished_at_the_next_start(tmp_path):
+    """Row 11 review: a v13 store whose move to v14 stopped after its first new
+    column (a crash, a killed process) is finished at the next start, its
+    history kept, rather than failing on the column it already has and leaving
+    metrics off."""
+    path = tmp_path / "metrics.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(V13_DDL)
+        conn.execute("INSERT INTO meta VALUES ('schema_version', '13')")
+        conn.execute(
+            "INSERT INTO request (started_at, requested_model, attempts, total_ms, outcome)"
+            " VALUES (?, 'old-history', 1, 9, 'served')",
+            (datetime.now(UTC).isoformat(),),
+        )
+        conn.execute("ALTER TABLE request ADD COLUMN queued_ms INTEGER")  # then it stopped
+    store = MetricsStore(path)
+    await store.start()
+    row = a_request()
+    row.queued_ms, row.band, row.refusal, row.tier_moves, row.outran_reserve = (
+        5,
+        "background",
+        None,
+        1,
+        False,
+    )
+    store.record(row)
+    await store.aclose()
+    assert schema_of(path) == "14"
+    with sqlite3.connect(path) as conn:
+        columns = {c[1] for c in conn.execute("PRAGMA table_info(request)")}
+        assert {"queued_ms", "band", "refusal", "tier_moves", "outran_reserve"} <= columns
+        assert conn.execute(
+            "SELECT requested_model, queued_ms, band FROM request ORDER BY id"
+        ).fetchall() == [("old-history", None, None), ("new", 5, "background")]
+    assert not list(tmp_path.glob("*.bak"))

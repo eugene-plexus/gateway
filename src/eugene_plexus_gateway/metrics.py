@@ -229,6 +229,33 @@ _ADDED = {
 }
 
 
+def _add_columns(conn: sqlite3.Connection, version: int) -> None:
+    """Move a released store (v12, v13) to this schema in place, keeping its
+    history: the request columns each later schema added, and the version.
+
+    **One explicit transaction, and each column only when it is not there.**
+    In this module's connection mode `with conn` opens no transaction before an
+    `ALTER TABLE`, so a move cut short after its first column left that column
+    and the old version behind, and the next start failed on "duplicate column
+    name" with metrics off (row 11 review). Now a cut-short move rolls back, and
+    one that an older build left half done is finished.
+    """
+    present = {column[1] for column in conn.execute("PRAGMA table_info(request)")}
+    conn.execute("BEGIN")
+    try:
+        for later in range(version + 1, SCHEMA_VERSION + 1):
+            for column in _ADDED[later]:
+                if column.split()[0] not in present:
+                    conn.execute(f"ALTER TABLE request ADD COLUMN {column}")
+        conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),)
+        )
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
+
+
 _DDL = """
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -447,14 +474,7 @@ class MetricsStore:
             )
             conn.commit()
         elif int(row[0]) in (12, 13):
-            # Adds columns without discarding the existing dashboard history.
-            with conn:
-                for version in range(int(row[0]) + 1, SCHEMA_VERSION + 1):
-                    for column in _ADDED[version]:
-                        conn.execute(f"ALTER TABLE request ADD COLUMN {column}")
-                conn.execute(
-                    "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),)
-                )
+            _add_columns(conn, int(row[0]))
         elif int(row[0]) != SCHEMA_VERSION:
             # A version this build does not write: rename the file aside
             # and start fresh rather than refuse to boot. Metrics are

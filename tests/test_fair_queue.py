@@ -39,6 +39,10 @@ class Root(FakeAgent):
         self.per_minute = per_minute
         self.max_queued = max_queued
         self.band: str | None = None
+        #: Whether the key is local-only, as the operator set it now.
+        self.local_only = False
+        #: Seconds each acquire takes to answer, so several are in flight at once.
+        self.acquire_delay = 0.0
         #: A band for one key, beside `band` for every key.
         self.key_bands: dict[str, str] = {}
         self.person_bands: dict[str, str] = {}
@@ -63,6 +67,8 @@ class Root(FakeAgent):
             }
             if self.max_queued != 8:  # as the root writes it: only when not the default
                 limits["maxQueuedRequests"] = self.max_queued
+            if self.local_only:
+                limits["localOnly"] = True
             band = self.key_bands.get(key, self.band)
             if band is not None:
                 limits["band"] = band
@@ -88,6 +94,22 @@ class Root(FakeAgent):
                 if token in self.person_bands:
                     answer["queueBand"] = self.person_bands[token]
             return httpx.Response(200, json=answer)
+
+    def as_guard(self, **kwargs: Any) -> Any:
+        guard = super().as_guard(**kwargs)
+
+        async def handle(request: httpx.Request) -> httpx.Response:
+            admission = request.url.path.endswith("/admission")
+            if (
+                self.acquire_delay
+                and admission
+                and json.loads(request.content)["action"] == "acquire"
+            ):
+                await asyncio.sleep(self.acquire_delay)
+            return self._handle(request)
+
+        guard._client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+        return guard
 
 
 class Holding(FakeDriverClient):
@@ -789,3 +811,279 @@ def test_a_runtime_still_starting_is_refused_in_its_words(gateway, install, monk
     assert {r["refusal"] for r in rows} == {"still_starting"}
     assert all(r["outcome"] == "refused" for r in rows)
     assert not driver.calls
+
+
+# --- the review's ten findings (Codex, 2026-10-26) -----------------------------------
+
+
+def test_a_policy_changed_while_waiting_is_refused_not_forwarded(gateway, install):
+    """Blocker 1: the key is made local-only while a request waits. Its lease is
+    granted under the new policy, but the backend was chosen and the request
+    shaped under the old one: it is refused, never sent with `localOnly` false."""
+    root, driver = Root(limit=1), Holding(seconds=0.4)
+    app = gateway(root, driver)
+    headers = _key(install)
+    with TestClient(app) as c, ThreadPoolExecutor(2) as pool:
+        first = pool.submit(c.post, "/v1/chat/completions", json=_chat("one"), headers=headers)
+        time.sleep(0.1)
+        second = pool.submit(c.post, "/v1/chat/completions", json=_chat("two"), headers=headers)
+        time.sleep(0.1)
+        with root.lock:
+            root.local_only = True
+        refused = second.result(timeout=5)
+        assert refused.status_code == 409, refused.text
+        assert "changed while it waited" in refused.json()["error"]["message"]
+        assert first.result().status_code == 200
+    assert [call.messages[-1].content for call in driver.calls] == ["one"]
+    assert not root.active, "the refused request's lease was given back"
+
+
+@pytest.mark.parametrize("gate", ["slot", "pool"])
+async def test_a_fallback_waits_for_room_where_it_goes(gate):
+    """Blocker 2: the first replica fails, and the fallback's runtime is full. The
+    fallback waits in line for its slot (or its pool's room) like any turn,
+    instead of entering a runtime that has none."""
+    from eugene_plexus_gateway import fair_queue
+
+    from .conftest import runtime_facts
+
+    first = FakeDriverClient(name="a-driver", base_url="http://a", model_id=MODEL, runtime="ra")
+    second = FakeDriverClient(name="b-driver", base_url="http://b", model_id=MODEL, runtime="rb")
+    first.generate_error = httpx.ConnectError("refused")
+    pooled = {"context_pool": 10_000} if gate == "pool" else {}
+    table = make_routing_table(
+        first,
+        second,
+        runtimes=[
+            runtime_facts("ra", parallel_slots=1, **pooled),
+            runtime_facts("rb", parallel_slots=1, **pooled),
+        ],
+    )
+    queue = fair_queue.of(table)
+    rb = (None, "rb")
+    if gate == "slot":
+        queue._take_seat(rb)  # a request runs there now
+    else:
+        table._ledger.take(rb, 9_500)  # its pool is all but full
+    client = table.pick(table.resolve(MODEL))
+    task = asyncio.ensure_future(client.generate(_turn("x" * 3_500, max_tokens=1_000)))
+    await asyncio.sleep(0.2)
+    assert first.calls, "the first replica was tried"
+    assert not second.calls, "the fallback entered a runtime with no room"
+    assert queue.waiting() == 1
+    if gate == "slot":
+        queue._give_seat(rb)
+    else:
+        table._ledger.give(rb, 9_500)
+    await asyncio.wait_for(task, 2)
+    assert client.served_by == "b-driver"
+    assert queue.running(rb) == 0 and table._ledger.in_flight(rb) == 0
+
+
+def test_root_refusals_do_not_let_a_key_wait_past_its_bound(gateway, install):
+    """Blocker 3: five requests leave the line at once, and the root refuses all
+    five because another gateway holds the key's leases. One may wait (the key's
+    `maxQueuedRequests`), the others are refused, and the one is served when the
+    other gateway lets go."""
+    from eugene_plexus_gateway import fair_queue
+
+    root, driver = Root(limit=5, max_queued=1), Holding(seconds=0.05)
+    root.elsewhere["key-1"] = 5
+    root.acquire_delay = 0.3  # all five ask the root before any answer comes back
+    app = gateway(root, driver)
+    headers = _key(install)
+    with TestClient(app) as c, ThreadPoolExecutor(5) as pool:
+        futures = [
+            pool.submit(c.post, "/v1/chat/completions", json=_chat(f"r{n}"), headers=headers)
+            for n in range(5)
+        ]
+        most = 0
+        for _ in range(30):
+            most = max(most, fair_queue.of(app.state.routing).waiting())
+            time.sleep(0.05)
+        assert most <= 1, f"{most} waited for a key that allows 1"
+        with root.lock:
+            root.elsewhere.clear()
+        answers = [f.result(timeout=10) for f in futures]
+    assert sorted(a.status_code for a in answers) == [200, 429, 429, 429, 429]
+    assert {a.json()["error"]["code"] for a in answers if a.status_code == 429} == {
+        "key_queue_full"
+    }
+
+
+def test_requests_for_a_starting_runtime_wait_in_the_bounded_line(gateway, install, monkeypatch):
+    """Blocker 4: requests that meet a starting runtime wait in the line, so the
+    gateway's bound applies to them, the Metrics page counts them, and stopping
+    the gateway refuses them `shutting_down`."""
+    from eugene_plexus_gateway import admission, fair_queue
+    from eugene_plexus_gateway.app import close_queue
+    from eugene_plexus_gateway.routes import inference
+
+    monkeypatch.setattr(inference, "_swap_wait_seconds", lambda request: 30.0)
+    monkeypatch.setattr(admission, "queue_settings", lambda app: (60.0, 16))
+    app, driver = _starting_app(gateway, install, ready_after=None)
+    app.state.client_key_guard = Root(limit=64, max_queued=64).as_guard(ttl_seconds=0)
+    headers = _key(install)
+    with TestClient(app) as c, ThreadPoolExecutor(20) as pool:
+        futures = [
+            pool.submit(c.post, "/v1/chat/completions", json=_chat(f"s{n}"), headers=headers)
+            for n in range(20)
+        ]
+        queue = fair_queue.of(app.state.routing)
+        for _ in range(100):
+            if queue.waiting() == 16 and sum(f.done() for f in futures) == 4:
+                break
+            time.sleep(0.05)
+        assert queue.waiting() == 16, queue.waiting()
+        full = [f.result() for f in futures if f.done()]
+        assert [a.json()["error"]["code"] for a in full] == ["queue_full"] * 4
+        assert sum(sum(q["waiting"].values()) for q in queue.snapshot()) == 16
+        c.portal.call(close_queue, app)  # type: ignore[union-attr]
+        stopped = [f.result(timeout=5) for f in futures if f.result(timeout=5) not in full]
+    assert len(stopped) == 16
+    assert {(a.status_code, a.json()["error"]["code"]) for a in stopped} == {(503, "shutting_down")}
+    assert not driver.calls
+
+
+def test_a_key_turn_before_a_wake_that_runs_out_is_key_queue_timeout(
+    settings, install, monkeypatch
+):
+    """Should-fix 6: the key's turn a wake waits for ends in `key_queue_timeout`,
+    not an unhandled error."""
+    from eugene_plexus_gateway import admission
+
+    from .conftest import runtime_facts
+
+    monkeypatch.setattr(admission, "queue_settings", lambda app: (0.3, 256))
+    root = Root(limit=1)
+    busy = Holding(seconds=1.0, name="busy-driver", model_id="busy")
+    sleeper = FakeDriverClient(name="sleepy-driver", model_id=MODEL, runtime="sleepy")
+    app = create_app(settings=settings)
+    app.state.auth_state = install.auth_state()
+    app.state.client_key_guard = root.as_guard(ttl_seconds=0)
+    app.state.routing = make_routing_table(
+        busy,
+        sleeper,
+        runtimes=[runtime_facts("sleepy", status="stopped", start_on_demand=True)],
+    )
+
+    class Lifecycle:
+        async def wake(self, resolution: Any) -> Any:
+            raise AssertionError("a key at its limit started a runtime")
+
+        async def aclose(self) -> None:
+            return None
+
+    app.state.lifecycle = Lifecycle()
+    headers = _key(install)
+    with TestClient(app) as c, ThreadPoolExecutor(1) as pool:
+        running = pool.submit(
+            c.post, "/v1/chat/completions", json={**_chat("one"), "model": "busy"}, headers=headers
+        )
+        time.sleep(0.1)
+        answer = c.post("/v1/chat/completions", json=_chat("wake"), headers=headers)
+        assert answer.status_code == 429, answer.text
+        assert answer.json()["error"]["code"] == "key_queue_timeout"
+        assert running.result().status_code == 200
+
+
+async def test_a_failed_reservation_gives_back_what_it_took():
+    """Should-fix 7: a reservation that fails as an entry leaves takes nothing with it."""
+    from eugene_plexus_gateway import fair_queue
+
+    queue = fair_queue.FairQueue()
+    runtime = (None, "rt")
+
+    def broken(seat: Any) -> None:
+        raise RuntimeError("the ledger broke")
+
+    entry = fair_queue.Entry(
+        key="k", limit=2, seats=[fair_queue.Seat(runtime=runtime, slots=2)], reserve=broken
+    )
+    with pytest.raises(RuntimeError, match="the ledger broke"):
+        await queue.wait(entry)
+    assert queue.key_running("k") == 0 and queue.running(runtime) == 0
+    assert queue.waiting() == 0
+
+
+async def test_a_refused_key_is_forgotten_when_its_last_waiter_leaves():
+    """Should-fix 8: what the root refused is not kept once nobody waits for it."""
+    from eugene_plexus_gateway import fair_queue
+
+    queue = fair_queue.FairQueue()
+    queue.root_full("k")
+    with pytest.raises(fair_queue.Waited):
+        await queue.wait(fair_queue.Entry(key="k", limit=2, wait_seconds=0.1))
+    assert queue._root_full == {}
+    queue.root_full("k")
+    task = asyncio.ensure_future(queue.wait(fair_queue.Entry(key="k", limit=2)))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert queue._root_full == {}
+
+
+def _line(queue: Any, flows: list[int], runtime: Any = (None, "busy")) -> None:
+    """`flows[i]` waiting entries for person i, all held back by a full runtime."""
+    from eugene_plexus_gateway import fair_queue
+
+    loop = asyncio.new_event_loop()
+    try:
+        seat = fair_queue.Seat(runtime=runtime, slots=1)
+        queue._take_seat(runtime)
+        seq = 0
+        for person, depth in enumerate(flows):
+            for _ in range(depth):
+                seq += 1
+                entry = fair_queue.Entry(fairness=f"person:{person}", seats=[seat])
+                entry.seq, entry.joined, entry.future = seq, 0.0, loop.create_future()
+                queue._add(entry)
+    finally:
+        loop.close()
+
+
+def _cost(call: Any) -> float:
+    best = float("inf")
+    for _ in range(3):
+        began = time.perf_counter()
+        call()
+        best = min(best, time.perf_counter() - began)
+    return best
+
+
+def test_ordering_a_skewed_line_costs_about_what_an_even_one_does():
+    """Should-fix 9: one person with 4,000 waiting beside 96 with one each is
+    ordered in about the time one person with 4,096 is: the work follows the
+    entries, not depth times persons."""
+    from eugene_plexus_gateway import fair_queue
+
+    skewed, even = fair_queue.FairQueue(), fair_queue.FairQueue()
+    _line(skewed, [4_000] + [1] * 96)
+    _line(even, [4_096])
+    assert len(skewed._ordered()) == len(even._ordered()) == 4_096
+    assert _cost(skewed._ordered) <= 3 * _cost(even._ordered) + 0.005
+
+
+async def test_a_request_that_needs_no_wait_does_not_pay_for_the_line():
+    """Should-fix 9: with 4,096 waiting on a busy runtime, a request for a free one
+    that competes with none of them leaves without a pass over the line."""
+    from eugene_plexus_gateway import fair_queue
+
+    queue = fair_queue.FairQueue()
+    _line(queue, [4_000] + [1] * 96)
+    passes = 0
+    real = queue._dispatch
+
+    def counted() -> None:
+        nonlocal passes
+        passes += 1
+        real()
+
+    queue._dispatch = counted  # type: ignore[method-assign]
+    free = fair_queue.Seat(runtime=(None, "free"), slots=1)
+    began = time.perf_counter()
+    ticket = await queue.wait(fair_queue.Entry(key="other", limit=2, seats=[free]))
+    took = time.perf_counter() - began
+    assert ticket.seat is free and passes == 0, passes
+    assert took < 0.01, f"{took * 1000:.1f} ms for a request that waited for nothing"
+    ticket.release()

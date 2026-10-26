@@ -77,6 +77,19 @@ def refused(refusal: fair_queue.Refusal) -> AdmissionFailure:
     )
 
 
+#: The limits the queue reads, which a running or waiting request is not bound to.
+QUEUE_LIMITS = frozenset({"band", "maxQueuedRequests"})
+
+
+def bound_policy(access: dict[str, Any]) -> Any:
+    """What a request is routed and shaped under: the key's limits, but for the
+    queue's own (`QUEUE_LIMITS`), as the authority's policy digest reads them."""
+    limits = access.get("limits")
+    if not isinstance(limits, dict):
+        return limits
+    return {k: v for k, v in limits.items() if k not in QUEUE_LIMITS and v is not None}
+
+
 def queue_settings(app: Any) -> tuple[float, int]:
     """`(queueWaitSeconds, queueMaxRequests)` from the gateway's settings now."""
     store = getattr(getattr(app, "state", None), "config_store", None)
@@ -271,8 +284,21 @@ class ClientRequest:
             self.queued_s += entry.queued_s
 
     async def _acquire(self) -> None:
+        """Take the key's lease as the request leaves its line. The request was
+        routed and shaped under the policy it was checked with (its models, its
+        locality, its tools); one that changed while it waited is refused here,
+        never sent under the old one (row 11 review, blocker 1). Its lease is
+        given back by the middleware, as for any refusal after an acquire."""
+        checked = self.access
         self.attempted = True
-        self.access = await self.contact("acquire")
+        acquired = await self.contact("acquire")
+        if checked is not None and bound_policy(checked) != bound_policy(acquired):
+            raise AdmissionFailure(
+                409,
+                "This key's permissions or limits changed while it waited in line. "
+                "Send the request again.",
+            )
+        self.access = acquired
         self.ready.set()
 
     @property

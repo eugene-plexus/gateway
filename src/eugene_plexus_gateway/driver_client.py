@@ -1091,6 +1091,12 @@ def capacity_refused(exc: BaseException) -> bool:
     )
 
 
+def _available(candidate: Any) -> bool:
+    """Whether `candidate`'s circuit would take an attempt now (a read)."""
+    circuit = getattr(candidate, "circuit", None)
+    return circuit is None or circuit.available()
+
+
 def _cooling_error(delay: float = 1) -> DriverError:
     return DriverError(
         driver_name="routing",
@@ -1170,8 +1176,11 @@ class TieredClient:
         #: Whether an answer was longer than the room its turn held (CB-C2).
         #: None while nothing was held for it.
         self.outran_reserve: bool | None = None
-        #: The slot the current turn holds in the queue, moved with its attempts.
+        #: The slot the current turn holds in the queue. A fallback to another
+        #: runtime gives it back and waits in line for that runtime's own.
         self._ticket: Ticket | None = None
+        #: Whether a turn holds its place from the queue now (`_admit` to `_release`).
+        self._in_turn = False
         #: The conversation this turn continues, when it has a key: its
         #: last prompt is kept for the budget's next estimate, and a hit is
         #: told from an eviction by it (CB5). Set by `RoutingTable.pick`.
@@ -1294,11 +1303,63 @@ class TieredClient:
                     continue
                 raise admission.refused(waited.refusal) from None
             self._ticket = ticket
+            self._in_turn = True
             seat = ticket.seat if ticket is not None else None
             if seat is not None and index is not None and seat.candidate in self._tiers[index]:
                 chosen = seat.candidate
                 self._tiers[index] = [chosen, *(c for c in self._tiers[index] if c is not chosen)]
             return
+
+    async def _admit_attempt(
+        self, candidate: DriverClient, rest: Sequence[DriverClient] = ()
+    ) -> DriverClient:
+        """Every attempt is admitted where it goes (row 11 review, blocker 2), and
+        answers the candidate it was let go on.
+
+        The first went where `_admit` let it. A fallback gives back the slot and
+        room it held and waits in line for its own, by the request's band, person
+        and arrival, like any turn: on `candidate`, or on the rest of its tier
+        (`rest`, whose circuits would take an attempt), whichever has room first,
+        as the first turn waits on its tier. A failed attempt must not walk into a
+        runtime with no free slot or no room in its pool. With no queue (a client
+        built by hand) only the room moves, as before.
+        """
+        from . import admission
+        from .fair_queue import Waited
+
+        if not self._in_turn:
+            if self.budget is not None:
+                self.budget.enter(candidate)
+            return candidate
+        held = self._ticket.seat if self._ticket is not None else None
+        stays = held is not None and held.candidate is candidate
+        if stays:
+            return candidate
+        if self._ticket is not None:
+            self._ticket.release_seat()
+            self._ticket = None
+        budget = self.budget
+        if budget is not None:
+            budget.unreserve()
+        tier = [candidate, *(c for c in rest if _available(c))]
+        try:
+            self._ticket = await admission.take_turn(
+                self.queue,
+                seats=[self._seat(c) for c in tier],
+                model=self.name,
+                prompt=budget.prompt if budget is not None else 0,
+                tokens=budget.tokens if budget is not None else 0,
+                reserve=(lambda seat: budget.reserve_on(seat.candidate))
+                if budget is not None
+                else None,
+                unreserve=budget.unreserve if budget is not None else None,
+                wait_seconds=self.queue_wait_seconds,
+            )
+        except Waited as waited:
+            raise admission.refused(waited.refusal) from None
+        seat = self._ticket.seat if self._ticket is not None else None
+        chosen = seat.candidate if seat is not None else None
+        return next((c for c in tier if c is chosen), candidate)
 
     def model_asked_first(self, request: GenerateRequest) -> DriverModel | None:
         """The model entry of the backend this request's first attempt goes to.
@@ -1344,14 +1405,13 @@ class TieredClient:
             if ahead is not None:
                 tiers[index] = [ahead, *(c for c in tiers[index] if c is not ahead)]
         first = Executor.first_to_try(tiers)
+        if first is not None and self.budget is not None and first not in tiers[index or 0]:
+            # The walk passed the front tier by (its circuits cool): a fallback is
+            # let go on the replica of its tier with room (`_admit_attempt`).
+            tier = next(t for t in tiers if first in t)
+            rest = [c for c in tier[tier.index(first) :] if _available(c)]
+            first = self.budget.first_in(request, rest) or first
         return self.entries.get(first) if first is not None else None
-
-    def _enter(self, candidate: DriverClient) -> None:
-        if self.budget is not None:
-            self.budget.enter(candidate)
-        if self._ticket is not None:
-            # A cascade holds the slot of the runtime it went to, and only its.
-            self._ticket.move(self._seat(candidate).runtime)
 
     def _served(self, usage: Any, candidate: DriverClient, request: GenerateRequest) -> None:
         """What the answer said about the cache: remember this conversation's
@@ -1391,6 +1451,7 @@ class TieredClient:
         self.outran_reserve = bool(self.outran_reserve) or answer > budget.room
 
     def _release(self) -> None:
+        self._in_turn = False
         if self.budget is not None:
             self.budget.close()
         if self._ticket is not None:
