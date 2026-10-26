@@ -323,9 +323,12 @@ def test_an_image_url_is_never_fetched(settings: Settings) -> None:
     assert "169.254" not in message, "a caller's URL is never reflected"
 
 
-def test_a_files_api_reference_is_refused(settings: Settings) -> None:
+def test_a_files_api_reference_to_no_file_of_the_callers_is_refused(settings: Settings) -> None:
+    """Row 53: a Files API id is read from the caller's own files in the
+    install's store; one the caller does not have is refused, naming it."""
     block = {"type": "image", "source": {"type": "file", "file_id": "file_011"}}
-    assert "base64" in refused(settings, claude_code_read([block]))
+    message = refused(settings, claude_code_read([block]))
+    assert "messages.2.content.0.content.0.source.file_id: no such file: file_011" in message
 
 
 def test_an_unsupported_media_type_is_refused(settings: Settings) -> None:

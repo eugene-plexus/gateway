@@ -27,6 +27,7 @@ from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS, ConfigStore
 from .control_tokens import SpecialTokenSpellings
 from .cors import FrontDoorCors
 from .dependencies import require_operator
+from .library_cache import LibraryCache
 from .lifecycle import AgentLifecycleClient, LifecycleManager
 from .metrics import MetricsStore
 from .outbound import Outbound
@@ -35,6 +36,7 @@ from .routes import admin as admin_routes
 from .routes import config as config_routes
 from .routes import health as health_routes
 from .routes import inference as inference_routes
+from .routes import info as info_routes
 from .routes import metrics as metrics_routes
 from .routes import roles as roles_routes
 from .routes import web_search as web_search_routes
@@ -151,6 +153,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     profiles: ProfileDefaults | None = None
     spellings: SpecialTokenSpellings | None = None
     lifecycle: LifecycleManager | None = None
+    saved = LibraryCache(settings.config_file.parent / "library-cache.json")
+    app.state.library_cache = saved
     if not hasattr(app.state, "routing"):
         if settings.safe_mode:
             # No table at all in safe mode, rather than an empty one:
@@ -180,9 +184,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             app.state.routing = table
             owns_routing = True
-            profiles = ProfileDefaults(settings.agent_url, auth_state.service_token, store.get)
+            profiles = ProfileDefaults(
+                settings.agent_url, auth_state.service_token, store.get, saved=saved
+            )
             app.state.profile_defaults = profiles
-            spellings = SpecialTokenSpellings(settings.agent_url, auth_state.service_token)
+            spellings = SpecialTokenSpellings(
+                settings.agent_url, auth_state.service_token, saved=saved
+            )
             app.state.special_tokens = spellings
             # Awaited, so the gateway is routable the moment it serves.
             await table.start()
@@ -200,10 +208,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        store_client = getattr(app.state, "store_client", None)
+        if store_client is not None:
+            await store_client.aclose()
         if profiles is not None:
             await profiles.aclose()
         if spellings is not None:
             await spellings.aclose()
+        await saved.aclose()
         if lifecycle is not None:
             await lifecycle.aclose()
         if owns_routing and app.state.routing is not None:
@@ -244,6 +256,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(config_routes.router, dependencies=operator_only)
     app.include_router(roles_routes.router, dependencies=operator_only)
     app.include_router(admin_routes.router, dependencies=operator_only)
+    app.include_router(info_routes.router, dependencies=operator_only)
     # Metrics are operator-only too, and unlike other reads they do not
     # accept a service token: no component needs them, and model names
     # plus traffic volumes are not nothing on a shared tailnet.
@@ -254,6 +267,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # router's own routes, so this is just the mount.
     app.include_router(inference_routes.router)
     app.include_router(web_search_routes.router)
+    # Row 53: OpenAI's Files and Uploads, and Anthropic's Files API, over the
+    # install's store. Each verifies its caller in its own body (`files_door`).
+    from . import files_door
+
+    app.include_router(files_door.router)
 
     # CORS on the three OpenAI-compatible paths, and on nothing else, so a
     # browser-based client -- the playground's direct mode among them --
@@ -261,6 +279,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Configured live from the store; see `cors.py`.
     from .admission import ClientAdmissionMiddleware
     from .body_limit import InferenceBodyLimit
+    from .gemini import BODY_PATHS, QueryKeyRedaction
+    from .gemini_body_limit import GeminiBodyLimit
 
     app.add_middleware(ClientAdmissionMiddleware)
     app.add_middleware(FrontDoorCors)
@@ -272,7 +292,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # belongs here.
     app.add_middleware(
         InferenceBodyLimit,
-        paths={
+        paths=set(BODY_PATHS)
+        | {
             "/v1/chat/completions",
             "/v1/web_search",
             "/v1/messages",
@@ -286,6 +307,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "/v1/systemone",
             "/v1/responses",
             "/v1/responses/input_tokens",
+            "/v1/responses/compact",
             "/v1/audio/speech",
             # P4: a generation is a small JSON body; variations only refuse.
             "/v1/images/generations",
@@ -308,4 +330,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "/v1/videos": 36 * 1024 * 1024,
         },
     )
+    app.add_middleware(GeminiBodyLimit)
+    # The files doors carry an id in their paths, which the shared limit
+    # (exact paths) cannot match.
+    app.add_middleware(files_door.FilesBodyLimit)
+    app.add_middleware(QueryKeyRedaction)
     return app

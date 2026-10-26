@@ -216,15 +216,15 @@ FIELDS: list[ConfigField] = [
     ),
     ConfigField(
         key="profileMaxStaleSeconds",
-        label="Profile outage grace period",
+        label="Use saved settings during a Library outage",
         description=(
-            "Seconds after cache expiry to keep the last profile defaults when Library "
-            "cannot answer. Then gateway defaults apply. Zero disables stale reuse. "
-            "Lookup failures and fallback choices are logged."
+            "Blank, the default, keeps the last known settings with no time limit while "
+            "the Library cannot answer. A number limits seconds after cache expiry, "
+            "then gateway defaults apply. Zero never uses saved settings."
         ),
         category="generation",
         valueType=ConfigValueType.duration,
-        default=300.0,
+        default=None,
         minimum=0,
         maximum=86400,
     ),
@@ -321,6 +321,18 @@ FIELDS: list[ConfigField] = [
             '"claude-opus-4-7"]}]`'
         ),
         category="lifecycle",
+        valueType=ConfigValueType.model_slots,
+        default=[],
+    ),
+    ConfigField(
+        key="geminiModelNames",
+        label="Gemini model names",
+        description=(
+            "Map a Gemini client model name to one model id or role. "
+            "Known Eugene model ids are used directly. Other names use the Chat role. "
+            "Each entry has a model name and one target, such as role:chat."
+        ),
+        category="routing",
         valueType=ConfigValueType.model_slots,
         default=[],
     ),
@@ -728,6 +740,16 @@ def _validate_value(field: ConfigField, value: Any) -> str | None:
         return None
 
     if vt == ConfigValueType.model_slots:
+        if field.key == "geminiModelNames":
+            if reason := _validate_model_slots(value):
+                return reason
+            for item in value:
+                if len(item["targets"]) != 1:
+                    return "geminiModelNames: each model must have exactly one target"
+                target = item["targets"][0]
+                if target.startswith("role:") and target.removeprefix("role:") not in ModelRole:
+                    return f"geminiModelNames: unknown role {target!r}"
+            return None
         return _validate_model_slots(value)
 
     return f"unsupported valueType: {vt}"
@@ -801,6 +823,9 @@ class ConfigStore:
                     # after an invalid hand edit. Bad repetition settings use
                     # their defaults, just as Policy.resolve does.
                     if k.startswith("repetition") and _validate_value(field, merged[k]):
+                        merged[k] = field.default
+                    if k == "geminiModelNames" and (cause := _validate_value(field, merged[k])):
+                        log.warning("geminiModelNames: %s; using the empty mapping", cause)
                         merged[k] = field.default
                 self._values = merged
                 self._settle_load_balancing_locked(raw.get("loadBalancing"))

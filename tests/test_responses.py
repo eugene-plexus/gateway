@@ -677,7 +677,8 @@ def test_a_text_only_backend_is_refused_rather_than_answering_blind(settings: Se
     [
         {"type": "input_image", "image_url": "https://example.com/cat.png"},
         {"type": "input_image", "file_id": "file-abc"},
-        # An inline PDF is carried since P2 (2026-09-28); a file id and a URL are not.
+        # An inline PDF is carried since P2 (2026-09-28), a stored file since row 53
+        # (here the caller has none by that id); a URL is not.
         {"type": "input_file", "file_id": "file-abc"},
         {"type": "input_file", "file_url": "https://example.com/a.pdf"},
     ],

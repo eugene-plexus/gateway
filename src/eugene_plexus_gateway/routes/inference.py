@@ -45,9 +45,12 @@ from .. import (
     affinity,
     anthropic,
     chat_contract,
+    compaction,
     completion_door,
     control_tokens,
     decisions,
+    files_door,
+    gemini,
     ignored_settings,
     image_doors,
     moderation_door,
@@ -122,8 +125,6 @@ from .._generated.models import (
     EmbeddingRequest,
     EmbeddingResponse,
     EmbeddingUsage,
-    FinishReason,
-    FunctionCall,
     FunctionCallDelta,
     ModelList,
     ModelListInfo,
@@ -133,8 +134,6 @@ from .._generated.models import (
     OutputCapSource,
     PromptTokensDetails,
     ResponseFormat,
-    Role1,
-    Role2,
     SpeechFormat,
     SpeechRequest,
     StreamProgress,
@@ -147,7 +146,11 @@ from .._generated.models import (
     ToolCallDelta,
     WebSearchAvailability,
 )
+from .._generated.models import FinishReason1 as FinishReason
+from .._generated.models import FunctionCallModel as FunctionCall
 from .._generated.models import Phase as StreamPhase
+from .._generated.models import Role2 as Role1
+from .._generated.models import Role3 as Role2
 from .._generated.models import Stage as StreamStage
 from ..capabilities import calls_tools, tools_refused
 from ..config import ConfigStore
@@ -709,8 +712,11 @@ def _not_ready(resolution: Resolution, wake: WakeResult | None) -> _Failure:
 # --------------------------------------------------------------------------- #
 
 
-@router.get("/v1/models", response_model=ModelList, dependencies=_auth)
-async def list_models(request: Request) -> ModelList:
+@router.get("/v1beta/models")
+@router.get("/v1/models", response_model=ModelList)
+async def list_models(request: Request) -> Any:
+    if denied := await gemini.authorize(request):
+        return denied
     await admission.authorize(request)
     context = admission.current.get()
     table = _routing(request)
@@ -720,18 +726,41 @@ async def list_models(request: Request) -> ModelList:
     if table is None and getattr(request.app.state, "safe_mode", False):
         reason = "this gateway is in safe mode, which routes nothing and runs no search"
     info = ModelListInfo(web_search=WebSearchAvailability(available=reason is None, reason=reason))
-    if table is None:
-        return ModelList(object="list", data=[], x_eugene_plexus=info)
+    listed = (
+        table.as_model_list(
+            context.allowed_models if context else None, local_only=admission.local_only()
+        )
+        if table is not None
+        else []
+    )
+    try:
+        listed, next_token = gemini.page(request, listed)
+    except gemini.Refusal as exc:
+        if gemini.is_request(request.scope):
+            return gemini.error_response(400, exc.message)
+        return _error(code=400, message=exc.message, error_type="invalid_request_error")
+    projection = [gemini.project(m) for m in listed]
+    for model, projected in zip(listed, projection, strict=True):
+        for name, value in projected.model_dump(exclude_none=True).items():
+            setattr(model, name, value)
+    if request.url.path.startswith("/v1beta/"):
+        return JSONResponse(
+            {
+                "models": [m.model_dump(exclude_none=True) for m in projection],
+                **({"nextPageToken": next_token} if next_token else {}),
+            }
+        )
     return ModelList(
         object="list",
-        data=table.as_model_list(
-            context.allowed_models if context else None, local_only=admission.local_only()
-        ),
+        data=listed,
+        models=projection,
+        nextPageToken=next_token,
         x_eugene_plexus=info,
     )
 
 
-@router.get("/v1/models/{model:path}", dependencies=_auth)
+@router.get("/v1beta/models/{model:path}")
+@router.get("/v1/models/{model:path}")
 async def retrieve_model(request: Request, model: str) -> Any:
     """One model, exactly as `GET /v1/models` lists it for this caller (P6).
 
@@ -740,6 +769,8 @@ async def retrieve_model(request: Request, model: str) -> Any:
     not use is the same 404 as one that does not exist, so a scoped key
     learns nothing of what it cannot reach.
     """
+    if denied := await gemini.authorize(request):
+        return denied
     await admission.authorize(request)
     context = admission.current.get()
     table = _routing(request)
@@ -751,15 +782,227 @@ async def retrieve_model(request: Request, model: str) -> Any:
         else []
     )
     found = next((m for m in listed if m.id == model), None)
+    if found is None and table is not None and gemini.is_request(request.scope):
+        resolved = gemini.resolve(model, table, _store(request))
+        target = next((m for m in listed if m.id == resolved), None)
+        if target is not None and (model != resolved or request.url.path.startswith("/v1beta/")):
+            found = target.model_copy(update={"id": model})
     if found is None:
+        if gemini.is_request(request.scope):
+            return gemini.error_response(404, f"model {model!r}: no permitted backend serves it.")
         return _no_such_model(model, table).as_openai()
     # Serialised as the list serialises it, so the two are the same object.
-    return JSONResponse(content=found.model_dump(mode="json"))
+    projection = gemini.project(found)
+    if request.url.path.startswith("/v1beta/"):
+        return JSONResponse(content=projection.model_dump(exclude_none=True))
+    return JSONResponse(
+        content={**found.model_dump(mode="json"), **projection.model_dump(exclude_none=True)}
+    )
 
 
 # --------------------------------------------------------------------------- #
 # /v1/chat/completions
 # --------------------------------------------------------------------------- #
+
+
+def _gemini_failure(failure: _Failure) -> JSONResponse:
+    result = gemini.error_response(failure.code, failure.message)
+    result.headers.update(
+        {
+            k: v
+            for k, v in failure.as_openai().headers.items()
+            if k not in {"content-length", "content-type"}
+        }
+    )
+    return result
+
+
+@router.post("/v1beta/models/{model:path}:generateContent")
+@router.post("/v1/models/{model:path}:generateContent")
+@router.post("/v1beta/models/{model:path}:streamGenerateContent")
+@router.post("/v1/models/{model:path}:streamGenerateContent")
+@router.post("/v1beta/models/{model:path}:countTokens")
+@router.post("/v1/models/{model:path}:countTokens")
+async def create_gemini_content(request: Request, model: str) -> Any:
+    if denied := await gemini.authorize(request):
+        return denied
+    try:
+        raw = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        return gemini.error_response(400, "body: must be valid JSON.")
+    method = request.url.path.rsplit(":", 1)[-1]
+    stream = method == "streamGenerateContent"
+    if stream and request.query_params.get("alt") != "sse":
+        return gemini.error_response(400, "alt: streamGenerateContent requires alt=sse.")
+    target = gemini.resolve(model, _routing(request), _store(request))
+    if method == "countTokens" and isinstance(raw, dict):
+        if set(raw) - {"contents", "generateContentRequest"}:
+            return gemini.error_response(
+                400,
+                "countTokens: unknown field(s): "
+                + ", ".join(sorted(set(raw) - {"contents", "generateContentRequest"})),
+            )
+        nested = raw.get("generateContentRequest")
+        if nested is not None:
+            if not isinstance(nested, dict):
+                return gemini.error_response(400, "generateContentRequest: must be an object.")
+            if nested.get("model") is not None and not isinstance(nested["model"], str):
+                return gemini.error_response(400, "generateContentRequest.model: must be a string.")
+            if (
+                nested.get("model")
+                and gemini.resolve(nested["model"], _routing(request), _store(request)) != target
+            ):
+                return gemini.error_response(
+                    400, "generateContentRequest.model: differs from the URL model."
+                )
+            if "contents" in raw and raw["contents"] != nested.get("contents"):
+                return gemini.error_response(
+                    400, "contents: conflicts with generateContentRequest.contents."
+                )
+            raw = nested
+    try:
+        body, ignored, thoughts = gemini.translate(
+            raw, target, stream=stream, max_images=max_images(_store(request))
+        )
+    except gemini.Refusal as exc:
+        return gemini.error_response(400, exc.message)
+    if method == "countTokens":
+        counted = await _counted(request, body)
+        if counted.failure:
+            return _gemini_failure(counted.failure)
+        if counted.rejected or counted.reason:
+            return gemini.error_response(400, f"countTokens: {counted.rejected or counted.reason}")
+        return JSONResponse({"totalTokens": counted.tokens}, headers=counted.headers)
+    plan = (
+        server_tools.plan_from_chat(body.web_search_options, has_tools=bool(body.tools))
+        if body.web_search_options is not None
+        else None
+    )
+    if plan is not None:
+        plan.when_blocked = "refuse"
+    prepared = await _prepare(request, body, surface="chat", instead="/v1/embeddings", search=plan)
+    if isinstance(prepared, _Failure):
+        return _gemini_failure(prepared)
+    own = {"x-eugene-plexus-ignored-settings": ", ".join(ignored)} if ignored else {}
+    if stream:
+
+        def headers_for_stream() -> dict[str, str]:
+            return {
+                **anthropic.envelope_headers(
+                    _routing_info(
+                        prepared.client,
+                        prepared.table,
+                        body.model,
+                        prepared.started,
+                        waited_ms=prepared.waited_ms,
+                        swapped_in=prepared.swapped_in,
+                    )
+                ),
+                **ignored_settings.added_to(own, prepared.not_honoured_by_answer(), "gemini"),
+                "x-eugene-plexus-model": getattr(prepared.client, "served_model", None)
+                or body.model,
+            }
+
+        return gemini.StreamResponse(_stream_gemini(body, prepared, thoughts), headers_for_stream)
+    with collect_attempts() as tries:
+        try:
+            response = await serve_while_connected(
+                request, prepared.client.generate(prepared.generate), what="a Gemini message"
+            )
+        except (ClientGone, DriverError, httpx.HTTPError) as exc:
+            _record(prepared.rec, body, tries)
+            return _gemini_failure(_serve_failure(exc, body, _store(request)))
+        _record(
+            prepared.rec,
+            body,
+            tries,
+            served_model=response.modelId or body.model,
+            tier=getattr(prepared.client, "tier", 1),
+            usage=response.usage,
+            backend_ms=response.latencyMs,
+            client=prepared.client,
+        )
+        try:
+            content = gemini.response_of(response, body.model, thoughts)
+        except gemini.Refusal as exc:
+            return gemini.error_response(502, exc.message)
+        routing = _routing_info(
+            prepared.client,
+            prepared.table,
+            body.model,
+            prepared.started,
+            waited_ms=prepared.waited_ms,
+            swapped_in=prepared.swapped_in,
+        )
+        headers = {
+            **anthropic.envelope_headers(routing),
+            **ignored_settings.added_to(own, prepared.not_honoured_by_answer(), "gemini"),
+            "x-eugene-plexus-model": response.modelId or body.model,
+        }
+        return JSONResponse(content, headers=headers)
+
+
+async def _stream_gemini(
+    body: ChatCompletionRequest, prepared: _Serving, thoughts: bool
+) -> AsyncIterator[str]:
+    def frame(content: dict[str, Any]) -> str:
+        return "data: " + json.dumps(content) + "\n\n"
+
+    with collect_attempts() as tries:
+        response: GenerateResponse | None = None
+        try:
+            async for event in prepared.client.stream(prepared.generate):
+                if event.done:
+                    response = event.result
+                    continue
+                parts: list[dict[str, Any]] = []
+                if event.text:
+                    parts.append({"text": event.text})
+                if event.reasoning and thoughts:
+                    parts.append({"text": event.reasoning, "thought": True})
+                if parts:
+                    # Tool fragments are JSON strings, while Gemini requires objects.
+                    # Emit complete calls once, from the driver's terminal result.
+                    served = getattr(prepared.client, "served_model", None) or body.model
+                    yield frame(
+                        {
+                            "candidates": [
+                                {"index": 0, "content": {"role": "model", "parts": parts}}
+                            ],
+                            "modelVersion": served,
+                        }
+                    )
+        except (DriverError, httpx.HTTPError) as exc:
+            _record(prepared.rec, body, tries)
+            failure = _serve_failure(exc, body, None)
+            detail = (
+                f"{failure.message} Observed cause: {exc}."
+                if isinstance(exc, httpx.HTTPError)
+                else failure.message
+            )
+            yield frame(gemini.error_body(failure.code, detail))
+            return
+        _record(
+            prepared.rec,
+            body,
+            tries,
+            served_model=response.modelId if response else None,
+            tier=getattr(prepared.client, "tier", 1),
+            usage=response.usage if response else None,
+            backend_ms=response.latencyMs if response else None,
+            client=prepared.client,
+        )
+        if response is None:
+            yield frame(
+                gemini.error_body(
+                    502, "The backend stream ended without a done result; the answer is partial."
+                )
+            )
+            return
+        try:
+            yield frame(gemini.response_of(response, body.model, thoughts, text=False))
+        except gemini.Refusal as exc:
+            yield frame(gemini.error_body(502, exc.message))
 
 
 @dataclass(slots=True)
@@ -1248,6 +1491,10 @@ async def create_chat_completion(request: Request) -> Any:
             error_type="invalid_request_error",
             param="body",
         )
+    resolved = await files_door.resolve_file_ids(request, raw, door="chat")
+    if isinstance(resolved, Response):
+        return resolved
+    raw = resolved
     try:
         body = await run_in_threadpool(
             lambda: chat_contract.parse_request(raw, max_images=max_images(_store(request)))
@@ -1575,6 +1822,10 @@ async def create_anthropic_message(request: Request) -> Any:
         return anthropic.error_response(400, "The request body is not valid JSON.")
     if not isinstance(raw, dict):
         return anthropic.error_response(400, "The request body must be a JSON object.")
+    resolved = await files_door.resolve_file_ids(request, raw, door="messages")
+    if isinstance(resolved, Response):
+        return resolved
+    raw = resolved
 
     try:
         body = anthropic.translate_request(raw, max_images=max_images(_store(request)))
@@ -1783,6 +2034,10 @@ async def count_anthropic_message_tokens(request: Request) -> Any:
         return anthropic.error_response(400, "The request body is not valid JSON.")
     if not isinstance(raw, dict):
         return anthropic.error_response(400, "The request body must be a JSON object.")
+    resolved = await files_door.resolve_file_ids(request, raw, door="messages")
+    if isinstance(resolved, Response):
+        return resolved
+    raw = resolved
     try:
         body = anthropic.translate_count_request(raw, max_images=max_images(_store(request)))
     except anthropic.Refusal as refusal:
@@ -1809,6 +2064,7 @@ class _Count:
     failure: _Failure | None = None
     rejected: str | None = None
     reason: str | None = None
+    headers: dict[str, str] | None = None
 
 
 async def _counted(request: Request, body: ChatCompletionRequest) -> _Count:
@@ -1842,6 +2098,7 @@ async def _counted(request: Request, body: ChatCompletionRequest) -> _Count:
 
 
 async def _count_with_a_backend(request: Request, body: ChatCompletionRequest) -> _Count:
+    started = time.perf_counter()
     table = _routing(request)
     if table is None:
         return _Count(reason="the gateway is starting or in safe mode")
@@ -1860,11 +2117,12 @@ async def _count_with_a_backend(request: Request, body: ChatCompletionRequest) -
     if body.tools and not _any_backend_carries_tools(resolution):
         return _Count(failure=_tools_unsupported(body.model, len(resolution.backends())))
     kinds = attachment_kinds(body.messages)
-    if "image" in kinds:
+    native_count = any(b.info.backend.value == "gemini_api" for b in resolution.backends())
+    if "image" in kinds and not native_count:
         return _Count(
             reason="an image's token cost is decided by the projector when it encodes the picture"
         )
-    if kinds:
+    if kinds and not native_count:
         return _Count(reason="an attachment's token cost is decided by the encoder that reads it")
 
     client = table.pick(resolution)
@@ -1891,7 +2149,10 @@ async def _count_with_a_backend(request: Request, body: ChatCompletionRequest) -
         return _Count(reason=detail)
     except httpx.HTTPError as e:
         return _Count(reason=f"its backend could not be reached ({type(e).__name__})")
-    return _Count(tokens=tokens)
+    return _Count(
+        tokens=tokens,
+        headers=anthropic.envelope_headers(_routing_info(client, table, body.model, started)),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1922,6 +2183,7 @@ async def _stream_responses(
         echo=translated.echo,
         include_reasoning=translated.include_reasoning,
         namespaces=translated.namespaces,
+        client_tools=translated.client_tools,
     )
     for chunk in translator.start():
         yield chunk
@@ -1957,6 +2219,11 @@ async def _stream_responses(
                 if event.text:
                     for chunk in translator.text(event.text):
                         yield chunk
+        except responses.Refusal as refusal:
+            _record(prepared.rec, body, tries)
+            for chunk in translator.failed(refusal.message, code="server_error"):
+                yield chunk
+            return
         except (DriverError, httpx.HTTPError) as e:
             log.warning("responses stream for %r failed: %s", body.model, e)
             _record(prepared.rec, body, tries)
@@ -1997,10 +2264,109 @@ async def _stream_responses(
         _warn_if_truncated(
             truncated, body, response.usage, getattr(prepared.client, "served_by", None), window
         )
-        for chunk in translator.finish(
-            model=served_model, finish=response.finishReason, usage=response.usage
-        ):
+        try:
+            frames = translator.finish(
+                model=served_model, finish=response.finishReason, usage=response.usage
+            )
+        except responses.Refusal as refusal:
+            frames = translator.failed(refusal.message, code="server_error")
+        for chunk in frames:
             yield chunk
+
+
+def _compaction_sealer(request: Request) -> compaction.Sealer:
+    settings = request.app.state.settings
+    return compaction.Sealer(settings.config_file.resolve().parent / "compaction.key")
+
+
+@router.post("/v1/responses/compact")
+async def compact_response(request: Request) -> Any:
+    """Summarize through the shared routing and admission path, then seal the result."""
+    try:
+        await responses.authorize(request)
+        try:
+            raw = await request.json()
+        except (ValueError, UnicodeDecodeError):
+            raise responses.Refusal("body: must be valid JSON.", param="body") from None
+        if not isinstance(raw, dict):
+            raise responses.Refusal("body: must be a JSON object.", param="body")
+        for name in raw:
+            if name not in {"model", "input", "instructions", "previous_response_id"}:
+                field = chat_contract._field_name(name)
+                raise responses.Refusal(f"{field}: unsupported setting.", param=field)
+        sealer = _compaction_sealer(request)
+        translated = await run_in_threadpool(
+            lambda: responses.translate_request(
+                raw, max_images=max_images(_store(request)), sealer=sealer
+            )
+        )
+        # Check the key before asking a model to do work. Failure leaves config reachable.
+        await run_in_threadpool(sealer.cipher)
+    except responses.Refusal as refusal:
+        return refusal.response()
+    except compaction.KeyUnavailable as exc:
+        return responses.error_response(503, str(exc), error_type="server_error")
+    body = translated.request
+    body.messages.append(ChatCompletionMessage(role=Role1.developer, content=compaction.PROMPT))
+    body.max_tokens = compaction.BUDGET
+    store = _store(request)
+    prepared = await _prepare(
+        request, body, surface="chat", instead="/v1/embeddings", install_max_tokens=False
+    )
+    if isinstance(prepared, _Failure):
+        return prepared.as_responses()
+    with collect_attempts() as tries:
+        try:
+            response = await serve_while_connected(
+                request, prepared.client.generate(prepared.generate), what="a compaction"
+            )
+        except (ClientGone, DriverError, httpx.HTTPError) as exc:
+            _record(prepared.rec, body, tries)
+            return _serve_failure(exc, body, store).as_responses()
+        _record(
+            prepared.rec,
+            body,
+            tries,
+            served_model=response.modelId or body.model,
+            usage=response.usage,
+            backend_ms=response.latencyMs,
+            client=prepared.client,
+        )
+        if response.finishReason != "stop" or not response.content or response.toolCalls:
+            return responses.error_response(
+                502,
+                "The backend did not complete a compaction summary "
+                f"(finish reason: {response.finishReason}); send the conversation instead.",
+                error_type="server_error",
+            )
+        summary = response.content
+        if response.usage is None:
+            return responses.error_response(
+                502,
+                "The backend did not report token usage for compaction; "
+                "send the conversation instead.",
+                error_type="server_error",
+            )
+        try:
+            encrypted = await run_in_threadpool(lambda: sealer.seal(summary))
+        except compaction.KeyUnavailable as exc:
+            return responses.error_response(503, str(exc), error_type="server_error")
+    return JSONResponse(
+        content={
+            "id": "cmp_" + uuid.uuid4().hex,
+            "object": "response.compaction",
+            "created_at": int(time.time()),
+            "output": [
+                {
+                    "id": "cmp_" + uuid.uuid4().hex,
+                    "type": "compaction",
+                    "encrypted_content": encrypted,
+                }
+            ],
+            "usage": responses.usage_block(response.usage),
+        },
+        headers=ignored_settings.added_to({}, prepared.not_honoured_by_answer(), "responses"),
+    )
 
 
 @router.post("/v1/responses/input_tokens")
@@ -2023,10 +2389,16 @@ async def count_response_input_tokens(request: Request) -> Any:
         return responses.error_response(400, "body: must be valid JSON.", param="body")
     if not isinstance(raw, dict):
         return responses.error_response(400, "body: must be a JSON object.", param="body")
+    resolved = await files_door.resolve_file_ids(request, raw, door="responses")
+    if isinstance(resolved, Response):
+        return resolved
+    raw = resolved
     raw = {k: v for k, v in raw.items() if k != "stream"}
     try:
         translated = await run_in_threadpool(
-            lambda: responses.translate_request(raw, max_images=max_images(_store(request)))
+            lambda: responses.translate_request(
+                raw, max_images=max_images(_store(request)), sealer=_compaction_sealer(request)
+            )
         )
     except responses.Refusal as refusal:
         return refusal.response()
@@ -2063,11 +2435,17 @@ async def create_response(request: Request) -> Any:
         return responses.error_response(400, "body: must be valid JSON.", param="body")
     if not isinstance(raw, dict):
         return responses.error_response(400, "body: must be a JSON object.", param="body")
+    resolved = await files_door.resolve_file_ids(request, raw, door="responses")
+    if isinstance(resolved, Response):
+        return resolved
+    raw = resolved
 
     store = _store(request)
     try:
         translated = await run_in_threadpool(
-            lambda: responses.translate_request(raw, max_images=max_images(store))
+            lambda: responses.translate_request(
+                raw, max_images=max_images(store), sealer=_compaction_sealer(request)
+            )
         )
     except responses.Refusal as refusal:
         return refusal.response()
@@ -2157,6 +2535,10 @@ async def create_response(request: Request) -> Any:
                 namespaces=translated.namespaces,
             )
         )
+        try:
+            output = responses.client_tool_items(output, translated.client_tools)
+        except responses.Refusal as refusal:
+            return refusal.response()
         return JSONResponse(
             content=responses.response_object(
                 response_id=response_id,
@@ -2235,9 +2617,9 @@ async def create_embedding(request: Request, body: EmbeddingRequest, response: R
     outlives the request. Same trade as M10's commit point: give up a
     retry rather than return a wrong answer that looks right.
 
-    **`dimensions` and `user` are accepted and ignored, and the answer says
-    so** (MR0): `x-eugene-plexus-ignored-settings` names each one the request
-    carried. The vectors come back at the model's own width.
+    `dimensions` reaches the driver, and Gemini applies it natively (row 58).
+    The driver's ignored-settings header survives replica failover. `user`
+    remains ignored and named; no layer truncates or pads vectors.
     """
     # The generated model discards extra fields. Inspect the original object
     # so an unsupported hint cannot silently change the caller's meaning.
@@ -2310,6 +2692,7 @@ async def create_embedding(request: Request, body: EmbeddingRequest, response: R
             client.embed(
                 EmbedRequest(
                     input=inputs,
+                    dimensions=body.dimensions,
                     localOnly=admission.local_only(),
                     requestId=str(admission.request_id()) if admission.request_id() else None,
                 )
@@ -2354,7 +2737,14 @@ async def create_embedding(request: Request, body: EmbeddingRequest, response: R
         context.embedding_result = result
     # On a served answer only: a refusal or a failure served nothing the
     # caller could have been misled about.
-    if ignored := _ignored_embedding_settings(body):
+    ignored = _ignored_embedding_settings(body)
+    if result.backend == "gemini_api" and "dimensions" in ignored:
+        ignored.remove("dimensions")
+    observed = getattr(result, "ignored_settings", None)
+    if observed is not None:
+        ignored = [name for name in ignored if name != "dimensions"]
+        ignored.extend(name for name in observed if name not in ignored)
+    if ignored:
         response.headers["x-eugene-plexus-ignored-settings"] = ", ".join(ignored)
     fmt = getattr(body.encoding_format, "value", body.encoding_format) or "float"
     usage = None
@@ -4754,22 +5144,23 @@ def _routing_info(
     served_node = getattr(client, "served_by_node", None)
     attempts = getattr(client, "attempts", 1)
     tier = getattr(client, "tier", 1)
-    # inference-driver.yaml and gateway.yaml each generate their own
-    # BackendKind with the same wire values; cross via `.value`.
-    backend_kind = next(
+    served_backend = next(
         (
-            BackendKind(b.info.backend.value)
+            b
             for b in table.backends_for(model)
             if b.name == served_by and (served_node is None or b.node == served_node)
         ),
         None,
     )
+    runtime = served_backend.runtime if served_backend is not None else None
     return CompletionRoutingInfo(
         driver=served_by,
-        # The engine process behind the driver that answered, when the
-        # agent supervises one — by name, so replicas are attributed too.
-        runtime=table.runtime_for(model, served_by, served_node),
-        backend=backend_kind,
+        # The serving driver's node is the root registry's machine name.
+        # Cloud and CLI drivers have a node too, but no supervised runtime.
+        runtime=runtime.name if runtime is not None else None,
+        node=served_backend.node if served_backend is not None and runtime is not None else None,
+        # The two contracts generate their own BackendKind; cross via its value.
+        backend=BackendKind(served_backend.info.backend.value) if served_backend else None,
         latency_ms=int((time.perf_counter() - started) * 1000),
         attempts=attempts if isinstance(attempts, int) and attempts >= 1 else 1,
         tier=tier if isinstance(tier, int) and tier >= 1 else 1,

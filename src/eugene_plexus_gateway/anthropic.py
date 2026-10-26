@@ -50,7 +50,6 @@ from ._generated.models import (
     ReasoningEffort,
     ResponseFormat,
     ResponseJsonSchema,
-    Role1,
     Stop,
     TextContentPart,
     Tool,
@@ -58,8 +57,9 @@ from ._generated.models import (
     ToolChoice,
 )
 from ._generated.models import (
-    FunctionCall as OpenAIFunctionCall,
+    FunctionCallModel as OpenAIFunctionCall,
 )
+from ._generated.models import Role2 as Role1
 
 log = logging.getLogger(__name__)
 
@@ -247,7 +247,9 @@ async def authorize(request: Request) -> None:
         context.key_id = payload.jti
         context.key_name = payload.sub
     guard = getattr(request.app.state, "client_key_guard", None)
-    decision = await guard.decision(payload.jti) if guard is not None else "unavailable"
+    decision = (
+        await guard.decision(payload.jti, payload.exp) if guard is not None else "unavailable"
+    )
     if decision == "unavailable":
         cause = guard.unavailable_reason if guard else "No client-key policy guard is configured."
         raise Refusal(
@@ -260,6 +262,13 @@ async def authorize(request: Request) -> None:
         raise Refusal(
             "This key is not registered with the current authority. Make a new one under "
             "Home -> Use it from your apps.",
+            status=403,
+            kind="permission_error",
+        )
+    if decision == "replaced":
+        raise Refusal(
+            "This key was replaced. Paste its replacement into this app, or make a new key "
+            "under Home -> Use it from your apps.",
             status=403,
             kind="permission_error",
         )

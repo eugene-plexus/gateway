@@ -9,6 +9,246 @@ from typing import Any, Literal
 from pydantic import AnyUrl, AwareDatetime, BaseModel, ConfigDict, Field, RootModel
 
 
+class GatewayLibraryStatus(BaseModel):
+    """
+    Library reachability observed by profile and special-token reads.
+    Loading saved caches after a restart does not establish whether
+    the Library can answer. A successful Library answer clears the
+    outage time and cause, including an answer with no profile.
+
+    """
+
+    reachable: bool | None = Field(
+        ...,
+        description='True after a successful Library answer. False after a\ntransport error, a proxy 502/503/504, or a timeout. Null\nbefore the first check, including after a gateway restart.\n',
+    )
+    since: AwareDatetime | None = Field(
+        ...,
+        description='When the current outage was first observed, in UTC. Further\nfailed checks keep this time. Null while reachable or before\nthe first check.\n',
+    )
+    cause: str | None = Field(
+        ...,
+        description='The latest observed cause of the failed Library check, such\nas connection refused, proxy HTTP 502/503/504, or a timeout.\nNull while reachable or before the first check.\n',
+    )
+    modelsOnSavedSettings: int = Field(
+        ...,
+        description='Number of distinct model paths currently using saved profile\ndefaults after cache expiry, including values loaded after a restart.\nCounts each path once. Excludes fresh profiles, saved values\nthat are not in effect, and values excluded by an explicit\nprofileMaxStaleSeconds limit.\n',
+        ge=0,
+    )
+
+
+class SafetySetting(BaseModel):
+    category: str | None = None
+    threshold: str | None = None
+
+
+class Role(StrEnum):
+    """
+    Omitted for systemInstruction; otherwise defaults to user.
+    """
+
+    user = 'user'
+    model = 'model'
+
+
+class InlineData(BaseModel):
+    mimeType: str
+    data: str
+
+
+class FunctionCall(BaseModel):
+    id: str | None = Field(
+        None,
+        description='Preserved when supplied; otherwise the shared path assigns one.',
+    )
+    name: str
+    args: dict[str, Any]
+
+
+class FunctionResponse(BaseModel):
+    """
+    Matched to the preceding call by id, or by name in call order when ids are absent. An
+    ambiguous or missing call is a 400 naming functionResponse; its content is never lost.
+    """
+
+    id: str | None = None
+    name: str
+    response: dict[str, Any]
+
+
+class GeminiPart(BaseModel):
+    """
+    Text, inline image/audio/PDF, function call or result. Existing attachment size and MIME
+    limits apply. Backend reasoning returns as text with thought true only when requested.
+    """
+
+    text: str | None = None
+    inlineData: InlineData | None = None
+    functionCall: FunctionCall | None = None
+    functionResponse: FunctionResponse | None = Field(
+        None,
+        description='Matched to the preceding call by id, or by name in call order when ids are absent. An\nambiguous or missing call is a 400 naming functionResponse; its content is never lost.',
+    )
+    thought: bool | None = None
+    thoughtSignature: str | None = Field(
+        None,
+        description='Opaque client data, never invented by the door. The Gemini provider retains its own\nrequired signatures on the shared path (G2).',
+    )
+
+
+class GeminiFunctionDeclaration(BaseModel):
+    name: str
+    description: str | None = None
+    parameters: dict[str, Any] | None = Field(
+        None,
+        description='Gemini schema form, translated to the shared function schema.',
+    )
+    parametersJsonSchema: Any | None = Field(
+        None,
+        description='JSON Schema form used by Gemini CLI; mutually exclusive with parameters.',
+    )
+    parameters_json_schema: Any | None = Field(
+        None,
+        description='Measured google-genai dictionary spelling of parametersJsonSchema. Same translation;\nconflicting spellings are refused naming the field.',
+    )
+
+
+class Mode(StrEnum):
+    """
+    Maps to tool_choice auto, required or none.
+    """
+
+    AUTO = 'AUTO'
+    ANY = 'ANY'
+    NONE = 'NONE'
+
+
+class GeminiFunctionCallingConfig(BaseModel):
+    mode: Mode | None = Field(
+        None, description='Maps to tool_choice auto, required or none.'
+    )
+    allowedFunctionNames: list[str] | None = Field(
+        None,
+        description='Restricts declarations offered to the shared path. A single name in ANY selects that\nfunction. Unknown names are a 400 naming allowedFunctionNames.',
+    )
+
+
+class GeminiThinkingConfig(BaseModel):
+    """
+    thinkingLevel LOW, MEDIUM, HIGH maps to reasoning_effort low, medium, high (case
+    insensitive). thinkingBudget maps 0 to none, 1..1024 to low, 1025..8192 to medium, larger
+    values to high; -1 leaves the backend default. An exact positive budget is not promised:
+    thinkingConfig.thinkingBudget is named in ignored-settings when reduced to effort. A level
+    and budget together are a 400 naming thinkingConfig. includeThoughts controls returning
+    thought parts independently of effort; omitted means false. Unsupported effort is refused
+    with the backend's observed cause, never guessed from a name.
+    """
+
+    thinkingLevel: str | None = None
+    thinkingBudget: int | None = Field(None, ge=-1)
+    includeThoughts: bool | None = False
+    thinking_level: str | None = Field(
+        None,
+        description='Measured google-genai dictionary spelling of thinkingLevel; conflicting spellings are\nrefused naming the field.',
+    )
+    thinking_budget: int | None = Field(
+        None,
+        description='Measured google-genai dictionary spelling of thinkingBudget; conflicting spellings are\nrefused naming the field.',
+        ge=-1,
+    )
+    include_thoughts: bool | None = Field(
+        None,
+        description='Measured google-genai dictionary spelling of includeThoughts; conflicting spellings are\nrefused naming the field.',
+    )
+
+
+class FinishReason(StrEnum):
+    """
+    STOP for stop or tool calls, MAX_TOKENS for length, SAFETY only for observed
+    content_filter. Never invent a safety refusal.
+    """
+
+    STOP = 'STOP'
+    MAX_TOKENS = 'MAX_TOKENS'
+    SAFETY = 'SAFETY'
+
+
+class GeminiUsageMetadata(BaseModel):
+    """
+    Counts from the shared path; omit unavailable counts rather than invent them.
+    candidatesTokenCount excludes thoughtsTokenCount; totalTokenCount includes prompt, candidate
+    and thought tokens, with cachedContentTokenCount already included in promptTokenCount.
+    """
+
+    promptTokenCount: int | None = Field(None, ge=0)
+    candidatesTokenCount: int | None = Field(None, ge=0)
+    totalTokenCount: int | None = Field(None, ge=0)
+    thoughtsTokenCount: int | None = Field(None, ge=0)
+    cachedContentTokenCount: int | None = Field(None, ge=0)
+
+
+class GeminiCountTokensResponse(BaseModel):
+    totalTokens: int = Field(..., ge=0)
+    cachedContentTokenCount: int | None = Field(None, ge=0)
+
+
+class GeminiModel(BaseModel):
+    name: str = Field(
+        ...,
+        description='models/<Eugene id or configured Gemini alias>; slashes in ids are preserved.',
+    )
+    version: str | None = None
+    displayName: str | None = None
+    description: str | None = None
+    inputTokenLimit: int | None = Field(
+        None,
+        description='Effective reported input limit; omitted when unknown, never guessed.',
+        ge=1,
+    )
+    outputTokenLimit: int | None = Field(
+        None,
+        description='Effective reported output limit; omitted when unknown, never guessed.',
+        ge=1,
+    )
+    supportedGenerationMethods: list[str] = Field(
+        ...,
+        description='Door methods the serving path reports, such as generateContent, streamGenerateContent\nand countTokens. Unknown capability is not a refusal; requests may still try it.',
+    )
+
+
+class Target(RootModel[str]):
+    root: str = Field(..., min_length=1)
+
+
+class GeminiModelNameMapping(BaseModel):
+    """
+    One geminiModelNames entry using the existing model_slots config renderer. model is the
+    requested Gemini name without models/; targets holds one Eugene model id or
+    role:<ModelRole>. A role uses its existing slot and failover. No capability allowlist blocks
+    an untested target. Duplicate names and empty targets are rejected by field name; a bad file
+    keeps config endpoints reachable.
+    """
+
+    model: str = Field(..., min_length=1)
+    targets: list[Target] = Field(..., max_length=1, min_length=1)
+
+
+class Error(BaseModel):
+    code: int = Field(..., description='HTTP status code.', ge=0)
+    message: str = Field(
+        ...,
+        description="Names the field or model and the observed cause. Upstream credentials are identified\nas the backend's, not the caller's. No query key or other secret appears here.",
+    )
+    status: str = Field(
+        ...,
+        description="Google's status word: INVALID_ARGUMENT (400), UNAUTHENTICATED (401),\nPERMISSION_DENIED (403), NOT_FOUND (404), RESOURCE_EXHAUSTED (429), CANCELLED (499),\nINTERNAL (502), UNAVAILABLE (503), DEADLINE_EXCEEDED (504).",
+    )
+
+
+class GeminiErrorResponse(BaseModel):
+    error: Error
+
+
 class WebSearchRequest(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -130,7 +370,7 @@ class ModelRole(StrEnum):
     decision = 'decision'
 
 
-class Role(StrEnum):
+class Role1(StrEnum):
     """
     The speaker of a single message in a conversation. Matches the
     OpenAI / Anthropic chat roles so adapters never re-shape on a hop.
@@ -210,7 +450,7 @@ class InputFile(BaseModel):
     )
     file_id: str | None = Field(
         None,
-        description="Refused with a 400. It names a file uploaded to one\nprovider's store, which this install does not have; send\n`file_data`.\n",
+        description="A file kept in this install's store (`POST /v1/files`, row\n53). The gateway reads it for the caller, from the caller's\nown files only, and carries it as `file_data` (a PDF), an\nimage or text, within the limits above; it never reaches a\nbackend as an id. Another owner's id is refused as one that\ndoes not exist.\n",
     )
 
 
@@ -403,6 +643,11 @@ class ComponentKind(StrEnum):
     calls a tool-driver when the model uses it. `library` scans the operator's model
     directories and holds per-model launch profiles; there is
     exactly one, and it is deliberately not in the request path.
+    `store` (row 53, 2026-10-23) keeps what the gateway's platform
+    doors keep for people -- uploaded files first, then stored
+    responses, batches and vector stores -- each object with an owner
+    and an end; there is exactly one, on the root by default, and the
+    gateway is its only caller (`openapi/store.yaml`).
 
     **The agent is not in this list**, for the same reason engine
     runtimes are not: it supervises, it is not supervised. Its
@@ -418,7 +663,52 @@ class ComponentKind(StrEnum):
     gateway = 'gateway'
     inference_driver = 'inference-driver'
     library = 'library'
+    store = 'store'
     tool_driver = 'tool-driver'
+
+
+class Peer(RootModel[str]):
+    root: str = Field(..., min_length=1)
+
+
+class ComputeDevicePcieLink(BaseModel):
+    """
+    Current and supported PCIe link measurements for one card. Each
+    measurement is null independently when its probe fails, so a
+    readable width survives an unreadable generation.
+
+    """
+
+    generation: int | None = Field(
+        ..., description='Current PCIe generation. Null when unreadable.', ge=1
+    )
+    width: int | None = Field(
+        ..., description='Current PCIe lane count. Null when unreadable.', ge=1
+    )
+    maxGeneration: int | None = Field(
+        ...,
+        description='Maximum PCIe generation the card supports. Null when unreadable.',
+        ge=1,
+    )
+    maxWidth: int | None = Field(
+        ...,
+        description='Maximum PCIe lane count the card supports. Null when unreadable.',
+        ge=1,
+    )
+
+
+class ComputeDeviceThrottleReason(StrEnum):
+    """
+    An observed reason a card is slowing down. `thermal` is a heat
+    limit, `power-cap` a power limit, `hardware-slowdown` another
+    hardware slowdown signal, and `other` another active NVML reason.
+
+    """
+
+    thermal = 'thermal'
+    power_cap = 'power-cap'
+    hardware_slowdown = 'hardware-slowdown'
+    other = 'other'
 
 
 class ComputeDeviceKind(StrEnum):
@@ -614,6 +904,68 @@ class PreparationVisionMode(StrEnum):
     gpu = 'gpu'
 
 
+class SpeedProjectionMode(StrEnum):
+    """
+    Changes the model's answers when on; experimental and off by default.
+    Strata's bundled refusal-direction projection reduces refusals and
+    also changes ordinary predictions. Upstream measures a 0.2-0.4%
+    cost per token on identical text, not a guaranteed speed-up.
+    Preparation uses --experimental-speed-projection on|off. Launch
+    applies the prepared control vector and reports the applied mode;
+    a requested mode alone is not evidence that it took effect.
+
+    """
+
+    off = 'off'
+    on = 'on'
+
+
+class StrataGpuSelectionItem(RootModel[int]):
+    root: int = Field(..., ge=0)
+
+
+class PreparationIntent(BaseModel):
+    """
+    Prepare the model for an engine before running it. Asked for,
+    never implied: Run without it picks an engine that runs the model
+    as it is. This is the source schema for the durable run protocol's
+    PreparationIntent; regenerate openapi/run-operations.json from the
+    Library after adopting this schema, rather than editing its copy.
+    The Strata choices use the same keys as that engine's profile
+    flags. Unsupported or ignored choices must name the observed
+    cause; no requested value may be reported as applied by default.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    engine: EngineKind
+    contextSize: int | None = Field(
+        None,
+        description="The context to prepare for. Absent uses the engine's recommendation for the node.",
+        ge=1,
+    )
+    vision: PreparationVisionMode | None = Field(
+        'off',
+        description='Image encoder placement. Off preserves text-only preparation.',
+    )
+    speedProjection: SpeedProjectionMode | None = Field(
+        'off',
+        description='Changes answers when on; experimental. Off preserves stock model behavior.',
+    )
+    gpus: list[StrataGpuSelectionItem] | None = Field(
+        None,
+        description="Ordered card ordinals from this node's ComputeDevice inventory;\nthe main card is first. The node validates each selected card\nagainst its current inventory and resolves process visibility at\nevery preparation and launch. Two or more cards share the model.\nOmission in a preparation keeps the existing automatic single-card\nselection. Omission in a profile preserves the prepared selection.\nAn empty list is not automatic selection.\nThis inventory has kind and index, not row 43's stable UUIDs;\nordinals are local to the selected node and must not be treated\nas stable identities or silently replaced by another card.\n",
+        min_length=1,
+    )
+    layerSplit: str | None = Field(
+        'auto',
+        description="auto places layers using the selected cards' free memory and\nexpert profile. An expert can give the first layer of each later\ncard, as comma-separated rising integers: 16,32 for three cards.\nThese are boundaries, not a count of layers per card. The node\nchecks one boundary per card after the first, each at least 2,\nstrictly rising and below the model's layer count. An explicit\nboundary requires several selected cards. With one card there\nis no layer split.\n",
+        min_length=1,
+    )
+
+
 class Context(RootModel[int]):
     root: int = Field(..., ge=1)
 
@@ -643,6 +995,10 @@ class ModelPreparation(BaseModel):
     visionModes: list[PreparationVisionMode] | None = Field(
         None,
         description="Image encoder choices supported by this model's preparation. Absent:\nno image preparation is offered. Omitting the choice in a run intent\npreserves text-only preparation. Enabling images downloads an extra\nencoder and uses additional memory while serving.\n",
+    )
+    speedProjectionModes: list[SpeedProjectionMode] | None = Field(
+        None,
+        description="Changes answers when on; experimental. Choices this model's\npreparation offers for the bundled projection. Absent means\nno projection choice is advertised, not a claim that an\nuntested model cannot run. Omitting the choice in a run\nintent selects off. An upstream fallback must be reported\nas the mode that actually took effect, with its cause.\n",
     )
     minEngineVersion: str | None = Field(
         None,
@@ -1486,6 +1842,19 @@ class RevokedSession(BaseModel):
     exp: int = Field(..., description="The session's own `exp`, unix seconds.")
 
 
+class TokenEpochs(BaseModel):
+    """
+    Since when every token the control root signs carries `ep`
+    (row 4): the time in unix seconds, and the epoch it was then.
+    Absent from a root older than row 4, and every root token
+    without `ep` is then accepted as before.
+
+    """
+
+    since: int
+    epoch: int
+
+
 class TrustBundle(BaseModel):
     """
     The set of keys every verifier in the install trusts, and what
@@ -1525,7 +1894,20 @@ class TrustBundle(BaseModel):
        the issuer's own, 14 days for a session, 10 minutes for an
        exchanged token, and 400 days for a client key;
     5. refuses a session that is listed in `revokedSessions`, or
-       whose `aud` names a node no longer in the bundle.
+       whose `aud` names a node no longer in the bundle;
+    6. refuses a token the control root signed, other than a client
+       key, whose `ep` claim (the epoch of the root that minted it,
+       row 4) is below this bundle's `epoch`: "This command came from a
+       root this machine no longer follows (epoch 2; it follows epoch
+       3)." A promotion keeps the root's token key, so this is what
+       stops the root it replaced. A root token without `ep` (from a
+       root older than row 4) is refused once `tokenEpochs` says roots
+       mark theirs, if it was minted after `tokenEpochs.since` or the
+       epoch has risen past `tokenEpochs.epoch`.
+
+    **Bundles are ordered by epoch first** (row 4): a higher `epoch`
+    replaces whatever its `version`, a lower one never does, and at
+    one epoch the version decides.
 
     No hard expiry, deliberately. A bundle that stopped verifying
     when the root was dead would end the data path's guarantee to
@@ -1536,11 +1918,15 @@ class TrustBundle(BaseModel):
 
     version: int = Field(
         ...,
-        description="The control root's replicated log index when this bundle was\nbuilt, so it only grows, including across a promotion. A\nverifier refuses a lower version than it holds (rollback)\nand replaces its bundle with an equal or higher one.\n",
+        description="The control root's replicated log index when this bundle was\nbuilt. At one epoch a verifier refuses a lower version than it\nholds (rollback) and replaces its bundle with an equal or\nhigher one. A root promoted from a copy that was behind may\nnumber below the root it replaced, so a higher `epoch` wins\nwhatever the version.\n",
         ge=0,
     )
     epoch: int = Field(
         ..., description="The control root's epoch; an agent refuses a lower one.", ge=0
+    )
+    tokenEpochs: TokenEpochs | None = Field(
+        None,
+        description='Since when every token the control root signs carries `ep`\n(row 4): the time in unix seconds, and the epoch it was then.\nAbsent from a root older than row 4, and every root token\nwithout `ep` is then accepted as before.\n',
     )
     iat: int = Field(
         ...,
@@ -1598,6 +1984,43 @@ class MasterKeyEnvelope(BaseModel):
         description='Base64-encoded 24-byte nonce. Generated per-encryption,\nnever reused with the same key.\n',
     )
     ciphertext: str = Field(..., description='Base64-encoded ciphertext + auth tag.')
+
+
+class Subject(RootModel[str]):
+    root: str = Field(..., max_length=200, min_length=1)
+
+
+class PeopleKnownRequest(BaseModel):
+    """
+    Which of these people the root still has (row 53). A component
+    that keeps people's objects (the store) asks its agent, which asks
+    the root with its own node token. Only the ids sent are answered,
+    so it cannot list people.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subjects: list[Subject] = Field(
+        ...,
+        description="People's ids, as a person token's `personId` names them.",
+        max_length=500,
+        min_length=1,
+    )
+
+
+class PeopleKnownResult(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    known: list[str] = Field(
+        ..., description="Ids the root has a person for (on or off), or the owner's."
+    )
+    unknown: list[str] = Field(
+        ...,
+        description="Ids the root has no person for. Each one was deleted, or never was the root's.",
+    )
 
 
 class RestartResult(BaseModel):
@@ -2336,7 +2759,7 @@ class ChatCompletionAudioDelta(BaseModel):
     expires_at: int | None = None
 
 
-class Role1(StrEnum):
+class Role2(StrEnum):
     """
     `function` is the deprecated role for a function's result,
     answering the assistant's `function_call` before it; it is
@@ -2359,7 +2782,7 @@ class Role1(StrEnum):
     function = 'function'
 
 
-class FinishReason(StrEnum):
+class FinishReason1(StrEnum):
     """
     `function_call` only when the request used the deprecated
     `functions`, in place of `tool_calls` (P2c).
@@ -2395,11 +2818,11 @@ class FinishReason(StrEnum):
     function_call = 'function_call'
 
 
-class Role2(StrEnum):
+class Role3(StrEnum):
     assistant = 'assistant'
 
 
-class FinishReason1(Enum):
+class FinishReason2(Enum):
     """
     Null until the terminal chunk.
     """
@@ -2441,7 +2864,7 @@ class NamedToolChoice(BaseModel):
     function: Function
 
 
-class FunctionCall(BaseModel):
+class FunctionCallModel(BaseModel):
     name: str
     arguments: str = Field(
         ...,
@@ -2696,7 +3119,7 @@ class EmbeddingRequest(BaseModel):
     )
     dimensions: int | None = Field(
         None,
-        description="**Accepted and ignored.** The vectors come back at the\nmodel's own width, whatever is asked here. No backend is sent\nthis field (the driver's `EmbedRequest` has none), and this\nlayer does not emulate truncation, because a silently\ntruncated vector is a wrong answer that looks like a right\none. A request that carries one is answered with\n`x-eugene-plexus-ignored-settings: dimensions` (`dimensions,\nuser` when both are sent). Before 2026-10-11 this said it was\npassed through to the backend unchanged; it never was.\n",
+        description='Requested vector width, forwarded in EmbedRequest.dimensions.\nGemini applies it as outputDimensionality. A backend that\ndoes not apply it returns its native width and names\ndimensions in x-eugene-plexus-ignored-settings; Gemini does\nnot call an applied value ignored. No layer truncates or\npads vectors, and an untested capability never blocks an\nattempt. A provider refusal names the field and its cause.\n',
         ge=1,
     )
 
@@ -2928,7 +3351,7 @@ class AnthropicTokenCount(BaseModel):
     )
 
 
-class Role3(StrEnum):
+class Role4(StrEnum):
     user = 'user'
     assistant = 'assistant'
     system = 'system'
@@ -3089,7 +3512,7 @@ class Type3(StrEnum):
     message = 'message'
 
 
-class Role4(StrEnum):
+class Role5(StrEnum):
     assistant = 'assistant'
 
 
@@ -3212,7 +3635,7 @@ class Type5(StrEnum):
     error = 'error'
 
 
-class Error(BaseModel):
+class Error1(BaseModel):
     type: str = Field(
         ...,
         description='`invalid_request_error`, `authentication_error`,\n`permission_error`, `not_found_error`,\n`rate_limit_error`, `api_error`, `overloaded_error`.\n',
@@ -3235,7 +3658,7 @@ class AnthropicErrorResponse(BaseModel):
     """
 
     type: Type5
-    error: Error
+    error: Error1
 
 
 class ResponsesInputTokens(BaseModel):
@@ -3245,8 +3668,10 @@ class ResponsesInputTokens(BaseModel):
 
 class ToolChoice1(StrEnum):
     """
-    `auto`, `none`, `required`, or `{"type": "function", "name": …}`.
-    Forcing any other tool type is refused.
+    `auto`, `none`, `required`, or an object forcing a declared
+    client-run tool: `function` or `custom` with `name`, or
+    `local_shell`, `shell` or `apply_patch` by `type`. An
+    undeclared or refused tool is a 400 naming the cause.
 
     """
 
@@ -3261,28 +3686,13 @@ class Truncation(Enum):
     NoneType_None = None
 
 
-class ResponsesInputItem(BaseModel):
+class ResponsesToolAction(BaseModel):
     """
-    One conversation item. **Modelled loosely on purpose**, as
-    `AnthropicContentBlock` is: the variants differ by `type`, and a
-    strict union would reject the next item type on a wire we do not
-    own.
-
-    Carried: `message` (`role` user, assistant, system or developer;
-    `content` a string or parts; `type` may be omitted), `function_call`
-    (`call_id`, `name`, `arguments` as a JSON string, and `namespace`
-    when the call was to a member of a `namespace` tool),
-    `function_call_output` (`call_id`, `output` as a string or a list
-    of `input_text` / `input_image` parts), and `reasoning`
-    (`content` of `reasoning_text` parts, `encrypted_content`), and a
-    `web_search_call` handed back (P8), which becomes a line of the
-    assistant's history naming the search and its sources, and an
-    `image_generation_call` handed back (P8e), which becomes a line
-    naming the prompt the image was made for -- its base64 is not
-    sent to the model.
-    Codex drops `id` and `status` when it sends items back
-    (measured), so neither is required. Refused: `item_reference` and
-    any other type.
+    A local-shell `exec` action has `type: exec`, `command`, `env`,
+    and optional `working_directory`, `timeout_ms` and `user`.
+    A shell action has `commands`, `timeout_ms` and
+    `max_output_length`. The gateway returns these for the client to
+    execute. Other action fields remain open for existing search items.
 
     """
 
@@ -3290,20 +3700,76 @@ class ResponsesInputItem(BaseModel):
         extra='allow',
     )
     type: str | None = None
-    role: str | None = None
-    content: Any | None = Field(None, description='A string, or a list of parts.')
-    call_id: str | None = None
-    name: str | None = None
-    namespace: str | None = Field(
-        None,
-        description='The `namespace` tool a `function_call` was to (Codex 0.133 and later).',
+    command: list[str] | None = None
+    commands: list[str] | None = None
+    working_directory: str | None = None
+    env: dict[str, str] | None = None
+    user: str | None = None
+    timeout_ms: int | None = None
+    max_output_length: int | None = None
+
+
+class Type6(StrEnum):
+    create_file = 'create_file'
+    delete_file = 'delete_file'
+    update_file = 'update_file'
+
+
+class ResponsesPatchOperation(BaseModel):
+    """
+    OpenAI's file operation for a client-run apply-patch call.
+    `create_file` and `update_file` include a V4A `diff`;
+    `delete_file` needs only `path`. The client applies the operation
+    and reports completed or failed with its observed cause.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
     )
-    arguments: str | None = None
-    output: Any | None = Field(
-        None, description='A string, or a list of `input_text` / `input_image` parts.'
+    type: Type6
+    path: str
+    diff: str | None = None
+
+
+class Type7(StrEnum):
+    text = 'text'
+    grammar = 'grammar'
+
+
+class Syntax(StrEnum):
+    lark = 'lark'
+    regex = 'regex'
+
+
+class Format(BaseModel):
+    """
+    A custom tool's free-text format, or grammar (Lark or regex).
+    Grammars are not enforced: they are included in the function
+    description and named as `tools[i].format` on
+    `x-eugene-plexus-ignored-settings`. No constrained output is claimed.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
     )
-    summary: list[dict[str, Any]] | None = None
-    encrypted_content: str | None = None
+    type: Type7
+    syntax: Syntax | None = None
+    definition: str | None = None
+
+
+class Environment(BaseModel):
+    """
+    A shell tool's execution environment. Only the client's local
+    environment is supported; hosted containers are refused.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    type: str | None = None
 
 
 class ResponsesTool(BaseModel):
@@ -3315,7 +3781,19 @@ class ResponsesTool(BaseModel):
     endpoint). `web_search` runs on this install's search account, or
     is removed and named when it cannot (see the endpoint);
     `image_generation` runs on this install's image models, or is
-    refused naming why (P8e); any other `type` is refused.
+    refused naming why (P8e).
+
+    `custom` (`name`, `description`, `format`) maps to a function with
+    one string parameter `input`; `local_shell` maps to a function
+    with `command`, `workdir`, `timeout_ms` and `env`; `shell` maps
+    to a function with `commands`, `timeout_ms` and
+    `max_output_length`; `apply_patch` maps to a function with one
+    string parameter `input`, the patch. The client executes their
+    calls; the gateway translates them into their Responses item
+    types. A shell's `environment` may be absent or `type: local`;
+    hosted containers are refused because no shell execution service
+    exists here. Other tool types are refused with the causes and
+    alternatives on `/v1/responses`.
 
     """
 
@@ -3330,6 +3808,14 @@ class ResponsesTool(BaseModel):
     description: str | None = None
     parameters: dict[str, Any] | None = None
     strict: bool | None = None
+    format: Format | None = Field(
+        None,
+        description="A custom tool's free-text format, or grammar (Lark or regex).\nGrammars are not enforced: they are included in the function\ndescription and named as `tools[i].format` on\n`x-eugene-plexus-ignored-settings`. No constrained output is claimed.\n",
+    )
+    environment: Environment | None = Field(
+        None,
+        description="A shell tool's execution environment. Only the client's local\nenvironment is supported; hosted containers are refused.\n",
+    )
 
 
 class Object2(StrEnum):
@@ -3350,12 +3836,17 @@ class Status1(StrEnum):
     in_progress = 'in_progress'
 
 
-class Type6(StrEnum):
+class Type8(StrEnum):
     reasoning = 'reasoning'
     message = 'message'
     function_call = 'function_call'
     web_search_call = 'web_search_call'
     image_generation_call = 'image_generation_call'
+    custom_tool_call = 'custom_tool_call'
+    local_shell_call = 'local_shell_call'
+    shell_call = 'shell_call'
+    apply_patch_call = 'apply_patch_call'
+    compaction = 'compaction'
 
 
 class ResponsesOutputItem(BaseModel):
@@ -3377,13 +3868,32 @@ class ResponsesOutputItem(BaseModel):
     "background", "output_format", "action": "generate"}` -- `result`
     the base64 image, null and `status: failed` when none was made.
 
+    Client-run calls are `custom_tool_call` (`id`, `call_id`, `name`,
+    `input`), `local_shell_call` and `shell_call` (`id`, `call_id`,
+    `status`, `action`), and `apply_patch_call` (`id`, `call_id`,
+    `status`, `operation`). Standalone compact returns a `compaction`
+    item (`id`, `encrypted_content`, the encrypted and authenticated
+    summary); it can be passed back unchanged to any model here.
+
     """
 
     model_config = ConfigDict(
         extra='allow',
     )
-    type: Type6
+    type: Type8
     id: str | None = None
+    call_id: str | None = None
+    name: str | None = None
+    input: str | None = Field(
+        None, description='Free-text input of a custom tool call.'
+    )
+    status: str | None = None
+    action: ResponsesToolAction | None = None
+    operation: ResponsesPatchOperation | None = None
+    encrypted_content: str | None = Field(
+        None,
+        description='An opaque compaction summary or the existing reasoning carrier.',
+    )
 
 
 class ResponsesUsage(BaseModel):
@@ -3401,7 +3911,7 @@ class ResponsesUsage(BaseModel):
     output_tokens_details: dict[str, Any] | None = None
 
 
-class Type7(StrEnum):
+class Type9(StrEnum):
     response_created = 'response.created'
     response_in_progress = 'response.in_progress'
     response_output_item_added = 'response.output_item.added'
@@ -3414,12 +3924,17 @@ class Type7(StrEnum):
     response_reasoning_text_done = 'response.reasoning_text.done'
     response_function_call_arguments_delta = 'response.function_call_arguments.delta'
     response_function_call_arguments_done = 'response.function_call_arguments.done'
+    response_custom_tool_call_input_delta = 'response.custom_tool_call_input.delta'
+    response_custom_tool_call_input_done = 'response.custom_tool_call_input.done'
+    response_shell_call_command_added = 'response.shell_call_command.added'
+    response_shell_call_command_delta = 'response.shell_call_command.delta'
+    response_shell_call_command_done = 'response.shell_call_command.done'
     response_completed = 'response.completed'
     response_incomplete = 'response.incomplete'
     response_failed = 'response.failed'
 
 
-class Type8(StrEnum):
+class Type10(StrEnum):
     noul = 'noul'
     choice = 'choice'
     score = 'score'
@@ -3436,7 +3951,7 @@ class SystemOneQuestion(BaseModel):
 
     """
 
-    type: Type8
+    type: Type10
     instructions: str | dict[str, Any] | list[Any]
     criteria: Any | None = Field(
         None, description='Shape depends on `type`; see above.'
@@ -3454,7 +3969,7 @@ class SystemOneAnswer(BaseModel):
 
     """
 
-    type: Type8
+    type: Type10
     noul: float | None = Field(None, ge=0.0, le=1.0)
     choice: str | None = None
     score: float | None = None
@@ -3474,7 +3989,7 @@ class SystemOneUsage(BaseModel):
     output_tokens: int | None = Field(None, ge=0)
 
 
-class Error1(BaseModel):
+class Error2(BaseModel):
     message: str = Field(
         ...,
         description='Human-readable failure. Names the model and, on a\ncascade, that every backend was tried — the operator\nreading it is usually the person who configured the\nthing.\n',
@@ -3498,7 +4013,7 @@ class OpenAIErrorResponse(BaseModel):
 
     """
 
-    error: Error1
+    error: Error2
 
 
 class Percentiles(BaseModel):
@@ -3726,6 +4241,231 @@ class ClientUsageSummary(BaseModel):
     clients: list[ClientUsageGroup]
 
 
+class OpenAIFilePurpose(StrEnum):
+    """
+    OpenAI's upload purposes. Kept as given; nothing here processes a file by its purpose.
+    """
+
+    assistants = 'assistants'
+    batch = 'batch'
+    fine_tune = 'fine-tune'
+    vision = 'vision'
+    user_data = 'user_data'
+    evals = 'evals'
+
+
+class OpenAIFileStatus(StrEnum):
+    """
+    OpenAI's (deprecated) file status. A file kept here is ready at once.
+    """
+
+    processed = 'processed'
+
+
+class OpenAIUploadStatus(StrEnum):
+    pending = 'pending'
+    completed = 'completed'
+    cancelled = 'cancelled'
+    expired = 'expired'
+
+
+class OpenAIExpiresAfter(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    anchor: Literal['created_at']
+    seconds: int = Field(
+        ...,
+        description='Seconds after upload, one hour to 30 days, as OpenAI takes them.',
+        ge=3600,
+        le=2592000,
+    )
+
+
+class FileUploadForm(BaseModel):
+    """
+    `POST /v1/files`, as the OpenAI SDK sends it. `purpose` is
+    required on the OpenAI door and absent on Anthropic's.
+    `expires_after` arrives as the two form fields the SDK writes.
+
+    """
+
+    file: bytes
+    purpose: OpenAIFilePurpose | None = None
+    expires_after_anchor_: Literal['created_at'] = Field(
+        'created_at', alias='expires_after[anchor]'
+    )
+    expires_after_seconds_: int | None = Field(
+        None, alias='expires_after[seconds]', ge=3600, le=2592000
+    )
+
+
+class OpenAIFile(BaseModel):
+    id: str
+    object: Literal['file']
+    bytes: int
+    created_at: int
+    expires_at: int | None = Field(
+        None,
+        description="Null when the file is kept until it is deleted (OpenAI's default).",
+    )
+    filename: str
+    purpose: OpenAIFilePurpose
+    status: OpenAIFileStatus
+    status_details: str | None = None
+
+
+class OpenAIFileList(BaseModel):
+    object: Literal['list']
+    data: list[OpenAIFile]
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool
+
+
+class OpenAIFileDeleted(BaseModel):
+    id: str
+    object: Literal['file']
+    deleted: bool
+
+
+class OpenAIUploadRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    bytes: int = Field(..., ge=1)
+    filename: str = Field(..., max_length=255, min_length=1)
+    mime_type: str = Field(..., max_length=255)
+    purpose: OpenAIFilePurpose
+    expires_after: OpenAIExpiresAfter | None = None
+
+
+class OpenAIUpload(BaseModel):
+    id: str
+    object: Literal['upload']
+    bytes: int
+    created_at: int
+    filename: str
+    purpose: OpenAIFilePurpose
+    status: OpenAIUploadStatus
+    expires_at: int
+    file: OpenAIFile | None = None
+
+
+class OpenAIUploadPart(BaseModel):
+    id: str
+    object: Literal['upload.part']
+    created_at: int
+    upload_id: str
+
+
+class OpenAIUploadComplete(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    part_ids: list[str] = Field(..., min_length=1)
+    md5: str | None = Field(
+        None, description="The joined file's MD5, checked before it becomes a file."
+    )
+    sha256: str | None = Field(
+        None, description="Eugene's own check, the joined file's SHA-256."
+    )
+
+
+class AnthropicFileMetadata(BaseModel):
+    id: str
+    type: Literal['file']
+    filename: str
+    mime_type: str
+    size_bytes: int
+    created_at: AwareDatetime
+    downloadable: bool | None = Field(
+        None, description='Always true here; the owner may read back what it kept.'
+    )
+
+
+class AnthropicFileList(BaseModel):
+    data: list[AnthropicFileMetadata]
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool
+
+
+class AnthropicFileDeleted(BaseModel):
+    id: str
+    type: Literal['file_deleted']
+
+
+class GatewayInfo(BaseModel):
+    """
+    The gateway's observed Library state and use of saved model settings.
+    """
+
+    library: GatewayLibraryStatus
+
+
+class ToolConfig(BaseModel):
+    functionCallingConfig: GeminiFunctionCallingConfig | None = None
+
+
+class GeminiContent(BaseModel):
+    role: Role | None = Field(
+        None, description='Omitted for systemInstruction; otherwise defaults to user.'
+    )
+    parts: list[GeminiPart] = Field(..., min_length=1)
+
+
+class GeminiTool(BaseModel):
+    functionDeclarations: list[GeminiFunctionDeclaration] | None = None
+    googleSearch: dict[str, Any] | None = Field(
+        None,
+        description="Runs the hub's web search through web_search_options, with the same key tool/locality\nlimits and observed-cause refusals.",
+    )
+
+
+class GeminiGenerationConfig(BaseModel):
+    temperature: float | None = None
+    topP: float | None = Field(None, ge=0.0, le=1.0)
+    topK: int | None = Field(None, ge=0)
+    maxOutputTokens: int | None = Field(None, ge=1)
+    stopSequences: list[str] | None = None
+    seed: int | None = None
+    candidateCount: int | None = Field(
+        None,
+        description='Only one candidate; larger values are refused naming candidateCount.',
+        ge=1,
+        le=1,
+    )
+    responseMimeType: str | None = Field(
+        None,
+        description='text/plain or application/json; other types are refused naming this field.',
+    )
+    responseSchema: dict[str, Any] | None = Field(
+        None,
+        description='Gemini schema form; used with application/json for structured output.',
+    )
+    responseJsonSchema: Any | None = Field(
+        None, description='JSON Schema form; mutually exclusive with responseSchema.'
+    )
+    thinkingConfig: GeminiThinkingConfig | None = None
+
+
+class GeminiCandidate(BaseModel):
+    index: Literal[0] = Field(0, ge=0)
+    content: GeminiContent | None = None
+    finishReason: FinishReason | None = Field(
+        None,
+        description='STOP for stop or tool calls, MAX_TOKENS for length, SAFETY only for observed\ncontent_filter. Never invent a safety refusal.',
+    )
+
+
+class GeminiListModelsResponse(BaseModel):
+    models: list[GeminiModel]
+    nextPageToken: str | None = Field(
+        None, description='Omitted on the last page, so SDK iteration terminates.'
+    )
+
+
 class DriverHealth(BaseModel):
     """
     What the gateway sees from one inference-driver's `/v1/info`,
@@ -3861,6 +4601,11 @@ class ComputeDevice(BaseModel):
     because a host with two cards is the case that makes replicas of
     one model possible.
 
+    Health readings are observations, never estimates. Each optional
+    health field is null when the platform cannot read it. The agent
+    refreshes these with its device list every 600 seconds and on
+    each `GET /v1/node` (row 43).
+
     """
 
     kind: ComputeDeviceKind
@@ -3870,8 +4615,45 @@ class ComputeDevice(BaseModel):
     )
     index: int | None = Field(
         None,
-        description="Device ordinal on its own host — what `CUDA_VISIBLE_DEVICES`\nor `HIP_VISIBLE_DEVICES` in a runtime's `env` selects to pin\nthat runtime to one card. For a `vulkan` device it is the\norder the operating system lists its adapters in, which is\nnot promised to be the order `GGML_VK_VISIBLE_DEVICES`\ncounts in.\n",
+        description='Current device ordinal on its own host. It can change when\nanother card disappears; `uuid`, when readable, identifies\nthe same card across that renumbering. NVIDIA launches use\nthe UUID in `CUDA_VISIBLE_DEVICES`, falling back to an index\nwhen no UUID was read. For a `vulkan` device the index is the\norder the operating system lists its adapters in, which is\nnot promised to be the order `GGML_VK_VISIBLE_DEVICES` counts\nin.\n',
         ge=0,
+    )
+    uuid: str | None = Field(
+        None,
+        description="Stable vendor device identifier, used to keep a runtime on\nthe same card when indices change. NVIDIA's NVML UUID (for\nexample `GPU-...`) or AMD's sysfs `unique_id`, kept as the\nvendor reports it; not necessarily an RFC UUID. Null when\nthe platform cannot read it.\n",
+        min_length=1,
+    )
+    pciBusId: str | None = Field(
+        None,
+        description='PCI bus address from NVML or the Linux sysfs device path.\nNull when unreadable. A location, not a stable card identity.\n',
+        min_length=1,
+    )
+    pcieLink: ComputeDevicePcieLink | None = Field(
+        None,
+        description="Observed PCIe link against the card's supported link. Null\nwhen no link measurements can be read. A lower generation\nis a warning only when this card's utilisation exceeded 50%\nin the last minute of host history: an idle card can lower\nits generation to save power. A narrower width is a warning\nat any time. Compare only measurements that are known.\n",
+    )
+    powerLimitWatts: float | None = Field(
+        None,
+        description="Power cap in effect, in watts, from NVML's enforced power\nlimit or Linux hwmon `power1_cap`. Null when unreadable.\n",
+        ge=0.0,
+    )
+    powerDefaultLimitWatts: float | None = Field(
+        None,
+        description="The card's default power cap in watts, from NVML or Linux\nhwmon `power1_cap_default`. Null when unreadable.\n",
+        ge=0.0,
+    )
+    throttleReasons: list[ComputeDeviceThrottleReason] | None = Field(
+        None,
+        description='Reasons the card is currently slowing down, read from NVML.\nAn empty list means it reported no throttling. Null when\nunreadable, including AMD and other unsupported platforms.\n',
+    )
+    uncorrectedMemoryErrors: int | None = Field(
+        None,
+        description="Volatile uncorrected ECC memory-error count from NVML, since\nthe device's counter was reset. Zero is a measured result.\nNull when ECC is off, unsupported or unreadable.\n",
+        ge=0,
+    )
+    peers: list[Peer] | None = Field(
+        None,
+        description='UUIDs of other cards this card can reach directly by P2P\nreads, as NVML reports it. Directional: the reverse path is\nreported on the other card. An empty list means no peers\nwere reachable; null means the peer check was unreadable or\nunsupported. Unknown checks never claim that P2P is absent.\n',
     )
     memoryTotalBytes: int | None = None
     memoryFreeBytes: int | None = Field(
@@ -4485,7 +5267,7 @@ class Delta(BaseModel):
 
     """
 
-    role: Role2 | None = None
+    role: Role3 | None = None
     content: str | None = None
     reasoning_content: str | None = Field(
         None,
@@ -4525,7 +5307,7 @@ class ToolCall(BaseModel):
         description='Correlation id. The caller echoes it as `tool_call_id` on\nthe message carrying the result.\n',
     )
     type: Literal['function']
-    function: FunctionCall
+    function: FunctionCallModel
 
 
 class ResponseFormat(BaseModel):
@@ -4698,7 +5480,7 @@ class AnthropicInputMessage(BaseModel):
     model_config = ConfigDict(
         extra='allow',
     )
-    role: Role3
+    role: Role4
     content: str | list[AnthropicContentBlock] = Field(
         ...,
         description='A plain string, or a list of blocks. Both forms arrive from\nreal clients in the same conversation.\n',
@@ -4717,7 +5499,7 @@ class AnthropicMessageResponse(BaseModel):
 
     id: str
     type: Type3
-    role: Role4
+    role: Role5
     model: str = Field(
         ...,
         description='The model that actually answered, which after a cascade is\nnot necessarily the one that was asked for.\n',
@@ -4737,85 +5519,96 @@ class AnthropicMessageResponse(BaseModel):
     usage: AnthropicUsage | None = None
 
 
-class ResponsesRequest(BaseModel):
+class ResponsesCompactResponse(BaseModel):
     """
-    Request body for `POST /v1/responses`, in OpenAI's shape. Like
-    `AnthropicMessagesRequest`, **this schema is what the gateway
-    reads, not what it refuses**: the refusals are enforced against
-    the raw body by the implementation, with a 400 naming the field,
-    and the endpoint description lists them. A top-level field not
-    named here is refused.
+    OpenAI's compacted response, with output items ending with a
+    `compaction` item (`id`, `type: compaction`, `encrypted_content`).
+    Send the whole output array back as the next input window.
 
     """
 
     model_config = ConfigDict(
         extra='allow',
     )
-    model: str = Field(
-        ...,
-        description="A model id from `GET /v1/models`, resolved against this install's slots.",
+    id: str
+    object: Literal['response.compaction']
+    created_at: int = Field(..., description='Unix timestamp in seconds.')
+    output: list[ResponsesOutputItem] = Field(..., min_length=1)
+    usage: ResponsesUsage
+
+
+class ResponsesInputItem(BaseModel):
+    """
+    One conversation item. **Modelled loosely on purpose**, as
+    `AnthropicContentBlock` is: the variants differ by `type`, and a
+    strict union would reject the next item type on a wire we do not
+    own.
+
+    Carried: `message` (`role` user, assistant, system or developer;
+    `content` a string or parts; `type` may be omitted), `function_call`
+    (`call_id`, `name`, `arguments` as a JSON string, and `namespace`
+    when the call was to a member of a `namespace` tool),
+    `function_call_output` (`call_id`, `output` as a string or a list
+    of `input_text` / `input_image` parts), `custom_tool_call`
+    (`call_id`, `name`, `input`), `local_shell_call` and `shell_call`
+    (`call_id`, `action`), and `apply_patch_call` (`call_id`,
+    `operation`). Their `custom_tool_call_output`,
+    `local_shell_call_output`, `shell_call_output` and
+    `apply_patch_call_output` become tool results by `call_id`
+    (a legacy local-shell output may use `id` instead).
+    A `compaction` item's authenticated `encrypted_content` is
+    expanded into a developer message with the summary; an
+    unauthenticated item is a 400 (see `/v1/responses/compact`).
+    Also carried: `reasoning`
+    (`content` of `reasoning_text` parts, `encrypted_content`), and a
+    `web_search_call` handed back (P8), which becomes a line of the
+    assistant's history naming the search and its sources, and an
+    `image_generation_call` handed back (P8e), which becomes a line
+    naming the prompt the image was made for -- its base64 is not
+    sent to the model.
+    Codex drops `id` and `status` when it sends items back
+    (measured), so neither is required. Refused: `item_reference` and
+    any other type.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
     )
-    input: str | list[ResponsesInputItem] = Field(
-        ...,
-        description='A string (one user message), or the conversation as a list of\nitems. Codex resends the whole conversation on every turn.\n',
-    )
-    instructions: str | None = Field(None, description='The leading system message.')
-    tools: list[ResponsesTool] | None = None
-    tool_choice: ToolChoice1 | dict[str, Any] | None = Field(
+    type: str | None = None
+    id: str | None = Field(
         None,
-        description='`auto`, `none`, `required`, or `{"type": "function", "name": …}`.\nForcing any other tool type is refused.\n',
+        description="Optional item id; also the legacy local-shell output's call id.",
     )
-    parallel_tool_calls: bool | None = None
-    stream: bool | None = Field(None, description='Codex sets this on every request.')
-    temperature: float | None = Field(None, ge=0.0, le=2.0)
-    top_p: float | None = Field(None, ge=0.0, le=1.0)
-    max_output_tokens: int | None = Field(
+    role: str | None = None
+    content: Any | None = Field(None, description='A string, or a list of parts.')
+    call_id: str | None = None
+    name: str | None = None
+    namespace: str | None = Field(
         None,
-        description='Absent means no cap here -- see "No cap from the install\ndefault" on the endpoint. The model\'s settings profile still\napplies.\n',
-        ge=1,
+        description='The `namespace` tool a `function_call` was to (Codex 0.133 and later).',
     )
-    text: dict[str, Any] | None = Field(
+    arguments: str | None = None
+    input: str | None = Field(
+        None, description='Free-text input of a custom tool call.'
+    )
+    action: ResponsesToolAction | None = None
+    operation: ResponsesPatchOperation | None = None
+    status: str | None = Field(
         None,
-        description="`format` (`text`, `json_object`, or `json_schema` with `name`,\n`schema`, `strict`, `description`) is carried as the backend's\nresponse format. `verbosity` is accepted and not honoured.\n",
+        description="A call's status; an apply-patch output reports completed or failed.",
     )
-    reasoning: dict[str, Any] | None = Field(
+    max_output_length: int | None = Field(
+        None, description='Carried on shell output when present on its call.'
+    )
+    output: Any | None = Field(
         None,
-        description='`effort` is carried to supporting backends, otherwise omitted and\nnamed as `reasoning.effort` on the ignored-settings header. `summary`\nis accepted and not honoured, and named when set. Codex sends null\nfor a model id it does not know.\n',
+        description='A function or custom result is a string or a list of\n`input_text` / `input_image` parts. A local-shell result is a\nstring. A shell result is a list of objects with `stdout`,\n`stderr` and `outcome` (`type: exit` with `exit_code`, or\n`type: timeout`). An apply-patch result is an optional string;\nits status and observed failure text are carried to the model.\n',
     )
-    include: list[str] | None = Field(
+    summary: list[dict[str, Any]] | None = None
+    encrypted_content: str | None = Field(
         None,
-        description='`reasoning.encrypted_content` is honoured. The server-side tool\nincludes are accepted (nothing here produces those items).\n`message.output_text.logprobs` is refused.\n',
-    )
-    store: bool | None = Field(
-        None,
-        description='Nothing is ever stored; `true` is named on the ignored-settings header.',
-    )
-    previous_response_id: str | None = Field(
-        None, description='Refused when set. This gateway keeps no response store.'
-    )
-    truncation: Truncation | None = None
-    metadata: dict[str, Any] | None = None
-    client_metadata: dict[str, Any] | None = Field(
-        None, description='Sent by Codex (`x-codex-installation-id`). Discarded.'
-    )
-    prompt_cache_key: str | None = Field(
-        None,
-        description='Sent by Codex (the session id). A local engine keeps its own cache.',
-    )
-    user: str | None = None
-    safety_identifier: str | None = None
-    service_tier: str | None = None
-    max_tool_calls: int | None = None
-    top_logprobs: int | None = None
-    background: bool | None = None
-    stream_options: dict[str, Any] | None = None
-    prompt_cache_retention: str | None = None
-    conversation: Any | None = Field(
-        None, description='Refused when set. Conversations are stored objects.'
-    )
-    prompt: Any | None = Field(
-        None,
-        description='Refused when set. A stored prompt template exists only at OpenAI.',
+        description="Reasoning's existing carrier, or a compaction item's encrypted\nand authenticated summary. A compaction requires a nonempty\nstring that this gateway can authenticate before using it.\n",
     )
 
 
@@ -4823,7 +5616,9 @@ class ResponsesResponse(BaseModel):
     """
     A response object. `output` holds a `reasoning` item first when
     the model reasoned, then a `message` with one `output_text` part,
-    then one `function_call` item per tool call. The request's settings
+    then one call item per tool call, using the declared tool's type
+    (`function_call`, `custom_tool_call`, `local_shell_call`,
+    `shell_call` or `apply_patch_call`). The request's settings
     are echoed as OpenAI echoes them; `store` is always false.
 
     """
@@ -4854,14 +5649,32 @@ class ResponsesStreamEvent(BaseModel):
     and `data.type` always agree, and every frame has a
     `sequence_number`.
 
+    Custom input uses `response.custom_tool_call_input.delta` (`delta`)
+    and `.done` (`input`), with `item_id` and `output_index`. Shell
+    commands use `response.shell_call_command.added`, `.delta` and
+    `.done`, with `command_index` and `output_index`; added and done
+    carry `command`, delta carries `delta`. All client call types,
+    including `local_shell_call` and `apply_patch_call`, also use
+    `response.output_item.added` and `response.output_item.done` with
+    their Responses `item`, including the complete action or operation
+    on done. Internal function-adapter arguments are not exposed as
+    function-call events for these client-run tools.
+
     """
 
     model_config = ConfigDict(
         extra='allow',
     )
-    type: Type7
+    type: Type9
     sequence_number: int
     response: ResponsesResponse | None = None
+    item: ResponsesOutputItem | None = None
+    item_id: str | None = None
+    output_index: int | None = Field(None, ge=0)
+    command_index: int | None = Field(None, ge=0)
+    delta: str | None = None
+    input: str | None = None
+    command: str | None = None
 
 
 class SystemOneRequest(BaseModel):
@@ -5081,6 +5894,89 @@ class MetricRequest(BaseModel):
 class MetricRequestPage(BaseModel):
     requests: list[MetricRequest]
     nextCursor: str | None = Field(None, description='Absent or null on the last page.')
+
+
+class GeminiGenerateContentRequest(BaseModel):
+    """
+    Native Gemini request translated onto the shared chat path. Unsupported settings are refused
+    by field name. Untested capabilities are attempted rather than blocked by an unmeasured
+    allowlist.
+    """
+
+    contents: list[GeminiContent] = Field(..., min_length=1)
+    systemInstruction: GeminiContent | None = None
+    tools: list[GeminiTool] | None = None
+    toolConfig: ToolConfig | None = None
+    generationConfig: GeminiGenerationConfig | None = None
+    safetySettings: list[SafetySetting] | None = Field(
+        None,
+        description='Accepted; named as ignored because no local safety filter runs.',
+    )
+    model: str | None = Field(
+        None,
+        description='Used inside countTokens.generateContentRequest only. When present it must resolve to the\nsame model as the URL; a mismatch is a 400 naming generateContentRequest.model.',
+    )
+
+
+class GeminiStreamGenerateContentResponse(BaseModel):
+    """
+    One SSE data object. Each frame carries Gemini response fields as available; text and tool
+    parts are deltas, usageMetadata may arrive only at the end, and finishReason appears only
+    when observed. No synthetic usage or finish reason.
+    """
+
+    candidates: list[GeminiCandidate] | None = Field(None, max_length=1)
+    usageMetadata: GeminiUsageMetadata | None = None
+    modelVersion: str | None = Field(
+        None,
+        description='The Eugene model id that actually answered, after role routing and failover.',
+    )
+    responseId: str | None = None
+
+
+class GeminiGenerateContentResponse(BaseModel):
+    """
+    A complete answer. SSE uses the same fields but may omit candidates in a usage-only frame
+    and usageMetadata until the final frame. Required fields here apply to a complete
+    non-streamed response.
+    """
+
+    candidates: list[GeminiCandidate] = Field(..., max_length=1)
+    usageMetadata: GeminiUsageMetadata
+    modelVersion: str = Field(
+        ...,
+        description='The Eugene model id that actually answered, after role routing and failover.',
+    )
+    responseId: str | None = None
+
+
+class GeminiCountTokensRequest1(BaseModel):
+    """
+    Either contents or a full generateContentRequest including system instructions and tools,
+    never both. The SDK sends contents for an ordinary count_tokens call.
+    """
+
+    contents: list[GeminiContent] = Field(..., min_length=1)
+    generateContentRequest: GeminiGenerateContentRequest | None = None
+
+
+class GeminiCountTokensRequest2(BaseModel):
+    """
+    Either contents or a full generateContentRequest including system instructions and tools,
+    never both. The SDK sends contents for an ordinary count_tokens call.
+    """
+
+    contents: list[GeminiContent] | None = Field(None, min_length=1)
+    generateContentRequest: GeminiGenerateContentRequest
+
+
+class GeminiCountTokensRequest(
+    RootModel[GeminiCountTokensRequest1 | GeminiCountTokensRequest2]
+):
+    root: GeminiCountTokensRequest1 | GeminiCountTokensRequest2 = Field(
+        ...,
+        description='Either contents or a full generateContentRequest including system instructions and tools,\nnever both. The SDK sends contents for an ordinary count_tokens call.',
+    )
 
 
 class DriversInfo(BaseModel):
@@ -5340,6 +6236,9 @@ class Model(BaseModel):
     is what makes it safe to answer "which of my backends is behind
     this name" without breaking compatibility.
 
+    Gemini clients read name, displayName, supportedGenerationMethods and known token limits;
+    OpenAI clients retain id, object and the namespaced extension.
+
     """
 
     id: str = Field(
@@ -5355,6 +6254,26 @@ class Model(BaseModel):
         description='OpenAI sends an organisation here. We send `local` only when\nevery backend reports local inference, otherwise the provider\nkey when there is one, `mixed` for multiple providers, or\n`unknown` when no provider or local inference is confirmed.\n',
     )
     x_eugene_plexus: ModelRoutingInfo | None = None
+    name: str = Field(
+        ...,
+        description='models/<Eugene id or configured Gemini alias>; slashes in ids are preserved.',
+    )
+    version: str | None = None
+    displayName: str | None = None
+    inputTokenLimit: int | None = Field(
+        None,
+        description='Effective reported input limit; omitted when unknown, never guessed.',
+        ge=1,
+    )
+    outputTokenLimit: int | None = Field(
+        None,
+        description='Effective reported output limit; omitted when unknown, never guessed.',
+        ge=1,
+    )
+    supportedGenerationMethods: list[str] = Field(
+        ...,
+        description='Door methods the serving path reports, such as generateContent, streamGenerateContent\nand countTokens. Unknown capability is not a refusal; requests may still try it.',
+    )
 
 
 class ModerationParts(RootModel[list[ModerationInputPart]]):
@@ -5379,7 +6298,7 @@ class ChatCompletionChunkChoice(BaseModel):
         None,
         description="The log probabilities of this frame's tokens, with `logprobs` true.",
     )
-    finish_reason: FinishReason1 | None = Field(
+    finish_reason: FinishReason2 | None = Field(
         None, description='Null until the terminal chunk.'
     )
 
@@ -5404,6 +6323,10 @@ class CompletionRoutingInfo(BaseModel):
     runtime: str | None = Field(
         None,
         description='Name of the engine runtime behind that driver, when it is a\nlocal engine. Absent for hosted and CLI backends, which have\nno runtime of ours.\n',
+    )
+    node: str | None = Field(
+        None,
+        description="Name of the machine whose runtime answered, as the root's node\nregistry names it. Null when the backend is not a machine's\nruntime, such as a cloud provider. Where the `x_eugene_plexus`\nenvelope rides on headers, this field rides as the\n`x-eugene-plexus-node` header.\n",
     )
     backend: BackendKind | None = None
     reported_model: str | None = Field(
@@ -5600,6 +6523,117 @@ class AnthropicCountTokensRequest(BaseModel):
     tool_choice: AnthropicToolChoice | None = None
 
 
+class ResponsesRequest(BaseModel):
+    """
+    Request body for `POST /v1/responses`, in OpenAI's shape. Like
+    `AnthropicMessagesRequest`, **this schema is what the gateway
+    reads, not what it refuses**: the refusals are enforced against
+    the raw body by the implementation, with a 400 naming the field,
+    and the endpoint description lists them. A top-level field not
+    named here is refused.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    model: str = Field(
+        ...,
+        description="A model id from `GET /v1/models`, resolved against this install's slots.",
+    )
+    input: str | list[ResponsesInputItem] = Field(
+        ...,
+        description='A string (one user message), or the conversation as a list of\nitems. Codex resends the whole conversation on every turn.\n',
+    )
+    instructions: str | None = Field(None, description='The leading system message.')
+    tools: list[ResponsesTool] | None = None
+    tool_choice: ToolChoice1 | dict[str, Any] | None = Field(
+        None,
+        description='`auto`, `none`, `required`, or an object forcing a declared\nclient-run tool: `function` or `custom` with `name`, or\n`local_shell`, `shell` or `apply_patch` by `type`. An\nundeclared or refused tool is a 400 naming the cause.\n',
+    )
+    parallel_tool_calls: bool | None = None
+    stream: bool | None = Field(None, description='Codex sets this on every request.')
+    temperature: float | None = Field(None, ge=0.0, le=2.0)
+    top_p: float | None = Field(None, ge=0.0, le=1.0)
+    max_output_tokens: int | None = Field(
+        None,
+        description='Absent means no cap here -- see "No cap from the install\ndefault" on the endpoint. The model\'s settings profile still\napplies.\n',
+        ge=1,
+    )
+    text: dict[str, Any] | None = Field(
+        None,
+        description="`format` (`text`, `json_object`, or `json_schema` with `name`,\n`schema`, `strict`, `description`) is carried as the backend's\nresponse format. `verbosity` is accepted and not honoured.\n",
+    )
+    reasoning: dict[str, Any] | None = Field(
+        None,
+        description='`effort` is carried to supporting backends, otherwise omitted and\nnamed as `reasoning.effort` on the ignored-settings header. `summary`\nis accepted and not honoured, and named when set. Codex sends null\nfor a model id it does not know.\n',
+    )
+    include: list[str] | None = Field(
+        None,
+        description='`reasoning.encrypted_content` is honoured. The server-side tool\nincludes are accepted (nothing here produces those items).\n`message.output_text.logprobs` is refused.\n',
+    )
+    store: bool | None = Field(
+        None,
+        description='Nothing is ever stored; `true` is named on the ignored-settings header.',
+    )
+    previous_response_id: str | None = Field(
+        None, description='Refused when set. This gateway keeps no response store.'
+    )
+    truncation: Truncation | None = None
+    metadata: dict[str, Any] | None = None
+    client_metadata: dict[str, Any] | None = Field(
+        None, description='Sent by Codex (`x-codex-installation-id`). Discarded.'
+    )
+    prompt_cache_key: str | None = Field(
+        None,
+        description='Sent by Codex (the session id). A local engine keeps its own cache.',
+    )
+    user: str | None = None
+    safety_identifier: str | None = None
+    service_tier: str | None = None
+    max_tool_calls: int | None = None
+    top_logprobs: int | None = None
+    background: bool | None = None
+    stream_options: dict[str, Any] | None = None
+    prompt_cache_retention: str | None = None
+    conversation: Any | None = Field(
+        None, description='Refused when set. Conversations are stored objects.'
+    )
+    prompt: Any | None = Field(
+        None,
+        description='Refused when set. A stored prompt template exists only at OpenAI.',
+    )
+
+
+class ResponsesCompactRequest(BaseModel):
+    """
+    Request for standalone compaction. The model and conversation are
+    required while no response store exists. Unknown top-level fields
+    are refused with a 400 naming the field.
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    model: str = Field(
+        ...,
+        description="A model id from `GET /v1/models`, resolved against this install's slots.",
+    )
+    input: str | list[ResponsesInputItem] = Field(
+        ...,
+        description='A string (one user message), or the conversation as a list of\nitems. Codex resends the whole conversation on every turn.\n',
+    )
+    instructions: str | None = Field(
+        None,
+        description='Summary guidance carried alongside the fixed compaction prompt.',
+    )
+    previous_response_id: str | None = Field(
+        None,
+        description='Refused when set until row 54 supplies chain loading; send input instead.',
+    )
+
+
 class SystemOneResponse(BaseModel):
     model: str = Field(
         ...,
@@ -5645,6 +6679,13 @@ class ModelList(BaseModel):
     object: Literal['list']
     data: list[Model]
     x_eugene_plexus: ModelListInfo | None = None
+    models: list[GeminiModel] = Field(
+        ...,
+        description='Gemini projection of this same page; existing OpenAI clients continue reading data.',
+    )
+    nextPageToken: str | None = Field(
+        None, description='Opaque token for the next page; omitted on the last page.'
+    )
 
 
 class CompletionResponse(BaseModel):
@@ -5830,7 +6871,7 @@ class ChatCompletionMessage(BaseModel):
 
     """
 
-    role: Role1 = Field(
+    role: Role2 = Field(
         ...,
         description="`function` is the deprecated role for a function's result,\nanswering the assistant's `function_call` before it; it is\ncarried as a `tool` message answering that call (P2c).\n\n`developer` is OpenAI's newer name for the instruction role,\nsent by current SDKs and frameworks when they target a\nreasoning model. It reaches the backend as `system`, in\nplace -- local chat templates know only `system`, and the\ntwo mean the same thing to a model that is not OpenAI's.\nRefused with a 400 until 2026-09-23.\n",
     )
@@ -5859,7 +6900,7 @@ class ChatCompletionMessage(BaseModel):
         None,
         description='On a response: the spoken answer (P2b). On a request:\nrefused with a 400, since it would name stored audio.\n',
     )
-    function_call: FunctionCall | None = Field(
+    function_call: FunctionCallModel | None = Field(
         None,
         description="The deprecated single function call (P2c). On a response, only\nwhen the request used `functions`. On a request's assistant\nmessage, it is carried as that turn's one tool call.\n",
     )
@@ -5875,7 +6916,7 @@ class ChatCompletionChoice(BaseModel):
     logprobs: ChatLogprobs | None = Field(
         None, description="With `logprobs` true, the answer's; otherwise null."
     )
-    finish_reason: FinishReason = Field(
+    finish_reason: FinishReason1 = Field(
         ...,
         description='`function_call` only when the request used the deprecated\n`functions`, in place of `tool_calls` (P2c).\n\n`stop` for a natural end or a matched stop sequence,\n`length` for hitting the token cap, `tool_calls` when the\nmodel stopped because it wants one or more tools run,\n`content_filter` when a safety classifier stopped it.\n\n**`content_filter` is OpenAI\'s own value and is carried\nsince 2026-09-19.** Before that the chain was\n`content_filter` → the driver\'s `error` → `stop`, so a\nfiltered answer arrived as a natural end and a caller had\nno way to tell a refusal from a reply. The same mistake as\n`tool_calls` → `stop` before 2026-09-11, one value along:\na state with no row of its own reported as its nearest\nneighbour.\n\nUntil 2026-09-11 this enum was `stop` and `length` only, and\nits description said so in as many words — "OpenAI\'s two\nvalues for a completion **without** tool calls". That\nsentence was the single occurrence of the string "tool"\nanywhere in this contract or the driver\'s, and it was an\naccurate description of a control plane no agent harness\ncould use.\n',
     )
@@ -5889,7 +6930,7 @@ class Message(BaseModel):
 
     """
 
-    role: Role
+    role: Role1
     content: str | MessageContent1 | None = Field(
         None,
         description='Text, null for an assistant tool-call turn, or ordered content parts.\nImages ride on user messages and on tool results (the gateway carries\na tool\'s picture on the next user message). Audio and files ride on\nuser messages only.\n\nImages are inline PNG/JPEG only: the gateway\'s `maxImagesPerRequest`\nper request (12 by default, at most 64, counted across the whole\nconversation), 5 MiB decoded each, 10 MiB decoded total, 16 million\npixels each, maximum dimension 8192. The inference-driver enforces\nthe ceiling of 64; the gateway enforces the setting.\n\nTool pictures count toward these same limits. On all three gateway\ndoors (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`), when\ntool pictures exceed the image count or decoded-byte limits, the\ngateway keeps the newest tool pictures that fit. Each picture not\nattached becomes a note in its tool message naming the limit, for\nexample: "[A picture this tool returned is not attached: this request\nholds at most 12 pictures.]" (with the effective setting\'s value).\nA person\'s own pictures are never dropped; if they alone exceed a\nlimit, the request is a 400.\n\nAudio (`input_audio`, WAV or MP3) and files (`file`, PDF) are\ninline too: at most 10 MiB decoded each, and every attachment in\nthe request together -- images, audio and files -- at most\n11 MiB decoded, which is what fits in the 16 MiB JSON body once\nbase64 has grown it by a third. Remote URLs are never fetched, and a\n`file_id` is refused:\neach names a store this install does not have.\n',

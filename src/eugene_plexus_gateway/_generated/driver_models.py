@@ -127,7 +127,7 @@ class InputFile(BaseModel):
     )
     file_id: str | None = Field(
         None,
-        description="Refused with a 400. It names a file uploaded to one\nprovider's store, which this install does not have; send\n`file_data`.\n",
+        description="A file kept in this install's store (`POST /v1/files`, row\n53). The gateway reads it for the caller, from the caller's\nown files only, and carries it as `file_data` (a PDF), an\nimage or text, within the limits above; it never reaches a\nbackend as an id. Another owner's id is refused as one that\ndoes not exist.\n",
     )
 
 
@@ -366,6 +366,11 @@ class ComponentKind(StrEnum):
     calls a tool-driver when the model uses it. `library` scans the operator's model
     directories and holds per-model launch profiles; there is
     exactly one, and it is deliberately not in the request path.
+    `store` (row 53, 2026-10-23) keeps what the gateway's platform
+    doors keep for people -- uploaded files first, then stored
+    responses, batches and vector stores -- each object with an owner
+    and an end; there is exactly one, on the root by default, and the
+    gateway is its only caller (`openapi/store.yaml`).
 
     **The agent is not in this list**, for the same reason engine
     runtimes are not: it supervises, it is not supervised. Its
@@ -381,7 +386,52 @@ class ComponentKind(StrEnum):
     gateway = 'gateway'
     inference_driver = 'inference-driver'
     library = 'library'
+    store = 'store'
     tool_driver = 'tool-driver'
+
+
+class Peer(RootModel[str]):
+    root: str = Field(..., min_length=1)
+
+
+class ComputeDevicePcieLink(BaseModel):
+    """
+    Current and supported PCIe link measurements for one card. Each
+    measurement is null independently when its probe fails, so a
+    readable width survives an unreadable generation.
+
+    """
+
+    generation: int | None = Field(
+        ..., description='Current PCIe generation. Null when unreadable.', ge=1
+    )
+    width: int | None = Field(
+        ..., description='Current PCIe lane count. Null when unreadable.', ge=1
+    )
+    maxGeneration: int | None = Field(
+        ...,
+        description='Maximum PCIe generation the card supports. Null when unreadable.',
+        ge=1,
+    )
+    maxWidth: int | None = Field(
+        ...,
+        description='Maximum PCIe lane count the card supports. Null when unreadable.',
+        ge=1,
+    )
+
+
+class ComputeDeviceThrottleReason(StrEnum):
+    """
+    An observed reason a card is slowing down. `thermal` is a heat
+    limit, `power-cap` a power limit, `hardware-slowdown` another
+    hardware slowdown signal, and `other` another active NVML reason.
+
+    """
+
+    thermal = 'thermal'
+    power_cap = 'power-cap'
+    hardware_slowdown = 'hardware-slowdown'
+    other = 'other'
 
 
 class ComputeDeviceKind(StrEnum):
@@ -577,6 +627,68 @@ class PreparationVisionMode(StrEnum):
     gpu = 'gpu'
 
 
+class SpeedProjectionMode(StrEnum):
+    """
+    Changes the model's answers when on; experimental and off by default.
+    Strata's bundled refusal-direction projection reduces refusals and
+    also changes ordinary predictions. Upstream measures a 0.2-0.4%
+    cost per token on identical text, not a guaranteed speed-up.
+    Preparation uses --experimental-speed-projection on|off. Launch
+    applies the prepared control vector and reports the applied mode;
+    a requested mode alone is not evidence that it took effect.
+
+    """
+
+    off = 'off'
+    on = 'on'
+
+
+class StrataGpuSelectionItem(RootModel[int]):
+    root: int = Field(..., ge=0)
+
+
+class PreparationIntent(BaseModel):
+    """
+    Prepare the model for an engine before running it. Asked for,
+    never implied: Run without it picks an engine that runs the model
+    as it is. This is the source schema for the durable run protocol's
+    PreparationIntent; regenerate openapi/run-operations.json from the
+    Library after adopting this schema, rather than editing its copy.
+    The Strata choices use the same keys as that engine's profile
+    flags. Unsupported or ignored choices must name the observed
+    cause; no requested value may be reported as applied by default.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    engine: EngineKind
+    contextSize: int | None = Field(
+        None,
+        description="The context to prepare for. Absent uses the engine's recommendation for the node.",
+        ge=1,
+    )
+    vision: PreparationVisionMode | None = Field(
+        'off',
+        description='Image encoder placement. Off preserves text-only preparation.',
+    )
+    speedProjection: SpeedProjectionMode | None = Field(
+        'off',
+        description='Changes answers when on; experimental. Off preserves stock model behavior.',
+    )
+    gpus: list[StrataGpuSelectionItem] | None = Field(
+        None,
+        description="Ordered card ordinals from this node's ComputeDevice inventory;\nthe main card is first. The node validates each selected card\nagainst its current inventory and resolves process visibility at\nevery preparation and launch. Two or more cards share the model.\nOmission in a preparation keeps the existing automatic single-card\nselection. Omission in a profile preserves the prepared selection.\nAn empty list is not automatic selection.\nThis inventory has kind and index, not row 43's stable UUIDs;\nordinals are local to the selected node and must not be treated\nas stable identities or silently replaced by another card.\n",
+        min_length=1,
+    )
+    layerSplit: str | None = Field(
+        'auto',
+        description="auto places layers using the selected cards' free memory and\nexpert profile. An expert can give the first layer of each later\ncard, as comma-separated rising integers: 16,32 for three cards.\nThese are boundaries, not a count of layers per card. The node\nchecks one boundary per card after the first, each at least 2,\nstrictly rising and below the model's layer count. An explicit\nboundary requires several selected cards. With one card there\nis no layer split.\n",
+        min_length=1,
+    )
+
+
 class Context(RootModel[int]):
     root: int = Field(..., ge=1)
 
@@ -606,6 +718,10 @@ class ModelPreparation(BaseModel):
     visionModes: list[PreparationVisionMode] | None = Field(
         None,
         description="Image encoder choices supported by this model's preparation. Absent:\nno image preparation is offered. Omitting the choice in a run intent\npreserves text-only preparation. Enabling images downloads an extra\nencoder and uses additional memory while serving.\n",
+    )
+    speedProjectionModes: list[SpeedProjectionMode] | None = Field(
+        None,
+        description="Changes answers when on; experimental. Choices this model's\npreparation offers for the bundled projection. Absent means\nno projection choice is advertised, not a claim that an\nuntested model cannot run. Omitting the choice in a run\nintent selects off. An upstream fallback must be reported\nas the mode that actually took effect, with its cause.\n",
     )
     minEngineVersion: str | None = Field(
         None,
@@ -1449,6 +1565,19 @@ class RevokedSession(BaseModel):
     exp: int = Field(..., description="The session's own `exp`, unix seconds.")
 
 
+class TokenEpochs(BaseModel):
+    """
+    Since when every token the control root signs carries `ep`
+    (row 4): the time in unix seconds, and the epoch it was then.
+    Absent from a root older than row 4, and every root token
+    without `ep` is then accepted as before.
+
+    """
+
+    since: int
+    epoch: int
+
+
 class TrustBundle(BaseModel):
     """
     The set of keys every verifier in the install trusts, and what
@@ -1488,7 +1617,20 @@ class TrustBundle(BaseModel):
        the issuer's own, 14 days for a session, 10 minutes for an
        exchanged token, and 400 days for a client key;
     5. refuses a session that is listed in `revokedSessions`, or
-       whose `aud` names a node no longer in the bundle.
+       whose `aud` names a node no longer in the bundle;
+    6. refuses a token the control root signed, other than a client
+       key, whose `ep` claim (the epoch of the root that minted it,
+       row 4) is below this bundle's `epoch`: "This command came from a
+       root this machine no longer follows (epoch 2; it follows epoch
+       3)." A promotion keeps the root's token key, so this is what
+       stops the root it replaced. A root token without `ep` (from a
+       root older than row 4) is refused once `tokenEpochs` says roots
+       mark theirs, if it was minted after `tokenEpochs.since` or the
+       epoch has risen past `tokenEpochs.epoch`.
+
+    **Bundles are ordered by epoch first** (row 4): a higher `epoch`
+    replaces whatever its `version`, a lower one never does, and at
+    one epoch the version decides.
 
     No hard expiry, deliberately. A bundle that stopped verifying
     when the root was dead would end the data path's guarantee to
@@ -1499,11 +1641,15 @@ class TrustBundle(BaseModel):
 
     version: int = Field(
         ...,
-        description="The control root's replicated log index when this bundle was\nbuilt, so it only grows, including across a promotion. A\nverifier refuses a lower version than it holds (rollback)\nand replaces its bundle with an equal or higher one.\n",
+        description="The control root's replicated log index when this bundle was\nbuilt. At one epoch a verifier refuses a lower version than it\nholds (rollback) and replaces its bundle with an equal or\nhigher one. A root promoted from a copy that was behind may\nnumber below the root it replaced, so a higher `epoch` wins\nwhatever the version.\n",
         ge=0,
     )
     epoch: int = Field(
         ..., description="The control root's epoch; an agent refuses a lower one.", ge=0
+    )
+    tokenEpochs: TokenEpochs | None = Field(
+        None,
+        description='Since when every token the control root signs carries `ep`\n(row 4): the time in unix seconds, and the epoch it was then.\nAbsent from a root older than row 4, and every root token\nwithout `ep` is then accepted as before.\n',
     )
     iat: int = Field(
         ...,
@@ -1561,6 +1707,43 @@ class MasterKeyEnvelope(BaseModel):
         description='Base64-encoded 24-byte nonce. Generated per-encryption,\nnever reused with the same key.\n',
     )
     ciphertext: str = Field(..., description='Base64-encoded ciphertext + auth tag.')
+
+
+class Subject(RootModel[str]):
+    root: str = Field(..., max_length=200, min_length=1)
+
+
+class PeopleKnownRequest(BaseModel):
+    """
+    Which of these people the root still has (row 53). A component
+    that keeps people's objects (the store) asks its agent, which asks
+    the root with its own node token. Only the ids sent are answered,
+    so it cannot list people.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    subjects: list[Subject] = Field(
+        ...,
+        description="People's ids, as a person token's `personId` names them.",
+        max_length=500,
+        min_length=1,
+    )
+
+
+class PeopleKnownResult(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    known: list[str] = Field(
+        ..., description="Ids the root has a person for (on or off), or the owner's."
+    )
+    unknown: list[str] = Field(
+        ...,
+        description="Ids the root has no person for. Each one was deleted, or never was the root's.",
+    )
 
 
 class RestartResult(BaseModel):
@@ -2644,6 +2827,11 @@ class ComputeDevice(BaseModel):
     because a host with two cards is the case that makes replicas of
     one model possible.
 
+    Health readings are observations, never estimates. Each optional
+    health field is null when the platform cannot read it. The agent
+    refreshes these with its device list every 600 seconds and on
+    each `GET /v1/node` (row 43).
+
     """
 
     kind: ComputeDeviceKind
@@ -2653,8 +2841,45 @@ class ComputeDevice(BaseModel):
     )
     index: int | None = Field(
         None,
-        description="Device ordinal on its own host — what `CUDA_VISIBLE_DEVICES`\nor `HIP_VISIBLE_DEVICES` in a runtime's `env` selects to pin\nthat runtime to one card. For a `vulkan` device it is the\norder the operating system lists its adapters in, which is\nnot promised to be the order `GGML_VK_VISIBLE_DEVICES`\ncounts in.\n",
+        description='Current device ordinal on its own host. It can change when\nanother card disappears; `uuid`, when readable, identifies\nthe same card across that renumbering. NVIDIA launches use\nthe UUID in `CUDA_VISIBLE_DEVICES`, falling back to an index\nwhen no UUID was read. For a `vulkan` device the index is the\norder the operating system lists its adapters in, which is\nnot promised to be the order `GGML_VK_VISIBLE_DEVICES` counts\nin.\n',
         ge=0,
+    )
+    uuid: str | None = Field(
+        None,
+        description="Stable vendor device identifier, used to keep a runtime on\nthe same card when indices change. NVIDIA's NVML UUID (for\nexample `GPU-...`) or AMD's sysfs `unique_id`, kept as the\nvendor reports it; not necessarily an RFC UUID. Null when\nthe platform cannot read it.\n",
+        min_length=1,
+    )
+    pciBusId: str | None = Field(
+        None,
+        description='PCI bus address from NVML or the Linux sysfs device path.\nNull when unreadable. A location, not a stable card identity.\n',
+        min_length=1,
+    )
+    pcieLink: ComputeDevicePcieLink | None = Field(
+        None,
+        description="Observed PCIe link against the card's supported link. Null\nwhen no link measurements can be read. A lower generation\nis a warning only when this card's utilisation exceeded 50%\nin the last minute of host history: an idle card can lower\nits generation to save power. A narrower width is a warning\nat any time. Compare only measurements that are known.\n",
+    )
+    powerLimitWatts: float | None = Field(
+        None,
+        description="Power cap in effect, in watts, from NVML's enforced power\nlimit or Linux hwmon `power1_cap`. Null when unreadable.\n",
+        ge=0.0,
+    )
+    powerDefaultLimitWatts: float | None = Field(
+        None,
+        description="The card's default power cap in watts, from NVML or Linux\nhwmon `power1_cap_default`. Null when unreadable.\n",
+        ge=0.0,
+    )
+    throttleReasons: list[ComputeDeviceThrottleReason] | None = Field(
+        None,
+        description='Reasons the card is currently slowing down, read from NVML.\nAn empty list means it reported no throttling. Null when\nunreadable, including AMD and other unsupported platforms.\n',
+    )
+    uncorrectedMemoryErrors: int | None = Field(
+        None,
+        description="Volatile uncorrected ECC memory-error count from NVML, since\nthe device's counter was reset. Zero is a measured result.\nNull when ECC is off, unsupported or unreadable.\n",
+        ge=0,
+    )
+    peers: list[Peer] | None = Field(
+        None,
+        description='UUIDs of other cards this card can reach directly by P2P\nreads, as NVML reports it. Directional: the reverse path is\nreported on the other card. An empty list means no peers\nwere reachable; null means the peer check was unreadable or\nunsupported. Unknown checks never claim that P2P is absent.\n',
     )
     memoryTotalBytes: int | None = None
     memoryFreeBytes: int | None = Field(
@@ -3159,6 +3384,11 @@ class EmbedRequest(BaseModel):
         None,
         description="Which of this driver's models the request is for: an `id` from\n`DriverInfo.models`, **unprefixed** — the gateway strips the\n`<driver name>/` it added. Optional so a caller from before P1\nstill works against a single-model driver, which serves its one\nmodel when this is absent. An account driver refuses a request\nwithout it (400, `#model-required`), and every driver refuses a\nmodel it does not list (404, `#model-not-served`) before calling\nits backend.\n",
         min_length=1,
+    )
+    dimensions: int | None = Field(
+        None,
+        description='Optional requested vector width. Gemini passes it to\noutputDimensionality on each embedContent request, including\neach entry in batchEmbedContents. A provider refusal names\ndimensions and the observed cause. The driver never truncates\nor pads a vector to imitate this setting. Backends that cannot\napply it keep their native width and name dimensions in\nx-eugene-plexus-ignored-settings; the gateway preserves that\nheader. An untested capability alone never blocks an attempt.\n',
+        ge=1,
     )
     localOnly: bool | None = Field(
         False,

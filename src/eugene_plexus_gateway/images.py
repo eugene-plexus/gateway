@@ -10,6 +10,7 @@ import base64
 import binascii
 import io
 import warnings
+from contextvars import ContextVar
 from typing import Any
 
 from PIL import Image
@@ -33,6 +34,11 @@ MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 #: Every attachment in a request together, images included: what fits in the
 #: 16 MiB JSON body once base64 has grown it by a third.
 MAX_ATTACHMENTS_TOTAL = 11 * 1024 * 1024
+#: Bytes of attachments already in this request that no budget below sees: the text of
+#: stored files the files door expanded in place of a `file_id` (second review of row 53).
+#: They count with every inline attachment against `MAX_ATTACHMENTS_TOTAL`, so a request
+#: has one budget however its attachments arrive. Set by the door, per request.
+carried_attachment_bytes: ContextVar[int] = ContextVar("carried_attachment_bytes", default=0)
 #: A content part's `type` and the input kind it asks the model to take.
 PART_KINDS = {"image_url": "image", "input_audio": "audio", "file": "file"}
 _PDF_DATA_URL = "data:application/pdf;base64,"
@@ -104,7 +110,7 @@ class ImageBudget:
     def __init__(self, max_images: int = DEFAULT_MAX_IMAGES) -> None:
         self.count = 0
         self.total = 0
-        self.attached = 0
+        self.attached = carried_attachment_bytes.get()
         self.max_images = max_images
         self.tool_fields: dict[str, str] = {}
 
@@ -325,7 +331,7 @@ def validate_file(file: Any, field: str) -> tuple[str, int]:
     if file.get("file_id"):
         raise ImageRefusal(
             f"{field}.file_id",
-            "names an uploaded file, and this install has no file store; send file_data",
+            "names a stored file, which this door does not read; send file_data",
         )
     data = file.get("file_data")
     if not isinstance(data, str) or not data:

@@ -180,7 +180,7 @@ def test_bare_base64_reaches_the_driver_as_the_data_url(settings: Settings) -> N
             {"type": "input_audio", "input_audio": {"data": b64(MP3), "format": "flac"}},
             "messages.0.content.1.input_audio.format",
         ),
-        (file_part(file_id="file-abc"), "no file store"),
+        (file_part(file_id="file-abc"), "send file_id or file_data, not both"),
         (file_part("data:text/plain;base64," + b64(b"hi")), "PDF data URL"),
         (file_part("https://example.com/a.pdf"), "URLs are not fetched"),
         (file_part(b64(b"not a pdf")), "is not a PDF"),

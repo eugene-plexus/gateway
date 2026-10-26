@@ -13,6 +13,24 @@ class Scope(StrEnum):
     standalone = 'standalone'
 
 
+class ClientKeyRotateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    overlapSeconds: int | None = Field(
+        86400,
+        description='How long the old token keeps working. 0 stops it now. The old and new tokens share one concurrency and rate allowance during the overlap.',
+        ge=0,
+        le=2592000,
+    )
+    ttlDays: int | None = Field(
+        None,
+        description="Lifetime of the new key. Absent, the old key's lifetime.",
+        ge=1,
+        le=3650,
+    )
+
+
 class AllowedModel(RootModel[str]):
     root: str = Field(..., max_length=256, min_length=1)
 
@@ -147,7 +165,24 @@ class ClientKey(BaseModel):
     expiresAt: AwareDatetime
     revokedAt: AwareDatetime | None = None
     lastUsedAt: AwareDatetime | None = Field(
-        None, description='Reserved; not currently measured.'
+        None,
+        description='When the authority last admitted a check or acquisition with this key, to the minute. Absent, no use recorded.',
+    )
+    retiresAt: AwareDatetime | None = Field(
+        None,
+        description='Set when the key was rotated. The token works until then, and new requests on it are refused as replaced afterwards. Running requests finish.',
+    )
+    replaces: str | None = Field(
+        None,
+        description='The id of the key this one replaced.',
+        max_length=128,
+        min_length=1,
+    )
+    replacedBy: str | None = Field(
+        None,
+        description='The id of the key that replaced this one.',
+        max_length=128,
+        min_length=1,
     )
     limits: ClientKeyLimits | None = Field(
         None,
@@ -178,6 +213,12 @@ class ClientAdmissionResult(BaseModel):
     )
     keyId: str
     keyName: str
+    lineage: str | None = Field(
+        None,
+        description="The id of the first key of this key's rotations (row 24): a\nreplacement shares its predecessor's lineage. The store names a\nkey's objects by it, so a rotated key keeps its files (row 53).\nReaders take it when present and use `keyId` when absent; the\nauthority starts sending it once every reader knows the field,\nbecause an older reader refuses an unknown one.\n",
+        max_length=128,
+        min_length=1,
+    )
     personId: str | None = Field(
         None, description='Stable subject verified by the root, never caller supplied.'
     )

@@ -56,6 +56,8 @@ SPECS_TO_GENERATE: list[tuple[str, str, list[str] | None]] = [
     ("openapi/components/client-keys.yaml", "client_key_models.py", None),
     # P8: the gateway calls a search account's tool-driver as a client.
     ("openapi/tool-driver.yaml", "tool_driver_models.py", None),
+    # Row 53: the gateway is the store's only client, for /v1/files and /v1/uploads.
+    ("openapi/store.yaml", "store_models.py", None),
 ]
 
 

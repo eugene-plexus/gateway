@@ -114,7 +114,7 @@ async def require_authorized(
         context.key_id = claims.jti
         context.key_name = claims.sub
     guard: ClientKeyGuard | None = getattr(request.app.state, "client_key_guard", None)
-    decision = await guard.decision(claims.jti) if guard is not None else "unavailable"
+    decision = await guard.decision(claims.jti, claims.exp) if guard is not None else "unavailable"
     if decision == "unavailable":
         cause = guard.unavailable_reason if guard else "No client-key policy guard is configured."
         raise _problem(
@@ -129,6 +129,13 @@ async def require_authorized(
             "Key not registered",
             "This key is not registered with the current authority. Make a new one under "
             "Home -> Use it from your apps.",
+        )
+    if decision == "replaced":
+        raise _problem(
+            401,
+            "Key replaced",
+            "This key was replaced. Paste its replacement into this app, or make a new key "
+            "under Home -> Use it from your apps.",
         )
     if decision == "revoked":
         raise _problem(
