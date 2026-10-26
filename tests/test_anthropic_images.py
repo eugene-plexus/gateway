@@ -373,11 +373,19 @@ def test_the_per_request_image_limit_counts_both_places(settings: Settings) -> N
     with serve(settings, driver) as client:
         client.patch("/v1/config", json={"maxImagesPerRequest": 4})
         r = client.post("/v1/messages", json=request)
-    assert r.status_code == 400
-    message = r.json()["error"]["message"]
-    assert "at most 4 images" in message and "maxImagesPerRequest" in message
-    assert "messages.2.content.2" in message
-    assert not driver.calls
+    assert r.status_code == 200, r.text
+    messages = sent(driver)
+    tool = next(m for m in messages if m["role"] == "tool")
+    assert "not attached: this request holds at most 4 pictures" in tool["content"]
+    assert (
+        sum(
+            p["type"] == "image_url"
+            for m in messages
+            if isinstance(m["content"], list)
+            for p in m["content"]
+        )
+        == 4
+    )
 
 
 def test_an_image_on_an_assistant_turn_is_refused(settings: Settings) -> None:

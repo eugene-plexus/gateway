@@ -613,7 +613,12 @@ def _split_data_url(url: Any, where: str) -> tuple[str, str]:
 
 
 def _image_part(
-    part: Mapping[str, Any], where: str, budget: images.ImageBudget, ignored: list[str]
+    part: Mapping[str, Any],
+    where: str,
+    budget: images.ImageBudget,
+    ignored: list[str],
+    *,
+    tool: bool = False,
 ) -> ImageContentPart:
     """An `input_image` as the part every door carries.
 
@@ -633,8 +638,16 @@ def _image_part(
     if part.get("detail") not in (None, "auto"):
         ignored.append("input_image.detail")
     try:
-        url = images.data_url_from_base64(media_type, data, f"{where}.image_url")
-        budget.admit(url, f"{where}.image_url")
+        field = f"{where}.image_url"
+        url = (
+            images.tool_picture_url(media_type, data, field)
+            if tool
+            else images.data_url_from_base64(media_type, data, field)
+        )
+        if tool:
+            budget.tool_fields[url] = field
+        else:
+            budget.admit(url, f"{where}.image_url")
     except images.ImageRefusal as e:
         raise Refusal(str(e), param="input") from None
     return ImageContentPart(type="image_url", image_url=ImageUrl(url=url))
@@ -999,6 +1012,7 @@ class _Conversation:
         output = item.get("output")
         texts: list[str] = []
         pictures: list[ImageContentPart | FileContentPart] = []
+        tool_pictures: list[ImageContentPart] = []
         moved: list[str] = []
         if isinstance(output, str):
             texts.append(output)
@@ -1011,8 +1025,9 @@ class _Conversation:
                 if kind in ("input_text", "output_text", "text"):
                     texts.append(_text(part.get("text"), at))
                 elif kind == "input_image":
-                    pictures.append(_image_part(part, at, self.budget, self.ignored))
-                    moved.append("image")
+                    tool_pictures.append(
+                        _image_part(part, at, self.budget, self.ignored, tool=True)
+                    )
                 elif kind == "input_file":
                     pictures.append(_file_part(part, at, self.budget, self.ignored))
                     moved.append("file")
@@ -1029,12 +1044,22 @@ class _Conversation:
             )
             self._hoisted.extend(pictures)
         self.messages.append(
-            ChatCompletionMessage(role=Role1.tool, content=text, tool_call_id=call_id)
+            ChatCompletionMessage(
+                role=Role1.tool,
+                content=_joined([TextContentPart(type="text", text=text), *tool_pictures])
+                if tool_pictures
+                else text,
+                tool_call_id=call_id,
+            )
         )
 
     def finish(self) -> list[ChatCompletionMessage]:
         self._flush_assistant()
         self._flush_hoisted()
+        try:
+            images.move_tool_pictures(self.messages, self.budget)
+        except images.ImageRefusal as exc:
+            raise Refusal(str(exc), param="input") from None
         return self.messages
 
 
