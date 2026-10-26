@@ -30,16 +30,25 @@ from eugene_plexus_gateway import __main__ as entry
 
 
 def entrypoint_kwargs(tmp_path: Path) -> dict[str, Any]:
+    """What the entrypoint configures uvicorn with, without serving: the server
+    is uvicorn's own, run through `_Server` (row 11), whose run is stood in for."""
     captured: dict[str, Any] = {}
-    original = entry.uvicorn.run
+    original_config, original_run = entry.uvicorn.Config, entry._Server.run
     env = dict(os.environ)
+
+    def config(app: Any, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return original_config(app, **kwargs)
+
     try:
-        entry.uvicorn.run = lambda app, **kwargs: captured.update(kwargs)  # type: ignore[assignment]
+        entry.uvicorn.Config = config  # type: ignore[assignment,misc]
+        entry._Server.run = lambda self, sockets=None: None  # type: ignore[method-assign]
         os.environ["EUGENE_PLEXUS_GATEWAY_CONFIG_FILE"] = str(tmp_path / "config.yaml")
         os.environ["EUGENE_PLEXUS_GATEWAY_BIND_PORT"] = "18999"
         entry.main()
     finally:
-        entry.uvicorn.run = original  # type: ignore[assignment]
+        entry.uvicorn.Config = original_config  # type: ignore[misc]
+        entry._Server.run = original_run  # type: ignore[method-assign]
         os.environ.clear()
         os.environ.update(env)
     return captured

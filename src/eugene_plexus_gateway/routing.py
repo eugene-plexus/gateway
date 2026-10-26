@@ -2189,8 +2189,23 @@ class RoutingTable:
         # not always: a circuit may be open, and a replica with room is moved up.
         client.entries = {b.client: b.model for b in picked}
         client.budget = self._budget_for(resolution, picked, affinity, outcome)
-        # Row 11: the one line every turn waits in, for its key and for room.
+        # Row 11: the one line every turn waits in, for its key and for room,
+        # and what gates each candidate there: its runtime's slots, when the
+        # agent reports them, and its shared pool, when it reports one.
         client.queue = fair_queue.of(self)
+        client.seats = {
+            b.client: fair_queue.Seat(
+                candidate=b.client,
+                runtime=b.runtime.key if b.runtime is not None else None,
+                slots=b.runtime.parallel_slots if b.runtime is not None else None,
+                pool=(key, pool)
+                if (key := b.pool_key) is not None and (pool := b.context_pool)
+                else None,
+                model=b.public_id or (b.runtime.alias if b.runtime is not None else None),
+                node=b.node,
+            )
+            for b in picked
+        }
         if affinity is not None:
             seen = self._sizes.get(resolution.model, affinity)
             client.conversation = Conversation(
@@ -2217,6 +2232,8 @@ class RoutingTable:
         }
         if not pools:
             return None
+        # Row 11: the wait for room is the fair queue's, bounded by
+        # `queueWaitSeconds`; the budget sizes the turn and holds its room.
         return TurnBudget(
             ledger=self._ledger,
             sizes=self._sizes,
@@ -2224,7 +2241,6 @@ class RoutingTable:
             target=resolution.model,
             conversation=conversation,
             held=outcome == HIT,
-            wait_seconds=self._room_wait,
         )
 
     def pick_moderation(self, resolution: Resolution) -> TieredClient | None:

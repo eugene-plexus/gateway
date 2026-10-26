@@ -191,10 +191,13 @@ class ClientRequest:
         tokens: int = 0,
         reserve: Callable[[fair_queue.Seat], None] | None = None,
         unreserve: Callable[[], None] | None = None,
+        wait_seconds: float | None = None,
     ) -> fair_queue.Entry:
         """This request's place in line, for one turn."""
         limits = (self.access or {}).get("limits") if self.key_id is not None else None
         wait, most = queue_settings(self.scope.get("app"))
+        if wait_seconds is not None:
+            wait = wait_seconds
         queued = limits.get("maxQueuedRequests") if limits else None
         bound = queued if isinstance(queued, int) else fair_queue.DEFAULT_MAX_QUEUED
         return fair_queue.Entry(
@@ -525,6 +528,7 @@ async def take_turn(
     tokens: int = 0,
     reserve: Callable[[fair_queue.Seat], None] | None = None,
     unreserve: Callable[[], None] | None = None,
+    wait_seconds: float | None = None,
 ) -> fair_queue.Ticket | None:
     """One turn in line for the request running now (row 11): its key's turn
     and, with `seats`, a runtime's. A request outside the client middleware
@@ -540,6 +544,7 @@ async def take_turn(
                 tokens=tokens,
                 reserve=reserve,
                 unreserve=unreserve,
+                wait_seconds=wait_seconds,
             ),
         )
     if queue is None or not seats:
@@ -551,6 +556,7 @@ async def take_turn(
         tokens=tokens,
         reserve=reserve,
         unreserve=unreserve,
+        wait_seconds=fair_queue.DEFAULT_WAIT_SECONDS if wait_seconds is None else wait_seconds,
     )
     try:
         return await queue.wait(entry)

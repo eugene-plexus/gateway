@@ -1068,17 +1068,24 @@ def test_a_stream_opens_before_its_backends_first_frame_and_the_head_carries_the
 def test_a_stream_whose_turn_waits_for_room_in_a_pool_still_opens_at_once(
     settings: Settings, door: str
 ) -> None:
-    """The wait for room in a shared pool (CB3) is after the head, as it always
-    was. Reading which backend is asked first asks the budget who has room now and
-    never waits for room, so a turn that must wait for it (its only replica's pool
-    is full) has its head out, with the header on it, long before it is let in."""
+    """The wait for room in a shared pool (CB3, the fair queue's since row 11)
+    is after the head, as it always was. Reading which backend is asked first
+    asks the budget who has room now and never waits for room, so a turn that
+    must wait for it (its only replica's pool is full) has its head out, with the
+    header on it, long before it is let in when the room is given back."""
     fake = _backend(runtime="rt-a")
     fake.responses = ["pelican"]
-    app = _app(settings, fake, runtimes=POOLED[:1], room_wait_seconds=0.6)
-    app.state.routing._ledger.take((None, "rt-a"), 9_500)
+    app = _app(settings, fake, runtimes=POOLED[:1])
+    ledger = app.state.routing._ledger
+    ledger.take((None, "rt-a"), 9_500)
     timeline = Timeline(app)
     with TestClient(timeline) as client:
+        portal = client.portal
+        assert portal is not None
+        freed = threading.Timer(0.6, lambda: portal.call(ledger.give, (None, "rt-a"), 9_500))
+        freed.start()
         r = _post(client, door, stream=True, **FORCED[door])
+        freed.join()
     assert r.status_code == 200 and "pelican" in r.text
     opened, headers = timeline.head()
     token = timeline.first(b"pelican")

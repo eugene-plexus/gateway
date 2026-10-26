@@ -14,13 +14,14 @@ the operator's repair survives the next normal boot; inference returns
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 
-from . import __version__
+from . import __version__, fair_queue
 from .auth_state import AuthState, load_auth_state
 from .client_keys import ClientKeyGuard
 from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS, ConfigStore
@@ -205,9 +206,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             await lifecycle.start()
             app.state.lifecycle = lifecycle
 
+    # Row 11: a stop signal refuses the line's waiters at once (`__main__`).
+    app.state.loop = asyncio.get_running_loop()
     try:
         yield
     finally:
+        # Row 11: every waiter is refused `shutting_down`, never left hanging.
+        close_queue(app)
         store_client = getattr(app.state, "store_client", None)
         if store_client is not None:
             await store_client.aclose()
@@ -228,6 +233,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         # shutdown are flushed rather than dropped.
         if metrics is not None:
             await metrics.aclose()
+
+
+def close_queue(app: FastAPI) -> None:
+    """Refuse every request waiting in the fair queue `shutting_down`, and every
+    later one (row 11). Row 13 adds the drain of what runs."""
+    routing = getattr(app.state, "routing", None)
+    if routing is not None:
+        fair_queue.of(routing).close()
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:

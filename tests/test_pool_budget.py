@@ -17,10 +17,15 @@ import pytest
 
 from eugene_plexus_gateway._generated.driver_models import GenerateRequest, Usage
 from eugene_plexus_gateway.budget import (
+    ANSWERS_KEPT,
     CHARS_PER_TOKEN,
+    DEFAULT_ANSWER_FLOOR,
+    NEW_CONVERSATION_ANSWER,
     ConversationSizes,
     PoolLedger,
+    answer_room,
     estimate,
+    long_answer,
     request_chars,
 )
 
@@ -69,12 +74,64 @@ def test_a_turn_is_its_last_prompt_plus_its_new_text_plus_its_answer():
     seen = sizes.get("m", "k")
     prompt, total = estimate(70_000 + 3_500, 32_000, seen)
     assert prompt == 30_000 + 1_000
-    assert total == 31_000 + 32_000
+    # CB-C2: not the whole `max_tokens` Claude Code sends (32,000): a
+    # conversation that has not answered yet holds 4,096 for its answer.
+    assert total == 31_000 + NEW_CONVERSATION_ANSWER
 
 
 def test_a_new_conversation_is_estimated_from_its_size():
     prompt, total = estimate(7_000, None, None)
-    assert prompt == int(7_000 / CHARS_PER_TOKEN) and total == prompt
+    assert prompt == int(7_000 / CHARS_PER_TOKEN)
+    assert total == prompt + NEW_CONVERSATION_ANSWER
+
+
+# --- CB-C2: the room an answer holds ---------------------------------------------
+
+
+def test_a_conversation_holds_room_for_its_long_answers():
+    """The length 95 of 100 of its last 16 answers were shorter than: one long
+    answer among short ones is what it holds room for."""
+    sizes = ConversationSizes()
+    for answer in [300] * 15 + [2_500]:
+        sizes.put("m", "k", prompt_tokens=1_000, chars=3_500, answer=answer)
+    seen = sizes.get("m", "k")
+    assert seen is not None and len(seen.answers) == ANSWERS_KEPT
+    assert long_answer(seen.answers) == 2_500
+    assert answer_room(32_000, seen) == 2_500
+
+
+def test_only_the_last_sixteen_answers_count():
+    sizes = ConversationSizes()
+    for answer in [9_000] + [300] * 16:
+        sizes.put("m", "k", prompt_tokens=1_000, chars=3_500, answer=answer)
+    seen = sizes.get("m", "k")
+    assert seen is not None and 9_000 not in seen.answers
+    # Short answers hold the floor, never less.
+    assert answer_room(32_000, seen) == DEFAULT_ANSWER_FLOOR
+    assert answer_room(32_000, seen, floor=2_048) == 2_048
+
+
+def test_max_tokens_caps_the_room():
+    """An answer cannot be longer than `max_tokens`, so no more is held, whatever
+    the floor says."""
+    assert answer_room(100, None) == 100
+    assert answer_room(100, None, floor=4_000) == 100
+    assert answer_room(None, None) == NEW_CONVERSATION_ANSWER
+
+
+async def test_an_answer_longer_than_its_room_is_counted():
+    table, a, b = _table()
+    for fake in (a, b):
+        fake.usage = Usage(promptTokens=40, completionTokens=5_000, totalTokens=5_040)
+    client = table.pick(table.resolve(LOCAL), affinity="k:long")
+    await client.generate(_turn(max_tokens=32_000))
+    assert client.budget.room == NEW_CONVERSATION_ANSWER
+    assert client.outran_reserve is True
+    for fake in (a, b):
+        fake.usage = Usage(promptTokens=40, completionTokens=5, totalTokens=45)
+    short = table.pick(table.resolve(LOCAL), affinity="k:short")
+    await short.generate(_turn(max_tokens=32_000))
+    assert short.outran_reserve is False
 
 
 def test_the_size_counts_tools_too():
@@ -147,14 +204,35 @@ async def test_a_new_conversation_takes_a_replica_with_room():
 
 
 async def test_the_wait_is_bounded_then_the_usual_order_runs():
-    table, _a, _b = _table(wait=0.2)
+    """Rewritten for row 11: the wait for room is the fair queue's, bounded by
+    `queueWaitSeconds`. After it a turn is no longer sent to an engine with no
+    room (CB3 did, after `swapWaitSeconds`): it moves to the slot's next tier
+    when there is one (TIER-SPILL), and is refused when there is none."""
+    from eugene_plexus_gateway import admission
+
+    table, a, b = _table()
     table._ledger.take(A, 9_500)
     table._ledger.take(B, 9_500)
     client = table.pick(table.resolve(LOCAL), affinity="k:new")
+    client.queue_wait_seconds = 0.2
     started = asyncio.get_running_loop().time()
-    await asyncio.wait_for(client.generate(_turn()), 2)
+    with pytest.raises(admission.AdmissionFailure) as refused:
+        await asyncio.wait_for(client.generate(_turn()), 2)
     assert asyncio.get_running_loop().time() - started >= 0.18
-    assert client.served_by is not None
+    assert refused.value.code == "queue_timeout"
+    assert not a.calls and not b.calls, "nothing was sent to an engine with no room"
+    assert table._ledger.in_flight(A) == table._ledger.in_flight(B) == 9_500
+
+    spill, fakes = _slot_table("cooling")
+    for runtime in (A, B):
+        spill._ledger.take(runtime, 9_500)
+    behind = spill.pick(spill.resolve(SLOT), affinity="k:new")
+    (ahead,) = behind._tiers[0]
+    behind._tiers = [[], behind._tiers[1], [ahead]]  # the local replicas first, then a fallback
+    behind.queue_wait_seconds = 0.2
+    await asyncio.wait_for(behind.generate(_turn()), 2)
+    assert behind.served_by == "ahead-driver" and behind.tier_moves == 1
+    assert not fakes["llama-a-driver"].calls and not fakes["llama-b-driver"].calls
 
 
 async def test_the_room_is_given_back_on_every_path():
@@ -263,7 +341,10 @@ async def test_first_names_who_admit_would_put_first_and_changes_nothing():
     client.budget.close()
 
 
-async def test_first_names_nobody_when_nothing_has_room_and_admit_waits_then_keeps_the_order():
+async def test_first_names_nobody_when_nothing_has_room_and_admit_keeps_the_order():
+    """`admit` places a turn no queue holds, so it waits for nothing (row 11: the
+    wait is the fair queue's): nothing has room, the usual order stands, and no
+    room is reserved."""
     table, _a, _b = _table(wait=0.05)
     table._ledger.take(A, 9_500)
     table._ledger.take(B, 9_500)
@@ -271,7 +352,7 @@ async def test_first_names_nobody_when_nothing_has_room_and_admit_waits_then_kee
     tier = _front_tier(client)
     assert client.budget.first(_turn(), tier) is None
     assert await client.budget.admit(_turn(), tier) == tier
-    assert client.budget.waited_ms >= 40
+    assert not client.budget.reserved
 
 
 async def test_first_counts_only_the_replica_a_conversation_holds_as_admit_does():
