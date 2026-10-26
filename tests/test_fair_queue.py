@@ -1087,3 +1087,16 @@ async def test_a_request_that_needs_no_wait_does_not_pay_for_the_line():
     assert ticket.seat is free and passes == 0, passes
     assert took < 0.01, f"{took * 1000:.1f} ms for a request that waited for nothing"
     ticket.release()
+
+
+async def test_the_turn_history_stays_bounded_on_the_fast_path():
+    """Re-review should-fix: requests that leave without a pass still record their
+    turn, and the history of turns stays within its bound however many people
+    came and went."""
+    from eugene_plexus_gateway import fair_queue
+
+    queue = fair_queue.FairQueue()
+    for person in range(fair_queue.TURNS_KEPT + 904):
+        ticket = await queue.wait(fair_queue.Entry(fairness=f"person:{person}"))
+        ticket.release()
+    assert len(queue._turns) <= fair_queue.TURNS_KEPT

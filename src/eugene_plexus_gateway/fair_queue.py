@@ -711,9 +711,6 @@ class FairQueue:
             del self._root_full[key]
         if held_back:
             self._arm(min(held_back))
-        if len(self._turns) > TURNS_KEPT:
-            keep = {(e.band, e.fairness) for e in self._waiting}
-            self._turns = {flow: n for flow, n in self._turns.items() if flow in keep}
 
     def _go(self, entry: Entry, seat: Seat | None) -> None:
         """Let `entry` leave on `seat`: count its key and its slot, take its
@@ -741,7 +738,14 @@ class FairQueue:
                 entry.future.set_exception(exc)
             return
         self._turn += 1
-        self._turns[(entry.band, entry.fairness)] = self._turn
+        # Least recently served first in the dict, so the history keeps its bound
+        # on every path, the fast one too, by dropping who was served longest ago
+        # (who, waiting again, still goes first: never served sorts first).
+        flow = (entry.band, entry.fairness)
+        self._turns.pop(flow, None)
+        self._turns[flow] = self._turn
+        while len(self._turns) > TURNS_KEPT:
+            del self._turns[next(iter(self._turns))]
         entry.future.set_result(Ticket(self, seat, key))
 
     def _bound(self, entry: Entry) -> None:

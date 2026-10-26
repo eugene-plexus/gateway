@@ -1280,6 +1280,8 @@ class TieredClient:
         while True:
             tier = self._tiers[index] if index is not None else []
             waiting_on = budget.waiting_on(tier) if budget is not None and index == first else tier
+            # A replica whose circuit would not take an attempt is not waited for.
+            waiting_on = [c for c in waiting_on if _available(c)]
             has_next = index is not None and any(self._tiers[index + 1 :])
             try:
                 ticket = await admission.take_turn(
@@ -1311,8 +1313,12 @@ class TieredClient:
             return
 
     async def _admit_attempt(
-        self, candidate: DriverClient, rest: Sequence[DriverClient] = ()
-    ) -> DriverClient:
+        self,
+        candidate: DriverClient,
+        rest: Sequence[DriverClient] = (),
+        *,
+        has_next_tier: bool = False,
+    ) -> DriverClient | None:
         """Every attempt is admitted where it goes (row 11 review, blocker 2), and
         answers the candidate it was let go on.
 
@@ -1321,11 +1327,13 @@ class TieredClient:
         and arrival, like any turn: on `candidate`, or on the rest of its tier
         (`rest`, whose circuits would take an attempt), whichever has room first,
         as the first turn waits on its tier. A failed attempt must not walk into a
-        runtime with no free slot or no room in its pool. With no queue (a client
-        built by hand) only the room moves, as before.
+        runtime with no free slot or no room in its pool. A wait that runs out
+        moves on by the rules the first turn spills by (`fair_queue.MOVE_RULES`):
+        None says go to the next tier, and only with none left is it refused. With
+        no queue (a client built by hand) only the room moves, as before.
         """
         from . import admission
-        from .fair_queue import Waited
+        from .fair_queue import Waited, move_for
 
         if not self._in_turn:
             if self.budget is not None:
@@ -1356,6 +1364,9 @@ class TieredClient:
                 wait_seconds=self.queue_wait_seconds,
             )
         except Waited as waited:
+            if move_for(waited, has_next_tier=has_next_tier) == "next_tier":
+                self.tier_moves += 1
+                return None
             raise admission.refused(waited.refusal) from None
         seat = self._ticket.seat if self._ticket is not None else None
         chosen = seat.candidate if seat is not None else None

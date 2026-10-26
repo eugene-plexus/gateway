@@ -518,3 +518,75 @@ async def test_admit_keeps_how_big_the_turn_was_for_the_conversations_next_estim
     seen = table._sizes.get(LOCAL, "k:served")
     assert seen is not None and seen.prompt_tokens == 40
     assert seen.chars == request_chars(served) > 0
+
+
+# --- the cascade through full tiers (row 11 re-review) ----------------------------
+
+
+def _three_tiers():  # type: ignore[no-untyped-def]
+    """A slot `cascade` -> [m1, m2]: m1 has replicas A (fails) and B (one slot,
+    held by a request running there), m2 is C, healthy, with no runtime of ours."""
+    import httpx
+
+    from eugene_plexus_gateway import fair_queue
+
+    a = FakeDriverClient(name="a-driver", base_url="http://a", model_id="m1", runtime="ra")
+    b = FakeDriverClient(name="b-driver", base_url="http://b", model_id="m1", runtime="rb")
+    c = FakeDriverClient(name="c-driver", base_url="http://c", model_id="m2")
+    a.generate_error = httpx.ConnectError("refused")
+    table = make_routing_table(
+        a,
+        b,
+        c,
+        runtimes=[runtime_facts("ra", parallel_slots=1), runtime_facts("rb", parallel_slots=1)],
+        slots=[{"model": "cascade", "targets": ["m1", "m2"]}],
+    )
+    queue = fair_queue.of(table)
+    queue._take_seat((None, "rb"))  # B's one slot is busy the whole time
+    return table, queue, a, b, c
+
+
+async def test_a_fallback_that_waits_out_its_tier_moves_to_the_next():
+    """Re-review blocker: A fails, B's slot stays busy, C is healthy. The fallback
+    waits for B its `queueWaitSeconds`, then moves to the next tier by the same
+    rule the first turn spills by, and C answers: it is not refused while a
+    healthy tier is left."""
+    table, queue, a, b, c = _three_tiers()
+    client = table.pick(table.resolve("cascade"))
+    client.queue_wait_seconds = 0.2
+    began = time.perf_counter()
+    await asyncio.wait_for(client.generate(_turn()), 3)
+    assert time.perf_counter() - began >= 0.18, "it waited for B first"
+    assert a.calls and not b.calls and c.calls
+    assert client.served_by == "c-driver" and client.tier == 2 and client.tier_moves == 1
+    assert queue.waiting() == 0 and queue.running((None, "ra")) == 0
+
+
+async def test_a_fallback_with_no_tier_left_is_refused():
+    """With no later tier, the fallback that waited out its tier is refused."""
+    from eugene_plexus_gateway import admission
+
+    table, queue, a, b, _c = _three_tiers()
+    client = table.pick(table.resolve("m1"))
+    client.queue_wait_seconds = 0.2
+    with pytest.raises(admission.AdmissionFailure) as refused:
+        await asyncio.wait_for(client.generate(_turn()), 3)
+    assert refused.value.code == "queue_timeout"
+    assert a.calls and not b.calls and queue.waiting() == 0
+
+
+async def test_a_cooling_full_replica_is_not_waited_for():
+    """Re-review should-fix: B's circuit is open and its slot is full. A fallback
+    does not wait for a replica that would not take an attempt anyway: it goes on
+    to C at once."""
+    table, _queue, a, b, c = _three_tiers()
+    client = table.pick(table.resolve("cascade"))
+    assert not c.calls
+    cooling = next(x for x in client._tiers[0] if x.name == "b-driver")
+    cooling.circuit.failures, cooling.circuit.until = 1, time.perf_counter() + 60
+    client.queue_wait_seconds = 2.0
+    began = time.perf_counter()
+    await asyncio.wait_for(client.generate(_turn()), 5)
+    assert time.perf_counter() - began < 1.0, "it waited for a replica whose circuit is open"
+    assert client.served_by == "c-driver" and client.tier_moves == 0
+    assert a.calls and not b.calls and c.calls

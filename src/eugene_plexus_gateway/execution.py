@@ -136,9 +136,19 @@ class Executor:
                 if self.owner.authorize_attempt is not None:
                     await self.owner.authorize_attempt()
                 if admit:
+                    early = getattr(candidate, "circuit", None)
+                    if early is not None and not early.available():
+                        # It would not take an attempt: it is not waited for.
+                        if self.last_error is None:
+                            self.last_error = _cooling_error(early.until - time.perf_counter())
+                        continue
                     # It may be let go on another replica of this tier, one with
-                    # room: that one is tried now, and this one after it.
-                    chosen = await self.owner._admit_attempt(candidate, left)
+                    # room: that one is tried now, and this one after it. A wait
+                    # that runs out moves on to the next tier (TIER-SPILL).
+                    later = any(self.owner._tiers[tier:])
+                    chosen = await self.owner._admit_attempt(candidate, left, has_next_tier=later)
+                    if chosen is None:
+                        break
                     if chosen is not candidate:
                         left.remove(chosen)
                         left.insert(0, candidate)
