@@ -62,7 +62,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from . import video_doors
+from . import fair_queue, video_doors
 from ._generated.driver_models import (
     Capabilities,
     DriverInfo,
@@ -2189,6 +2189,8 @@ class RoutingTable:
         # not always: a circuit may be open, and a replica with room is moved up.
         client.entries = {b.client: b.model for b in picked}
         client.budget = self._budget_for(resolution, picked, affinity, outcome)
+        # Row 11: the one line every turn waits in, for its key and for room.
+        client.queue = fair_queue.of(self)
         if affinity is not None:
             seen = self._sizes.get(resolution.model, affinity)
             client.conversation = Conversation(

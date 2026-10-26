@@ -65,6 +65,10 @@ def front_door_claims(auth: AuthState, token: str) -> tokens.Claims:
             f"a service token from {claims.iss!r} is not accepted at this front door; "
             "only this machine's own components and the operator may use it"
         )
+    if not claims.is_client and (context := current.get()) is not None:
+        # Whose turn it is in the queue when no key says (row 11): every door
+        # verifies its credential here, the Anthropic one included.
+        context.subject = f"{'session' if claims.is_session else 'service'}:{claims.sub}"
     return claims
 
 

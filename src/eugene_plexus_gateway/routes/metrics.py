@@ -13,15 +13,17 @@ nothing on a shared tailnet.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 
+from .. import fair_queue
 from .._generated.models import (
     ClientUsageSummary,
     MetricRequest,
     MetricRequestPage,
     MetricsGroup,
+    MetricsQueueRuntime,
     MetricsSummary,
     Problem,
 )
@@ -85,7 +87,15 @@ async def get_metrics(
         # retention describes less than it was asked for and says so.
         truncated=start < store.oldest_retained(),
         groups=[MetricsGroup.model_validate(g) for g in groups],
+        # Row 11: what the queue refused over the window, and what waits now.
+        refused=store.refused(since=start, until=end) or None,
+        queue=[MetricsQueueRuntime.model_validate(q) for q in _waiting_now(request)],
     )
+
+
+def _waiting_now(request: Request) -> list[dict[str, Any]]:
+    table = getattr(request.app.state, "routing", None)
+    return fair_queue.of(table).snapshot() if table is not None else []
 
 
 @router.get("/v1/metrics/requests", response_model=MetricRequestPage)
@@ -94,7 +104,7 @@ async def get_metric_requests(
     limit: Annotated[int, Query(ge=1, le=500)] = 50,
     cursor: Annotated[str | None, Query()] = None,
     model: Annotated[str | None, Query()] = None,
-    outcome: Annotated[Literal["served", "error", "cascaded"] | None, Query()] = None,
+    outcome: Annotated[Literal["served", "error", "refused", "cascaded"] | None, Query()] = None,
 ) -> MetricRequestPage:
     store = _store(request)
     rows, next_cursor = store.requests(limit=limit, cursor=cursor, model=model, outcome=outcome)

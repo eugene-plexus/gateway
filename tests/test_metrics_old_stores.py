@@ -1,15 +1,17 @@
 """Released v12 history migrates in place; older alpha and future files are kept aside.
 
 Schema 13 adds person attribution to the released schema 12 without losing
-dashboard history. Other schemas retain the prior backup-and-reset behavior
+dashboard history, and schema 14 (row 11) adds the queue's columns to 12 and 13
+the same way. Other schemas retain the prior backup-and-reset behavior
 (`metrics.v<N>.bak`, history readable in it).
 
 **The fixtures are real files of the old formats.** Schema 2 is the DDL of the
 build that introduced it (gateway `7cf5640`, 2026-09-10), copied from that
 commit, with rows written as that build wrote them. Schema 11 (`601f4c7`) has
 the same DDL as 12 (`2a2be9c`), which added a value to a column and no column.
-Removing the two attribution columns from today's `_DDL` reproduces it.
-Schema 14 represents a build newer than this one.
+Removing the two attribution columns and the queue's five from today's `_DDL`
+reproduces it; removing the queue's five alone reproduces 13. Schema 15
+represents a build newer than this one.
 
 The cases: each such file is set aside whole and its history is readable
 there; nothing old is read back; a second start opens the fresh file in place
@@ -122,7 +124,14 @@ CREATE TABLE IF NOT EXISTS rollup (
 """
 
 
-V12_DDL = _DDL.replace("    person_id        TEXT,\n", "").replace(
+V13_DDL = _DDL.replace(
+    "    affinity          TEXT,\n    queued_ms         INTEGER,\n    band              TEXT,\n"
+    "    refusal           TEXT,\n    tier_moves        INTEGER,\n"
+    "    outran_reserve    INTEGER\n",
+    "    affinity          TEXT\n",
+)
+assert V13_DDL != _DDL
+V12_DDL = V13_DDL.replace("    person_id        TEXT,\n", "").replace(
     "    app_client_id    TEXT,\n", ""
 )
 
@@ -186,6 +195,52 @@ def a_request() -> RequestRow:
     )
 
 
+async def test_a_v13_store_gains_the_queue_columns_in_place(tmp_path):
+    """Row 11, acceptance check 10: a v13 store keeps its history and gains
+    `queued_ms`, `band`, `refusal`, `tier_moves` and `outran_reserve`."""
+    path = tmp_path / "metrics.sqlite3"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(V13_DDL)
+        conn.execute("INSERT INTO meta VALUES ('schema_version', '13')")
+        conn.execute(
+            "INSERT INTO request (started_at, requested_model, attempts, total_ms, outcome,"
+            " person_id) VALUES (?, 'old-history', 1, 9, 'served', 'ada')",
+            (datetime.now(UTC).isoformat(),),
+        )
+    store = MetricsStore(path)
+    await store.start()
+    row = a_request()
+    row.queued_ms, row.band, row.tier_moves, row.outran_reserve = 420, "background", 1, True
+    store.record(row)
+    refused = a_request()
+    refused.outcome, refused.refusal, refused.band = "refused", "queue_full", "interactive"
+    store.record(refused)
+    await store.aclose()
+    assert schema_of(path) == "14"
+    with sqlite3.connect(path) as conn:
+        assert conn.execute(
+            "SELECT requested_model, person_id, queued_ms, band, refusal, tier_moves,"
+            " outran_reserve, outcome FROM request ORDER BY id"
+        ).fetchall() == [
+            ("old-history", "ada", None, None, None, None, None, "served"),
+            ("new", None, 420, "background", None, 1, 1, "served"),
+            ("new", None, None, "interactive", "queue_full", None, None, "refused"),
+        ]
+    assert not list(tmp_path.glob("*.bak"))
+    again = MetricsStore(path)
+    await again.start()
+    try:
+        rows, _ = again.requests(limit=10)
+        assert [(r["queuedMs"], r["band"], r["refusal"]) for r in rows] == [
+            (None, "interactive", "queue_full"),
+            (420, "background", None),
+            (None, None, None),
+        ]
+        assert rows[1]["outranReserve"] is True and rows[1]["tierMoves"] == 1
+    finally:
+        await again.aclose()
+
+
 async def test_released_v12_history_is_preserved_when_person_attribution_is_added(tmp_path):
     path = tmp_path / "metrics.sqlite3"
     with sqlite3.connect(path) as conn:
@@ -212,7 +267,7 @@ async def test_released_v12_history_is_preserved_when_person_attribution_is_adde
     assert not list(tmp_path.glob("*.bak"))
 
 
-@pytest.mark.parametrize("version", ["2", "11", "14"])
+@pytest.mark.parametrize("version", ["2", "11", "15"])
 async def test_a_store_of_another_schema_is_kept_aside_whole(
     tmp_path: Path, version: str, caplog: pytest.LogCaptureFixture
 ) -> None:

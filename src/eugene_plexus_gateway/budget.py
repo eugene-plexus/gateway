@@ -146,6 +146,8 @@ class PoolLedger:
     def __init__(self) -> None:
         self._tokens: dict[Key, int] = {}
         self._room: asyncio.Event | None = None
+        #: Told whenever room is given back: the fair queue's dispatch (row 11).
+        self.listeners: list[Callable[[], None]] = []
 
     def in_flight(self, runtime: Key) -> int:
         return self._tokens.get(runtime, 0)
@@ -177,6 +179,8 @@ class PoolLedger:
         if self._room is not None:
             self._room.set()
             self._room = None
+        for listener in self.listeners:
+            listener()
 
     async def changed(self, seconds: float) -> None:
         """Until something is released, or `seconds` pass."""

@@ -57,6 +57,7 @@ from .affinity import EVICTED, HIT
 from .budget import Conversation, TurnBudget, request_chars
 from .circuit import Circuit
 from .execution import Executor, StreamPolicy
+from .fair_queue import FairQueue
 from .repetition import Detection, Guard, Policy, stop_message
 
 log = logging.getLogger(__name__)
@@ -1154,6 +1155,12 @@ class TieredClient:
         #: CB3: this turn's place in its replicas' shared pools, when any
         #: has one. Set by `RoutingTable.pick`; see `budget.py`.
         self.budget: TurnBudget | None = None
+        #: Row 11: the routing table's fair queue, where this turn waits for its
+        #: key's turn and for room. Set by `RoutingTable.pick`; None when built
+        #: by hand, which waits for nothing.
+        self.queue: FairQueue | None = None
+        #: Times this turn moved to the next tier after waiting (TIER-SPILL).
+        self.tier_moves = 0
         #: The conversation this turn continues, when it has a key: its
         #: last prompt is kept for the budget's next estimate, and a hit is
         #: told from an eviction by it (CB5). Set by `RoutingTable.pick`.
@@ -1224,7 +1231,15 @@ class TieredClient:
         return next((index for index, tier in enumerate(self._tiers) if tier), None)
 
     async def _admit(self, request: GenerateRequest) -> None:
-        """CB3: wait for room in a shared pool, and try first where there is."""
+        """Row 11: wait for the key's turn (and acquire its lease then); CB3:
+        wait for room in a shared pool, and try first where there is."""
+        from . import admission
+        from .fair_queue import Waited
+
+        try:
+            await admission.take_turn(self.queue, model=self.name)
+        except Waited as waited:
+            raise admission.refused(waited.refusal) from None
         if self.budget is None:
             return
         index = self._front()

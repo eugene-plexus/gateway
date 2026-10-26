@@ -49,6 +49,7 @@ from .. import (
     completion_door,
     control_tokens,
     decisions,
+    fair_queue,
     files_door,
     gemini,
     ignored_settings,
@@ -324,6 +325,11 @@ def _record(
                 tool_executions=_tool_rows(searched),
                 cached_tokens=getattr(usage, "cachedPromptTokens", None),
                 affinity=getattr(getattr(client, "_inner", client), "affinity", None),
+                # Row 11: the line it waited in, and what the wait did to it.
+                queued_ms=context.queued_ms if context else None,
+                band=context.band if context else None,
+                tier_moves=getattr(getattr(client, "_inner", client), "tier_moves", None),
+                outran_reserve=getattr(getattr(client, "_inner", client), "outran_reserve", None),
             )
         )
         if (context := admission.current.get()) is not None:
@@ -1126,7 +1132,9 @@ async def _prepare(
     # to the agent and to every driver, inside the request that
     # triggered it, so "before the clock starts" was not the same as
     # "free".
-    await admission.authorize(request, body.model, streamed=bool(body.stream))
+    # Checked now, and the key's lease acquired when the turn leaves its line
+    # (`TieredClient._admit`, row 11), where the runtimes it may go to are known.
+    await admission.authorize(request, body.model, streamed=bool(body.stream), defer=True)
     repetition_override = request.headers.get(repetition.HEADER)
     if repetition_override is not None and repetition_override not in repetition.MODES:
         return _Failure(
@@ -1306,7 +1314,14 @@ async def _prepare(
     considered = table.candidates_considered(resolution)
     if client is None:
         lifecycle = _lifecycle(request)
-        if lifecycle is not None:
+        if lifecycle is not None and resolution.startable():
+            # Row 11: a wake starts only when the key has its turn here, so a
+            # key at its limit cannot start or stop runtimes. The lease taken
+            # now is held through the wake and the turn that follows it.
+            await admission.take_turn(fair_queue.of(table), model=body.model)
+            resolution = await resolve()
+            client = table.pick(resolution, needs=needs, surface=only, affinity=conversation)
+        if client is None and lifecycle is not None:
             wake = await lifecycle.wake(resolution)
             if wake.ok:
                 resolution = await resolve()

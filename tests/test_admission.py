@@ -100,7 +100,14 @@ def test_discovery_and_fallback_never_reveal_or_call_excluded_targets(setup):
         response = c.post("/v1/chat/completions", json=body(), headers=headers)
         assert response.status_code == 502
         assert len(allowed.calls) == 1 and not excluded.calls
-        assert [x["action"] for x in authority.calls] == ["check", "acquire", "renew", "release"]
+        # Row 11: the chat checks when it arrives and acquires when it leaves its line.
+        assert [x["action"] for x in authority.calls] == [
+            "check",
+            "check",
+            "acquire",
+            "renew",
+            "release",
+        ]
 
 
 def test_alias_permission_alone_cannot_authorize_its_target(setup):
@@ -418,7 +425,9 @@ async def test_disconnect_cancels_work_and_releases_reservation(setup, surface):
     task = asyncio.create_task(app(scope, receive, send))
     try:
         await asyncio.wait_for(hang.entered.wait(), 3)
-        assert authority.calls[0]["action"] == "acquire"
+        # Row 11: a check on arrival, the lease when it leaves the line (before a
+        # wake too, so a key at its limit cannot start a runtime).
+        assert [c["action"] for c in authority.calls][:2] == ["check", "acquire"]
         gone.set()
         await asyncio.wait_for(task, 2)
         assert hang.cancelled

@@ -50,7 +50,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 # Bounded because the alternative to dropping rows is stalling
 # completions, and that trade is never worth making. Sized so a burst
@@ -205,6 +205,28 @@ class RequestRow:
     # `conversation` balancing did (PC4): hit, new or moved.
     cached_tokens: int | None = None
     affinity: str | None = None
+    # v14 (row 11): how long it waited in line, the band it waited in, why the
+    # queue refused it (outcome `refused`), its moves to the next tier, and
+    # whether its answer outran the room its turn held for it.
+    queued_ms: int | None = None
+    band: str | None = None
+    refusal: str | None = None
+    tier_moves: int | None = None
+    outran_reserve: bool | None = None
+
+
+#: The request columns each schema since v12 added, in order, for a store that
+#: is moved forward in place.
+_ADDED = {
+    13: ("person_id TEXT", "app_client_id TEXT"),
+    14: (
+        "queued_ms INTEGER",
+        "band TEXT",
+        "refusal TEXT",
+        "tier_moves INTEGER",
+        "outran_reserve INTEGER",
+    ),
+}
 
 
 _DDL = """
@@ -242,7 +264,12 @@ CREATE TABLE IF NOT EXISTS request (
     images            INTEGER,
     video_seconds     INTEGER,
     cached_tokens     INTEGER,
-    affinity          TEXT
+    affinity          TEXT,
+    queued_ms         INTEGER,
+    band              TEXT,
+    refusal           TEXT,
+    tier_moves        INTEGER,
+    outran_reserve    INTEGER
 );
 
 CREATE INDEX IF NOT EXISTS request_started_at ON request (started_at);
@@ -410,19 +437,21 @@ class MetricsStore:
         conn.commit()
 
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        # The released v12 store gains nullable person attribution in place.
-        # Alpha schemas and unknown future schemas remain kept aside whole.
+        # A released store (v12, v13) gains its nullable columns in place: v13
+        # person attribution (U3), v14 the queue's (row 11). Alpha schemas and
+        # unknown future schemas remain kept aside whole.
         if row is None:
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
             conn.commit()
-        elif int(row[0]) == 12:
-            # U3 adds attribution without discarding the existing dashboard history.
+        elif int(row[0]) in (12, 13):
+            # Adds columns without discarding the existing dashboard history.
             with conn:
-                conn.execute("ALTER TABLE request ADD COLUMN person_id TEXT")
-                conn.execute("ALTER TABLE request ADD COLUMN app_client_id TEXT")
+                for version in range(int(row[0]) + 1, SCHEMA_VERSION + 1):
+                    for column in _ADDED[version]:
+                        conn.execute(f"ALTER TABLE request ADD COLUMN {column}")
                 conn.execute(
                     "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),)
                 )
@@ -563,9 +592,11 @@ class MetricsStore:
                     " completion_tokens, outcome, routing_ms, refreshed, strategy,"
                     " client_key_id, client_key_name, correlation_id, elapsed_ms,"
                     " door, characters, audio_seconds, images, video_seconds,"
-                    " cached_tokens, affinity, person_id, app_client_id)"
+                    " cached_tokens, affinity, person_id, app_client_id,"
+                    " queued_ms, band, refusal, tier_moves, outran_reserve)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-                    " ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+                    " ?, ?, ?, ?, ?)",
                     (
                         _iso(row.started_at),
                         row.requested_model,
@@ -595,6 +626,11 @@ class MetricsStore:
                         row.affinity,
                         row.person_id,
                         row.app_client_id,
+                        row.queued_ms,
+                        row.band,
+                        row.refusal,
+                        row.tier_moves,
+                        None if row.outran_reserve is None else int(row.outran_reserve),
                     ),
                 )
                 request_id = cursor.lastrowid
@@ -784,7 +820,7 @@ class MetricsStore:
         computable from per-backend p90s, so the coarse grain must be
         computed here, over the raw rows.
         """
-        where = ["r.started_at >= ?", "r.started_at < ?"]
+        where = ["r.started_at >= ?", "r.started_at < ?", "r.outcome != 'refused'"]
         params: list[Any] = [_iso(since), _iso(until)]
         if model:
             where.append("r.requested_model = ?")
@@ -803,7 +839,7 @@ class MetricsStore:
                    served.driver, served.runtime, served.node, served.backend,
                    served.elapsed_ms, r.routing_ms, served.backend_ms,
                    served.first_ms, served.served, r.prompt_tokens, r.cached_tokens,
-                   r.affinity
+                   r.affinity, r.queued_ms, r.tier_moves, r.outran_reserve
             FROM request r
             -- The attempt a request is ATTRIBUTED to: the one that served
             -- it, or, when none did, the last one tried.
@@ -854,6 +890,9 @@ class MetricsStore:
             prompt_tokens,
             cached_tokens,
             affinity,
+            queued_ms,
+            tier_moves,
+            outran_reserve,
         ) in rows:
             bucket_start = started_at[:13] + ":00:00Z" if bucket == "hour" else None
             key: tuple[Any, ...]
@@ -890,6 +929,9 @@ class MetricsStore:
                     "_cache": [0, 0, 0],
                     "_affinity": {"hit": 0, "new": 0, "moved": 0, "evicted": 0},
                     "tierCounts": {},
+                    "_queued": [],
+                    "tierMoves": 0,
+                    "outranReserve": 0,
                 }
             g["requests"] += 1
             if outcome == "error":
@@ -940,6 +982,10 @@ class MetricsStore:
                 g["_cache"][2] += int(cached_tokens)
             if affinity in g["_affinity"]:
                 g["_affinity"][affinity] += 1
+            if queued_ms:
+                g["_queued"].append(int(queued_ms))
+            g["tierMoves"] += int(tier_moves or 0)
+            g["outranReserve"] += 1 if outran_reserve else 0
 
         out: list[dict[str, Any]] = []
         for g in groups.values():
@@ -958,6 +1004,10 @@ class MetricsStore:
             )
             placed = g.pop("_affinity")
             g["affinity"] = placed if any(placed.values()) else None
+            queued = sorted(g.pop("_queued"))
+            g["queuedMs"] = (
+                {**(_spread(queued) or {}), "p95": _percentile(queued, 0.95)} if queued else None
+            )
             g["routingMs"] = _spread(routing)
             g["overheadMs"] = _spread(overhead)
             g["latencyMs"] = {
@@ -1016,6 +1066,18 @@ class MetricsStore:
         out.sort(key=lambda x: (x["bucketStart"] or "", -x["requests"]))
         return out
 
+    def refused(self, *, since: datetime, until: datetime) -> dict[str, int]:
+        """Requests the queue refused in a window, by `QueueRefusalCode` (row 11)."""
+        with self._reader() as conn:
+            if conn is None:
+                return {}
+            rows = conn.execute(
+                "SELECT refusal, COUNT(*) FROM request WHERE outcome = 'refused'"
+                " AND started_at >= ? AND started_at < ? GROUP BY refusal",
+                (_iso(since), _iso(until)),
+            ).fetchall()
+        return {str(code or "unknown"): int(count) for code, count in rows}
+
     def client_usage(self, *, since: datetime, until: datetime) -> list[dict[str, Any]]:
         with self._reader() as conn:
             if conn is None:
@@ -1073,7 +1135,7 @@ class MetricsStore:
             params.append(model)
         if outcome == "cascaded":
             where.append("r.attempts > 1")
-        elif outcome in {"served", "error"}:
+        elif outcome in {"served", "error", "refused"}:
             where.append("r.outcome = ?")
             params.append(outcome)
         clause = f"WHERE {' AND '.join(where)}" if where else ""
@@ -1090,7 +1152,8 @@ class MetricsStore:
                        completion_tokens, outcome, routing_ms, refreshed, strategy,
                        client_key_id, client_key_name, correlation_id, elapsed_ms,
                        door, characters, audio_seconds, images, video_seconds,
-                       cached_tokens, affinity, person_id, app_client_id
+                       cached_tokens, affinity, person_id, app_client_id,
+                       queued_ms, band, refusal, tier_moves, outran_reserve
                 FROM request r {clause}
                 ORDER BY id DESC LIMIT ?
                 """,
@@ -1245,6 +1308,11 @@ class MetricsStore:
                 "affinity": r[26],
                 "personId": r[27],
                 "appClientId": r[28],
+                "queuedMs": r[29],
+                "band": r[30],
+                "refusal": r[31],
+                "tierMoves": r[32],
+                "outranReserve": None if r[33] is None else bool(r[33]),
                 "tries": tries[r[0]],
                 "candidates": considered[r[0]],
                 **_tool_lists(searched[r[0]]),

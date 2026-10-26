@@ -39,39 +39,6 @@ class AllowedTool(RootModel[str]):
     root: str = Field(..., max_length=64, min_length=1)
 
 
-class ClientKeyLimits(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    localOnly: bool | None = Field(
-        False,
-        description='Permit only backends explicitly classified local by drivers enforcing\nthe local-only request policy. External, unknown and older drivers\nare ineligible, including through aliases, fallback and wake. The\ncaller cannot relax this restriction. Local is a configured trust\nboundary, not a promise to sandbox a malicious backend.\n',
-    )
-    allowedModels: list[AllowedModel] | None = Field(
-        None,
-        description="Null permits all. Empty permits none. Both the id the caller\nasked for and every model actually tried (a slot's fallback\ntargets) must be allowed.\n\nAn entry is an exact id, or a pattern with `*` (P1,\n2026-09-27): `*` matches any run of characters, `/` included,\nand is the only wildcard, so `openrouter/*` allows every\nmodel of the account named `openrouter`\n(`openrouter/anthropic/claude-opus-5.5`) and nothing else.\nWithout it, scoping a key to one account means typing out\nhundreds of names. The same matcher runs in the gateway, the\nagent and the control root.\n",
-        max_length=100,
-    )
-    allowedTools: list[AllowedTool] | None = Field(
-        None,
-        description='The tools the hub runs itself (P8) that this key may have run\non its behalf -- `web_search` today. **Null permits every tool\nthe install runs** (design call #5: a key is allowed search once\na search account exists, and can be denied it here). Empty\npermits none. An entry is a tool name or a pattern with `*`,\nmatched by the same matcher as `allowedModels`.\n\nA key denied a tool is not refused for asking: the door says\nwhy the search did not run, as it does for an install with no\nsearch account (`gateway.yaml`, "Server-run tools"). A\n`localOnly` key never has a tool run whatever this says,\nbecause a search sends a query derived from the prompt to the\npublic internet.\n',
-        max_length=100,
-    )
-    writeLogs: bool | None = Field(
-        False,
-        description="Whether this key may send log records to an agent's log ingress\n(`POST /v1/logs` on `agent.yaml`, C1 in `workbench.md`). It\ngrants nothing else: reading logs stays operator-only.\n\nEvery app the registry installs gets a key with this on,\nbecause the launcher that runs an app in its own account\nforwards what the app prints. Any other key gets it when the\noperator turns it on, so a tool outside the registry sends its\nlogs the same way ours do.\n",
-    )
-    maxConcurrentRequests: int | None = Field(2, ge=1, le=64)
-    requestsPerMinute: int | None = Field(60, ge=1, le=10000)
-
-
-class ClientKeyUpdateRequest(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    limits: ClientKeyLimits
-
-
 class Action(StrEnum):
     check = 'check'
     acquire = 'acquire'
@@ -94,6 +61,20 @@ class Purpose(StrEnum):
 
 
 class ClientAdmissionRequest(BaseModel):
+    """
+    Since row 11 the gateway sends `check` when a request arrives and
+    `acquire` when the request leaves its queue, so a request that waits
+    holds no lease. A `check` that names a `model` applies the key's
+    `allowedModels` as `acquire` does, and takes nothing.
+
+    An `acquire` refused for the key's limits is a 429 with
+    `Retry-After` and `X-Eugene-Refusal-Reason`: `concurrency` when the
+    key already runs `maxConcurrentRequests` requests (on any gateway;
+    the gateway keeps the request's place and asks again), `rate` when
+    its `requestsPerMinute` are used (the gateway refuses the request).
+
+    """
+
     model_config = ConfigDict(
         extra='forbid',
     )
@@ -111,6 +92,21 @@ class ClientAdmissionRequest(BaseModel):
         max_length=16384,
         min_length=1,
     )
+
+
+class AdmissionRefusalReason(StrEnum):
+    """
+    Why an `acquire` was refused with a 429, in its
+    `X-Eugene-Refusal-Reason` header (row 11): `concurrency`, the key
+    already runs `maxConcurrentRequests` requests; `rate`, its
+    `requestsPerMinute` are used. An agent that forwards the root's
+    answer passes the header on, and a standalone agent sets it the same
+    way.
+
+    """
+
+    concurrency = 'concurrency'
+    rate = 'rate'
 
 
 class QueueBand(StrEnum):
@@ -155,6 +151,78 @@ class ClientKeyPolicy(BaseModel):
         description='Authority UTC Unix timestamp. Intermediaries must not renew it.',
     )
     keys: list[ClientKeyPolicyEntry]
+
+
+class ClientKeyLimits(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    localOnly: bool | None = Field(
+        False,
+        description='Permit only backends explicitly classified local by drivers enforcing\nthe local-only request policy. External, unknown and older drivers\nare ineligible, including through aliases, fallback and wake. The\ncaller cannot relax this restriction. Local is a configured trust\nboundary, not a promise to sandbox a malicious backend.\n',
+    )
+    allowedModels: list[AllowedModel] | None = Field(
+        None,
+        description="Null permits all. Empty permits none. Both the id the caller\nasked for and every model actually tried (a slot's fallback\ntargets) must be allowed.\n\nAn entry is an exact id, or a pattern with `*` (P1,\n2026-09-27): `*` matches any run of characters, `/` included,\nand is the only wildcard, so `openrouter/*` allows every\nmodel of the account named `openrouter`\n(`openrouter/anthropic/claude-opus-5.5`) and nothing else.\nWithout it, scoping a key to one account means typing out\nhundreds of names. The same matcher runs in the gateway, the\nagent and the control root.\n",
+        max_length=100,
+    )
+    allowedTools: list[AllowedTool] | None = Field(
+        None,
+        description='The tools the hub runs itself (P8) that this key may have run\non its behalf -- `web_search` today. **Null permits every tool\nthe install runs** (design call #5: a key is allowed search once\na search account exists, and can be denied it here). Empty\npermits none. An entry is a tool name or a pattern with `*`,\nmatched by the same matcher as `allowedModels`.\n\nA key denied a tool is not refused for asking: the door says\nwhy the search did not run, as it does for an install with no\nsearch account (`gateway.yaml`, "Server-run tools"). A\n`localOnly` key never has a tool run whatever this says,\nbecause a search sends a query derived from the prompt to the\npublic internet.\n',
+        max_length=100,
+    )
+    writeLogs: bool | None = Field(
+        False,
+        description="Whether this key may send log records to an agent's log ingress\n(`POST /v1/logs` on `agent.yaml`, C1 in `workbench.md`). It\ngrants nothing else: reading logs stays operator-only.\n\nEvery app the registry installs gets a key with this on,\nbecause the launcher that runs an app in its own account\nforwards what the app prints. Any other key gets it when the\noperator turns it on, so a tool outside the registry sends its\nlogs the same way ours do.\n",
+    )
+    maxConcurrentRequests: int | None = Field(
+        2,
+        description="How many of this key's requests run at once, across every\ngateway. A request past it waits in the gateway's queue (row 11)\nwhile `maxQueuedRequests` allows, and is refused when it does not.\n",
+        ge=1,
+        le=64,
+    )
+    requestsPerMinute: int | None = Field(60, ge=1, le=10000)
+    band: QueueBand | None = Field(
+        None,
+        description="The key's queue band (row 11): which of its requests wait or are\nturned away first when the machines are busy. Absent means\n`interactive`. A verified person's band from their permission\ngroups (`ClientAdmissionResult.queueBand`) replaces it, and a\nrequest's `X-Eugene-Band` header can only lower it. Not part of\nthe policy a running request is bound to: changing it never cuts\na request that is already running.\n",
+    )
+    maxQueuedRequests: int | None = Field(
+        8,
+        description="How many of this key's requests may wait in one gateway's queue\nfor each person (row 11): Workbench's one app key serves\neveryone, so each verified person has a line of their own. A\nrequest past it is refused with `key_queue_full` and\n`Retry-After`. `0` refuses at once, as before the queue. Not part\nof the policy a running request is bound to.\n",
+        ge=0,
+        le=64,
+    )
+
+
+class ClientKeyUpdateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    limits: ClientKeyLimits
+
+
+class ClientAdmissionResult(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    keyId: str
+    keyName: str
+    lineage: str | None = Field(
+        None,
+        description="The id of the first key of this key's rotations (row 24): a\nreplacement shares its predecessor's lineage. The store names a\nkey's objects by it, so a rotated key keeps its files (row 53).\nReaders take it when present and use `keyId` when absent; the\nauthority starts sending it once every reader knows the field,\nbecause an older reader refuses an unknown one.\n",
+        max_length=128,
+        min_length=1,
+    )
+    personId: str | None = Field(
+        None, description='Stable subject verified by the root, never caller supplied.'
+    )
+    appClientId: str | None = None
+    limits: ClientKeyLimits | None = None
+    leaseSeconds: float | None = Field(None, gt=0.0, le=30.0)
+    queueBand: QueueBand | None = Field(
+        None,
+        description="The verified person's queue band from their permission groups\n(row 70): the highest band any of their groups sets. Present only\nwhen the root verified a person (`personId`) and one of their\ngroups sets a band. Absent for a key with no person, a release, or\na person whose groups set none: the key's own band, or the\ninstall's default, applies. Never taken from the caller.\n",
+    )
 
 
 class ClientKey(BaseModel):
@@ -205,30 +273,6 @@ class ClientKeyCreateRequest(BaseModel):
     name: str = Field(..., max_length=64, min_length=1)
     ttlDays: int | None = Field(365, ge=1, le=3650)
     limits: ClientKeyLimits | None = None
-
-
-class ClientAdmissionResult(BaseModel):
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    keyId: str
-    keyName: str
-    lineage: str | None = Field(
-        None,
-        description="The id of the first key of this key's rotations (row 24): a\nreplacement shares its predecessor's lineage. The store names a\nkey's objects by it, so a rotated key keeps its files (row 53).\nReaders take it when present and use `keyId` when absent; the\nauthority starts sending it once every reader knows the field,\nbecause an older reader refuses an unknown one.\n",
-        max_length=128,
-        min_length=1,
-    )
-    personId: str | None = Field(
-        None, description='Stable subject verified by the root, never caller supplied.'
-    )
-    appClientId: str | None = None
-    limits: ClientKeyLimits | None = None
-    leaseSeconds: float | None = Field(None, gt=0.0, le=30.0)
-    queueBand: QueueBand | None = Field(
-        None,
-        description="The verified person's queue band from their permission groups\n(row 70): the highest band any of their groups sets. Present only\nwhen the root verified a person (`personId`) and one of their\ngroups sets a band. Absent for a key with no person, a release, or\na person whose groups set none: the key's own band, or the\ninstall's default, applies. Never taken from the caller.\n",
-    )
 
 
 class ClientKeyCreated(BaseModel):
