@@ -126,15 +126,19 @@ class AttemptRow:
 
 def _tool_lists(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """A request's tool rows, split by tool as the contract names them:
-    `webSearches` (P8) and `imageGenerations` (P8e). Each is left out when
-    empty, so a row that ran neither reads exactly as it did before P8."""
+    `webSearches` (P8), `imageGenerations` (P8e) and `mcpCalls` (row 59b).
+    Each is left out when empty, so a row that ran none reads exactly as it
+    did before P8."""
     out: dict[str, Any] = {}
-    searches = [r for r in rows if r["tool"] != "image_generation"]
+    searches = [r for r in rows if r["tool"] not in ("image_generation", "mcp")]
     images = [r for r in rows if r["tool"] == "image_generation"]
+    calls = [r for r in rows if r["tool"] == "mcp"]
     if searches:
         out["webSearches"] = searches
     if images:
         out["imageGenerations"] = images
+    if calls:
+        out["mcpCalls"] = calls
     return out
 
 

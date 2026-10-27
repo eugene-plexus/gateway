@@ -29,6 +29,8 @@ from ._generated.models import (
     ConfigDocument,
     ConfigField,
     ConfigFieldError,
+    ConfigFieldStatus,
+    ConfigFieldStatusLevel,
     ConfigSchema,
     ConfigUpdateRequest,
     ConfigUpdateResult,
@@ -200,6 +202,24 @@ FIELDS: list[ConfigField] = [
         category="generation",
         valueType=ConfigValueType.string,
         default=None,
+    ),
+    ConfigField(
+        key="remoteMcp",
+        label="Remote MCP from API clients",
+        description=(
+            "Which MCP servers an app may ask Eugene to call for it on `/v1/responses`.\n\n"
+            "- **Internet only**, the default: servers on the internet, over https.\n"
+            "- **Internet and this network**, for experts: servers on your own network "
+            "too. A client could then reach services on your network through Eugene.\n"
+            "- **Off**: an app's MCP servers are refused.\n\n"
+            "This machine's own addresses and cloud metadata addresses are never reached. "
+            "The app's credentials for a server go to that server only and are never kept."
+        ),
+        category="generation",
+        valueType=ConfigValueType.enum,
+        default="internet",
+        enumValues=["off", "internet", "network"],
+        enumLabels=["Off", "Internet only", "Internet and this network (expert)"],
     ),
     ConfigField(
         key="profileCacheSeconds",
@@ -603,10 +623,18 @@ UNSET_MEANS: dict[str, str] = {
 }
 
 
+#: What `remoteMcp: network` does on this install, said beside the control.
+REMOTE_MCP_NETWORK = (
+    "API clients may reach MCP servers on your own network through Eugene, as well as on "
+    "the internet."
+)
+
+
 def as_schema(
     *,
     pending: dict[str, Any] | None = None,
     derived_control_url: str | None = None,
+    values: dict[str, Any] | None = None,
 ) -> ConfigSchema:
     """Emit the gateway config schema, with what this process knows now.
 
@@ -630,6 +658,10 @@ def as_schema(
             update["pendingRestart"] = True
             if not field.sensitive:
                 update["inEffect"] = pending[field.key]
+        if field.key == "remoteMcp" and values is not None and values.get(field.key) == "network":
+            update["status"] = ConfigFieldStatus(
+                level=ConfigFieldStatusLevel.warning, text=REMOTE_MCP_NETWORK
+            )
         fields.append(field.model_copy(update=update) if update else field)
     return ConfigSchema(component="gateway", fields=fields, categories=CATEGORY_LABELS)
 

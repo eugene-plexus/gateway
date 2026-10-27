@@ -32,7 +32,7 @@ from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import ValidationError
 
-from . import chat_contract, compaction, images, response_tools, server_tools
+from . import chat_contract, compaction, images, remote_mcp, response_tools, server_tools
 from ._generated.models import (
     ChatCompletionMessage,
     ChatCompletionRequest,
@@ -351,6 +351,8 @@ class Translated:
     search_reason: str | None = None
     #: An `image_generation` tool (P8e), or None. It runs or is refused.
     image: server_tools.ImagePlan | None = None
+    #: The request's `mcp` tools (row 59b), or None. They run or are refused.
+    mcp: remote_mcp.McpPlan | None = None
     #: The `namespace` tool each offered member function came from, by the
     #: function's name, so a call to one goes back carrying it.
     namespaces: dict[str, str] = field(default_factory=dict)
@@ -521,6 +523,9 @@ def _tools(
             continue
         if kind == "image_generation" and images is not None:
             images.append(definition)
+            continue
+        if kind == remote_mcp.MCP:
+            # Read by `remote_mcp.plan_from_tools`; run by the loop (row 59b).
             continue
         if kind == "namespace":
             out += _namespace_members(definition, f"tools[{index}]", ignored, namespaces)
@@ -996,6 +1001,22 @@ class _Conversation:
             note = "[Made an image.]" if made else "[Tried to make an image; it failed.]"
         self._parts.append(TextContentPart(type="text", text=note))
 
+    def mcp(self, turns: list[tuple[str, Any]], where: str) -> None:
+        """An `mcp_*` item's place in the history (row 59b): the call the model
+        made and its result, as a function call and its answer, or a note
+        for a server this request does not offer."""
+        for kind, value in turns:
+            if kind == "call":
+                ident, name, arguments = value
+                self.function_call({"call_id": ident, "name": name, "arguments": arguments}, where)
+            elif kind == "result":
+                ident, text = value
+                self.function_call_output({"call_id": ident, "output": text}, where)
+            elif kind == "note":
+                self._flush_hoisted()
+                self._assistant = True
+                self._parts.append(TextContentPart(type="text", text=str(value)))
+
     def function_call_output(self, item: Mapping[str, Any], where: str) -> None:
         """A tool's result, as the `tool` message answering its call.
 
@@ -1068,6 +1089,7 @@ def _messages(
     budget: images.ImageBudget,
     ignored: list[str],
     sealer: compaction.Sealer | None = None,
+    mcp: remote_mcp.McpPlan | None = None,
 ) -> list[ChatCompletionMessage]:
     conversation = _Conversation(budget, ignored)
     instructions = raw.get("instructions")
@@ -1080,11 +1102,23 @@ def _messages(
         items = [{"type": "message", "role": "user", "content": items}]
     if not isinstance(items, list):
         raise Refusal("input: must be a string or a list of items.", param="input")
+    try:
+        # Checked whole before any message is built: an approval answers a
+        # request the conversation carries, wherever in `input` (row 59b).
+        history = remote_mcp.McpInput(mcp, items)
+    except remote_mcp.InvalidMcp as exc:
+        raise Refusal(exc.message, param=exc.param) from exc
     for index, item in enumerate(items):
         where = f"input[{index}]"
         if not isinstance(item, Mapping):
             raise Refusal(f"{where}: must be an object.", param="input")
         kind = item.get("type") or ("message" if "role" in item else None)
+        if kind == "mcp_list_tools":
+            history.list_tools(item)
+            continue
+        if kind in ("mcp_call", "mcp_approval_request", "mcp_approval_response"):
+            conversation.mcp(history.turns(item), where)
+            continue
         if kind == "compaction":
             try:
                 if sealer is None:
@@ -1230,7 +1264,18 @@ def translate_request(
         )
 
     budget = images.ImageBudget(max_images)
-    messages = _messages(raw, budget, ignored, sealer)
+    # The `mcp` tools first: the history's MCP calls are named as the model
+    # will be offered them (row 59b). Their ignored keys keep their place
+    # after the history's in the header.
+    mcp_ignored: list[str] = []
+    try:
+        mcp = remote_mcp.plan_from_tools(
+            raw.get("tools"), mcp_ignored, max_tool_calls=raw.get("max_tool_calls")
+        )
+    except remote_mcp.InvalidMcp as exc:
+        raise Refusal(exc.message, param=exc.param) from exc
+    messages = _messages(raw, budget, ignored, sealer, mcp)
+    ignored.extend(mcp_ignored)
     searches: list[Mapping[str, Any]] = []
     image_tools: list[Mapping[str, Any]] = []
     namespaces: dict[str, str] = {}
@@ -1288,11 +1333,13 @@ def translate_request(
         search=search,
         search_reason=search_reason,
         image=image,
+        mcp=mcp,
         namespaces=namespaces,
         client_tools=client_tools,
         echo={
             "instructions": raw.get("instructions"),
-            "tools": raw.get("tools") or [],
+            # An `mcp` tool's headers and authorization never leave the request.
+            "tools": remote_mcp.echo_tools(raw.get("tools") or []),
             "tool_choice": raw.get("tool_choice") or "auto",
             "parallel_tool_calls": raw.get("parallel_tool_calls", True),
             "temperature": raw.get("temperature"),
@@ -1492,6 +1539,12 @@ def transcript_items(
             items.append(web_search_item(value))
         elif kind == "image":
             items.append(image_generation_item(value))
+        elif kind == "mcp_list":
+            items.append(remote_mcp.list_item(value))
+        elif kind == "mcp":
+            items.append(remote_mcp.call_item(value))
+        elif kind == "mcp_approval":
+            items.append(remote_mcp.approval_item(value))
     items += _call_items(tool_calls, item_status, namespaces)
     return items
 
@@ -2165,6 +2218,65 @@ class StreamTranslator:
                 "response.image_generation_call.completed",
                 {"item_id": item_id, "output_index": index},
             ),
+            self.frame("response.output_item.done", {"output_index": index, "item": done}),
+        ]
+
+    def mcp(self, update: Any) -> list[str]:
+        """Remote MCP as OpenAI streams it (row 59b): a tool list read
+        (`response.mcp_list_tools.in_progress` then `.completed`), a call
+        (`response.mcp_call.in_progress`, then `.completed` or `.failed`),
+        and an approval request, each as an output item added and done."""
+        value = update.value
+        if update.phase == "listed":
+            events = self._close_open() + self._close_calls()
+            index = self._next_index()
+            done = remote_mcp.list_item(value)
+            added = {**done, "tools": []}
+            common = {"item_id": done["id"], "output_index": index}
+            events += [
+                self.frame("response.output_item.added", {"output_index": index, "item": added}),
+                self.frame("response.mcp_list_tools.in_progress", common),
+                self.frame("response.mcp_list_tools.completed", common),
+                self.frame("response.output_item.done", {"output_index": index, "item": done}),
+            ]
+            self.output.append(done)
+            return events
+        if update.phase == "approval":
+            events = self._close_open() + self._close_calls()
+            index = self._next_index()
+            done = remote_mcp.approval_item(value)
+            events += [
+                self.frame("response.output_item.added", {"output_index": index, "item": done}),
+                self.frame("response.output_item.done", {"output_index": index, "item": done}),
+            ]
+            self.output.append(done)
+            return events
+        item_id = value.item_id
+        if update.phase == "started":
+            events = self._close_open() + self._close_calls()
+            index = self._next_index()
+            item = remote_mcp.call_item(value)
+            common = {"item_id": item_id, "output_index": index}
+            events += [
+                self.frame("response.output_item.added", {"output_index": index, "item": item}),
+                self.frame("response.mcp_call.in_progress", common),
+                self.frame(
+                    "response.mcp_call_arguments.done", {**common, "arguments": value.arguments}
+                ),
+            ]
+            self.output.append(item)
+            return events
+        index = next(
+            (i for i, it in enumerate(self.output) if it.get("id") == item_id), len(self.output)
+        )
+        done = remote_mcp.call_item(value)
+        if index < len(self.output):
+            self.output[index] = done
+        else:
+            self.output.append(done)
+        outcome = "completed" if done["status"] == "completed" else "failed"
+        return [
+            self.frame(f"response.mcp_call.{outcome}", {"item_id": item_id, "output_index": index}),
             self.frame("response.output_item.done", {"output_index": index, "item": done}),
         ]
 

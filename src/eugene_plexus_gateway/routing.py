@@ -1723,6 +1723,13 @@ class RoutingTable:
         """Every search account that answered, set up or not."""
         return list(self._snapshot.tools)
 
+    def mcp_accounts(self) -> list[ToolAccount]:
+        """The tool-drivers that run remote MCP (row 59b), in search order.
+
+        Set up or not: remote MCP needs no account settings, so a search
+        account still waiting for its key runs it too."""
+        return [a for a, _ in self._ordered_tools() if "mcp" in a.info.tools]
+
     async def _probe(self, node: str | None, name: str, url: str) -> _Backend | _Unreachable:
         client = self._clients.get((node, name, url))
         if client is None:

@@ -160,7 +160,7 @@ def test_tool_choice_forces_a_declared_client_tool(settings: Settings, definitio
     [
         ("computer_use_preview", "no local model"),
         ("code_interpreter", "no sandbox"),
-        ("mcp", "row 59"),
+        ("mcp", "server_label: required"),
         ("file_search", "row 56"),
     ],
 )

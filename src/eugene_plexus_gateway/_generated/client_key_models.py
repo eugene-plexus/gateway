@@ -54,7 +54,7 @@ class ClientKeyLimits(BaseModel):
     )
     allowedTools: list[AllowedTool] | None = Field(
         None,
-        description='The tools the hub runs itself (P8) that this key may have run\non its behalf -- `web_search` today. **Null permits every tool\nthe install runs** (design call #5: a key is allowed search once\na search account exists, and can be denied it here). Empty\npermits none. An entry is a tool name or a pattern with `*`,\nmatched by the same matcher as `allowedModels`.\n\nA key denied a tool is not refused for asking: the door says\nwhy the search did not run, as it does for an install with no\nsearch account (`gateway.yaml`, "Server-run tools"). A\n`localOnly` key never has a tool run whatever this says,\nbecause a search sends a query derived from the prompt to the\npublic internet.\n',
+        description='The tools the hub runs itself (P8) that this key may have run\non its behalf -- `web_search`, `image_generation`, and `mcp`\n(remote MCP servers the key\'s caller names, row 59b). **Null permits every tool\nthe install runs** (design call #5: a key is allowed search once\na search account exists, and can be denied it here). Empty\npermits none. An entry is a tool name or a pattern with `*`,\nmatched by the same matcher as `allowedModels`.\n\nA key denied a tool is not refused for asking: the door says\nwhy the search did not run, as it does for an install with no\nsearch account (`gateway.yaml`, "Server-run tools"). A\n`localOnly` key never has a tool run whatever this says,\nbecause a search sends a query derived from the prompt to the\npublic internet.\n',
         max_length=100,
     )
     writeLogs: bool | None = Field(

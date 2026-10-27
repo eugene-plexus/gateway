@@ -11,13 +11,16 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, RootModel
 
 class ToolName(StrEnum):
     """
-    A tool the hub runs itself. `web_search` only today; the gateway's
-    `image_generation` (P8e) runs through the install's own images door
-    and needs no tool-driver.
+    A tool the hub runs itself. `web_search` runs on the account's
+    search provider; `mcp` is remote MCP (row 59b), which needs no
+    account settings and so is listed whether or not the search is
+    set up. The gateway's `image_generation` (P8e) runs through the
+    install's own images door and needs no tool-driver.
 
     """
 
     web_search = 'web_search'
+    mcp = 'mcp'
 
 
 class Egress(StrEnum):
@@ -32,8 +35,8 @@ class Egress(StrEnum):
 
 class ToolBilling(StrEnum):
     """
-    Whether the provider bills each search (`per_search`: Brave) or not
-    (`free`: SearXNG). The gateway tries a free account before one that
+    Whether the provider bills each search (`per_search`: Brave,
+    Google, Tavily) or not (`free`: SearXNG). The gateway tries a free account before one that
     bills, so an install with both pays only when the free one could not
     answer. Absent is read as `per_search`: an account that does not say
     is not assumed to cost nothing.
@@ -1929,13 +1932,99 @@ class WebSearchResult(BaseModel):
     )
 
 
+class McpReach(StrEnum):
+    """
+    Which addresses a remote MCP call may connect to: the gateway's
+    `remoteMcp` setting, which the owner sets (call R59-MCP).
+    `internet`, the default: globally reachable addresses only, over
+    `https`. `network`: also the owner's own network (private ranges,
+    unique-local IPv6, 100.64.0.0/10), where plain `http` is allowed
+    too. Loopback, link-local, metadata, multicast, reserved and
+    unspecified addresses are refused under both. The setting's third
+    value, `off`, never reaches this component: the gateway refuses
+    the request itself.
+
+    """
+
+    internet = 'internet'
+    network = 'network'
+
+
+class AllowedTool(RootModel[str]):
+    root: str = Field(..., max_length=128, min_length=1)
+
+
+class McpListToolsRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    serverUrl: str = Field(
+        ...,
+        description="The MCP server's Streamable HTTP endpoint, as the caller named it.",
+        max_length=2048,
+        min_length=1,
+    )
+    headers: dict[str, str] | None = Field(
+        None,
+        description="The caller's headers for this server, its `authorization` already\nturned into `Authorization: Bearer ...` by the gateway. Sent to\nthis server only, for this call only. Headers that frame the\nrequest (`Host`, `Content-Length`, `Content-Type`, `Accept`,\n`Connection`, `Transfer-Encoding`, `Mcp-Session-Id`,\n`MCP-Protocol-Version` and the like) are refused with a 400\nnaming the header, never its value.\n",
+    )
+    reach: McpReach
+    allowedTools: list[AllowedTool] | None = Field(
+        None,
+        description='Only these tools, by name. Null or absent keeps every tool the\nserver lists (up to the limit of 64).\n',
+        max_length=256,
+    )
+
+
+class McpTool(BaseModel):
+    name: str
+    description: str | None = None
+    inputSchema: dict[str, Any] = Field(
+        ...,
+        description="The tool's JSON Schema for its arguments, as the server gave it.",
+    )
+    annotations: dict[str, Any] | None = Field(
+        None,
+        description="The server's hints about the tool (`readOnlyHint` and others), as given.",
+    )
+
+
+class McpCallRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    serverUrl: str = Field(..., max_length=2048, min_length=1)
+    headers: dict[str, str] | None = Field(
+        None, description='As on `McpListToolsRequest`.'
+    )
+    reach: McpReach
+    name: str = Field(..., max_length=128, min_length=1)
+    arguments: dict[str, Any] | None = Field(
+        None,
+        description='The arguments the model gave, as a JSON object. Absent is `{}`.',
+    )
+
+
+class McpCallResponse(BaseModel):
+    output: str | None = Field(
+        None,
+        description="The tool's text content, joined. A part that is not text (an\nimage, audio) is named in a line of its own and not carried; a\ntool with only structured content answers it as JSON. Null when\n`error` is set.\n",
+    )
+    error: str | None = Field(
+        None,
+        description="The tool's own words when it ran and reported a failure\n(`isError`), or null.\n",
+    )
+    latencyMs: float | None = None
+
+
 class ToolDriverInfo(BaseModel):
     provider: str = Field(
-        ..., description='The provider key, `searxng`, `brave` or `google`.'
+        ..., description='The provider key, `searxng`, `brave`, `google` or `tavily`.'
     )
     label: str | None = Field(None, description="The provider's display name.")
     tools: list[ToolName] = Field(
-        ..., description='The tools this process runs. Empty until it is configured.'
+        ...,
+        description='The tools this process runs. `web_search` only once the account\nis configured; `mcp` always (row 59b).\n',
     )
     egress: Egress = Field(
         ...,
@@ -2370,7 +2459,7 @@ class WebSearchResponse(BaseModel):
     results: list[WebSearchResult]
     answer: str | None = Field(
         None,
-        description="Text the provider itself wrote in answer to the query (SearXNG's\ninstant answers), or null. A provider that searches by asking a\nhosted model answers here, with its citations in `results`.\n",
+        description="Text the provider itself wrote in answer to the query (SearXNG's\ninstant answers, Tavily's `answer`), or null. A provider that\nsearches by asking a hosted model answers here, with its\ncitations in `results`.\n",
     )
     provider: str
     latencyMs: float | None = None
@@ -2381,6 +2470,11 @@ class WebSearchResponse(BaseModel):
         None,
         description="HTML the provider's terms require shown with these results, to\nthe person who asked, unmodified: Google's Search Suggestions\n(`searchEntryPoint.renderedContent`), for the `google` provider\n(docs/design/google-search-account.md, GS1, GS4). Null or absent\nfor providers with none. The gateway carries it to the caller\nand keeps none of it.\n",
     )
+
+
+class McpListToolsResponse(BaseModel):
+    tools: list[McpTool] = Field(..., max_length=64)
+    latencyMs: float | None = None
 
 
 class InputAudioContentPart(BaseModel):

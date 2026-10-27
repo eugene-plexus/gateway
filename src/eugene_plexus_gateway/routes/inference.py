@@ -54,6 +54,7 @@ from .. import (
     ignored_settings,
     image_doors,
     moderation_door,
+    remote_mcp,
     repetition,
     rerank_door,
     responses,
@@ -362,6 +363,18 @@ def _tool_rows(searched: server_tools.SearchingClient | None) -> list[ToolExecut
                     version=value.version,
                     outcome=value.outcome,
                     results=1 if value.outcome == "ok" else None,
+                    elapsed_ms=value.elapsed_ms,
+                )
+            )
+        elif kind == "mcp":
+            # The caller's server, tool and arguments are its own words: the
+            # row says that a call ran, where, and how it went (row 59b).
+            rows.append(
+                ToolExecutionRow(
+                    tool=remote_mcp.MCP,
+                    driver=value.driver,
+                    node=value.node,
+                    outcome="ok" if value.outcome == "ok" else value.outcome,
                     elapsed_ms=value.elapsed_ms,
                 )
             )
@@ -1112,6 +1125,7 @@ async def _prepare(
     completion: CompletionPrompt | None = None,
     search: server_tools.SearchPlan | None = None,
     image: server_tools.ImagePlan | None = None,
+    mcp: remote_mcp.McpPlan | None = None,
 ) -> _Serving | _Failure:
     """Resolve, refuse, refresh, wake, and start the clock.
 
@@ -1201,7 +1215,37 @@ async def _prepare(
                 param="tools",
             )
         image.chosen = chosen
-    looping = searching or image is not None
+
+    # Row 59b: remote MCP runs, or the request is a 400 naming why -- the
+    # owner's `remoteMcp` setting, the key, a process that runs it -- read
+    # after `admission.authorize` as the image tool is. Each server's tools
+    # are listed here, so a server that cannot be read is answered before
+    # anything streams (424, as OpenAI answers it).
+    mcp_runner: remote_mcp.McpRunner | None = None
+    if mcp is not None:
+        settings = _store(request)
+        setting = settings.get("remoteMcp") if settings is not None else None
+        mcp_reason = remote_mcp.why_not(table, admission.current.get(), setting)
+        if mcp_reason is not None:
+            return _Failure(
+                code=400,
+                message=f"tools: remote MCP could not run for this request: {mcp_reason}. "
+                "Nothing was forwarded.",
+                error_type="invalid_request_error",
+                param="tools",
+            )
+        mcp.reach = remote_mcp.reach_of(setting)
+        mcp_runner = remote_mcp.McpRunner(table, mcp)
+        try:
+            await remote_mcp.list_all(mcp_runner)
+        except remote_mcp.McpRefusal as refused:
+            return _Failure(
+                code=refused.status,
+                message=refused.message,
+                error_type=refused.error_type,
+                param=refused.param,
+            )
+    looping = searching or image is not None or mcp is not None
 
     async def permit(resolved: Any) -> Any:
         try:
@@ -1222,9 +1266,12 @@ async def _prepare(
         nonlocal native
         resolved = await permit(table.resolve(body.model))
         if looping:
-            # An image is made only here, so with one asked for every
-            # candidate must call tools, a backend that searches itself too.
-            resolved, native = server_tools.searchable(resolved, native_ok=image is None)
+            # An image and an MCP call are made only here, so with either asked
+            # for every candidate must call tools, a backend that searches
+            # itself too.
+            resolved, native = server_tools.searchable(
+                resolved, native_ok=image is None and mcp is None
+            )
         return resolved
 
     resolution = await resolve()
@@ -1238,6 +1285,13 @@ async def _prepare(
                     "forwarded or woken."
                 )
                 if image is not None
+                else (
+                    f"No backend serving {body.model!r} can call MCP tools: remote MCP tools "
+                    "are offered to the model as functions, and none of its backends calls "
+                    "tools. Choose a model whose backend supports tool calling. Nothing was "
+                    "forwarded or woken."
+                )
+                if mcp is not None
                 else (
                     f"No backend serving {body.model!r} can search the web: it neither runs "
                     "web search itself nor calls tools, and a search this install runs is "
@@ -1437,6 +1491,8 @@ async def _prepare(
             )
             if image is not None
             else None,
+            mcp=mcp,
+            mcp_runner=mcp_runner,
         )
     waited_ms = wake.waited_ms if wake is not None and wake.ok else 0
     # Excludes the wake, which is `waited_ms` and already reported. The
@@ -2208,6 +2264,10 @@ async def _stream_responses(
                     for chunk in translator.image(event.image):
                         yield chunk
                     continue
+                if event.mcp is not None:
+                    for chunk in translator.mcp(event.mcp):
+                        yield chunk
+                    continue
                 if event.tool_calls:
                     for chunk in translator.tool_fragments(event.tool_calls):
                         yield chunk
@@ -2463,6 +2523,7 @@ async def create_response(request: Request) -> Any:
         install_max_tokens=False,
         search=translated.search,
         image=translated.image,
+        mcp=translated.mcp,
     )
     if isinstance(prepared, _Failure):
         return prepared.as_responses()
@@ -2514,7 +2575,7 @@ async def create_response(request: Request) -> Any:
         searched = (
             prepared.client
             if isinstance(prepared.client, server_tools.SearchingClient)
-            and (prepared.client.executions or prepared.client.images)
+            and prepared.client.ran_tools
             else None
         )
         output = (

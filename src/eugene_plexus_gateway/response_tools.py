@@ -17,7 +17,6 @@ REFUSALS = {
     "computer_use_preview": "no local model is trained for it; use a function tool instead",
     "computer": "no local model is trained for it; use a function tool instead",
     "code_interpreter": "Eugene has no sandbox; use a function tool and run it yourself",
-    "mcp": "remote MCP execution needs row 59; use a client-run function tool instead",
     "file_search": "file search needs row 56; use a client-run function tool instead",
 }
 

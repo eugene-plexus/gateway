@@ -40,6 +40,7 @@ async def get_config_schema(request: Request) -> ConfigSchema:
     return as_schema(
         pending=store.pending_restart() if store is not None else None,
         derived_control_url=derived_control,
+        values={"remoteMcp": store.get("remoteMcp")} if store is not None else None,
     )
 
 

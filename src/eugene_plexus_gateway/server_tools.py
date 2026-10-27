@@ -77,6 +77,16 @@ from .chat_contract import _field_name
 from .driver_client import DriverClient, DriverError, StreamEvent
 from .image_doors import ImageAsk, format_name, to_driver
 from .model_patterns import permits
+from .remote_mcp import (
+    McpApproval,
+    McpExecution,
+    McpPlan,
+    McpRunner,
+    McpUpdate,
+    offered,
+    pending_text,
+    told,
+)
 from .tool_client import SearchAnswer, ToolDriverError
 
 log = logging.getLogger(__name__)
@@ -982,12 +992,19 @@ class SearchingClient:
         native: set[tuple[str | None, str, str | None]],
         image: ImagePlan | None = None,
         image_runner: ImageRunner | None = None,
+        mcp: McpPlan | None = None,
+        mcp_runner: McpRunner | None = None,
     ) -> None:
         self._inner = inner
         self.plan = plan
         self.runner = runner
         self.image = image
         self.image_runner = image_runner
+        #: Remote MCP (row 59b): the servers, their tools, approvals to run.
+        self.mcp = mcp
+        self.mcp_runner = mcp_runner
+        self.mcp_calls: list[McpExecution] = []
+        self.approvals: list[McpApproval] = []
         self.limit = limit
         #: `(node, driver, public model)` of the candidates that search
         #: themselves and are sent the request natively.
@@ -996,8 +1013,10 @@ class SearchingClient:
         #: Every image call the model made (P8e), in order.
         self.images: list[ImageExecution] = []
         #: What happened, in order: `("text", str)`, `("reasoning", str)`,
-        #: `("search", Execution)`, `("image", ImageExecution)`. The Responses
-        #: and Anthropic doors render their items and blocks from it.
+        #: `("search", Execution)`, `("image", ImageExecution)`, and for
+        #: remote MCP `("mcp_list", McpListing)`, `("mcp", McpExecution)` and
+        #: `("mcp_approval", McpApproval)`. The Responses and Anthropic doors
+        #: render their items and blocks from it.
         self.transcript: list[tuple[str, Any]] = []
         self.turns = 0
         self.first_attempts: int | None = None
@@ -1021,9 +1040,14 @@ class SearchingClient:
 
     @property
     def max_turns(self) -> int:
-        # Every call the limit allows, one turn to read the last results,
+        # Every call the limits allow, one turn to read the last results,
         # and one more for a model that asks past the limit to be told no.
-        return self.limit + 2
+        return self.limit + (self.mcp.limit if self.mcp is not None else 0) + 2
+
+    @property
+    def ran_tools(self) -> bool:
+        """Whether this loop ran anything, or asked the person about it."""
+        return any(kind not in ("text", "reasoning") for kind, _ in self.transcript)
 
     @property
     def _names(self) -> set[str]:
@@ -1032,6 +1056,8 @@ class SearchingClient:
             names.add(self._tool_name)
         if self.image is not None:
             names.add(self._image_name)
+        if self.mcp is not None:
+            names |= set(self.mcp.functions())
         return names
 
     # -- per candidate: native, or the loop ------------------------------------
@@ -1063,16 +1089,23 @@ class SearchingClient:
         )
 
     def _name_tools(self, request: GenerateRequest) -> None:
-        self._tool_name = tool_name_for(request.tools)
-        self._image_name = tool_name_for(request.tools, IMAGE_GENERATION, taken={self._tool_name})
+        mcp_names = set(self.mcp.functions()) if self.mcp is not None else set()
+        self._tool_name = tool_name_for(request.tools, taken=mcp_names)
+        self._image_name = tool_name_for(
+            request.tools, IMAGE_GENERATION, taken={self._tool_name, *mcp_names}
+        )
 
     def _offered(self) -> list[Tool]:
-        offered = []
+        tools = []
         if self.plan is not None:
-            offered.append(search_tool(self._tool_name))
+            tools.append(search_tool(self._tool_name))
         if self.image is not None:
-            offered.append(image_tool(self._image_name, with_size=self.image.size is None))
-        return offered
+            tools.append(image_tool(self._image_name, with_size=self.image.size is None))
+        if self.mcp is not None:
+            tools += [
+                Tool(type="function", function=FunctionDefinition(**f)) for f in offered(self.mcp)
+            ]
+        return tools
 
     def _turn_request(
         self, base: GenerateRequest, history: list[Message], turn: int
@@ -1093,6 +1126,7 @@ class SearchingClient:
             and self.plan is not None
             and self.plan.only_tool
             and self.image is None
+            and self.mcp is None
             and (choice is None or choice == ToolChoice.auto)
         ):
             # The caller asked for a search; the first call makes one. Not
@@ -1199,16 +1233,40 @@ class SearchingClient:
         images = [e for e in self.images if e.outcome != "over_limit"]
         return len(searches) + len(images)
 
-    def _pending(self, call: ToolCall) -> Execution | ImageExecution:
+    def _pending(self, call: ToolCall) -> Any:
         if call.function.name == self._image_name and self.image is not None:
             prompt, size = image_args(call.function.arguments)
             return ImageExecution(call_id=call.id, prompt=prompt, size=size)
+        functions = self.mcp.functions() if self.mcp is not None else {}
+        if call.function.name in functions:
+            server, tool = functions[call.function.name]
+            arguments = call.function.arguments or "{}"
+            if server.approval.needs(tool.name, read_only=tool.read_only):
+                return McpApproval(
+                    call_id=call.id, label=server.label, name=tool.name, arguments=arguments
+                )
+            return McpExecution(
+                call_id=call.id, label=server.label, name=tool.name, arguments=arguments
+            )
         assert self.plan is not None
         return Execution(
             call_id=call.id, query=query_of(call.function.arguments), version=self.plan.version
         )
 
-    async def _run(self, execution: Execution | ImageExecution) -> Execution | ImageExecution:
+    async def _run(self, execution: Any) -> Any:
+        if isinstance(execution, McpApproval):
+            # Not run: the response ends asking the person (row 59b).
+            self.approvals.append(execution)
+            return execution
+        if isinstance(execution, McpExecution):
+            assert self.mcp is not None
+            ran = [e for e in self.mcp_calls if e.outcome != "over_limit"]
+            if len(ran) >= self.mcp.limit:
+                execution.outcome = "over_limit"
+            elif self.mcp_runner is not None:
+                await self.mcp_runner.call(execution)
+            self.mcp_calls.append(execution)
+            return execution
         over = self._spent() >= self.limit
         if isinstance(execution, ImageExecution):
             if over:
@@ -1224,14 +1282,50 @@ class SearchingClient:
         self.executions.append(execution)
         return execution
 
-    def _told(self, execution: Execution | ImageExecution) -> str:
+    def _told(self, execution: Any) -> str:
         if isinstance(execution, ImageExecution):
             return image_text(execution, limit=self.limit)
+        if isinstance(execution, McpExecution):
+            return told(execution, self.mcp.limit if self.mcp is not None else 0)
         return result_text(execution, limit=self.limit)
 
     @staticmethod
-    def _kind(execution: Execution | ImageExecution) -> str:
+    def _kind(execution: Any) -> str:
+        if isinstance(execution, McpExecution):
+            return "mcp"
+        if isinstance(execution, McpApproval):
+            return "mcp_approval"
         return "image" if isinstance(execution, ImageExecution) else "search"
+
+    async def _mcp_opening(self, history: list[Message]) -> AsyncGenerator[McpUpdate, None]:
+        """Before the first turn: the listings this request made, then each call
+        the person approved, run and put where its placeholder sits in the
+        history, so the model reads the approved call's result (row 59b)."""
+        if self.mcp is None:
+            return
+        for listing in self.mcp.listings:
+            self.transcript.append(("mcp_list", listing))
+            yield McpUpdate("listed", listing)
+        for answered in self.mcp.pending:
+            asked = answered.asked
+            execution = McpExecution(
+                call_id=asked.id,
+                label=asked.label,
+                name=asked.name,
+                arguments=asked.arguments,
+                approval_request_id=asked.id,
+            )
+            yield McpUpdate("started", execution)
+            await self._run(execution)
+            self.transcript.append(("mcp", execution))
+            for index, message in enumerate(history):
+                if (
+                    message.role == Role.tool
+                    and message.toolCallId == asked.id
+                    and message.content == pending_text()
+                ):
+                    history[index] = message.model_copy(update={"content": self._told(execution)})
+            yield McpUpdate("completed", execution)
 
     def _history_after(
         self,
@@ -1239,7 +1333,7 @@ class SearchingClient:
         text: str,
         reasoning: str | None,
         calls: list[ToolCall],
-        done: list[Execution | ImageExecution],
+        done: list[Any],
     ) -> list[Message]:
         history = list(history)
         history.append(
@@ -1287,6 +1381,8 @@ class SearchingClient:
         self._base = request
         self._name_tools(request)
         history = list(request.messages)
+        async for _ in self._mcp_opening(history):
+            pass
         usage: Usage | None = None
         for turn in range(self.max_turns):
             response = await self._turn_generate(self._turn_request(request, history, turn), turn)
@@ -1299,11 +1395,15 @@ class SearchingClient:
             ours, others = self._split(response.toolCalls)
             if not ours or self.searched_natively or turn >= self.max_turns - 1:
                 return self._final(response, others, usage)
-            done: list[Execution | ImageExecution] = []
+            done: list[Any] = []
             for call in ours:
                 execution = await self._run(self._pending(call))
                 self.transcript.append((self._kind(execution), execution))
                 done.append(execution)
+            if any(isinstance(e, McpApproval) for e in done):
+                # The response ends asking the person; the caller's own calls
+                # from this turn are dropped, as beside a search.
+                return self._final(response, [], usage)
             history = self._history_after(
                 history, response.content or "", response.reasoning, ours, done
             )
@@ -1313,6 +1413,8 @@ class SearchingClient:
         self._base = request
         self._name_tools(request)
         history = list(request.messages)
+        async for opening in self._mcp_opening(history):
+            yield StreamEvent(mcp=opening)
         usage: Usage | None = None
         for turn in range(self.max_turns):
             fragments: dict[int, list[dict[str, Any]]] = {}
@@ -1364,9 +1466,22 @@ class SearchingClient:
                     yield StreamEvent(annotations=cited)
                 yield StreamEvent(done=True, result=final)
                 return
-            done: list[Execution | ImageExecution] = []
+            done: list[Any] = []
             for call in ours:
                 pending = self._pending(call)
+                if isinstance(pending, McpApproval):
+                    await self._run(pending)
+                    self.transcript.append((self._kind(pending), pending))
+                    done.append(pending)
+                    yield StreamEvent(mcp=McpUpdate("approval", pending))
+                    continue
+                if isinstance(pending, McpExecution):
+                    yield StreamEvent(mcp=McpUpdate("started", pending))
+                    await self._run(pending)
+                    self.transcript.append((self._kind(pending), pending))
+                    done.append(pending)
+                    yield StreamEvent(mcp=McpUpdate("completed", pending))
+                    continue
                 update = SearchUpdate("started", pending)
                 yield (
                     StreamEvent(image=update)
@@ -1382,6 +1497,10 @@ class SearchingClient:
                     if isinstance(execution, ImageExecution)
                     else StreamEvent(search=finished)
                 )
+            if any(isinstance(e, McpApproval) for e in done):
+                # The response ends asking the person (row 59b).
+                yield StreamEvent(done=True, result=self._final(result, [], usage))
+                return
             history = self._history_after(
                 history, "".join(text), "".join(thought) or None, ours, done
             )

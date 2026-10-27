@@ -188,6 +188,10 @@ class StreamEvent:
     """An image the gateway itself is making for this answer (P8e), as a
     `server_tools.SearchUpdate` over an `ImageExecution`. Only on the
     Responses door, the one door whose API defines `image_generation`."""
+    mcp: Any = None
+    """Remote MCP's progress (row 59b), as a `remote_mcp.McpUpdate`: a tool
+    list read, a call started or ended, an approval asked for. Only on the
+    Responses door, the one door whose API defines the `mcp` tool."""
 
 
 def _problem_from_bytes(raw: bytes) -> Problem | None:

@@ -25,6 +25,9 @@ from ._http import internal_client
 #: failed. A search the model waits on is a pause in someone's answer,
 #: and a provider that has not answered in this long is not going to.
 SEARCH_TIMEOUT_SECONDS = 30.0
+#: A remote MCP call's wait (row 59b): the tool-driver's own 30 s limit,
+#: and room for it to say so, so the person reads its words, not this one's.
+MCP_TIMEOUT_SECONDS = 40.0
 
 
 class ToolDriverError(Exception):
@@ -176,6 +179,87 @@ class ToolDriverClient:
             search_suggestions=body.get("searchSuggestions")
             if isinstance(body.get("searchSuggestions"), str) and body.get("searchSuggestions")
             else None,
+        )
+
+    async def _mcp(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """One remote MCP request (row 59b). The payload carries the caller's
+        headers for this one call; nothing here logs or keeps it, and an error
+        is built from the tool-driver's words, never from the payload."""
+        try:
+            response = await self._client.post(
+                path, json=payload, timeout=httpx.Timeout(MCP_TIMEOUT_SECONDS, connect=5.0)
+            )
+        except httpx.TimeoutException:
+            raise ToolDriverError(
+                driver=self.name,
+                status=0,
+                detail=f"the remote MCP call did not finish within {MCP_TIMEOUT_SECONDS:g}s",
+                code="timeout",
+            ) from None
+        except httpx.HTTPError as exc:
+            raise ToolDriverError(
+                driver=self.name,
+                status=0,
+                detail=f"the process that runs remote MCP could not be reached "
+                f"({type(exc).__name__})",
+                code="unreachable",
+            ) from None
+        if response.status_code >= 400:
+            raise _failure(self.name, response)
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        if not isinstance(body, dict):
+            raise ToolDriverError(
+                driver=self.name, status=502, detail="the remote MCP answer was unreadable"
+            )
+        return body
+
+    async def mcp_list_tools(
+        self,
+        server_url: str,
+        *,
+        headers: dict[str, str],
+        reach: str,
+        allowed: list[str] | None,
+    ) -> list[dict[str, Any]]:
+        body = await self._mcp(
+            "/v1/tools/mcp/list_tools",
+            {
+                "serverUrl": server_url,
+                "headers": headers,
+                "reach": reach,
+                **({"allowedTools": allowed} if allowed is not None else {}),
+            },
+        )
+        tools = body.get("tools")
+        return [t for t in tools if isinstance(t, dict)] if isinstance(tools, list) else []
+
+    async def mcp_call(
+        self,
+        server_url: str,
+        *,
+        headers: dict[str, str],
+        reach: str,
+        name: str,
+        arguments: dict[str, Any],
+    ) -> tuple[str | None, str | None]:
+        """`(output, error)`: the tool's text, or its own words for a failure."""
+        body = await self._mcp(
+            "/v1/tools/mcp/call",
+            {
+                "serverUrl": server_url,
+                "headers": headers,
+                "reach": reach,
+                "name": name,
+                "arguments": arguments,
+            },
+        )
+        output, error = body.get("output"), body.get("error")
+        return (
+            output if isinstance(output, str) else None,
+            error if isinstance(error, str) and error else None,
         )
 
     async def aclose(self) -> None:
