@@ -3968,6 +3968,12 @@ class Type9(StrEnum):
     response_shell_call_command_added = 'response.shell_call_command.added'
     response_shell_call_command_delta = 'response.shell_call_command.delta'
     response_shell_call_command_done = 'response.shell_call_command.done'
+    response_mcp_list_tools_in_progress = 'response.mcp_list_tools.in_progress'
+    response_mcp_list_tools_completed = 'response.mcp_list_tools.completed'
+    response_mcp_call_in_progress = 'response.mcp_call.in_progress'
+    response_mcp_call_arguments_done = 'response.mcp_call_arguments.done'
+    response_mcp_call_completed = 'response.mcp_call.completed'
+    response_mcp_call_failed = 'response.mcp_call.failed'
     response_completed = 'response.completed'
     response_incomplete = 'response.incomplete'
     response_failed = 'response.failed'
@@ -5730,6 +5736,13 @@ class ResponsesStreamEvent(BaseModel):
     on done. Internal function-adapter arguments are not exposed as
     function-call events for these client-run tools.
 
+    Remote MCP (row 59b): a tool list read is
+    `response.mcp_list_tools.in_progress` then `.completed`; a call is
+    `response.mcp_call.in_progress`, `response.mcp_call_arguments.done`
+    (`arguments`), then `response.mcp_call.completed` or `.failed`; each
+    with `item_id` and `output_index`, between its item's added and
+    done. An `mcp_approval_request` is an item added and done.
+
     """
 
     model_config = ConfigDict(
@@ -5745,6 +5758,10 @@ class ResponsesStreamEvent(BaseModel):
     delta: str | None = None
     input: str | None = None
     command: str | None = None
+    arguments: str | None = Field(
+        None,
+        description="An MCP call's arguments, as a JSON string, on `response.mcp_call_arguments.done`.",
+    )
 
 
 class SystemOneRequest(BaseModel):
