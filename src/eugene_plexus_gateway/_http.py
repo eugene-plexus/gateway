@@ -41,7 +41,13 @@ install's machine table, from a list the root signs, to the file named by
   pins the table lists for it, after the handshake and before the first
   request byte, with no certificate chain and no name check;
 * when the install requires encryption, refuses plain HTTP to a machine
-  the table names but cannot carry.
+  the table names but cannot carry;
+* never sends one of this install's tokens to another machine in plain
+  HTTP unless the table says that machine runs a version with no machine
+  port. A machine the table does not name yet (it has just joined, and this
+  process has not read the root's list since) is refused, not sent the
+  token in clear; the caller tries again after the table names it
+  (agent#38).
 
 With no table, behaviour is exactly what it was.
 
@@ -145,22 +151,26 @@ def egress_client(**kwargs: Any) -> httpx.AsyncClient:
 
 
 def client_for(url: str, **kwargs: Any) -> httpx.AsyncClient:
-    """Whichever of the two `url` calls for."""
-    kwargs.setdefault("trust_env", not is_internal(url))
+    """Whichever of the two `url` calls for. Another machine of this install
+    is always internal, under whatever name it is reached (agent#38 review:
+    a root reached as `root.lan` went out through the egress client)."""
+    kwargs.setdefault("trust_env", not (is_internal(url) or machine_named(url)))
     kwargs.setdefault("verify", ssl_context())
     kwargs.setdefault("limits", httpx.Limits(keepalive_expiry=_KEEPALIVE_SECONDS))
     if not kwargs["trust_env"]:
         _machine_transport(kwargs)
+    _machine_options(kwargs)
     return httpx.AsyncClient(**kwargs)
 
 
 def sync_client_for(url: str, **kwargs: Any) -> httpx.Client:
     """`client_for`, for the few synchronous call sites."""
-    kwargs.setdefault("trust_env", not is_internal(url))
+    kwargs.setdefault("trust_env", not (is_internal(url) or machine_named(url)))
     kwargs.setdefault("verify", ssl_context())
     kwargs.setdefault("limits", httpx.Limits(keepalive_expiry=_KEEPALIVE_SECONDS))
     if not kwargs["trust_env"]:
         _machine_transport(kwargs, sync=True)
+    _machine_options(kwargs)
     return httpx.Client(**kwargs)
 
 
@@ -253,8 +263,10 @@ _REFUSAL_LOG_SECONDS = 300.0
 
 
 class MachineRefused(httpx.ConnectError):
-    """Plain HTTP to another machine, refused because the install requires
-    encryption and that machine has no key on record. Nothing was sent."""
+    """Plain HTTP to another machine, refused: the install requires
+    encryption and that machine has no key on record, or the request carries
+    a token of this install to a machine not known to speak plain HTTP only.
+    Nothing was sent."""
 
 
 class PinRefused(httpcore.ConnectError):
@@ -304,10 +316,49 @@ class MachineTable:
     local: frozenset[str] = frozenset()
     """Origins that are this machine under a LAN address (its own agent),
     which a request may reach in plain HTTP whatever `required` says."""
+    present: bool = True
+    """False only for `NO_TABLE`: this process was given no table at all (no
+    agent of a version with machine ports started it), so nothing is carried
+    or refused. A table that names no machine yet is present, and empty."""
+    invalid: frozenset[str] = frozenset()
+    """Plain origins whose entry does not hold together: a TLS address this
+    table pins no key for, or one two machines claim (agent#38 review). Not
+    an older version: nothing is sent there, plain or encrypted."""
 
     @property
     def empty(self) -> bool:
         return not self.machines and not self.routes
+
+    def speaks_plain(self, url: httpx.URL, listed_by: str | None = None) -> bool:
+        """Whether the table says `url` is on a machine that runs a version
+        with no machine port, so plain HTTP is the only way to reach it.
+
+        **That machine's own address, and no other** (agent#38 review): its
+        route is null. Another port on the same host may be another machine
+        behind the same name. A driver on it is reached at another port, so
+        the client that dials one says which agent listed it (`listed_by`):
+        a driver an older machine's own agent listed, on that agent's host,
+        is that machine's."""
+        if self.routes.get(_origin(url), False) is None:
+            return True
+        if not listed_by:
+            return False
+        try:
+            agent = httpx.URL(listed_by)
+        except httpx.InvalidURL:
+            return False
+        return (
+            agent.scheme == "http"
+            and self.routes.get(_origin(agent), False) is None
+            and _host(agent.host) == _host(url.host)
+        )
+
+    def names_machine(self, url: httpx.URL) -> bool:
+        """Whether `url` is another machine's address in this table."""
+        if url.scheme == "https":
+            return self.pins(url) is not None
+        origin = _origin(url)
+        return origin in self.routes or origin in self.invalid
 
     def pins(self, url: httpx.URL) -> frozenset[str] | None:
         if url.scheme != "https":
@@ -321,6 +372,12 @@ class MachineTable:
         if url.scheme != "http":
             return None
         origin = _origin(url)
+        if origin in self.invalid:
+            who = self.names.get(origin) or origin
+            raise MachineRefused(
+                f"This machine does not trust {who} at {origin}: its machine port has no "
+                "key on record here, or two machines claim that address. Nothing was sent."
+            )
         if origin not in self.routes:
             return None
         base = self.routes[origin]
@@ -339,6 +396,8 @@ class MachineTable:
 
 
 EMPTY_TABLE = MachineTable()
+#: No table at all: behaviour is exactly what it was before machine ports.
+NO_TABLE = MachineTable(present=False)
 
 #: Where a transport reads its table: `machine_table`, unless a caller with a
 #: table of its own (an enrolment that pins the root from its join token)
@@ -360,6 +419,7 @@ def parse_machine_table(document: Any) -> MachineTable:
                 if parts.hostname and parts.port:
                     machines[_hostport(parts.hostname, parts.port)] = listed
     routes: dict[str, str | None] = {}
+    invalid: set[str] = set()
     for key, target in (document.get("routes") or {}).items():
         if not isinstance(key, str):
             continue
@@ -369,19 +429,26 @@ def parse_machine_table(document: Any) -> MachineTable:
             continue
         if not origin.startswith("http://"):
             continue
-        carried: str | None = None
+        if target is None:
+            # A machine with no machine port: an older version.
+            routes[origin] = None
+            continue
+        parsed: httpx.URL | None = None
         if isinstance(target, str):
             try:
                 parsed = httpx.URL(target)
             except httpx.InvalidURL:
                 parsed = None
-            if (
-                parsed is not None
-                and parsed.scheme == "https"
-                and _hostport(parsed.host, parsed.port or 443) in machines
-            ):
-                carried = target.rstrip("/")
-        routes[origin] = carried
+        if (
+            parsed is not None
+            and parsed.scheme == "https"
+            and _hostport(parsed.host, parsed.port or 443) in machines
+        ):
+            routes[origin] = str(target).rstrip("/")
+        else:
+            # `false` (two machines claim it), or a TLS address with no key
+            # here: untrusted, never an older version (agent#38 review).
+            invalid.add(origin)
     names = {
         str(k): str(v)
         for k, v in (document.get("names") or {}).items()
@@ -393,7 +460,14 @@ def parse_machine_table(document: Any) -> MachineTable:
             local.add(_origin(httpx.URL(str(key))))
         except (httpx.InvalidURL, TypeError):
             continue
-    return MachineTable(machines, routes, bool(document.get("required")), names, frozenset(local))
+    return MachineTable(
+        machines=machines,
+        routes=routes,
+        required=bool(document.get("required")),
+        names=names,
+        local=frozenset(local),
+        invalid=frozenset(invalid),
+    )
 
 
 _TABLE_OVERRIDE: MachineTable | None = None
@@ -412,13 +486,14 @@ def set_machine_table(table: MachineTable | None) -> None:
 def machine_table() -> MachineTable:
     """The table in effect: one installed in-process, else the file, re-read
     when it changes (checked at most once a second). A file that becomes
-    unreadable keeps the last table read from it; a file removed is none."""
+    unreadable keeps the last table read from it; a file removed is an empty
+    table. Without a file named at all there is no table (`NO_TABLE`)."""
     global _TABLE_FILE, _TABLE_FROM_FILE, _TABLE_CHECKED
     if _TABLE_OVERRIDE is not None:
         return _TABLE_OVERRIDE
     path = os.environ.get(MACHINE_PINS_ENV)
     if not path:
-        return EMPTY_TABLE
+        return NO_TABLE
     now = time.perf_counter()
     if (
         _TABLE_FILE is not None
@@ -456,6 +531,15 @@ def machine_route(url: str) -> str | None:
     except (httpx.InvalidURL, MachineRefused):
         return None
     return str(carried) if carried is not None else None
+
+
+def machine_named(url: str) -> bool:
+    """Whether `url` is another machine of this install in this process's
+    table: its agent's or the root's address, or a machine port it pins."""
+    try:
+        return machine_table().names_machine(httpx.URL(url))
+    except httpx.InvalidURL:
+        return False
 
 
 def machine_pinned(url: str) -> bool:
@@ -648,9 +732,29 @@ def _pool_options(limits: httpx.Limits) -> dict[str, Any]:
     }
 
 
-def _route(request: httpx.Request, table: MachineTable) -> MachineTable:
-    """Carry a plain request for another machine to its TLS address, in place."""
-    if table.empty and not table.required:
+def _route(
+    request: httpx.Request,
+    table: MachineTable,
+    *,
+    hop: bool = False,
+    listed_by: str | None = None,
+) -> MachineTable:
+    """Carry a plain request for another machine to its TLS address, in place,
+    or refuse it with nothing sent (`MachineRefused`).
+
+    **A token of this install never crosses to another machine in plain HTTP**
+    unless the table says that machine speaks nothing else (its route is
+    null: it runs a version with no machine port) and the install allows that
+    (`automatic` or `off`). A machine the table does not name may be one that
+    joined a moment ago, whose machine port this process has not read about
+    yet: the root records the key at once, but its agent writes the table for
+    its children a moment later, and they read it at most once a second. Two
+    plain reads with a token slipped through that gap (agent#38). Now such a
+    request is refused and the caller tries again, by then over TLS. A
+    request without a token (a model server on the LAN) is not this rule's
+    business, and neither is this machine itself.
+    """
+    if not table.present:
         return table
     try:
         carried = table.carry(request.url)
@@ -660,18 +764,51 @@ def _route(request: httpx.Request, table: MachineTable) -> MachineTable:
     if carried is not None:
         request.url = carried
         request.headers["Host"] = carried.netloc.decode("ascii")
-    elif table.required and request.url.scheme == "http" and _eugene_token(request.headers):
-        # An address the table does not name (a node just enrolled, another
-        # spelling of a machine's name): under required, a token of this
-        # install never crosses to another machine in plain HTTP. A request
-        # without one (a model server on the LAN) is not this rule's business.
-        if not _is_loopback(request.url.host) and _origin(request.url) not in table.local:
-            raise MachineRefused(
-                "Encryption between machines is required, and this request would carry "
-                f"an Eugene Plexus token to {request.url.host} in plain HTTP; it was not sent.",
-                request=request,
-            )
-    return table
+        return table
+    url = request.url
+    if url.scheme != "http" or _is_loopback(url.host) or _origin(url) in table.local:
+        return table
+    if not table.required and table.speaks_plain(url, listed_by):
+        return table
+    # A machine hop (a client built with `machine_hop=True`: the console's
+    # proxy to another machine, sign-in steps forwarded to the root) carries
+    # whatever a person sent, a passphrase in a body or a cookie included, so
+    # it goes by the route alone (agent#38 review). Anything else is judged
+    # by whether it carries a token of this install.
+    if not hop and not _eugene_token(request.headers):
+        return table
+    origin = _origin(url)
+    if table.required:
+        why = (
+            "Encryption between machines is required, and this request would carry "
+            f"an Eugene Plexus token to {url.host} in plain HTTP; it was not sent."
+        )
+    else:
+        who = table.names.get(origin) or origin
+        carries = "what a person sent" if hop else "an Eugene Plexus token"
+        why = (
+            f"Not sent to {who}: this machine does not know yet whether {url.host} takes "
+            f"TLS, and the request carries {carries}, which never crosses to another "
+            "machine in plain HTTP. The next try after the install's machine list names "
+            "that machine goes over TLS."
+        )
+    _log_held_back(origin, why)
+    raise MachineRefused(why, request=request)
+
+
+_HELD_BACK_LOGGED: dict[str, float] = {}
+
+
+def _log_held_back(origin: str, why: str) -> None:
+    """Say it once in a while per address, not on every refresh."""
+    now = time.perf_counter()
+    if now - _HELD_BACK_LOGGED.get(origin, -_REFUSAL_LOG_SECONDS) >= _REFUSAL_LOG_SECONDS:
+        _HELD_BACK_LOGGED[origin] = now
+        log.info("held back a request to %s: %s", origin, why)
+
+
+def _host(host: str) -> str:
+    return host.strip().strip("[]").lower()
 
 
 def _is_loopback(host: str) -> bool:
@@ -716,6 +853,8 @@ class MachineTransport(httpx.AsyncBaseTransport):
         verify: Any,
         limits: httpx.Limits,
         table: TableSource | None = None,
+        hop: bool = False,
+        listed_by: str | None = None,
         **options: Any,
     ) -> None:
         self._plain = httpx.AsyncHTTPTransport(
@@ -724,6 +863,9 @@ class MachineTransport(httpx.AsyncBaseTransport):
         self._limits = limits
         self._table: TableSource = table or machine_table
         self._pinned: httpx.AsyncHTTPTransport | None = None
+        #: `_route`'s two options: every request is a machine hop, and the
+        #: agent whose list named the one address this client dials.
+        self.hop, self.listed_by = hop, listed_by
 
     @property
     def _pool(self) -> httpcore.AsyncConnectionPool:
@@ -740,7 +882,7 @@ class MachineTransport(httpx.AsyncBaseTransport):
         return self._pinned
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        table = _route(request, self._table())
+        table = _route(request, self._table(), hop=self.hop, listed_by=self.listed_by)
         if table.pins(request.url) is not None:
             return await self._pinned_transport().handle_async_request(request)
         return await self._plain.handle_async_request(request)
@@ -760,12 +902,15 @@ class SyncMachineTransport(httpx.BaseTransport):
         verify: Any,
         limits: httpx.Limits,
         table: TableSource | None = None,
+        hop: bool = False,
+        listed_by: str | None = None,
         **options: Any,
     ) -> None:
         self._plain = httpx.HTTPTransport(verify=verify, limits=limits, trust_env=False, **options)
         self._limits = limits
         self._table: TableSource = table or machine_table
         self._pinned: httpx.HTTPTransport | None = None
+        self.hop, self.listed_by = hop, listed_by
 
     @property
     def _pool(self) -> httpcore.ConnectionPool:
@@ -782,7 +927,7 @@ class SyncMachineTransport(httpx.BaseTransport):
         return self._pinned
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
-        table = _route(request, self._table())
+        table = _route(request, self._table(), hop=self.hop, listed_by=self.listed_by)
         if table.pins(request.url) is not None:
             return self._pinned_transport().handle_request(request)
         return self._plain.handle_request(request)
@@ -793,9 +938,20 @@ class SyncMachineTransport(httpx.BaseTransport):
             self._pinned.close()
 
 
+def _machine_options(kwargs: dict[str, Any]) -> tuple[bool, str | None]:
+    """Take `machine_hop` and `machine_listed_by` out of a client's
+    arguments (httpx knows neither)."""
+    return bool(kwargs.pop("machine_hop", False)), kwargs.pop("machine_listed_by", None)
+
+
 def _machine_transport(kwargs: dict[str, Any], *, sync: bool = False) -> None:
     """Give an internal client the machine transport, unless the caller
-    brought a transport of its own (a test's mock, a Unix socket)."""
+    brought a transport of its own (a test's mock, a Unix socket).
+
+    `machine_hop=True`: every request is a machine hop, judged by its route
+    alone (`_route`). `machine_listed_by=<agent URL>`: the agent whose list
+    named the one address this client dials (a driver)."""
+    hop, listed_by = _machine_options(kwargs)
     # `transport=None` is a test seam left unset, not a transport: callers
     # pass it through from `app.state`, and taking it as one sent their
     # requests to other machines in plain HTTP (found by the LT1 capture).
@@ -805,12 +961,15 @@ def _machine_transport(kwargs: dict[str, Any], *, sync: bool = False) -> None:
     options = {k: kwargs[k] for k in ("cert", "http1", "http2") if k in kwargs}
     cls = SyncMachineTransport if sync else MachineTransport
     limits = kwargs.get("limits") or httpx.Limits(max_connections=100, max_keepalive_connections=20)
-    kwargs["transport"] = cls(verify=kwargs["verify"], limits=limits, **options)
+    kwargs["transport"] = cls(
+        verify=kwargs["verify"], limits=limits, hop=hop, listed_by=listed_by, **options
+    )
 
 
 __all__ = [
     "EMPTY_TABLE",
     "MACHINE_PINS_ENV",
+    "NO_TABLE",
     "MachineRefused",
     "MachineTable",
     "MachineTransport",
@@ -821,6 +980,7 @@ __all__ = [
     "egress_client",
     "internal_client",
     "is_internal",
+    "machine_named",
     "machine_pinned",
     "machine_required",
     "machine_route",

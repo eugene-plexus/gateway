@@ -920,6 +920,9 @@ class RoutingTable:
         # entry here is what the refresh uses instead of an empty list,
         # which is the whole of review §6.1 #9 and §6.2 #18.
         self._last_entries: dict[str | None, list[tuple[str, str]]] = {}
+        #: Each node's agent, from the last discovery: the agent that listed
+        #: that node's drivers, which their clients name (agent#38 review).
+        self._listing_agents: dict[str | None, str] = {}
         #: The search accounts each node last declared -- kept for a node
         #: that did not answer, as its drivers are.
         self._last_tool_entries: dict[str | None, list[tuple[str, str]]] = {}
@@ -1249,6 +1252,7 @@ class RoutingTable:
 
     async def _refresh_locked(self) -> None:
         agents, control_root = await self._discover()
+        self._listing_agents = dict(agents)
 
         # A node that has left the install keeps nothing. The per-node
         # caches exist so a missed READ does not erase a node; a node
@@ -1663,7 +1667,11 @@ class RoutingTable:
             client = self._tool_clients.get((node, name, url))
             if client is None:
                 client = ToolDriverClient(
-                    name=name, base_url=url, node=node, auth=self._driver_auth(node)
+                    name=name,
+                    base_url=url,
+                    node=node,
+                    auth=self._driver_auth(node),
+                    listed_by=self._listing_agents.get(node),
                 )
                 self._tool_clients[(node, name, url)] = client
             try:
@@ -1739,6 +1747,7 @@ class RoutingTable:
                 timeout_seconds=self._request_timeout,
                 auth=self._driver_auth(node),
                 node=node,
+                listed_by=self._listing_agents.get(node),
             )
             self._clients[(node, name, url)] = client
         try:

@@ -104,7 +104,13 @@ class ToolDriverClient:
     """HTTP client for one tool-driver, built once and kept by the table."""
 
     def __init__(
-        self, *, name: str, base_url: str, node: str | None, auth: httpx.Auth | None = None
+        self,
+        *,
+        name: str,
+        base_url: str,
+        node: str | None,
+        auth: httpx.Auth | None = None,
+        listed_by: str | None = None,
     ) -> None:
         self.name = name
         self.node = node
@@ -116,6 +122,8 @@ class ToolDriverClient:
             base_url=self.base_url,
             timeout=httpx.Timeout(SEARCH_TIMEOUT_SECONDS, connect=5.0),
             auth=auth,
+            # The agent that listed it (`HttpDriverClient`, agent#38 review).
+            machine_listed_by=listed_by,
         )
 
     async def info(self) -> ToolDriverInfo:
