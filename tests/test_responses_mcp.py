@@ -34,6 +34,8 @@ from eugene_plexus_gateway import admission, remote_mcp
 from eugene_plexus_gateway._generated.driver_models import FunctionCall, ToolCall
 from eugene_plexus_gateway.routing import ToolAccount
 from eugene_plexus_gateway.tool_client import ToolDriverError, ToolDriverInfo
+from tests.fake_response_store import response_store  # noqa: F401  (the fixture)
+from tests.test_admission import setup  # noqa: F401  (the fixture)
 
 from .test_server_tools import MODEL, ScriptedDriver, Turn, app_with, events
 
@@ -140,6 +142,7 @@ def mcp_call_of(name: str, arguments: dict[str, Any], call_id: str = "call_m1") 
 
 
 def ask(client: TestClient, *, tools: list[Any], **extra: Any) -> Any:
+    headers = extra.pop("headers", None)
     return client.post(
         "/v1/responses",
         json={
@@ -148,6 +151,7 @@ def ask(client: TestClient, *, tools: list[Any], **extra: Any) -> Any:
             "tools": tools,
             **extra,
         },
+        headers=headers,
     )
 
 
@@ -605,3 +609,95 @@ def test_two_servers_are_offered_by_label(settings) -> None:
     assert {"fixture__echo", "second__echo"} <= names
     assert two.listed == []  # One process runs both servers' calls.
     assert [entry["url"] for entry in one.listed] == [URL, "https://other.example/mcp"]
+
+
+# --------------------------------------------------------------------------- #
+# Chained by previous_response_id (row 54's store)
+# --------------------------------------------------------------------------- #
+
+
+def _chained(given: Any, fake_mcp: FakeMcp, turns: list[Turn]) -> tuple[Any, ScriptedDriver]:
+    from .conftest import make_routing_table
+
+    app, authority, *_ = given
+    authority.allowed = None
+    model = ScriptedDriver(turns=turns)
+    table = make_routing_table(model)
+    table._snapshot.tools = [mcp_account(fake_mcp)]
+    app.state.routing = table
+    return app, model
+
+
+def test_an_approval_chained_by_previous_response_id_runs_once(setup, response_store, fake):  # noqa: F811
+    """The approval request lives in the stored response; the next request
+    sends only the answer, by `previous_response_id`, and the call runs."""
+    app, _model = _chained(
+        setup,
+        fake,
+        [Turn(calls=[mcp_call_of("echo", {"text": "hi"})]), Turn("The tool said hi.")],
+    )
+    headers = setup[4]
+    with TestClient(app) as client:
+        first = ask(client, tools=[mcp_tool()], headers=headers)
+        assert first.status_code == 200, first.text
+        assert first.json()["store"] is True
+        asked = first.json()["output"][-1]
+        assert asked["type"] == "mcp_approval_request" and fake.called == []
+        answer = {
+            "type": "mcp_approval_response",
+            "approval_request_id": asked["id"],
+            "approve": True,
+        }
+        second = client.post(
+            "/v1/responses",
+            json={
+                "model": MODEL,
+                "previous_response_id": first.json()["id"],
+                "input": [answer],
+                "tools": [mcp_tool()],
+            },
+            headers=headers,
+        )
+        assert second.status_code == 200, second.text
+        items = second.json()["output"]
+        assert [i["type"] for i in items] == ["mcp_call", "message"]
+        assert items[0]["approval_request_id"] == asked["id"]
+        assert len(fake.called) == 1
+        # An approval whose request is in no stored response nor the input: refused.
+        forged = client.post(
+            "/v1/responses",
+            json={
+                "model": MODEL,
+                "previous_response_id": second.json()["id"],
+                "input": [{**answer, "approval_request_id": "mcpr_" + "f" * 24}],
+                "tools": [mcp_tool()],
+            },
+            headers=headers,
+        )
+        assert forged.status_code == 400, forged.text
+        # The call that ran is in the chain now: answering it again runs nothing.
+        again = client.post(
+            "/v1/responses",
+            json={
+                "model": MODEL,
+                "previous_response_id": second.json()["id"],
+                "input": [{"role": "user", "content": "and again?"}],
+                "tools": [mcp_tool()],
+            },
+            headers=headers,
+        )
+        assert again.status_code == 200, again.text
+    assert len(fake.called) == 1
+
+
+def test_a_stored_response_keeps_no_credential(setup, response_store, fake):  # noqa: F811
+    app, _ = _chained(
+        setup, fake, [Turn(calls=[mcp_call_of("echo", {"text": "hi"})]), Turn("done")]
+    )
+    with TestClient(app) as client:
+        response = ask(client, tools=[mcp_tool(require_approval="never")], headers=setup[4])
+    assert response.status_code == 200, response.text
+    assert response.json()["store"] is True
+    kept = json.dumps(response_store.responses)
+    assert TOKEN not in kept and "blue" not in kept
+    assert '"mcp_call"' in kept, "the items were kept, without the credential"
