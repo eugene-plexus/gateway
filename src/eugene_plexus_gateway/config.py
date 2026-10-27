@@ -212,8 +212,9 @@ FIELDS: list[ConfigField] = [
             "- **Internet and this network**, for experts: servers on your own network "
             "too. A client could then reach services on your network through Eugene.\n"
             "- **Off**: an app's MCP servers are refused.\n\n"
-            "This machine's own addresses and cloud metadata addresses are never reached. "
-            "The app's credentials for a server go to that server only and are never kept."
+            "This machine's loopback address and cloud metadata addresses are never reached; "
+            "a public address counts as the internet, whichever machine has it. The app's "
+            "credentials for a server go to that server only and are never kept."
         ),
         category="generation",
         valueType=ConfigValueType.enum,
@@ -658,10 +659,19 @@ def as_schema(
             update["pendingRestart"] = True
             if not field.sensitive:
                 update["inEffect"] = pending[field.key]
-        if field.key == "remoteMcp" and values is not None and values.get(field.key) == "network":
-            update["status"] = ConfigFieldStatus(
-                level=ConfigFieldStatusLevel.warning, text=REMOTE_MCP_NETWORK
-            )
+        if field.key == "remoteMcp" and values is not None:
+            held = values.get(field.key)
+            if held == "network":
+                update["status"] = ConfigFieldStatus(
+                    level=ConfigFieldStatusLevel.warning, text=REMOTE_MCP_NETWORK
+                )
+            elif held is not None and held not in (field.enumValues or []):
+                # A hand edit Eugene cannot read: refused, never taken for on.
+                update["status"] = ConfigFieldStatus(
+                    level=ConfigFieldStatusLevel.warning,
+                    text=f"The file holds {held!r}, which is not one of these: remote MCP is "
+                    "refused until you choose one.",
+                )
         fields.append(field.model_copy(update=update) if update else field)
     return ConfigSchema(component="gateway", fields=fields, categories=CATEGORY_LABELS)
 
@@ -686,7 +696,8 @@ def _enum_word_for_yaml_bool(field: ConfigField, value: Any) -> Any:
     would otherwise get a setting that reads False and means Observe. The
     console writes the word quoted, so only a hand edit comes here.
     """
-    if isinstance(value, bool) and field.key == "repetitionMode":
+    # `remoteMcp: off` read as False meant the internet (second-model review).
+    if isinstance(value, bool) and field.key in ("repetitionMode", "remoteMcp"):
         word = "on" if value else "off"
         if word in (field.enumValues or []):
             return word

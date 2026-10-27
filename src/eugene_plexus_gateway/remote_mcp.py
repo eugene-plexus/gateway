@@ -25,14 +25,17 @@ metrics row (`echo_tools` takes them off what the response echoes).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import re
+import sqlite3
 import time
 import uuid
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from .model_patterns import permits
@@ -577,13 +580,25 @@ class McpInput:
 # --------------------------------------------------------------------------- #
 
 
-def reach_of(setting: Any) -> str:
-    return setting if setting in REACHES else DEFAULT_REACH
+def reach_of(setting: Any) -> str | None:
+    """The owner's `remoteMcp`: one of `REACHES`, the default when unset, and
+    None for a value Eugene does not know -- which is refused, never taken for
+    on (second-model review: a hand-written `off` read as YAML's False and
+    meant the internet)."""
+    if setting is None:
+        return DEFAULT_REACH
+    return setting if isinstance(setting, str) and setting in REACHES else None
 
 
 def why_not(table: Any, context: Any, setting: Any) -> str | None:
     """None when remote MCP may run for this request, else why not, in words."""
-    if reach_of(setting) == "off":
+    reach = reach_of(setting)
+    if reach is None:
+        return (
+            f"the gateway's Remote MCP setting holds {setting!r}, a value Eugene does not know; "
+            "choose Off, Internet only or Internet and this network under Gateway, Settings"
+        )
+    if reach == "off":
         return (
             "remote MCP is turned off on this install (Gateway, Settings, Remote MCP from "
             "API clients)"
@@ -655,12 +670,83 @@ class McpUpdate:
     value: McpListing | McpExecution | McpApproval
 
 
+class ApprovalLedger:
+    """The approvals whose calls ran, so each runs once (second-model review).
+
+    The conversation a request carries is not the only record: answering the
+    same approval again against the same `previous_response_id` -- a fork, or
+    a client retrying -- carries no `mcp_call` for it, and ran the call again.
+    So an approval is taken here, atomically (a primary key in SQLite), just
+    before its call runs, and one already taken is refused. Kept beside the
+    gateway's config, so a restart remembers; an entry is dropped after the 31
+    days a stored response can be continued for. Holds approval ids only.
+    """
+
+    KEEP_SECONDS = 31 * 24 * 3600
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def _connect(self) -> sqlite3.Connection:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(self.path, timeout=5)
+        db.execute("CREATE TABLE IF NOT EXISTS taken (id TEXT PRIMARY KEY, at REAL NOT NULL)")
+        return db
+
+    def _used(self, ident: str) -> bool:
+        db = self._connect()
+        try:
+            return db.execute("SELECT 1 FROM taken WHERE id = ?", (ident,)).fetchone() is not None
+        finally:
+            db.close()
+
+    def _take(self, ident: str) -> bool:
+        now = time.time()  # a date kept across restarts, not a duration
+        db = self._connect()
+        try:
+            with db:
+                db.execute("DELETE FROM taken WHERE at < ?", (now - self.KEEP_SECONDS,))
+                taken = db.execute(
+                    "INSERT OR IGNORE INTO taken (id, at) VALUES (?, ?)", (ident, now)
+                )
+                return taken.rowcount == 1
+        finally:
+            db.close()
+
+    async def used(self, ident: str) -> bool:
+        return await asyncio.to_thread(self._used, ident)
+
+    async def take(self, ident: str) -> bool:
+        """True for the one caller that takes `ident`; False once it is taken."""
+        return await asyncio.to_thread(self._take, ident)
+
+
+def ledger_for(state: Any) -> ApprovalLedger:
+    """The gateway's ledger, made once, beside its config file."""
+    ledger: ApprovalLedger | None = getattr(state, "mcp_approvals", None)
+    if ledger is None:
+        folder = Path(state.settings.config_file).resolve().parent
+        ledger = ApprovalLedger(folder / "mcp-approvals.sqlite3")
+        state.mcp_approvals = ledger
+    return ledger
+
+
 class McpRunner:
     """Lists and calls through this install's tool-drivers, the first that answers."""
 
-    def __init__(self, table: Any, plan: McpPlan) -> None:
+    def __init__(self, table: Any, plan: McpPlan, *, ledger: ApprovalLedger | None = None) -> None:
         self.table = table
         self.plan = plan
+        self.ledger = ledger
+
+    async def take(self, ident: str) -> bool:
+        """Takes an approval just before its call runs; False when it ran before."""
+        return True if self.ledger is None else await self.ledger.take(ident)
+
+    def allows(self, label: str, name: str) -> bool:
+        """Whether this request still offers the tool: its `allowed_tools` now,
+        not the request's that asked for the approval (second-model review)."""
+        return any(tool.name == name for tool in self.plan.tools.get(label, []))
 
     async def list_tools(self, server: McpServer) -> list[ListedTool]:
         last: ToolDriverError | None = None

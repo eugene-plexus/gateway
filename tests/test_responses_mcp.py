@@ -32,6 +32,7 @@ from fastapi.testclient import TestClient
 
 from eugene_plexus_gateway import admission, remote_mcp
 from eugene_plexus_gateway._generated.driver_models import FunctionCall, ToolCall
+from eugene_plexus_gateway.app import create_app
 from eugene_plexus_gateway.routing import ToolAccount
 from eugene_plexus_gateway.tool_client import ToolDriverError, ToolDriverInfo
 from tests.fake_response_store import response_store  # noqa: F401  (the fixture)
@@ -701,3 +702,117 @@ def test_a_stored_response_keeps_no_credential(setup, response_store, fake):  # 
     kept = json.dumps(response_store.responses)
     assert TOKEN not in kept and "blue" not in kept
     assert '"mcp_call"' in kept, "the items were kept, without the credential"
+
+
+# --------------------------------------------------------------------------- #
+# The second-model review (2026-10-27)
+# --------------------------------------------------------------------------- #
+
+
+def test_off_written_by_hand_is_off(settings, fake) -> None:
+    """Blocker 6: a bare `off` in the file is YAML's False, and read as False it
+    meant the internet. The switch says off, so it is off."""
+    settings.config_file.write_text("remoteMcp: off\n", encoding="utf-8")
+    with TestClient(
+        app_with(settings, ScriptedDriver(turns=[]), searches=[mcp_account(fake)])
+    ) as c:
+        assert c.get("/v1/config").json()["remoteMcp"] == "off"
+        response = ask(c, tools=[mcp_tool()])
+    assert response.status_code == 400 and "turned off" in response.json()["error"]["message"]
+    assert fake.listed == []
+
+
+@pytest.mark.parametrize("written", ["yes", "on", "true", "sometimes"])
+def test_a_value_eugene_does_not_know_is_refused_never_on(settings, fake, written) -> None:
+    settings.config_file.write_text(f"remoteMcp: {written}\n", encoding="utf-8")
+    with TestClient(
+        app_with(settings, ScriptedDriver(turns=[]), searches=[mcp_account(fake)])
+    ) as c:
+        response = ask(c, tools=[mcp_tool()])
+        field = next(
+            f for f in c.get("/v1/config/schema").json()["fields"] if f["key"] == "remoteMcp"
+        )
+    assert response.status_code == 400, response.text
+    assert "does not know" in response.json()["error"]["message"]
+    assert fake.listed == []
+    assert field["status"]["level"] == "warning" and "refused" in field["status"]["text"]
+
+
+def test_an_approval_replayed_on_the_same_chain_runs_once(setup, response_store, fake):  # noqa: F811
+    """Should-fix 4: the stored chain is not the only record. Answering the same
+    approval again against the same `previous_response_id` -- a fork, or a
+    client's retry -- never runs the call a second time, after a restart too."""
+    app, _ = _chained(
+        setup,
+        fake,
+        [
+            Turn(calls=[mcp_call_of("echo", {"text": "hi"})]),
+            Turn("The tool said hi."),
+            Turn("never asked"),
+        ],
+    )
+    headers = setup[4]
+    with TestClient(app) as client:
+        first = ask(client, tools=[mcp_tool()], headers=headers)
+        asked = first.json()["output"][-1]
+        answer = {
+            "type": "mcp_approval_response",
+            "approval_request_id": asked["id"],
+            "approve": True,
+        }
+        body = {
+            "model": MODEL,
+            "previous_response_id": first.json()["id"],
+            "input": [answer],
+            "tools": [mcp_tool()],
+        }
+        assert client.post("/v1/responses", json=body, headers=headers).status_code == 200
+        assert len(fake.called) == 1
+        again = client.post("/v1/responses", json=body, headers=headers)
+    assert again.status_code == 400, again.text
+    assert "already" in again.json()["error"]["message"]
+    assert len(fake.called) == 1
+    # A gateway started again reads the same record.
+    restarted = create_app(settings=app.state.settings)
+    restarted.state.routing = app.state.routing
+    restarted.state.auth_state = app.state.auth_state
+    restarted.state.client_key_guard = app.state.client_key_guard
+    restarted.state.store_transport = app.state.store_transport
+    with TestClient(restarted) as client:
+        after = client.post("/v1/responses", json=body, headers=headers)
+    assert after.status_code == 400 and len(fake.called) == 1
+
+
+def test_an_approved_call_is_checked_against_this_requests_tools(settings, fake) -> None:
+    """Should-fix 4: approved earlier, then left out of `allowed_tools` now: not run."""
+    first_model = ScriptedDriver(turns=[Turn(calls=[mcp_call_of("delete_everything", {})])])
+    with TestClient(app_with(settings, first_model, searches=[mcp_account(fake)])) as client:
+        first = ask(client, tools=[mcp_tool()], store=False)
+    output = first.json()["output"]
+    asked = output[-1]
+    assert asked["name"] == "delete_everything"
+    answer = {"type": "mcp_approval_response", "approval_request_id": asked["id"], "approve": True}
+    model = ScriptedDriver(turns=[Turn("I could not.")])
+    with TestClient(app_with(settings, model, searches=[mcp_account(fake)])) as client:
+        second = ask(
+            client,
+            tools=[mcp_tool(allowed_tools=["echo"])],
+            input=[{"role": "user", "content": "go"}, *output, answer],
+            store=False,
+        )
+    assert second.status_code == 200, second.text
+    assert fake.called == []
+    called = second.json()["output"][0]
+    assert called["type"] == "mcp_call" and called["status"] == "failed"
+    assert "allowed_tools" in called["error"]
+    assert "allowed_tools" in model.calls[0].messages[-1].content
+
+
+def test_the_setting_claims_only_what_is_refused() -> None:
+    """Should-fix 6b: a public address of this machine is not told apart from the
+    internet, so the setting no longer says "this machine's own addresses"."""
+    from eugene_plexus_gateway.config import as_schema
+
+    field = next(f for f in as_schema(values={}).fields if f.key == "remoteMcp")
+    assert "own addresses" not in field.description
+    assert "loopback" in field.description

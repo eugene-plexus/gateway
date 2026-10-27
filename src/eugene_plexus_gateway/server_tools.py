@@ -1316,7 +1316,22 @@ class SearchingClient:
                 approval_request_id=asked.id,
             )
             yield McpUpdate("started", execution)
-            await self._run(execution)
+            runner = self.mcp_runner
+            if runner is not None and not runner.allows(asked.label, asked.name):
+                # Approved under an earlier request's tools; this request's
+                # `allowed_tools` leaves it out, so it does not run (review).
+                execution.outcome = "error"
+                execution.error = (
+                    "not run: this request's allowed_tools for the MCP server leaves this tool out"
+                )
+                self.mcp_calls.append(execution)
+            elif runner is not None and not await runner.take(asked.id):
+                # Taken by another request between the check and now.
+                execution.outcome = "error"
+                execution.error = "not run: this approval's call already ran in another response"
+                self.mcp_calls.append(execution)
+            else:
+                await self._run(execution)
             self.transcript.append(("mcp", execution))
             for index, message in enumerate(history):
                 if (

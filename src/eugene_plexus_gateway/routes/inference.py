@@ -1235,8 +1235,21 @@ async def _prepare(
                 error_type="invalid_request_error",
                 param="tools",
             )
-        mcp.reach = remote_mcp.reach_of(setting)
-        mcp_runner = remote_mcp.McpRunner(table, mcp)
+        mcp.reach = remote_mcp.reach_of(setting) or "off"
+        # An approval whose call ran already -- in this chain or another, before
+        # a restart too -- is refused before anything streams (review).
+        ledger = remote_mcp.ledger_for(request.app.state)
+        for answered in mcp.pending:
+            if await ledger.used(answered.asked.id):
+                return _Failure(
+                    code=400,
+                    message=f"input: the approval {answered.asked.id!r} was already used: its "
+                    "call ran in another response, and one approval runs its call once. "
+                    "Nothing was forwarded.",
+                    error_type="invalid_request_error",
+                    param="input",
+                )
+        mcp_runner = remote_mcp.McpRunner(table, mcp, ledger=ledger)
         try:
             await remote_mcp.list_all(mcp_runner)
         except remote_mcp.McpRefusal as refused:
