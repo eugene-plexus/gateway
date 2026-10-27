@@ -285,6 +285,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from . import files_door
 
     app.include_router(files_door.router)
+    # Row 54: a stored response by id, its input items, and conversations. After the
+    # inference routes, so `/v1/responses/compact` and `/input_tokens` match first.
+    from . import stored_responses
+
+    app.include_router(stored_responses.router)
 
     # CORS on the three OpenAI-compatible paths, and on nothing else, so a
     # browser-based client -- the playground's direct mode among them --

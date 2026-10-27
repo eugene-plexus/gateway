@@ -3989,6 +3989,60 @@ class SystemOneUsage(BaseModel):
     output_tokens: int | None = Field(None, ge=0)
 
 
+class StoredItemOrder(StrEnum):
+    """
+    The order items are listed in, by their place in the conversation.
+    """
+
+    asc = 'asc'
+    desc = 'desc'
+
+
+class ResponsesDeleted(BaseModel):
+    """
+    `DELETE /v1/responses/{responseId}` (row 54).
+    """
+
+    id: str
+    object: Literal['response.deleted']
+    deleted: Literal[True]
+
+
+class ResponsesConversationRef(BaseModel):
+    """
+    A conversation named by object, as OpenAI's SDKs may send it.
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    id: str
+
+
+class Conversation(BaseModel):
+    """
+    A conversation (row 54), OpenAI's shape.
+    """
+
+    id: str
+    object: Literal['conversation']
+    created_at: int
+    metadata: dict[str, str]
+
+
+class ConversationDeleted(BaseModel):
+    id: str
+    object: Literal['conversation.deleted']
+    deleted: Literal[True]
+
+
+class ConversationUpdateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    metadata: dict[str, str] | None
+
+
 class Error2(BaseModel):
     message: str = Field(
         ...,
@@ -5871,7 +5925,9 @@ class ResponsesResponse(BaseModel):
     then one call item per tool call, using the declared tool's type
     (`function_call`, `custom_tool_call`, `local_shell_call`,
     `shell_call` or `apply_patch_call`). The request's settings
-    are echoed as OpenAI echoes them; `store` is always false.
+    are echoed as OpenAI echoes them; `store` says whether the
+    response was kept (row 54), and `previous_response_id` and
+    `conversation` are echoed when sent.
 
     """
 
@@ -5943,6 +5999,48 @@ class SystemOneRequest(BaseModel):
         ..., description='What is being judged — text, or structured data.'
     )
     questions: dict[str, SystemOneQuestion]
+
+
+class ResponsesItemList(BaseModel):
+    """
+    One page of a stored response's input items (row 54), OpenAI's
+    list: `first_id` and `last_id` name the page's ends (null when it
+    is empty).
+
+    """
+
+    object: Literal['list']
+    data: list[ResponsesInputItem]
+    first_id: str | None
+    last_id: str | None
+    has_more: bool
+
+
+class ConversationCreateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    items: list[ResponsesInputItem] | None = Field(None, max_length=20)
+    metadata: dict[str, str] | None = None
+
+
+class ConversationItemsCreateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    items: list[ResponsesInputItem] = Field(..., max_length=20, min_length=1)
+
+
+class ConversationItemList(BaseModel):
+    """
+    One page of a conversation's items, OpenAI's list.
+    """
+
+    object: Literal['list']
+    data: list[ResponsesInputItem]
+    first_id: str | None
+    last_id: str | None
+    has_more: bool
 
 
 class MetricsGroup(BaseModel):
@@ -6874,7 +6972,10 @@ class ResponsesRequest(BaseModel):
     reads, not what it refuses**: the refusals are enforced against
     the raw body by the implementation, with a 400 naming the field,
     and the endpoint description lists them. A top-level field not
-    named here is refused.
+    named here is refused. `input` is optional, as on OpenAI, with
+    `previous_response_id` or `conversation` (row 54): absent, the
+    stored conversation is continued as it stands. Without either it
+    is required.
 
     """
 
@@ -6885,8 +6986,8 @@ class ResponsesRequest(BaseModel):
         ...,
         description="A model id from `GET /v1/models`, resolved against this install's slots.",
     )
-    input: str | list[ResponsesInputItem] = Field(
-        ...,
+    input: str | list[ResponsesInputItem] | None = Field(
+        None,
         description='A string (one user message), or the conversation as a list of\nitems. Codex resends the whole conversation on every turn.\n',
     )
     instructions: str | None = Field(None, description='The leading system message.')
@@ -6918,10 +7019,11 @@ class ResponsesRequest(BaseModel):
     )
     store: bool | None = Field(
         None,
-        description='Nothing is ever stored; `true` is named on the ignored-settings header.',
+        description="Absent or `true` (OpenAI's default), the response is kept for\nits owner for `responseDays` (row 54); `false` keeps nothing\n(Codex sends `false`). The response's own `store` says whether\nit was kept; a `true` that is not kept is named on the\nignored-settings header.\n",
     )
     previous_response_id: str | None = Field(
-        None, description='Refused when set. This gateway keeps no response store.'
+        None,
+        description="A stored response of this caller's to continue: its chain is\nthe conversation so far. Not with `conversation`.\n",
     )
     truncation: Truncation | None = None
     metadata: dict[str, Any] | None = None
@@ -6940,20 +7042,20 @@ class ResponsesRequest(BaseModel):
     background: bool | None = None
     stream_options: dict[str, Any] | None = None
     prompt_cache_retention: str | None = None
-    conversation: Any | None = Field(
-        None, description='Refused when set. Conversations are stored objects.'
+    conversation: str | ResponsesConversationRef | None = Field(
+        None,
+        description='A conversation of this caller\'s (`conv_...`, or `{"id":\n"conv_..."}`) to continue: its items come first, and this\nrequest\'s input and output are added to it. Not with\n`previous_response_id`.\n',
     )
     prompt: Any | None = Field(
         None,
-        description='Refused when set. A stored prompt template exists only at OpenAI.',
+        description="Refused when set: a reusable prompt is made in OpenAI's\ndashboard, and Eugene has no prompt dashboard.\n",
     )
 
 
 class ResponsesCompactRequest(BaseModel):
     """
-    Request for standalone compaction. The model and conversation are
-    required while no response store exists. Unknown top-level fields
-    are refused with a 400 naming the field.
+    Request for standalone compaction. Unknown top-level fields are
+    refused with a 400 naming the field.
 
     """
 
@@ -6974,7 +7076,7 @@ class ResponsesCompactRequest(BaseModel):
     )
     previous_response_id: str | None = Field(
         None,
-        description='Refused when set until row 54 supplies chain loading; send input instead.',
+        description="A stored response of this caller's whose chain is compacted with `input` (row 54).",
     )
 
 

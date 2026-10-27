@@ -309,13 +309,10 @@ _TOP_LEVEL = frozenset(
     }
 )
 
-#: State that lives only on OpenAI's servers. This gateway keeps none, so
-#: each is refused by name rather than silently answered without it.
-_STATEFUL = {
-    "previous_response_id": "names a stored response",
-    "conversation": "names a stored conversation",
-    "prompt": "names a stored prompt template",
-}
+#: Row 54: a chain or a conversation is read from the store before translation
+#: (`stored_responses.prepare`), which takes these fields off the body; one that
+#: reaches here was not read, and is refused rather than answered without it.
+_CONTINUED = ("previous_response_id", "conversation")
 
 #: `include` values asking for the output of server-side tools. Nothing here
 #: runs one, so there is never such an item to add them to.
@@ -1129,8 +1126,8 @@ def _messages(
             conversation.image_generation_call(item)
         elif kind == "item_reference":
             raise Refusal(
-                f"{where}: an item_reference names a stored item, and this gateway keeps no "
-                "store. Send the item itself.",
+                f"{where}: an item_reference is not resolved here. Send the item itself, or "
+                "continue the conversation with `previous_response_id` or `conversation`.",
                 param="input",
             )
         else:
@@ -1163,17 +1160,22 @@ def translate_request(
     model = raw.get("model")
     if not isinstance(model, str) or not model:
         raise Refusal("model: required.", param="model")
-    for name, why in _STATEFUL.items():
+    for name in _CONTINUED:
         if raw.get(name) is not None:
             raise Refusal(
-                f"{name}: this gateway keeps no response store, so it cannot resolve what this "
-                f"{why}. Send the whole conversation in `input` with `store: false`, which is "
-                "what Codex CLI does.",
+                f"{name}: not read on this path. Send the whole conversation in `input`.",
                 param=name,
             )
+    if raw.get("prompt") is not None:
+        raise Refusal(
+            "prompt: a reusable prompt is made in OpenAI's dashboard, and Eugene has no prompt "
+            "dashboard. Send the prompt's text as `instructions` and `input`.",
+            param="prompt",
+        )
     if raw.get("background"):
         raise Refusal(
-            "background: a background response is polled from a store this gateway does not keep.",
+            "background: this gateway answers while the request is open and makes no "
+            "background responses; send the request without it.",
             param="background",
         )
     top_logprobs = raw.get("top_logprobs")
@@ -1302,7 +1304,8 @@ def translate_request(
             "text": raw.get("text") or {"format": {"type": "text"}},
             "truncation": truncation or "disabled",
             "metadata": raw.get("metadata") or {},
-            # Nothing is ever kept, whatever was asked for.
+            # Whether the answer is kept, and what it continues, are the door's to
+            # say (`stored_responses.Plan.echo`): false and none until then.
             "store": False,
             "previous_response_id": None,
         },
@@ -2170,7 +2173,9 @@ class StreamTranslator:
 
     # -- the end --------------------------------------------------------------
 
-    def finish(self, *, model: str, finish: Any, usage: Any) -> list[str]:
+    def close(self, *, model: str, finish: Any, usage: Any) -> tuple[list[str], dict[str, Any]]:
+        """The open items' last events, and the response they make, without the
+        terminal event: the door keeps the response first (row 54)."""
         status, details = status_of(finish)
         item_status = "incomplete" if status == "incomplete" else "completed"
         events = self._close_open(item_status) + self._close_calls(status=item_status)
@@ -2185,14 +2190,21 @@ class StreamTranslator:
             usage=usage,
             incomplete_details=details,
         )
-        name = "response.incomplete" if status == "incomplete" else "response.completed"
-        events.append(self.frame(name, {"response": response}))
-        return events
+        return events, response
 
-    def failed(self, message: str, *, code: str) -> list[str]:
-        """`response.failed`, never a bare `error` event -- Codex reports the
-        latter without our message (record §4). What had arrived is closed
-        as `incomplete` and kept on the response."""
+    def terminal(self, response: dict[str, Any]) -> str:
+        """The event that ends the stream, carrying `response` as it is now."""
+        name = {"incomplete": "response.incomplete", "failed": "response.failed"}.get(
+            response.get("status", ""), "response.completed"
+        )
+        return self.frame(name, {"response": response})
+
+    def finish(self, *, model: str, finish: Any, usage: Any) -> list[str]:
+        events, response = self.close(model=model, finish=finish, usage=usage)
+        return [*events, self.terminal(response)]
+
+    def close_failed(self, message: str, *, code: str) -> tuple[list[str], dict[str, Any]]:
+        """`failed`'s events and response, without the terminal event."""
         events = self._close_open("incomplete") + self._close_calls(status="incomplete")
         response = response_object(
             response_id=self.response_id,
@@ -2203,8 +2215,32 @@ class StreamTranslator:
             echo=self.echo,
             error={"code": code, "message": message},
         )
-        events.append(self.frame("response.failed", {"response": response}))
-        return events
+        return events, response
+
+    def failed(self, message: str, *, code: str) -> list[str]:
+        """`response.failed`, never a bare `error` event -- Codex reports the
+        latter without our message (record §4). What had arrived is closed
+        as `incomplete` and kept on the response."""
+        events, response = self.close_failed(message, code=code)
+        return [*events, self.terminal(response)]
+
+    def partial(self) -> dict[str, Any]:
+        """What was sent before the client left, as an `incomplete` response
+        (row 54: a cancelled stream is kept with what was sent, as OpenAI
+        keeps it). Its events go to nobody."""
+        try:
+            self._close_open("incomplete")
+            self._close_calls(status="incomplete")
+        except Refusal:
+            pass
+        return response_object(
+            response_id=self.response_id,
+            created_at=self.created_at,
+            model=self.model,
+            status="incomplete",
+            output=self.output,
+            echo=self.echo,
+        )
 
 
 def failed_frame(response_id: str, message: str, *, code: str) -> str:
