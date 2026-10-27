@@ -357,6 +357,7 @@ class HttpDriverClient:
         timeout_seconds: float = 180.0,
         auth: httpx.Auth | None = None,
         node: str | None = None,
+        listed_by: str | None = None,
     ) -> None:
         self.name = name
         self.circuit = Circuit()
@@ -382,10 +383,15 @@ class HttpDriverClient:
         # the event loop), and no proxy, because a driver is this machine
         # or another node of this install and a user's `HTTP_PROXY` --
         # inherited by the Windows logon task -- would swallow every hop.
+        # `listed_by`: the agent whose component list named this driver. On a
+        # machine with no machine port, that agent's own address is the only
+        # one plain HTTP may go to, and this driver is reached because that
+        # agent listed it on its own host (agent#38 review).
         self._client = internal_client(
             base_url=self.base_url,
             timeout=httpx.Timeout(timeout_seconds, connect=CONNECT_TIMEOUT_SECONDS),
             auth=auth,
+            machine_listed_by=listed_by,
         )
         self._auth = auth
 
