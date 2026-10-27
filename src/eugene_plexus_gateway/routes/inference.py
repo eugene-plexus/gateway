@@ -58,6 +58,7 @@ from .. import (
     rerank_door,
     responses,
     server_tools,
+    stored_responses,
     system_placement,
     video_doors,
 )
@@ -1292,7 +1293,12 @@ async def _prepare(
     # PC4: the conversation this request continues, so the balancer can
     # send it back to the replica that holds its prompt. A door that knows
     # the client's own session (the Anthropic door) leaves it on the request.
-    conversation = affinity.key_for(body, getattr(request.state, "affinity_key", None))
+    conversation = affinity.key_for(
+        body,
+        getattr(request.state, "affinity_key", None),
+        # Row 54: a stored conversation's id or a chain's first response, first.
+        chain=getattr(request.state, "affinity_chain", None),
+    )
     client = table.pick(resolution, needs=needs, surface=only, affinity=conversation)
     if client is None and await table.refresh_if_stale():
         refreshed = True
@@ -2166,6 +2172,50 @@ async def _stream_responses(
     translated: responses.Translated,
     response_id: str,
     store: ConfigStore | None,
+    plan: stored_responses.Plan | None = None,
+) -> AsyncIterator[str]:
+    """The stream, its answer kept (row 54) before its last event, and kept with
+    what was sent when the client leaves first."""
+    translator = responses.StreamTranslator(
+        response_id,
+        body.model,
+        echo=translated.echo,
+        include_reasoning=translated.include_reasoning,
+        namespaces=translated.namespaces,
+        client_tools=translated.client_tools,
+    )
+    ended = False
+    try:
+        async for chunk in _respond_stream(body, prepared, translator, store, plan):
+            yield chunk
+        ended = True
+    finally:
+        if not ended and plan is not None and plan.writes:
+            # The client left: what was sent is kept, unless the last event's keeping
+            # already began (one keeping per answer, `stored_responses.finalize`).
+            stored_responses.finalize(plan, translator.partial())
+
+
+async def _end_responses(
+    translator: responses.StreamTranslator,
+    closed: tuple[list[str], dict[str, Any]],
+    plan: stored_responses.Plan | None,
+) -> AsyncIterator[str]:
+    """The last events, then the answer kept, then the event that ends the stream."""
+    events, response = closed
+    for chunk in events:
+        yield chunk
+    if plan is not None:
+        await stored_responses.finish(plan, response)
+    yield translator.terminal(response)
+
+
+async def _respond_stream(
+    body: ChatCompletionRequest,
+    prepared: _Serving,
+    translator: responses.StreamTranslator,
+    store: ConfigStore | None,
+    plan: stored_responses.Plan | None,
 ) -> AsyncIterator[str]:
     """The driver's stream as the Responses event stream.
 
@@ -2177,14 +2227,6 @@ async def _stream_responses(
     event too -- and starts the whole request again, which on a slow
     prefill is a loop that never finishes (record §5).
     """
-    translator = responses.StreamTranslator(
-        response_id,
-        body.model,
-        echo=translated.echo,
-        include_reasoning=translated.include_reasoning,
-        namespaces=translated.namespaces,
-        client_tools=translated.client_tools,
-    )
     for chunk in translator.start():
         yield chunk
     with collect_attempts() as tries:
@@ -2221,17 +2263,20 @@ async def _stream_responses(
                         yield chunk
         except responses.Refusal as refusal:
             _record(prepared.rec, body, tries)
-            for chunk in translator.failed(refusal.message, code="server_error"):
+            async for chunk in _end_responses(
+                translator, translator.close_failed(refusal.message, code="server_error"), plan
+            ):
                 yield chunk
             return
         except (DriverError, httpx.HTTPError) as e:
             log.warning("responses stream for %r failed: %s", body.model, e)
             _record(prepared.rec, body, tries)
             failure = _serve_failure(e, body, store)
-            for chunk in translator.failed(
+            closed = translator.close_failed(
                 failure.message,
                 code=responses.stream_error_code(failure.code, failure.message, failure.error_type),
-            ):
+            )
+            async for chunk in _end_responses(translator, closed, plan):
                 yield chunk
             return
 
@@ -2241,10 +2286,11 @@ async def _stream_responses(
             # by another backend.
             log.warning("driver stream for %r ended without a done event", body.model)
             _record(prepared.rec, body, tries)
-            for chunk in translator.failed(
+            closed = translator.close_failed(
                 "The backend stopped before it finished. What arrived above is partial.",
                 code="server_error",
-            ):
+            )
+            async for chunk in _end_responses(translator, closed, plan):
                 yield chunk
             return
 
@@ -2265,12 +2311,12 @@ async def _stream_responses(
             truncated, body, response.usage, getattr(prepared.client, "served_by", None), window
         )
         try:
-            frames = translator.finish(
+            closed = translator.close(
                 model=served_model, finish=response.finishReason, usage=response.usage
             )
         except responses.Refusal as refusal:
-            frames = translator.failed(refusal.message, code="server_error")
-        for chunk in frames:
+            closed = translator.close_failed(refusal.message, code="server_error")
+        async for chunk in _end_responses(translator, closed, plan):
             yield chunk
 
 
@@ -2294,6 +2340,14 @@ async def compact_response(request: Request) -> Any:
             if name not in {"model", "input", "instructions", "previous_response_id"}:
                 field = chat_contract._field_name(name)
                 raise responses.Refusal(f"{field}: unsupported setting.", param=field)
+        # Row 54: a stored response's chain comes first; nothing compacted is kept.
+        raw, _plan = await stored_responses.prepare(
+            request, raw, response_id=responses.new_id(admission.request_id()), keeps=False
+        )
+        resolved = await files_door.resolve_file_ids(request, raw, door="responses")
+        if isinstance(resolved, Response):
+            return resolved
+        raw = resolved
         sealer = _compaction_sealer(request)
         translated = await run_in_threadpool(
             lambda: responses.translate_request(
@@ -2389,6 +2443,13 @@ async def count_response_input_tokens(request: Request) -> Any:
         return responses.error_response(400, "body: must be valid JSON.", param="body")
     if not isinstance(raw, dict):
         return responses.error_response(400, "body: must be a JSON object.", param="body")
+    try:
+        # Row 54: a stored chain or conversation is counted with the input; nothing is kept.
+        raw, _plan = await stored_responses.prepare(
+            request, raw, response_id=responses.new_id(admission.request_id()), keeps=False
+        )
+    except responses.Refusal as refusal:
+        return refusal.response()
     resolved = await files_door.resolve_file_ids(request, raw, door="responses")
     if isinstance(resolved, Response):
         return resolved
@@ -2435,6 +2496,13 @@ async def create_response(request: Request) -> Any:
         return responses.error_response(400, "body: must be valid JSON.", param="body")
     if not isinstance(raw, dict):
         return responses.error_response(400, "body: must be a JSON object.", param="body")
+    response_id = responses.new_id(admission.request_id())
+    try:
+        # Row 54: the conversation so far, read from the store, comes before the
+        # input; and whether the answer is kept, and for whom.
+        raw, plan = await stored_responses.prepare(request, raw, response_id=response_id)
+    except responses.Refusal as refusal:
+        return refusal.response()
     resolved = await files_door.resolve_file_ids(request, raw, door="responses")
     if isinstance(resolved, Response):
         return resolved
@@ -2449,6 +2517,8 @@ async def create_response(request: Request) -> Any:
         )
     except responses.Refusal as refusal:
         return refusal.response()
+    translated.ignored.extend(plan.ignored)
+    plan.echo(translated.echo)
     body = translated.request
 
     # P8: `web_search` runs when a search can run here, and is removed and
@@ -2470,7 +2540,6 @@ async def create_response(request: Request) -> Any:
         translated.skip_search(prepared.search_blocked)
     elif translated.search is not None:
         translated.run_search()
-    response_id = responses.new_id(admission.request_id())
     # The hints this door dropped come first, then what the backend that serves does
     # not honour of what the caller sent: the first attempt's backend on a stream
     # (its head is on the wire before any is asked), the one that served on a whole
@@ -2479,7 +2548,7 @@ async def create_response(request: Request) -> Any:
 
     if body.stream:
         return StreamingResponse(
-            _stream_responses(body, prepared, translated, response_id, store),
+            _stream_responses(body, prepared, translated, response_id, store, plan),
             media_type="text/event-stream",
             headers=ignored_settings.added_to(own, prepared.not_honoured, "responses"),
         )
@@ -2539,17 +2608,22 @@ async def create_response(request: Request) -> Any:
             output = responses.client_tool_items(output, translated.client_tools)
         except responses.Refusal as refusal:
             return refusal.response()
+        answer = responses.response_object(
+            response_id=response_id,
+            created_at=created_at,
+            model=served_model,
+            status=status,
+            output=output,
+            echo=translated.echo,
+            usage=response.usage,
+            incomplete_details=details,
+        )
+        # Kept before it is sent, so the client's next request finds it (row 54).
+        if plan.writes and not await stored_responses.finish(plan, answer) and plan.keep:
+            translated.ignored.append("store")
+            own = translated.headers()
         return JSONResponse(
-            content=responses.response_object(
-                response_id=response_id,
-                created_at=created_at,
-                model=served_model,
-                status=status,
-                output=output,
-                echo=translated.echo,
-                usage=response.usage,
-                incomplete_details=details,
-            ),
+            content=answer,
             headers={
                 **ignored_settings.added_to(own, prepared.not_honoured_by_answer(), "responses"),
                 **anthropic.envelope_headers(
@@ -2567,18 +2641,8 @@ async def create_response(request: Request) -> Any:
         )
 
 
-@router.api_route("/v1/responses/{rest:path}", methods=["GET", "POST", "DELETE"])
-async def no_stored_responses(rest: str) -> Any:
-    """A stored response, asked for by id. There are none, and the caller is
-    told why in OpenAI's envelope rather than getting a framework's bare
-    404."""
-    return responses.error_response(
-        404,
-        "This gateway keeps no response store: every response is returned once and "
-        "forgotten. Send the whole conversation in `input` with `store: false`.",
-        param="response_id",
-        code="response_not_found",
-    )
+# A stored response by id, its input items and the conversations doors are
+# `stored_responses`' (row 54), mounted after this router.
 
 
 # --------------------------------------------------------------------------- #

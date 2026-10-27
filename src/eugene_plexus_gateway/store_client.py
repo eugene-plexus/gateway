@@ -101,9 +101,14 @@ class StoreClient:
         params: Mapping[str, Any] | None = None,
         json: Any = None,
         content: bytes | None = None,
+        time_limit: httpx.Timeout | None = None,
     ) -> Any:
-        """One JSON answer from the store, or `StoreRefusal` / `StoreUnavailable`."""
-        response = await self._send(method, path, owner, params=params, json=json, content=content)
+        """One JSON answer from the store, or `StoreRefusal` / `StoreUnavailable`.
+        `time_limit` replaces the client's own for this call (row 54: a stored
+        response's read and keep wait seconds, not an upload's minutes)."""
+        response = await self._send(
+            method, path, owner, params=params, json=json, content=content, time_limit=time_limit
+        )
         try:
             return response.json()
         except ValueError as exc:
@@ -146,6 +151,7 @@ class StoreClient:
         params: Mapping[str, Any] | None,
         json: Any,
         content: bytes | None,
+        time_limit: httpx.Timeout | None = None,
     ) -> httpx.Response:
         if self.base is None:
             raise StoreUnavailable("this gateway has no agent to reach it through")
@@ -160,6 +166,7 @@ class StoreClient:
                 json=json,
                 content=content,
                 headers=headers,
+                timeout=time_limit if time_limit is not None else httpx.USE_CLIENT_DEFAULT,
             )
         except httpx.HTTPError as exc:
             raise StoreUnavailable(_observed(exc)) from exc

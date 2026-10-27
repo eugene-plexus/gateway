@@ -7,7 +7,9 @@ session alternating reused 52.8% of its prompt tokens and took 6.0 s;
 pinned to one replica, 75.3% and 3.3 s
 (`specs/docs/acceptance/prompt-cache-measurement.md` §7).
 
-**The key** is the client's own when it sends one -- `prompt_cache_key` on
+**The key** is a stored conversation's own when there is one (row 54): the
+conversation's id, or the first response of a `previous_response_id` chain.
+Then it is the client's own when it sends one -- `prompt_cache_key` on
 chat and Responses (Codex sends its session id), Claude Code's `session_id`
 inside `metadata.user_id` -- and otherwise a fingerprint of how the
 conversation starts: the model, the first system message and the first
@@ -66,8 +68,15 @@ def _text(content: Any) -> str | None:
     return str(content)
 
 
-def key_for(body: Any, explicit: str | None = None) -> str | None:
-    """The conversation a chat-shaped request belongs to, or None."""
+def key_for(body: Any, explicit: str | None = None, *, chain: str | None = None) -> str | None:
+    """The conversation a chat-shaped request belongs to, or None.
+
+    `chain` (row 54) comes first: a stored conversation's id, or the first
+    response of a `previous_response_id` chain. It is an exact key, so two
+    chats that open alike are two conversations, and one chat stays where
+    its cache is."""
+    if chain:
+        return f"c:{chain}"
     if explicit:
         return f"k:{explicit}"
     own = getattr(body, "prompt_cache_key", None)

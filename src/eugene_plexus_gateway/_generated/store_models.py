@@ -2021,6 +2021,180 @@ class StoredUploadCompleteRequest(BaseModel):
     )
 
 
+class StoredItem(BaseModel):
+    """
+    One item in OpenAI's shape (a message, a function call, its
+    output, reasoning, ...), as the gateway sent it. The store reads
+    only `id`, which is unique within its response or conversation.
+    An id has OpenAI's shape, a short prefix and hex digits, so no id
+    carries words into a path, a log line or an error: the gateway
+    gives a new one to an item whose id has another shape, and the
+    store refuses one (400, the id not repeated).
+
+    """
+
+    model_config = ConfigDict(
+        extra='allow',
+    )
+    id: str = Field(..., pattern='^[a-z]{1,16}_[0-9a-f]{16,64}$')
+    type: str | None = None
+
+
+class StoredResponseStatus(StrEnum):
+    """
+    How the response ended. A stream the client left is kept with what
+    was sent, `incomplete`.
+
+    """
+
+    completed = 'completed'
+    incomplete = 'incomplete'
+    failed = 'failed'
+    cancelled = 'cancelled'
+
+
+class StoredResponseRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(
+        ...,
+        description="The gateway's id for the response, which the client already has.",
+        pattern='^resp_[0-9a-f]{32}$',
+    )
+    model: str = Field(..., max_length=512)
+    status: StoredResponseStatus
+    previousResponseId: str | None = Field(
+        None, description='The response this one continues (its chain).', max_length=64
+    )
+    conversationId: str | None = Field(
+        None,
+        description='The conversation this response belongs to; its items are added to it.',
+        max_length=64,
+    )
+    conversationPosition: int | None = Field(
+        None,
+        description="With `conversationId`: the conversation's `position` when its\ncontext was read for this request (`StoredContext.position`).\nThe items before it are what the response was given, whatever\nanother turn added meanwhile; absent, the conversation's end\nwhen the response is kept.\n",
+        ge=0,
+    )
+    input: list[StoredItem] = Field(
+        ...,
+        description="The items the request itself sent (not the chain's or the\nconversation's), each with an id.\n",
+        max_length=10000,
+    )
+    output: list[StoredItem] = Field(..., max_length=10000)
+    response: dict[str, Any] = Field(
+        ...,
+        description='The response object as the client was given it, without\n`output` (kept once, above). `GET` gives it back whole.\n',
+    )
+
+
+class StoredResponse(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str
+    model: str
+    status: StoredResponseStatus
+    createdAt: int = Field(..., description='Unix seconds.')
+    expiresAt: int = Field(
+        ...,
+        description='Unix seconds: `responseDays` after it was kept, or later when a\nresponse after it in its chain was kept later.\n',
+    )
+    rootId: str = Field(
+        ...,
+        description='The first response of its chain; its own id when it starts one.',
+    )
+    previousResponseId: str | None = None
+    conversationId: str | None = None
+    bytes: int = Field(
+        ..., description="What it holds, counted against the owner's quota."
+    )
+    response: dict[str, Any] | None = Field(
+        None, description='The response object, `output` included. Present on `GET`.'
+    )
+
+
+class StoredObjectDeleted(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str
+    deleted: Literal[True]
+
+
+class StoredItemList(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    data: list[StoredItem]
+    hasMore: bool
+
+
+class StoredItemsRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    items: list[StoredItem] = Field(
+        ...,
+        description="Added at the end, in order, in one transaction. The gateway\ntakes OpenAI's 20 at a time from a client; a turn kept with\n`store: false` adds all its items in one call.\n",
+        max_length=10000,
+        min_length=1,
+    )
+
+
+class StoredContext(BaseModel):
+    """
+    The conversation so far, oldest first.
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    items: list[StoredItem]
+    bytes: int
+    rootId: str | None = Field(None, description='For a chain, its first response.')
+    conversationId: str | None = Field(None, description='For a conversation, its id.')
+    position: int | None = Field(
+        None,
+        description='For a conversation, the place after its last item when it was\nread: sent back as `conversationPosition` when the response is\nkept.\n',
+        ge=0,
+    )
+    hadInstructions: bool | None = Field(
+        None,
+        description="For a chain, whether the response named was made with\n`instructions`, which are not carried to the next (OpenAI's\nrule), so the door can say so.\n",
+    )
+
+
+class StoredConversationRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    metadata: dict[str, str] | None = None
+    items: list[StoredItem] | None = Field(None, max_length=20)
+
+
+class StoredConversationUpdate(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    metadata: dict[str, str] | None
+
+
+class StoredConversation(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., pattern='^conv_[0-9a-f]{48}$')
+    createdAt: int
+    expiresAt: int | None = Field(
+        None,
+        description='Unix seconds, `conversationDays` after its last use. Absent,\nthe conversation is kept until it is deleted (the default, as\nOpenAI keeps one).\n',
+    )
+    metadata: dict[str, str]
+    items: int = Field(..., description='How many items it holds.')
+
+
 class StoreOwner(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -2031,9 +2205,11 @@ class StoreOwner(BaseModel):
     files: int
     bytes: int = Field(
         ...,
-        description="The bytes of the owner's files and of its uploads in progress.",
+        description="The bytes of the owner's files, its uploads in progress, its\nstored responses and its conversations.\n",
     )
     uploads: int = Field(..., description='Uploads in progress.')
+    responses: int | None = Field(None, description='Stored responses (row 54).')
+    conversations: int | None = Field(None, description='Conversations (row 54).')
     removedAt: int | None = Field(
         None,
         description='Unix seconds. Set for a person Eugene removed: their objects\nhave been hidden from everyone since then.\n',
@@ -2107,6 +2283,13 @@ class SweepReport(BaseModel):
     parts: int = Field(..., description='Upload parts deleted.')
     blobs: int = Field(..., description='Blob files unlinked.')
     freedBytes: int
+    responses: int | None = Field(
+        None, description='Stored responses deleted, ended or removed (row 54).'
+    )
+    conversations: int | None = Field(
+        None,
+        description='Conversations deleted, with their items, ended or removed (row 54).',
+    )
     removal: RemovalCheck | None = None
     error: str | None = Field(None, description='Why the sweep could not finish.')
 
@@ -2116,6 +2299,10 @@ class StoreParts(BaseModel):
         extra='forbid',
     )
     files: bool = Field(..., description='`/v1/files` and `/v1/uploads` keep files.')
+    responses: bool | None = Field(
+        None,
+        description='`/v1/responses` keeps responses when apps ask (`store: true`),\nand `/v1/conversations` keeps conversations (row 54,\n`responsesEnabled`).\n',
+    )
 
 
 class StoreStatus(BaseModel):
