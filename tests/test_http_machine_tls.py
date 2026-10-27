@@ -13,6 +13,7 @@ import ssl
 import threading
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -214,11 +215,29 @@ def test_required_lets_a_loopback_machine_go_plain() -> None:
         table.carry(httpx.URL("http://10.9.9.8:8079/v1/node"))
 
 
-async def test_a_route_to_an_unpinned_machine_is_dropped() -> None:
+async def test_a_route_that_does_not_hold_together_is_refused_not_plain() -> None:
+    """agent#38 review: a TLS address the table pins no key for, or one two
+    machines claim (`false`), is untrusted, never an older version. Nothing
+    goes there, plain or encrypted, token or not."""
     parsed = _http.parse_machine_table(
-        {"machines": {}, "routes": {"http://10.9.9.9:8079": "https://10.9.9.9:8083/agent"}}
+        {
+            "machines": {},
+            "routes": {
+                "http://10.9.9.9:8079": "https://10.9.9.9:8083/agent",
+                "http://10.9.9.6:8079": False,
+            },
+        }
     )
-    assert parsed.routes == {"http://10.9.9.9:8079": None}
+    assert parsed.routes == {}
+    assert parsed.invalid == {"http://10.9.9.9:8079", "http://10.9.9.6:8079"}
+    _http.set_machine_table(parsed)
+    sent: list[httpx.Request] = []
+    async with _recording_client(sent) as client:
+        for url in ("http://10.9.9.9:8079/v1/node", "http://10.9.9.6:8079/healthz"):
+            with pytest.raises(_http.MachineRefused) as caught:
+                await client.get(url)
+            assert "does not trust" in str(caught.value)
+    assert sent == []
 
 
 async def test_the_sync_client_pins_too(server: Server, keys: dict) -> None:
@@ -293,9 +312,7 @@ def _ep_token() -> str:
     return f"{part({'alg': 'EdDSA', 'typ': 'ep-service+jwt'})}.{part({'sub': 'x'})}.c2ln"
 
 
-def _recording_client(
-    sent: list[httpx.Request],
-) -> httpx.AsyncClient:
+def _recording_client(sent: list[httpx.Request], **options: Any) -> httpx.AsyncClient:
     """An internal client with the real machine transport, whose plain leg
     records what it would put on the wire instead of sending it. (A mock
     handed to `internal_client` as its transport would bypass the rule.)"""
@@ -304,7 +321,7 @@ def _recording_client(
         sent.append(request)
         return httpx.Response(200, json={})
 
-    client = _http.internal_client(timeout=2)
+    client = _http.internal_client(timeout=2, **options)
     transport = client._transport
     assert isinstance(transport, _http.MachineTransport)
     transport._plain = httpx.MockTransport(plain)  # type: ignore[assignment]
@@ -360,16 +377,17 @@ async def test_automatic_still_reaches_what_it_should_in_plain() -> None:
     )
     token = {"Authorization": f"Bearer {_ep_token()}"}
     sent: list[httpx.Request] = []
+    async with _recording_client(sent, machine_listed_by="http://10.9.9.8:8079") as client:
+        await client.get("http://10.9.9.8:8091/v1/info", headers=token)  # a driver it listed
     async with _recording_client(sent) as client:
         await client.get("http://10.9.9.8:8079/v1/components", headers=token)
-        await client.get("http://10.9.9.8:8091/v1/info", headers=token)  # its driver
         await client.get("http://10.9.9.7:8000/v1/models")  # no token: a model server
         await client.get("http://10.9.9.7:8079/v1/node", headers={"Authorization": "Bearer sk-1"})
         await client.get("http://10.9.9.2:8079/v1/node", headers=token)  # this machine
         await client.get("http://127.0.0.1:8081/v1/info", headers=token)
     assert [str(r.url) for r in sent] == [
-        "http://10.9.9.8:8079/v1/components",
         "http://10.9.9.8:8091/v1/info",
+        "http://10.9.9.8:8079/v1/components",
         "http://10.9.9.7:8000/v1/models",
         "http://10.9.9.7:8079/v1/node",
         "http://10.9.9.2:8079/v1/node",
@@ -417,6 +435,83 @@ async def test_a_table_file_named_but_not_written_yet_refuses_too(
     assert sent == []
 
 
+async def test_an_older_machine_is_reached_in_plain_at_its_own_address_only() -> None:
+    """agent#38 review: a null route lets plain HTTP through to that address,
+    not to every port on its host, which may be another machine behind the
+    same name. A driver of that machine is reached because the client that
+    dials it says the older machine's own agent listed it."""
+    _http.set_machine_table(
+        _http.parse_machine_table(
+            {
+                "machines": {"10.9.9.5:8083": ["p"]},
+                "routes": {
+                    "http://nat.example:8079": None,
+                    "http://10.9.9.5:8079": "https://10.9.9.5:8083/agent",
+                },
+            }
+        )
+    )
+    token = {"Authorization": f"Bearer {_ep_token()}"}
+    sent: list[httpx.Request] = []
+    async with _recording_client(sent) as client:
+        await client.get("http://nat.example:8079/v1/components", headers=token)
+        for url in ("http://nat.example:9079/v1/node", "http://nat.example:8091/v1/info"):
+            with pytest.raises(_http.MachineRefused):
+                await client.get(url, headers=token)
+    async with _recording_client(sent, machine_listed_by="http://nat.example:8079") as client:
+        await client.get("http://nat.example:8091/v1/info", headers=token)
+        with pytest.raises(_http.MachineRefused):  # listed on another host
+            await client.get("http://10.9.9.4:8091/v1/info", headers=token)
+    async with _recording_client(sent, machine_listed_by="http://10.9.9.5:8079") as client:
+        with pytest.raises(_http.MachineRefused):  # its lister takes TLS
+            await client.get("http://10.9.9.5:8091/v1/info", headers=token)
+    assert [str(r.url) for r in sent] == [
+        "http://nat.example:8079/v1/components",
+        "http://nat.example:8091/v1/info",
+    ]
+
+
+async def test_a_machine_hop_goes_by_its_route_alone() -> None:
+    """agent#38 review: the console's proxy forwards what a person sent, a
+    passphrase in a body or a cookie, not only tokens. A machine-hop client
+    sends nothing in plain HTTP to a machine the table does not name, token
+    or not; an older machine is still reached; loopback is not its business."""
+    _http.set_machine_table(
+        _http.parse_machine_table({"routes": {"http://10.9.9.8:8079": None}, "required": False})
+    )
+    login = {"json": {"passphrase": "hunter2"}, "headers": {"Cookie": "ep_session=x"}}
+    sent: list[httpx.Request] = []
+    async with _recording_client(sent, machine_hop=True) as client:
+        with pytest.raises(_http.MachineRefused) as caught:
+            await client.post("http://10.9.9.7:8079/v1/auth/login", **login)
+        assert "carries what a person sent" in str(caught.value)
+        await client.post("http://10.9.9.8:8079/v1/auth/login", **login)
+        await client.post("http://127.0.0.1:8079/v1/auth/login", **login)
+    async with _recording_client(sent) as client:  # not a hop: no token, no rule
+        await client.post("http://10.9.9.7:8079/v1/auth/login", **login)
+    assert [str(r.url) for r in sent] == [
+        "http://10.9.9.8:8079/v1/auth/login",
+        "http://127.0.0.1:8079/v1/auth/login",
+        "http://10.9.9.7:8079/v1/auth/login",
+    ]
+
+
+def test_a_machine_in_the_table_gets_the_machine_transport_whatever_its_name() -> None:
+    """agent#38 review: a root reached as `root.lan` (a dotted name, so not
+    "internal") got the egress client, and its Bearer went out unrouted."""
+    _http.set_machine_table(
+        _http.parse_machine_table({"routes": {"http://root.lan:8083": None}, "required": True})
+    )
+    client = _http.client_for("http://root.lan:8083", timeout=2)
+    assert isinstance(client._transport, _http.MachineTransport)
+    assert isinstance(
+        _http.sync_client_for("http://root.lan:8083")._transport, _http.SyncMachineTransport
+    )
+    assert not isinstance(
+        _http.client_for("http://elsewhere.example")._transport, _http.MachineTransport
+    )
+
+
 def test_the_router_keeps_a_loopback_driver_under_required() -> None:
     """gateway#17, the routing half: a driver whose agent advertises loopback
     is reached plain under "required"; one on another machine with no key
@@ -437,3 +532,24 @@ def test_the_router_keeps_a_loopback_driver_under_required() -> None:
         assert routing._remote_url("spelled", spelled, same_host=True) is None
     finally:
         _http.set_machine_table(_http.parse_machine_table({}))
+
+
+async def test_the_router_names_the_agent_that_listed_each_driver() -> None:
+    """agent#38 review: a driver on a machine with no machine port is reached
+    in plain HTTP only because its own agent listed it; the gateway's driver
+    and search clients say which agent that was."""
+    from eugene_plexus_gateway.routing import RoutingTable
+
+    table = RoutingTable(agent_url="http://127.0.0.1:1")
+    table._listing_agents = {"old-box": "http://10.9.9.8:8079"}
+    try:
+        await table._probe("old-box", "llm", "http://127.0.0.1:1")
+        await table._probe_tools([("old-box", "search", "http://127.0.0.1:1")])
+        driver = table._clients[("old-box", "llm", "http://127.0.0.1:1")]
+        tool = table._tool_clients[("old-box", "search", "http://127.0.0.1:1")]
+        for client in (driver._client, tool._client):
+            transport = client._transport
+            assert isinstance(transport, _http.MachineTransport)
+            assert transport.listed_by == "http://10.9.9.8:8079"
+    finally:
+        await table.aclose()
