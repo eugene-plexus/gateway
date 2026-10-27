@@ -17,10 +17,15 @@ import pytest
 
 from eugene_plexus_gateway._generated.driver_models import GenerateRequest, Usage
 from eugene_plexus_gateway.budget import (
+    ANSWERS_KEPT,
     CHARS_PER_TOKEN,
+    DEFAULT_ANSWER_FLOOR,
+    NEW_CONVERSATION_ANSWER,
     ConversationSizes,
     PoolLedger,
+    answer_room,
     estimate,
+    long_answer,
     request_chars,
 )
 
@@ -69,12 +74,64 @@ def test_a_turn_is_its_last_prompt_plus_its_new_text_plus_its_answer():
     seen = sizes.get("m", "k")
     prompt, total = estimate(70_000 + 3_500, 32_000, seen)
     assert prompt == 30_000 + 1_000
-    assert total == 31_000 + 32_000
+    # CB-C2: not the whole `max_tokens` Claude Code sends (32,000): a
+    # conversation that has not answered yet holds 4,096 for its answer.
+    assert total == 31_000 + NEW_CONVERSATION_ANSWER
 
 
 def test_a_new_conversation_is_estimated_from_its_size():
     prompt, total = estimate(7_000, None, None)
-    assert prompt == int(7_000 / CHARS_PER_TOKEN) and total == prompt
+    assert prompt == int(7_000 / CHARS_PER_TOKEN)
+    assert total == prompt + NEW_CONVERSATION_ANSWER
+
+
+# --- CB-C2: the room an answer holds ---------------------------------------------
+
+
+def test_a_conversation_holds_room_for_its_long_answers():
+    """The length 95 of 100 of its last 16 answers were shorter than: one long
+    answer among short ones is what it holds room for."""
+    sizes = ConversationSizes()
+    for answer in [300] * 15 + [2_500]:
+        sizes.put("m", "k", prompt_tokens=1_000, chars=3_500, answer=answer)
+    seen = sizes.get("m", "k")
+    assert seen is not None and len(seen.answers) == ANSWERS_KEPT
+    assert long_answer(seen.answers) == 2_500
+    assert answer_room(32_000, seen) == 2_500
+
+
+def test_only_the_last_sixteen_answers_count():
+    sizes = ConversationSizes()
+    for answer in [9_000] + [300] * 16:
+        sizes.put("m", "k", prompt_tokens=1_000, chars=3_500, answer=answer)
+    seen = sizes.get("m", "k")
+    assert seen is not None and 9_000 not in seen.answers
+    # Short answers hold the floor, never less.
+    assert answer_room(32_000, seen) == DEFAULT_ANSWER_FLOOR
+    assert answer_room(32_000, seen, floor=2_048) == 2_048
+
+
+def test_max_tokens_caps_the_room():
+    """An answer cannot be longer than `max_tokens`, so no more is held, whatever
+    the floor says."""
+    assert answer_room(100, None) == 100
+    assert answer_room(100, None, floor=4_000) == 100
+    assert answer_room(None, None) == NEW_CONVERSATION_ANSWER
+
+
+async def test_an_answer_longer_than_its_room_is_counted():
+    table, a, b = _table()
+    for fake in (a, b):
+        fake.usage = Usage(promptTokens=40, completionTokens=5_000, totalTokens=5_040)
+    client = table.pick(table.resolve(LOCAL), affinity="k:long")
+    await client.generate(_turn(max_tokens=32_000))
+    assert client.budget.room == NEW_CONVERSATION_ANSWER
+    assert client.outran_reserve is True
+    for fake in (a, b):
+        fake.usage = Usage(promptTokens=40, completionTokens=5, totalTokens=45)
+    short = table.pick(table.resolve(LOCAL), affinity="k:short")
+    await short.generate(_turn(max_tokens=32_000))
+    assert short.outran_reserve is False
 
 
 def test_the_size_counts_tools_too():
@@ -147,14 +204,35 @@ async def test_a_new_conversation_takes_a_replica_with_room():
 
 
 async def test_the_wait_is_bounded_then_the_usual_order_runs():
-    table, _a, _b = _table(wait=0.2)
+    """Rewritten for row 11: the wait for room is the fair queue's, bounded by
+    `queueWaitSeconds`. After it a turn is no longer sent to an engine with no
+    room (CB3 did, after `swapWaitSeconds`): it moves to the slot's next tier
+    when there is one (TIER-SPILL), and is refused when there is none."""
+    from eugene_plexus_gateway import admission
+
+    table, a, b = _table()
     table._ledger.take(A, 9_500)
     table._ledger.take(B, 9_500)
     client = table.pick(table.resolve(LOCAL), affinity="k:new")
+    client.queue_wait_seconds = 0.2
     started = asyncio.get_running_loop().time()
-    await asyncio.wait_for(client.generate(_turn()), 2)
+    with pytest.raises(admission.AdmissionFailure) as refused:
+        await asyncio.wait_for(client.generate(_turn()), 2)
     assert asyncio.get_running_loop().time() - started >= 0.18
-    assert client.served_by is not None
+    assert refused.value.code == "queue_timeout"
+    assert not a.calls and not b.calls, "nothing was sent to an engine with no room"
+    assert table._ledger.in_flight(A) == table._ledger.in_flight(B) == 9_500
+
+    spill, fakes = _slot_table("cooling")
+    for runtime in (A, B):
+        spill._ledger.take(runtime, 9_500)
+    behind = spill.pick(spill.resolve(SLOT), affinity="k:new")
+    (ahead,) = behind._tiers[0]
+    behind._tiers = [[], behind._tiers[1], [ahead]]  # the local replicas first, then a fallback
+    behind.queue_wait_seconds = 0.2
+    await asyncio.wait_for(behind.generate(_turn()), 2)
+    assert behind.served_by == "ahead-driver" and behind.tier_moves == 1
+    assert not fakes["llama-a-driver"].calls and not fakes["llama-b-driver"].calls
 
 
 async def test_the_room_is_given_back_on_every_path():
@@ -263,7 +341,10 @@ async def test_first_names_who_admit_would_put_first_and_changes_nothing():
     client.budget.close()
 
 
-async def test_first_names_nobody_when_nothing_has_room_and_admit_waits_then_keeps_the_order():
+async def test_first_names_nobody_when_nothing_has_room_and_admit_keeps_the_order():
+    """`admit` places a turn no queue holds, so it waits for nothing (row 11: the
+    wait is the fair queue's): nothing has room, the usual order stands, and no
+    room is reserved."""
     table, _a, _b = _table(wait=0.05)
     table._ledger.take(A, 9_500)
     table._ledger.take(B, 9_500)
@@ -271,7 +352,7 @@ async def test_first_names_nobody_when_nothing_has_room_and_admit_waits_then_kee
     tier = _front_tier(client)
     assert client.budget.first(_turn(), tier) is None
     assert await client.budget.admit(_turn(), tier) == tier
-    assert client.budget.waited_ms >= 40
+    assert not client.budget.reserved
 
 
 async def test_first_counts_only_the_replica_a_conversation_holds_as_admit_does():
@@ -367,11 +448,12 @@ async def test_an_empty_first_tier_is_passed_over_by_the_read_and_by_admit_alike
     client.budget.close()
 
 
-async def test_the_budget_is_read_for_the_front_tier_and_no_other():
-    """`_admit` orders the front tier and leaves the others in the balancer's order,
-    so when the front tier's only backend is cooling the walk goes to the next tier's
-    usual first, whoever has room there. A read that looked at room in every tier
-    would name the replica `_admit` never moves up. Checked against the real attempt."""
+async def test_a_fallback_tier_is_read_and_walked_to_its_replica_with_room():
+    """Rewritten for row 11's review (blocker 2). When the front tier's only backend
+    is cooling, the walk reaches the next tier as a fallback, and a fallback is let
+    go on a replica of its tier with room, as the first turn is: never into the
+    usual first, whose pool is full. The read that names who is asked first says
+    the same replica. Checked against the real attempt."""
     table, fakes = _slot_table("cooling")
     client = table.pick(table.resolve(SLOT), affinity="k:new")
     (ahead,) = client._tiers[0]
@@ -380,10 +462,10 @@ async def test_the_budget_is_read_for_the_front_tier_and_no_other():
     table._ledger.take(_pool(usual_first), 9_000)
 
     named = client.model_asked_first(_turn())
-    assert named is client.entries[usual_first], "the second tier is in its usual order"
+    assert named is client.entries[roomy], "the fallback tier's replica with room"
 
     await client.generate(_turn())
-    assert fakes[usual_first.name].calls and not fakes[roomy.name].calls, "and the attempt agrees"
+    assert fakes[roomy.name].calls and not fakes[usual_first.name].calls, "and the attempt agrees"
 
 
 def test_reading_who_is_asked_first_leaves_the_tiers_as_they_were():
@@ -436,3 +518,75 @@ async def test_admit_keeps_how_big_the_turn_was_for_the_conversations_next_estim
     seen = table._sizes.get(LOCAL, "k:served")
     assert seen is not None and seen.prompt_tokens == 40
     assert seen.chars == request_chars(served) > 0
+
+
+# --- the cascade through full tiers (row 11 re-review) ----------------------------
+
+
+def _three_tiers():  # type: ignore[no-untyped-def]
+    """A slot `cascade` -> [m1, m2]: m1 has replicas A (fails) and B (one slot,
+    held by a request running there), m2 is C, healthy, with no runtime of ours."""
+    import httpx
+
+    from eugene_plexus_gateway import fair_queue
+
+    a = FakeDriverClient(name="a-driver", base_url="http://a", model_id="m1", runtime="ra")
+    b = FakeDriverClient(name="b-driver", base_url="http://b", model_id="m1", runtime="rb")
+    c = FakeDriverClient(name="c-driver", base_url="http://c", model_id="m2")
+    a.generate_error = httpx.ConnectError("refused")
+    table = make_routing_table(
+        a,
+        b,
+        c,
+        runtimes=[runtime_facts("ra", parallel_slots=1), runtime_facts("rb", parallel_slots=1)],
+        slots=[{"model": "cascade", "targets": ["m1", "m2"]}],
+    )
+    queue = fair_queue.of(table)
+    queue._take_seat((None, "rb"))  # B's one slot is busy the whole time
+    return table, queue, a, b, c
+
+
+async def test_a_fallback_that_waits_out_its_tier_moves_to_the_next():
+    """Re-review blocker: A fails, B's slot stays busy, C is healthy. The fallback
+    waits for B its `queueWaitSeconds`, then moves to the next tier by the same
+    rule the first turn spills by, and C answers: it is not refused while a
+    healthy tier is left."""
+    table, queue, a, b, c = _three_tiers()
+    client = table.pick(table.resolve("cascade"))
+    client.queue_wait_seconds = 0.2
+    began = time.perf_counter()
+    await asyncio.wait_for(client.generate(_turn()), 3)
+    assert time.perf_counter() - began >= 0.18, "it waited for B first"
+    assert a.calls and not b.calls and c.calls
+    assert client.served_by == "c-driver" and client.tier == 2 and client.tier_moves == 1
+    assert queue.waiting() == 0 and queue.running((None, "ra")) == 0
+
+
+async def test_a_fallback_with_no_tier_left_is_refused():
+    """With no later tier, the fallback that waited out its tier is refused."""
+    from eugene_plexus_gateway import admission
+
+    table, queue, a, b, _c = _three_tiers()
+    client = table.pick(table.resolve("m1"))
+    client.queue_wait_seconds = 0.2
+    with pytest.raises(admission.AdmissionFailure) as refused:
+        await asyncio.wait_for(client.generate(_turn()), 3)
+    assert refused.value.code == "queue_timeout"
+    assert a.calls and not b.calls and queue.waiting() == 0
+
+
+async def test_a_cooling_full_replica_is_not_waited_for():
+    """Re-review should-fix: B's circuit is open and its slot is full. A fallback
+    does not wait for a replica that would not take an attempt anyway: it goes on
+    to C at once."""
+    table, _queue, a, b, c = _three_tiers()
+    client = table.pick(table.resolve("cascade"))
+    assert not c.calls
+    cooling = next(x for x in client._tiers[0] if x.name == "b-driver")
+    cooling.circuit.failures, cooling.circuit.until = 1, time.perf_counter() + 60
+    client.queue_wait_seconds = 2.0
+    began = time.perf_counter()
+    await asyncio.wait_for(client.generate(_turn()), 5)
+    assert time.perf_counter() - began < 1.0, "it waited for a replica whose circuit is open"
+    assert client.served_by == "c-driver" and client.tier_moves == 0
+    assert a.calls and not b.calls and c.calls

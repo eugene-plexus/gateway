@@ -67,6 +67,8 @@ async def web_search(request: Request) -> JSONResponse:
                 person_id=context.person_id if context else None,
                 app_client_id=context.app_client_id if context else None,
                 request_id=context.id if context else None,
+                queued_ms=context.queued_ms if context else None,
+                band=context.band if context else None,
                 tool_executions=[
                     ToolExecutionRow(
                         tool="web_search",

@@ -1005,13 +1005,15 @@ def test_a_scoped_key_sorts_only_with_the_models_it_may_use(keyed: Any) -> None:
     assert refused.status_code == 404, refused.text
     assert "sorter-b" not in refused.text
     assert len(a.heard) == 1 and not b.heard
-    # The reservation: acquired for the model named, renewed before the one
-    # attempt, and released; the refused model is acquired and released and
-    # never attempted.
+    # The reservation: checked on arrival and acquired as it leaves its line
+    # (row 11) for the model named, renewed before the one attempt, and
+    # released; the refused model is acquired and released and never attempted.
     assert [(c["action"], c.get("model")) for c in authority.calls] == [
+        ("check", "sorter-a"),
         ("acquire", "sorter-a"),
         ("renew", "sorter-a"),
         ("release", "sorter-a"),
+        ("check", "sorter-b"),
         ("acquire", "sorter-b"),
         ("release", "sorter-b"),
     ]

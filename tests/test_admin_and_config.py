@@ -191,6 +191,10 @@ def test_config_schema_lists_the_gateway_fields(client: TestClient) -> None:
         "loadBalancing",
         "conversationAffinity",
         "swapWaitSeconds",
+        # Row 11: the fair queue's wait and size, and CB-C2's answer floor.
+        "queueWaitSeconds",
+        "queueMaxRequests",
+        "answerReserveFloorTokens",
         "idleCheckSeconds",
         "controlUrl",
         "metricsEnabled",

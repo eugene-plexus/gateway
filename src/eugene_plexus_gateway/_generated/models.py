@@ -4125,6 +4125,9 @@ class Percentiles(BaseModel):
 
     p50: int = Field(..., ge=0)
     p90: int = Field(..., ge=0)
+    p95: int | None = Field(
+        None, description='Present where a reader shows it (`queuedMs`, row 11).', ge=0
+    )
     p99: int | None = Field(None, ge=0)
     max: int = Field(..., ge=0)
 
@@ -4176,6 +4179,260 @@ class MetricsAffinity(BaseModel):
     new: int = Field(..., ge=0)
     moved: int = Field(..., ge=0)
     evicted: int = Field(..., ge=0)
+
+
+class MetricsQueueBands(BaseModel):
+    interactive: int = Field(..., ge=0)
+    background: int = Field(..., ge=0)
+    sheddable: int = Field(..., ge=0)
+
+
+class QueueBand(StrEnum):
+    """
+    Which requests wait or are turned away first when the machines are
+    busy. From highest to lowest: `interactive` (a person waiting at a
+    chat), `background` (work nobody watches), `sheddable` (refused first
+    under load). With no policy the install's default is `interactive`.
+
+    """
+
+    interactive = 'interactive'
+    background = 'background'
+    sheddable = 'sheddable'
+
+
+class Scope(StrEnum):
+    install = 'install'
+    standalone = 'standalone'
+
+
+class ClientKeyRotateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    overlapSeconds: int | None = Field(
+        86400,
+        description='How long the old token keeps working. 0 stops it now. The old and new tokens share one concurrency and rate allowance during the overlap.',
+        ge=0,
+        le=2592000,
+    )
+    ttlDays: int | None = Field(
+        None,
+        description="Lifetime of the new key. Absent, the old key's lifetime.",
+        ge=1,
+        le=3650,
+    )
+
+
+class AllowedModel(RootModel[str]):
+    root: str = Field(..., max_length=256, min_length=1)
+
+
+class AllowedTool(RootModel[str]):
+    root: str = Field(..., max_length=64, min_length=1)
+
+
+class ClientKeyLimits(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    localOnly: bool | None = Field(
+        False,
+        description='Permit only backends explicitly classified local by drivers enforcing\nthe local-only request policy. External, unknown and older drivers\nare ineligible, including through aliases, fallback and wake. The\ncaller cannot relax this restriction. Local is a configured trust\nboundary, not a promise to sandbox a malicious backend.\n',
+    )
+    allowedModels: list[AllowedModel] | None = Field(
+        None,
+        description="Null permits all. Empty permits none. Both the id the caller\nasked for and every model actually tried (a slot's fallback\ntargets) must be allowed.\n\nAn entry is an exact id, or a pattern with `*` (P1,\n2026-09-27): `*` matches any run of characters, `/` included,\nand is the only wildcard, so `openrouter/*` allows every\nmodel of the account named `openrouter`\n(`openrouter/anthropic/claude-opus-5.5`) and nothing else.\nWithout it, scoping a key to one account means typing out\nhundreds of names. The same matcher runs in the gateway, the\nagent and the control root.\n",
+        max_length=100,
+    )
+    allowedTools: list[AllowedTool] | None = Field(
+        None,
+        description='The tools the hub runs itself (P8) that this key may have run\non its behalf -- `web_search`, `image_generation`, and `mcp`\n(remote MCP servers the key\'s caller names, row 59b). **Null permits every tool\nthe install runs** (design call #5: a key is allowed search once\na search account exists, and can be denied it here). Empty\npermits none. An entry is a tool name or a pattern with `*`,\nmatched by the same matcher as `allowedModels`.\n\nA key denied a tool is not refused for asking: the door says\nwhy the search did not run, as it does for an install with no\nsearch account (`gateway.yaml`, "Server-run tools"). A\n`localOnly` key never has a tool run whatever this says,\nbecause a search sends a query derived from the prompt to the\npublic internet.\n',
+        max_length=100,
+    )
+    writeLogs: bool | None = Field(
+        False,
+        description="Whether this key may send log records to an agent's log ingress\n(`POST /v1/logs` on `agent.yaml`, C1 in `workbench.md`). It\ngrants nothing else: reading logs stays operator-only.\n\nEvery app the registry installs gets a key with this on,\nbecause the launcher that runs an app in its own account\nforwards what the app prints. Any other key gets it when the\noperator turns it on, so a tool outside the registry sends its\nlogs the same way ours do.\n",
+    )
+    maxConcurrentRequests: int | None = Field(
+        2,
+        description="How many of this key's requests run at once, across every\ngateway. A request past it waits in the gateway's queue (row 11)\nwhile `maxQueuedRequests` allows, and is refused when it does not.\n",
+        ge=1,
+        le=64,
+    )
+    requestsPerMinute: int | None = Field(60, ge=1, le=10000)
+    band: QueueBand | None = Field(
+        None,
+        description="The key's queue band (row 11): which of its requests wait or are\nturned away first when the machines are busy. Absent means\n`interactive`. A verified person's band from their permission\ngroups (`ClientAdmissionResult.queueBand`) replaces it, and a\nrequest's `X-Eugene-Band` header can only lower it. Not part of\nthe policy a running request is bound to: changing it never cuts\na request that is already running.\n",
+    )
+    maxQueuedRequests: int | None = Field(
+        None,
+        description="How many of this key's requests may wait in one gateway's queue\nfor each person (row 11): Workbench's one app key serves\neveryone, so each verified person has a line of their own. A\nrequest past it is refused with `key_queue_full` and\n`Retry-After`. `0` refuses at once, as before the queue. Not part\nof the policy a running request is bound to.\n\n**Absent means 8**, and no default is declared here on purpose:\na declared default is filled into every answer a generated model\nwrites, and a reader a release behind refuses the field\n(`extra='forbid'`), so the authority and the agent send it only\nwhen it was set to something else, as `band` and row 70's\n`queueBand`.\n",
+        ge=0,
+        le=64,
+    )
+
+
+class ClientKeyUpdateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    limits: ClientKeyLimits
+
+
+class Action(StrEnum):
+    check = 'check'
+    acquire = 'acquire'
+    renew = 'renew'
+    release = 'release'
+
+
+class Purpose(StrEnum):
+    """
+    Logs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.
+
+    Search is a web search that names no model (POST /v1/web_search, the door Open WebUI's external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key's `allowedModels` does not apply. The gateway checks the key's `allowedTools` and `localOnly`, as for every tool.
+
+    """
+
+    inference = 'inference'
+    logs = 'logs'
+    catalog = 'catalog'
+    search = 'search'
+
+
+class ClientAdmissionRequest(BaseModel):
+    """
+    Since row 11 the gateway sends `check` when a request arrives and
+    `acquire` when the request leaves its queue, so a request that waits
+    holds no lease. A `check` that names a `model` applies the key's
+    `allowedModels` as `acquire` does, and takes nothing.
+
+    An `acquire` refused for the key's limits is a 429 with
+    `Retry-After` and `X-Eugene-Refusal-Reason`: `concurrency` when the
+    key already runs `maxConcurrentRequests` requests (on any gateway;
+    the gateway keeps the request's place and asks again), `rate` when
+    its `requestsPerMinute` are used (the gateway refuses the request).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    action: Action
+    keyId: str = Field(..., max_length=128, min_length=1)
+    requestId: str = Field(..., max_length=128, min_length=1)
+    purpose: Purpose | None = Field(
+        'inference',
+        description="Logs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.\n\nSearch is a web search that names no model (POST /v1/web_search, the door Open WebUI's external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key's `allowedModels` does not apply. The gateway checks the key's `allowedTools` and `localOnly`, as for every tool.\n",
+    )
+    model: str | None = Field(None, max_length=256, min_length=1)
+    personToken: str | None = Field(
+        None,
+        description='Root-issued OIDC access token carried alongside the app key in\nX-Eugene-Person-Token. The root checks its signature, session,\ncurrent person access and exact registered app owner on every check,\nacquisition and renewal. Required for app:workbench@ keys. Never\npersist or log this token. A standalone authority refuses it.\n',
+        max_length=16384,
+        min_length=1,
+    )
+
+
+class ClientAdmissionResult(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    keyId: str
+    keyName: str
+    lineage: str | None = Field(
+        None,
+        description="The id of the first key of this key's rotations (row 24): a\nreplacement shares its predecessor's lineage. The store names a\nkey's objects by it, so a rotated key keeps its files (row 53).\nReaders take it when present and use `keyId` when absent; the\nauthority starts sending it once every reader knows the field,\nbecause an older reader refuses an unknown one.\n",
+        max_length=128,
+        min_length=1,
+    )
+    personId: str | None = Field(
+        None, description='Stable subject verified by the root, never caller supplied.'
+    )
+    appClientId: str | None = None
+    limits: ClientKeyLimits | None = None
+    leaseSeconds: float | None = Field(None, gt=0.0, le=30.0)
+    queueBand: QueueBand | None = Field(
+        None,
+        description="The verified person's queue band from their permission groups\n(row 70): the highest band any of their groups sets. Present only\nwhen the root verified a person (`personId`) and one of their\ngroups sets a band. Absent for a key with no person, a release, or\na person whose groups set none: the key's own band, or the\ninstall's default, applies. Never taken from the caller.\n",
+    )
+
+
+class AdmissionRefusalReason(StrEnum):
+    """
+    Why an `acquire` was refused with a 429, in its
+    `X-Eugene-Refusal-Reason` header (row 11): `concurrency`, the key
+    already runs `maxConcurrentRequests` requests; `rate`, its
+    `requestsPerMinute` are used. An agent that forwards the root's
+    answer passes the header on, and a standalone agent sets it the same
+    way.
+
+    """
+
+    concurrency = 'concurrency'
+    rate = 'rate'
+
+
+class ClientKeyPolicyEntry(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., max_length=128, min_length=1)
+    expiresAt: AwareDatetime
+    revokedAt: AwareDatetime | None = None
+
+
+class ClientKeyPolicy(BaseModel):
+    """
+    Positive registry: only listed, unrevoked, unexpired identifiers may be
+    authorized. Default refresh 15 seconds, maximum age 60 seconds (up to
+    five seconds clock tolerance). Missing/stale policy causes client-only
+    503; known revoked keys remain refused. Operator/service auth is unaffected.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    authority: str = Field(..., min_length=1)
+    revision: int = Field(..., ge=0)
+    generatedAt: float = Field(
+        ...,
+        description='Authority UTC Unix timestamp. Intermediaries must not renew it.',
+    )
+    keys: list[ClientKeyPolicyEntry]
+
+
+class QueueRefusalCode(StrEnum):
+    """
+    Why the queue refused a request (row 11), on its
+    `X-Eugene-Refusal-Reason` header and its metrics row. "Waiting in
+    line" in this document's description has the table.
+
+    """
+
+    key_queue_full = 'key_queue_full'
+    queue_full = 'queue_full'
+    set_aside = 'set_aside'
+    key_queue_timeout = 'key_queue_timeout'
+    queue_timeout = 'queue_timeout'
+    still_starting = 'still_starting'
+    shutting_down = 'shutting_down'
+    rate_limited = 'rate_limited'
+
+
+class MetricOutcome(StrEnum):
+    """
+    `refused` (row 11, schema v14): the queue turned the request away
+    before any backend was asked, for the `refusal` the row names.
+    Named rather than inline, so a new value cannot rename an enum.
+
+    """
+
+    served = 'served'
+    error = 'error'
+    refused = 'refused'
 
 
 class RetryDisposition1(StrEnum):
@@ -4236,11 +4493,6 @@ class MetricAttempt(BaseModel):
         None,
         description="The exception **class name** only, never its message.\nDriver error text can carry a provider's response body, and\na metrics table is the kind of thing that gets pasted into\nan issue — this must not become an accidental credential\nstore.\n",
     )
-
-
-class Outcome(StrEnum):
-    served = 'served'
-    error = 'error'
 
 
 class MetricToolOutcome(StrEnum):
@@ -5954,25 +6206,96 @@ class MetricsGroup(BaseModel):
         None,
         description='Requests served, keyed by the 1-based tier that answered. A\nslot whose tier 2 answers everything has a primary that is\nnot working, and this is where that becomes visible.\n',
     )
-
-
-class MetricsSummary(BaseModel):
-    windowStart: AwareDatetime
-    windowEnd: AwareDatetime
-    gatewayStartedAt: AwareDatetime = Field(
-        ...,
-        description='When this gateway process started. Present so a history\nthat begins mid-window reads as partial rather than as an\ninstall that served nothing — the gateway is respawned on\noperator login, so a fresh start time is routine.\n',
+    queuedMs: Percentiles | None = Field(
+        None,
+        description="How long requests waited in line (row 11), with `p95`, over the\ngroup's requests that waited at all. Null when none waited.\nRefused requests are not in a group; `MetricsSummary.refused`\ncounts them.\n",
     )
-    rowsDropped: int = Field(
-        ...,
-        description='Measurements discarded since startup because the write\nqueue was full. Non-zero means these numbers are a sample\nrather than a census, and the endpoint says so instead of\nquietly under-reporting. Recording degrades before\ninference does.\n',
+    tierMoves: int | None = Field(
+        None,
+        description="Times a request moved to its slot's next tier after it waited\n`queueWaitSeconds` for a runtime (row 11). Absent on stores\nfrom before schema v14.\n",
         ge=0,
     )
-    truncated: bool | None = Field(
+    outranReserve: int | None = Field(
         None,
-        description='True when the window reaches past `metricsRetentionDays`,\nso raw rows for its early part no longer exist and the\nnumbers describe less than the window asked for. Hourly\nrollups do cover that period on disk; nothing serves them\nyet.\n',
+        description="Answers longer than the room their turn held for them in a\nshared context (row 11, CB-C2). Many of them mean the floor\n(`answerReserveFloorTokens`) is too low for this model's work.\n",
+        ge=0,
     )
-    groups: list[MetricsGroup]
+
+
+class MetricsQueueRuntime(BaseModel):
+    model: str | None = Field(None, description='The model the requests asked for.')
+    runtime: str | None = Field(
+        None,
+        description="The runtime they wait for. Null for a wait for the key's turn only.",
+    )
+    node: str | None = None
+    waiting: MetricsQueueBands
+    running: int = Field(
+        ..., description='Requests this gateway runs on the runtime now.', ge=0
+    )
+    slots: int | None = Field(
+        None,
+        description="The runtime's `parallelSlots`, when its agent reports them.",
+        ge=1,
+    )
+
+
+class ClientKey(BaseModel):
+    id: str = Field(..., max_length=128, min_length=1)
+    name: str = Field(..., max_length=64, min_length=1)
+    tail: str = Field(..., max_length=6)
+    createdAt: AwareDatetime
+    expiresAt: AwareDatetime
+    revokedAt: AwareDatetime | None = None
+    lastUsedAt: AwareDatetime | None = Field(
+        None,
+        description='When the authority last admitted a check or acquisition with this key, to the minute. Absent, no use recorded.',
+    )
+    retiresAt: AwareDatetime | None = Field(
+        None,
+        description='Set when the key was rotated. The token works until then, and new requests on it are refused as replaced afterwards. Running requests finish.',
+    )
+    replaces: str | None = Field(
+        None,
+        description='The id of the key this one replaced.',
+        max_length=128,
+        min_length=1,
+    )
+    replacedBy: str | None = Field(
+        None,
+        description='The id of the key that replaced this one.',
+        max_length=128,
+        min_length=1,
+    )
+    limits: ClientKeyLimits | None = Field(
+        None,
+        description='Absent on legacy keys (all models, no per-key limits); new keys receive bounded defaults.',
+    )
+
+
+class ClientKeyList(BaseModel):
+    keys: list[ClientKey]
+    authority: str | None = None
+    revision: int | None = Field(None, ge=0)
+    scope: Scope | None = None
+    detail: str | None = None
+
+
+class ClientKeyCreateRequest(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    name: str = Field(..., max_length=64, min_length=1)
+    ttlDays: int | None = Field(365, ge=1, le=3650)
+    limits: ClientKeyLimits | None = None
+
+
+class ClientKeyCreated(BaseModel):
+    key: ClientKey
+    token: str = Field(
+        ...,
+        description='Returned once; never persisted in the registry or gateway cache.',
+    )
 
 
 class MetricRequest(BaseModel):
@@ -6064,7 +6387,28 @@ class MetricRequest(BaseModel):
     videoSeconds: int | None = Field(
         None, description='For a video job, the seconds asked for (P5, schema v9).'
     )
-    outcome: Outcome
+    outcome: MetricOutcome
+    queuedMs: int | None = Field(
+        None,
+        description="How long the request waited in line (row 11, schema v14): for\nits key's turn, for a runtime, or both. Not the wake, which is\n`waitedMs`. Null on rows from before v14.\n",
+        ge=0,
+    )
+    band: QueueBand | None = Field(
+        None,
+        description='The queue band the request ran or waited in. Null on rows from before v14.',
+    )
+    refusal: QueueRefusalCode | None = Field(
+        None, description='Why the queue refused it, when `outcome` is `refused`.'
+    )
+    tierMoves: int | None = Field(
+        None,
+        description="Times it moved to its slot's next tier after waiting (row 11).",
+        ge=0,
+    )
+    outranReserve: bool | None = Field(
+        None,
+        description='Its answer was longer than the room its turn held for it in a\nshared context (row 11, CB-C2). Null where nothing was held.\n',
+    )
     tries: list[MetricAttempt] = Field(..., min_length=0)
     webSearches: list[MetricToolExecution] | None = Field(
         None,
@@ -6835,6 +7179,33 @@ class SystemOneResponse(BaseModel):
     answers: dict[str, SystemOneAnswer]
     usage: SystemOneUsage | None = None
     x_eugene_plexus: CompletionRoutingInfo | None = None
+
+
+class MetricsSummary(BaseModel):
+    windowStart: AwareDatetime
+    windowEnd: AwareDatetime
+    gatewayStartedAt: AwareDatetime = Field(
+        ...,
+        description='When this gateway process started. Present so a history\nthat begins mid-window reads as partial rather than as an\ninstall that served nothing — the gateway is respawned on\noperator login, so a fresh start time is routine.\n',
+    )
+    rowsDropped: int = Field(
+        ...,
+        description='Measurements discarded since startup because the write\nqueue was full. Non-zero means these numbers are a sample\nrather than a census, and the endpoint says so instead of\nquietly under-reporting. Recording degrades before\ninference does.\n',
+        ge=0,
+    )
+    truncated: bool | None = Field(
+        None,
+        description='True when the window reaches past `metricsRetentionDays`,\nso raw rows for its early part no longer exist and the\nnumbers describe less than the window asked for. Hourly\nrollups do cover that period on disk; nothing serves them\nyet.\n',
+    )
+    groups: list[MetricsGroup]
+    refused: dict[str, int] | None = Field(
+        None,
+        description='Requests refused in the window, by `QueueRefusalCode` (row 11),\neach kept as a row with outcome `refused`. Absent when none\nwere.\n',
+    )
+    queue: list[MetricsQueueRuntime] | None = Field(
+        None,
+        description="What waits in this gateway's line now (row 11), one entry for\neach runtime something waits for, and one with no runtime for\nrequests that wait only for their key's turn. Live, not a\nfigure over the window.\n",
+    )
 
 
 class EngineFitModel(BaseModel):

@@ -228,6 +228,8 @@ EXPOSED_HEADERS = b", ".join(
         b"X-Eugene-Plexus-Context-Length",
         b"X-Eugene-Plexus-Prompt-Truncated",
         b"X-Eugene-Plexus-Ignored-Settings",
+        # Row 11: why the queue refused a request.
+        b"X-Eugene-Refusal-Reason",
     ]
 )
 

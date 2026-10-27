@@ -1,4 +1,4 @@
-"""A turn waits for room in its replica's shared context (CB3).
+"""A turn holds room in its replica's shared context (CB3, CB-C2).
 
 **llama-server's slots share one KV pool by default** (`-c`, automatic
 slots), and when the prompts in flight on a replica together outgrow it the
@@ -12,23 +12,27 @@ turns from 44 to 0 and halved the p99.
 `capabilities.contextPoolTokens`, the prompt tokens in flight may not pass
 90% of the pool. Each turn counts as its conversation's last prompt tokens,
 plus its new text at ~3.5 characters a token (the whole request's, for a new
-conversation), plus its `max_tokens`. The 10% spare is because characters
+conversation), plus room for its answer. The 10% spare is because characters
 over 3.5 let two overflows through on a pool that holds two prompts.
 
-**The wait.** A turn that does not fit waits for a request on that runtime
-to finish: on its own replica while it holds the conversation (going
-elsewhere would read its whole history again), else on whichever replica of
-the tier has room first. After `swapWaitSeconds` it is sent in the usual
-order, and a refusal then is the driver's `#backend-capacity`, which
-cascades and is not counted against the replica. A turn alone on its
-runtime always fits, and a request bigger than the whole pool is sent at
-once: the engine's own refusal is the honest answer to it.
+**The answer's room (CB-C2, Choice 3, Troy 2026-10-21).** Not the whole
+`max_tokens` (Claude Code sends 32,000 and writes a few hundred): the lower of
+`max_tokens` and the length 95 of 100 of its conversation's last 16 answers
+were shorter than, or 4,096 tokens for a new conversation, and never less than
+the owner's floor (`answerReserveFloorTokens`, default 1,024). An answer longer
+than its room is counted (`outranReserve`); the 10% spare absorbs some of it.
+
+**The wait is the fair queue's (row 11).** A turn that does not fit waits in
+`fair_queue`, by band, person and arrival, for room on its own replica while
+it holds the conversation (going elsewhere would read its whole history
+again), else on whichever replica of the tier has room first; the ledger tells
+the queue each time room is given back. A turn alone on its runtime always
+fits, and a request bigger than the whole pool is sent at once: the engine's
+own refusal is the honest answer to it.
 """
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import json
 import math
 import threading
@@ -45,6 +49,12 @@ from .affinity import MAX_KEYS, TTL_SECONDS
 CHARS_PER_TOKEN = 3.5
 #: The share of a pool the budget keeps free for its own estimate's error.
 SPARE = 0.10
+#: CB-C2: the room a new conversation holds for its answer.
+NEW_CONVERSATION_ANSWER = 4096
+#: CB-C2: how many of a conversation's answers its room is judged from.
+ANSWERS_KEPT = 16
+#: CB-C2: the least room an answer holds when the gateway's setting does not say.
+DEFAULT_ANSWER_FLOOR = 1024
 
 #: A runtime, as the routing table keys it: `(node, name)`.
 Key = tuple[str | None, str]
@@ -91,10 +101,13 @@ class _Seen:
     prompt_tokens: int
     chars: int
     at: float
+    #: Its last answers' lengths in tokens, oldest first (CB-C2).
+    answers: tuple[int, ...] = ()
 
 
 class ConversationSizes:
-    """Model and conversation key -> its last prompt, as the engine counted it.
+    """Model and conversation key -> its last prompt, as the engine counted it,
+    and its last `ANSWERS_KEPT` answers.
 
     Bounded and expiring like the affinity table: a conversation idle past
     its TTL is estimated from its size alone, which only overcounts.
@@ -116,23 +129,50 @@ class ConversationSizes:
                 return None
             return seen
 
-    def put(self, target: str, key: str, prompt_tokens: int, chars: int) -> None:
+    def put(
+        self, target: str, key: str, prompt_tokens: int, chars: int, answer: int | None = None
+    ) -> None:
         with self._lock:
-            self._entries[(target, key)] = _Seen(prompt_tokens, chars, time.perf_counter())
+            before = self._entries.get((target, key))
+            answers = before.answers if before is not None else ()
+            if answer is not None and answer >= 0:
+                answers = (*answers, answer)[-ANSWERS_KEPT:]
+            self._entries[(target, key)] = _Seen(prompt_tokens, chars, time.perf_counter(), answers)
             self._entries.move_to_end((target, key))
             while len(self._entries) > self._size:
                 self._entries.popitem(last=False)
 
 
-def estimate(chars: int, max_tokens: int | None, seen: _Seen | None) -> tuple[int, int]:
+def long_answer(answers: Sequence[int]) -> int | None:
+    """The length 95 of 100 of `answers` are no longer than (nearest rank)."""
+    if not answers:
+        return None
+    ordered = sorted(answers)
+    return ordered[min(len(ordered) - 1, max(0, math.ceil(0.95 * len(ordered)) - 1))]
+
+
+def answer_room(
+    max_tokens: int | None, seen: _Seen | None, floor: int = DEFAULT_ANSWER_FLOOR
+) -> int:
+    """CB-C2: the room a turn holds for its answer."""
+    typical = long_answer(seen.answers) if seen is not None else None
+    room = max(max(0, floor), typical if typical is not None else NEW_CONVERSATION_ANSWER)
+    if max_tokens is not None and max_tokens > 0:
+        room = min(room, max_tokens)
+    return room
+
+
+def estimate(
+    chars: int, max_tokens: int | None, seen: _Seen | None, *, floor: int = DEFAULT_ANSWER_FLOOR
+) -> tuple[int, int]:
     """`(prompt, total)`: the tokens one turn's prompt is, and what the turn
-    will hold in its runtime's pool once it has answered."""
+    holds in its runtime's pool while it answers (its prompt and its room)."""
     if seen is not None and chars >= seen.chars:
         prompt = seen.prompt_tokens + (chars - seen.chars) / CHARS_PER_TOKEN
     else:
         prompt = chars / CHARS_PER_TOKEN
     tokens = math.ceil(prompt)
-    return tokens, tokens + max(0, max_tokens or 0)
+    return tokens, tokens + answer_room(max_tokens, seen, floor)
 
 
 class PoolLedger:
@@ -140,12 +180,13 @@ class PoolLedger:
 
     One per routing table. Synchronous bookkeeping on the event loop, so a
     check and the reservation that follows it cannot be split by another
-    request; `room` wakes every waiter when anything is released.
+    request. `listeners` are told whenever room is given back: the fair
+    queue's dispatch (row 11), which is where a turn waits for it.
     """
 
     def __init__(self) -> None:
         self._tokens: dict[Key, int] = {}
-        self._room: asyncio.Event | None = None
+        self.listeners: list[Callable[[], None]] = []
 
     def in_flight(self, runtime: Key) -> int:
         return self._tokens.get(runtime, 0)
@@ -156,9 +197,8 @@ class PoolLedger:
         Alone it always goes. A PROMPT bigger than the pool goes at once,
         because the engine refuses it outright and so takes nothing from
         anyone; judged on the prompt and not on `tokens`, since a turn's
-        `max_tokens` (Claude Code sends 32,000) can make a prompt that runs
-        fine look bigger than the pool, and sent at once it would overflow
-        the turns already there.
+        answer room can make a prompt that runs fine look bigger than the
+        pool, and sent at once it would overflow the turns already there.
         """
         held = self._tokens.get(runtime, 0)
         if held == 0 or prompt > pool:
@@ -174,26 +214,20 @@ class PoolLedger:
             self._tokens[runtime] = left
         else:
             self._tokens.pop(runtime, None)
-        if self._room is not None:
-            self._room.set()
-            self._room = None
-
-    async def changed(self, seconds: float) -> None:
-        """Until something is released, or `seconds` pass."""
-        if self._room is None:
-            self._room = asyncio.Event()
-        room = self._room
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(room.wait(), seconds)
+        for listener in self.listeners:
+            listener()
 
 
 class TurnBudget:
     """One turn's place in the ledger, across the attempts it makes.
 
     Built by `RoutingTable.pick` when any backend in the slot reports a
-    shared pool; held by the `TieredClient`. `admit` waits and reorders the
-    first tier; `enter` moves the reservation to whichever backend an
-    attempt goes to; `close` gives it back, on every path.
+    shared pool; held by the `TieredClient`. `size` measures the turn;
+    the fair queue reserves its room where it leaves for (`reserve_on`);
+    `enter` moves the reservation to whichever backend an attempt goes to;
+    `close` gives it back, on every path. `admit` places a turn that no
+    queue holds (a client built by hand): first where it fits now, waiting
+    for nothing.
     """
 
     def __init__(
@@ -205,7 +239,7 @@ class TurnBudget:
         target: str,
         conversation: str | None,
         held: bool,
-        wait_seconds: Callable[[], float],
+        floor: int = DEFAULT_ANSWER_FLOOR,
     ) -> None:
         self._ledger = ledger
         self._sizes = sizes
@@ -213,19 +247,29 @@ class TurnBudget:
         self._target = target
         self._conversation = conversation
         self._held = held
-        self._wait_seconds = wait_seconds
+        #: The least room an answer holds (`answerReserveFloorTokens`).
+        self.floor = floor
         self._chars = 0
         self.prompt = 0
         self.tokens = 0
         self._lease: tuple[int, Key] | None = None
-        #: Milliseconds this turn waited for room; 0 when it did not.
-        self.waited_ms = 0
 
-    def _pool_of(self, candidate: Any) -> tuple[Key, int] | None:
+    @property
+    def held(self) -> bool:
+        """Whether the turn's conversation holds its first replica (an
+        affinity hit), so it waits only on that one."""
+        return self._held
+
+    @property
+    def room(self) -> int:
+        """The tokens this turn holds for its answer."""
+        return self.tokens - self.prompt
+
+    def pool_of(self, candidate: Any) -> tuple[Key, int] | None:
         return self._pools.get(id(candidate))
 
     def _reserve(self, candidate: Any) -> None:
-        pool = self._pool_of(candidate)
+        pool = self.pool_of(candidate)
         if pool is None:
             return
         self._ledger.take(pool[0], self.tokens)
@@ -235,59 +279,66 @@ class TurnBudget:
         """`(chars, prompt, tokens)` of one turn, as the estimate reads it."""
         chars = request_chars(request)
         seen = self._sizes.get(self._target, self._conversation) if self._conversation else None
-        prompt, tokens = estimate(chars, getattr(request, "maxTokens", None), seen)
+        prompt, tokens = estimate(
+            chars, getattr(request, "maxTokens", None), seen, floor=self.floor
+        )
         return chars, prompt, tokens
 
-    def _with_room(self, waiting_on: Sequence[Any], prompt: int, tokens: int) -> Any | None:
-        """The first of `waiting_on` a turn this size fits on now, if any.
+    def size(self, request: Any) -> None:
+        """Measure this turn: what it reserves where it goes."""
+        self._chars, self.prompt, self.tokens = self._sized(request)
 
-        The one place that decides who has room, so what `admit` does and what
-        `first` says it would do cannot differ.
-        """
+    def waiting_on(self, tier: Sequence[Any]) -> list[Any]:
+        """The replicas this turn waits for room on: its own while it holds
+        the conversation, else any of the tier."""
+        return list(tier[:1] if self._held else tier)
+
+    def _with_room(self, waiting_on: Sequence[Any], prompt: int, tokens: int) -> Any | None:
+        """The first of `waiting_on` a turn this size fits on now, if any."""
         for candidate in waiting_on:
-            pool = self._pool_of(candidate)
+            pool = self.pool_of(candidate)
             if pool is None or self._ledger.fits(pool[0], pool[1], tokens, prompt):
                 return candidate
         return None
 
     def first(self, request: Any, tier: Sequence[Any]) -> Any | None:
-        """The backend `admit` would put first this instant, or None.
+        """The backend with room for this turn this instant, or None.
 
         **A read**: nothing is reserved and nothing waits, so a stream's head can
         ask it before anything is sent. None when nothing has room now, which is
-        when `admit` waits, and who gets room first is not known until it has: the
-        tier's usual order is then the best answer, and where the turn goes when
-        the wait runs out.
+        when the turn waits in the queue, and who gets room first is not known
+        until it has: the tier's usual order is then the best answer.
         """
         if not tier:
             return None
         _chars, prompt, tokens = self._sized(request)
-        # Only the conversation's own replica counts while it holds it, as in `admit`.
-        waiting_on = tier[:1] if self._held else tier
-        return self._with_room(waiting_on, prompt, tokens)
+        return self._with_room(self.waiting_on(tier), prompt, tokens)
+
+    def first_in(self, request: Any, candidates: Sequence[Any]) -> Any | None:
+        """The first of `candidates` with room for this turn now, whatever its
+        conversation holds: a fallback tier, where no replica is its home. A read."""
+        _chars, prompt, tokens = self._sized(request)
+        return self._with_room(list(candidates), prompt, tokens)
 
     async def admit(self, request: Any, tier: Sequence[Any]) -> list[Any]:
-        """Wait for room, and answer the tier with the backend to try first."""
-        self._chars, self.prompt, self.tokens = self._sized(request)
+        """A turn no queue holds: sized, put first where it fits now and its
+        room reserved there; the usual order when nothing has room."""
+        self.size(request)
         ordered = list(tier)
-        if not ordered:
+        candidate = self._with_room(self.waiting_on(ordered), self.prompt, self.tokens)
+        if candidate is None:
             return ordered
-        # Only the conversation's own replica counts while it holds it.
-        waiting_on = ordered[:1] if self._held else ordered
-        started = time.perf_counter()
-        deadline = started + max(0.0, float(self._wait_seconds()))
-        while True:
-            candidate = self._with_room(waiting_on, self.prompt, self.tokens)
-            if candidate is not None:
-                self._reserve(candidate)
-                self.waited_ms = int((time.perf_counter() - started) * 1000)
-                return [candidate, *(c for c in ordered if c is not candidate)]
-            remaining = deadline - time.perf_counter()
-            if remaining <= 0:
-                # Waited long enough: the usual order, and the engine decides.
-                self.waited_ms = int((time.perf_counter() - started) * 1000)
-                return ordered
-            await self._ledger.changed(remaining)
+        self._reserve(candidate)
+        return [candidate, *(c for c in ordered if c is not candidate)]
+
+    def reserve_on(self, candidate: Any) -> None:
+        """The queue let this turn go to `candidate`: hold its room there."""
+        self._release()
+        self._reserve(candidate)
+
+    def unreserve(self) -> None:
+        """The turn went back in line: give its room back."""
+        self._release()
 
     def enter(self, candidate: Any) -> None:
         """An attempt is going to `candidate`: hold its room, and only its."""
@@ -298,8 +349,12 @@ class TurnBudget:
 
     @property
     def chars(self) -> int:
-        """The request's size as `admit` measured it."""
+        """The request's size as `size` measured it."""
         return self._chars
+
+    @property
+    def reserved(self) -> bool:
+        return self._lease is not None
 
     def _release(self) -> None:
         if self._lease is not None:

@@ -122,14 +122,37 @@ class Executor:
                     return candidate
         return None
 
-    async def attempts(self) -> AsyncIterator[Attempt]:
+    async def attempts(self, *, admit: bool = False) -> AsyncIterator[Attempt]:
+        """Each candidate in turn. With `admit` (a generation), each is admitted
+        by the fair queue before its attempt starts (`TieredClient._admit_attempt`):
+        a fallback waits for its runtime's slot and room like any turn."""
         from .driver_client import _cooling_error
 
         count = 0
         for tier, candidates in enumerate(self.owner._tiers, 1):
-            for candidate in candidates:
+            left = list(candidates)
+            while left:
+                candidate = left.pop(0)
                 if self.owner.authorize_attempt is not None:
                     await self.owner.authorize_attempt()
+                if admit:
+                    early = getattr(candidate, "circuit", None)
+                    if early is not None and not early.available():
+                        # It would not take an attempt: it is not waited for.
+                        if self.last_error is None:
+                            self.last_error = _cooling_error(early.until - time.perf_counter())
+                        continue
+                    # It may be let go on another replica of this tier, one with
+                    # room: that one is tried now, and this one after it. A wait
+                    # that runs out moves on to the next tier (TIER-SPILL).
+                    later = any(self.owner._tiers[tier:])
+                    chosen = await self.owner._admit_attempt(candidate, left, has_next_tier=later)
+                    if chosen is None:
+                        break
+                    if chosen is not candidate:
+                        left.remove(chosen)
+                        left.insert(0, candidate)
+                        candidate = chosen
                 circuit = getattr(candidate, "circuit", None)
                 if circuit is not None and not circuit.acquire():
                     if self.last_error is None:
@@ -161,10 +184,8 @@ class Executor:
         *,
         generation: GenerateRequest | None = None,
     ) -> T:
-        async for attempt in self.attempts():
+        async for attempt in self.attempts(admit=generation is not None):
             try:
-                if generation is not None:
-                    self.owner._enter(attempt.candidate)
                 result = await call(attempt.candidate)
             except BaseException as exc:
                 attempt.finish(error=exc)
@@ -188,13 +209,11 @@ class Executor:
         policy: StreamPolicy = DEFAULT_STREAM_POLICY,
         generation: GenerateRequest | None = None,
     ) -> AsyncGenerator[T, None]:
-        async for attempt in self.attempts():
+        async for attempt in self.attempts(admit=generation is not None):
             events = None
             complete = False
             usage = None
             try:
-                if generation is not None:
-                    self.owner._enter(attempt.candidate)
                 events = call(attempt.candidate)
                 async for event in events:
                     if not policy.progress(event):

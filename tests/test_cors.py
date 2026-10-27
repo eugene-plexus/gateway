@@ -282,3 +282,11 @@ def test_body_chunks_are_forwarded_as_they_are_sent() -> None:
     assert (b"access-control-allow-origin", b"*") in start["headers"]
     bodies = [m["body"] for m in forwarded if m["type"] == "http.response.body"]
     assert bodies == [b"data: one\n\n", b"data: two\n\n"]
+
+
+def test_a_browser_can_read_why_the_queue_refused(cors_client: TestClient) -> None:
+    """Row 11: every refusal names its cause in `X-Eugene-Refusal-Reason`, and a
+    browser hides any header the response does not expose."""
+    r = cors_client.get("/v1/models", headers={"origin": ORIGIN})
+    exposed = {h.strip().lower() for h in r.headers["access-control-expose-headers"].split(",")}
+    assert "x-eugene-refusal-reason" in exposed

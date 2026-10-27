@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
+from types import FrameType
+from typing import Any
 
 import uvicorn
 
-from .app import create_app
+from .app import close_queue, create_app
 from .config import ConfigStore
 from .settings import load_settings
 
@@ -59,7 +62,7 @@ def main() -> None:
     logging.getLogger("uvicorn.access").addFilter(_DropHealthzFilter())
 
     app = create_app(settings)
-    uvicorn.run(
+    config = uvicorn.Config(
         app,
         host=settings.bind_host,
         port=port,
@@ -73,6 +76,28 @@ def main() -> None:
         # carries the argument.
         forwarded_allow_ips=[],
     )
+    _Server(config, app).run()
+
+
+class _Server(uvicorn.Server):
+    """uvicorn, refusing the fair queue's waiters as a stop begins (row 11).
+
+    uvicorn waits for every request in flight before the app's lifespan ends,
+    and a request waiting in line is one: closed only there, a stop with
+    waiters would hang until each waited its `queueWaitSeconds`. Closed when
+    the signal arrives, each is refused `shutting_down` at once.
+    """
+
+    def __init__(self, config: uvicorn.Config, app: Any) -> None:
+        super().__init__(config)
+        self._app = app
+
+    def handle_exit(self, sig: int, frame: FrameType | None) -> None:
+        loop = getattr(self._app.state, "loop", None)
+        if loop is not None:
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(close_queue, self._app)
+        super().handle_exit(sig, frame)
 
 
 if __name__ == "__main__":

@@ -49,6 +49,7 @@ from .. import (
     completion_door,
     control_tokens,
     decisions,
+    fair_queue,
     files_door,
     gemini,
     ignored_settings,
@@ -170,7 +171,14 @@ from ..driver_client import (
 from ..images import attachment_kinds, max_images
 from ..lifecycle import LifecycleManager, WakeResult
 from ..metrics import AttemptRow, CandidateRow, MetricsStore, RequestRow, ToolExecutionRow
-from ..routing import Resolution, RoutingTable, collect_attempts, current_attempts, takes
+from ..routing import (
+    COMING_UP,
+    Resolution,
+    RoutingTable,
+    collect_attempts,
+    current_attempts,
+    takes,
+)
 
 log = logging.getLogger(__name__)
 
@@ -326,6 +334,11 @@ def _record(
                 tool_executions=_tool_rows(searched),
                 cached_tokens=getattr(usage, "cachedPromptTokens", None),
                 affinity=getattr(getattr(client, "_inner", client), "affinity", None),
+                # Row 11: the line it waited in, and what the wait did to it.
+                queued_ms=context.queued_ms if context else None,
+                band=context.band if context else None,
+                tier_moves=getattr(getattr(client, "_inner", client), "tier_moves", None),
+                outran_reserve=getattr(getattr(client, "_inner", client), "outran_reserve", None),
             )
         )
         if (context := admission.current.get()) is not None:
@@ -388,6 +401,7 @@ def _error(
     message: str,
     error_type: str,
     param: str | None = None,
+    error_code: str | None = None,
 ) -> JSONResponse:
     """OpenAI's error envelope, not RFC 7807.
 
@@ -401,7 +415,7 @@ def _error(
             "message": message,
             "type": error_type,
             "param": param,
-            "code": None,
+            "code": error_code,
         }
     }
     return JSONResponse(status_code=code, content=body)
@@ -437,6 +451,15 @@ class _Failure:
     context_overflow: bool = False
     prompt_tokens: int | None = None
     context_tokens: int | None = None
+    #: The queue's `QueueRefusalCode` (row 11), for `X-Eugene-Refusal-Reason`.
+    refusal: str | None = None
+
+    def _named(self, response: JSONResponse) -> JSONResponse:
+        if self.retry_after:
+            response.headers["Retry-After"] = self.retry_after
+        if self.refusal:
+            response.headers[admission.REASON_HEADER] = self.refusal
+        return response
 
     def anthropic_message(self) -> str:
         if not self.context_overflow:
@@ -445,11 +468,13 @@ class _Failure:
 
     def as_openai(self) -> JSONResponse:
         response = _error(
-            code=self.code, message=self.message, error_type=self.error_type, param=self.param
+            code=self.code,
+            message=self.message,
+            error_type=self.error_type,
+            param=self.param,
+            error_code=self.refusal,
         )
-        if self.retry_after:
-            response.headers["Retry-After"] = self.retry_after
-        return response
+        return self._named(response)
 
     def as_responses(self) -> JSONResponse:
         # A 404 becomes a 400 on this door too, on its own measurement:
@@ -461,9 +486,7 @@ class _Failure:
             param=self.param,
             code=responses.error_code(self.code, self.message, self.error_type),
         )
-        if self.retry_after:
-            response.headers["Retry-After"] = self.retry_after
-        return response
+        return self._named(response)
 
     def as_anthropic(self) -> JSONResponse:
         # `status_for` moves exactly one code, and it moves on a
@@ -473,9 +496,7 @@ class _Failure:
         # sealed-control-root diagnosis.
         status = anthropic.status_for(self.code)
         response = anthropic.error_response(status, self.anthropic_message())
-        if self.retry_after:
-            response.headers["Retry-After"] = self.retry_after
-        return response
+        return self._named(response)
 
 
 def _control_root_hint(table: RoutingTable | None) -> str:
@@ -698,6 +719,58 @@ def _encode_embedding(vector: list[float], encoding_format: str | None) -> list[
     if encoding_format != "base64":
         return vector
     return base64.b64encode(struct.pack(f"<{len(vector)}f", *vector)).decode("ascii")
+
+
+def _swap_wait_seconds(request: Request) -> float:
+    store = _store(request)
+    value = store.get("swapWaitSeconds") if store is not None else None
+    return float(value) if isinstance(value, int | float) and value > 0 else 120.0
+
+
+async def _await_starting(
+    request: Request, table: RoutingTable, facts: Any
+) -> tuple[str | None, int]:
+    """Wait in line for a runtime that is coming up, up to `swapWaitSeconds`: one
+    poll of the routing table each second, shared by every request that meets it
+    (`fair_queue.FairQueue.starting`). In line, so both bounds count it and a stop
+    refuses it `shutting_down` (row 11 review, blocker 4). Answers the runtime's
+    last status and the wait."""
+    began = time.perf_counter()
+
+    async def poll() -> str | None:
+        await table.refresh_if_stale(1.0)
+        return next((r.status for r in table.runtimes() if r.key == facts.key), None)
+
+    seat = fair_queue.Seat(runtime=facts.key, model=facts.alias or facts.name, node=facts.node)
+    context = admission.current.get()
+    entry = (
+        context.entry(seats=[seat], model=facts.alias or facts.name)
+        if context is not None
+        else fair_queue.Entry(seats=[seat], model=facts.alias or facts.name)
+    )
+    try:
+        status = await fair_queue.of(table).wait_for_start(
+            entry, facts.key, poll, _swap_wait_seconds(request)
+        )
+    except fair_queue.Refused as exc:
+        raise admission.refused(exc.refusal) from None
+    return status, int((time.perf_counter() - began) * 1000)
+
+
+def _still_starting(request: Request, facts: Any) -> _Failure:
+    """503: the runtime is still starting after `swapWaitSeconds`."""
+    refusal = fair_queue.still_starting(
+        fair_queue.runtime_words(facts.alias or facts.name, facts.node),
+        _swap_wait_seconds(request),
+    )
+    admission.refused(refusal)  # kept on the request, for its row
+    return _Failure(
+        code=refusal.status,
+        message=refusal.words,
+        error_type="service_unavailable",
+        retry_after=str(refusal.retry),
+        refusal=refusal.code,
+    )
 
 
 def _not_ready(resolution: Resolution, wake: WakeResult | None) -> _Failure:
@@ -1141,7 +1214,9 @@ async def _prepare(
     # to the agent and to every driver, inside the request that
     # triggered it, so "before the clock starts" was not the same as
     # "free".
-    await admission.authorize(request, body.model, streamed=bool(body.stream))
+    # Checked now, and the key's lease acquired when the turn leaves its line
+    # (`TieredClient._admit`, row 11), where the runtimes it may go to are known.
+    await admission.authorize(request, body.model, streamed=bool(body.stream), defer=True)
     repetition_override = request.headers.get(repetition.HEADER)
     if repetition_override is not None and repetition_override not in repetition.MODES:
         return _Failure(
@@ -1379,12 +1454,39 @@ async def _prepare(
     considered = table.candidates_considered(resolution)
     if client is None:
         lifecycle = _lifecycle(request)
-        if lifecycle is not None:
+        if lifecycle is not None and resolution.startable():
+            # Row 11: a wake starts only when the key has its turn here, so a
+            # key at its limit cannot start or stop runtimes. The lease taken
+            # now is held through the wake and the turn that follows it.
+            try:
+                await admission.take_turn(fair_queue.of(table), model=body.model)
+            except fair_queue.Waited as timed_out:
+                raise admission.refused(timed_out.refusal) from None
+            resolution = await resolve()
+            client = table.pick(resolution, needs=needs, surface=only, affinity=conversation)
+        if client is None and lifecycle is not None:
             wake = await lifecycle.wake(resolution)
             if wake.ok:
                 resolution = await resolve()
                 client = table.pick(resolution, needs=needs, surface=only, affinity=conversation)
                 considered = table.candidates_considered(resolution)
+            elif not resolution.startable() and (coming := resolution.waking()):
+                # WAKE (Troy 2026-10-21): a runtime that is already starting is
+                # waited for, one shared poll a runtime, instead of a 503; the
+                # request then joins the line with its original arrival.
+                status, waited = await _await_starting(request, table, coming[0])
+                resolution = await resolve()
+                client = table.pick(resolution, needs=needs, surface=only, affinity=conversation)
+                considered = table.candidates_considered(resolution)
+                if client is not None:
+                    wake = WakeResult(
+                        ok=True,
+                        runtime=coming[0].name,
+                        waited_ms=waited,
+                        message=f"runtime {coming[0].name!r} was starting; waited for it",
+                    )
+                elif status in COMING_UP:
+                    return _still_starting(request, coming[0])
         if client is None:
             if needs and resolution.eligible_backends():
                 return _unconfirmed_input(needs, resolution)
@@ -1398,6 +1500,10 @@ async def _prepare(
             body.model,
             repetition_override,
         )
+        floor = store.get("answerReserveFloorTokens") if store is not None else None
+        if client.budget is not None and isinstance(floor, int) and floor >= 0:
+            # CB-C2: the least room a turn holds for its answer, the owner's.
+            client.budget.floor = floor
     generate = _to_generate_request(body, store, install_max_tokens=install_max_tokens)
     generate.localOnly = admission.local_only()
     # PC6: a door that knows the client marked part of the prompt for caching (the

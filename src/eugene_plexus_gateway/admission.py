@@ -18,7 +18,7 @@ from fastapi import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from . import door_paths, gemini
+from . import door_paths, fair_queue, gemini
 from ._generated.client_key_models import ClientAdmissionResult
 from .capabilities import TOOL_SETTINGS, calls_tools, chats, said_tools, tools_refused
 from .driver_client import credential_refused_next_step, each_named
@@ -36,6 +36,9 @@ class AdmissionFailure(Exception):
         retry: str | None = None,
         param: str | None = None,
         kind: str | None = None,
+        *,
+        code: str | None = None,
+        reason: str | None = None,
     ):
         self.status, self.message, self.retry = status, message, retry
         self.param = param
@@ -44,7 +47,65 @@ class AdmissionFailure(Exception):
         #: the front door's own 502 for it is). Not on the Anthropic doors, whose error
         #: types are a closed set.
         self.kind = kind
+        #: The queue's `QueueRefusalCode` (row 11), for the error's `code` and the
+        #: `X-Eugene-Refusal-Reason` header.
+        self.code = code
+        #: Which limit the authority's 429 was (`concurrency` or `rate`, row 11).
+        self.reason = reason
         super().__init__(message)
+
+
+#: The header a request lowers its own queue band with (row 11).
+BAND_HEADER = "x-eugene-band"
+#: The header a refusal names its cause in, on the authority's 429 and on the
+#: front door's own refusals (row 11).
+REASON_HEADER = "X-Eugene-Refusal-Reason"
+
+
+def refused(refusal: fair_queue.Refusal) -> AdmissionFailure:
+    """The queue's refusal as the failure every door renders, kept on the
+    request so its metrics row says `refused` and why."""
+    context = current.get()
+    if context is not None:
+        context.refusal = refusal.code
+    return AdmissionFailure(
+        refusal.status,
+        refusal.words,
+        str(refusal.retry),
+        kind="rate_limit_error" if refusal.status == 429 else "service_unavailable",
+        code=refusal.code,
+    )
+
+
+#: The limits the queue reads, which a running or waiting request is not bound to.
+QUEUE_LIMITS = frozenset({"band", "maxQueuedRequests"})
+
+
+def bound_policy(access: dict[str, Any]) -> Any:
+    """What a request is routed and shaped under: the key's limits, but for the
+    queue's own (`QUEUE_LIMITS`), as the authority's policy digest reads them."""
+    limits = access.get("limits")
+    if not isinstance(limits, dict):
+        return limits
+    return {k: v for k, v in limits.items() if k not in QUEUE_LIMITS and v is not None}
+
+
+def queue_settings(app: Any) -> tuple[float, int]:
+    """`(queueWaitSeconds, queueMaxRequests)` from the gateway's settings now."""
+    store = getattr(getattr(app, "state", None), "config_store", None)
+    wait = store.get("queueWaitSeconds") if store is not None else None
+    most = store.get("queueMaxRequests") if store is not None else None
+    return (
+        float(wait)
+        if isinstance(wait, int | float) and wait > 0
+        else fair_queue.DEFAULT_WAIT_SECONDS,
+        int(most) if isinstance(most, int) and most > 0 else fair_queue.DEFAULT_MAX_REQUESTS,
+    )
+
+
+def _queue_of(app: Any) -> fair_queue.FairQueue | None:
+    table = getattr(getattr(app, "state", None), "routing", None)
+    return fair_queue.of(table) if table is not None else None
 
 
 current: ContextVar[ClientRequest | None] = ContextVar("client_request", default=None)
@@ -78,6 +139,167 @@ class ClientRequest:
         # after the release and be refused (which would cut the reply short).
         self.lease_lock = asyncio.Lock()
         self.released = False
+        # Row 11: the line it waits in.
+        #: The band its `X-Eugene-Band` asked for, which can only lower its own.
+        self.asked_band: str | None = None
+        #: An operator's or service's subject, for its turn when it has no key.
+        self.subject: str | None = None
+        #: Why the queue refused it, for its metrics row.
+        self.refusal: str | None = None
+        #: Seconds it waited in line, over every turn it took.
+        self.queued_s = 0.0
+        #: Its key's place on this gateway, given back with the lease.
+        self.ticket: fair_queue.Ticket | None = None
+
+    @property
+    def band(self) -> str:
+        """The band in effect (row 11, LD-C4): the verified person's from their
+        groups, else the key's, else `interactive`; the header only lowers it.
+        Never taken from the caller."""
+        access = self.access or {}
+        limits = access.get("limits") or {}
+        own = access.get("queueBand") or limits.get("band") or fair_queue.DEFAULT_BAND
+        return fair_queue.lower(own, self.asked_band)
+
+    @property
+    def bucket(self) -> str | None:
+        """The key's allowance, shared by its rotations (row 24)."""
+        if self.key_id is None:
+            return None
+        return str((self.access or {}).get("lineage") or self.key_id)
+
+    @property
+    def fairness(self) -> str:
+        """Whose turn it is (LD-C3, KEY-OWNER Choice 1): the verified person,
+        else the key, else the session, else nobody in particular."""
+        if self.person_id:
+            return f"person:{self.person_id}"
+        if self.bucket is not None:
+            return f"key:{self.bucket}"
+        if self.subject:
+            return self.subject
+        return "anonymous"
+
+    @property
+    def queued_ms(self) -> int:
+        return int(self.queued_s * 1000)
+
+    @property
+    def needs_lease(self) -> bool:
+        """Whether leaving the line must acquire the key's lease: it has a key,
+        and has not acquired one yet."""
+        return (
+            self.key_id is not None
+            and self.guard is not None
+            and not self.ready.is_set()
+            and self.purpose not in ("catalog", "logs")
+        )
+
+    def entry(
+        self,
+        *,
+        seats: Sequence[fair_queue.Seat] = (),
+        model: str | None = None,
+        prompt: int = 0,
+        tokens: int = 0,
+        reserve: Callable[[fair_queue.Seat], None] | None = None,
+        unreserve: Callable[[], None] | None = None,
+        wait_seconds: float | None = None,
+    ) -> fair_queue.Entry:
+        """This request's place in line, for one turn."""
+        limits = (self.access or {}).get("limits") if self.key_id is not None else None
+        wait, most = queue_settings(self.scope.get("app"))
+        if wait_seconds is not None:
+            wait = wait_seconds
+        queued = limits.get("maxQueuedRequests") if limits else None
+        bound = queued if isinstance(queued, int) else fair_queue.DEFAULT_MAX_QUEUED
+        return fair_queue.Entry(
+            band=self.band,
+            fairness=self.fairness,
+            key=self.bucket,
+            limit=limits.get("maxConcurrentRequests") if limits else None,
+            max_queued=bound if limits else None,
+            seats=list(seats),
+            prompt=prompt,
+            tokens=tokens,
+            wait_seconds=wait,
+            max_requests=most,
+            holds_key=not self.needs_lease,
+            reserve=reserve,
+            unreserve=unreserve,
+            model=model or self.model,
+            arrived=self.started,
+        )
+
+    async def take_turn(
+        self, queue: fair_queue.FairQueue | None, entry: fair_queue.Entry
+    ) -> fair_queue.Ticket | None:
+        """Wait in line, then acquire the key's lease as the request leaves it.
+
+        A root 429 for `concurrency` means another gateway holds the key's leases:
+        what was reserved is given back, the entry keeps its place, and it asks
+        again at the next local release or after a second. A 429 for `rate` is the
+        `rate_limited` refusal; any other refusal ends the request as it did.
+        `fair_queue.Waited` is the caller's to act on (a move to the next tier).
+        """
+        if queue is None:
+            if self.needs_lease:
+                await self._acquire()
+            return None
+        if not self.needs_lease and not entry.seats:
+            return None
+        try:
+            while True:
+                try:
+                    ticket = await queue.wait(entry)
+                except fair_queue.Refused as exc:
+                    raise refused(exc.refusal) from None
+                if not self.needs_lease:
+                    return ticket
+                try:
+                    await self._acquire()
+                except AdmissionFailure as exc:
+                    queue.undo(entry, ticket)
+                    if exc.status == 429 and exc.reason == "concurrency" and entry.key:
+                        if entry.max_queued == 0:
+                            # A key that may wait for nothing is refused at once.
+                            raise refused(
+                                fair_queue.key_queue_full(queue.key_running(entry.key), 0)
+                            ) from None
+                        queue.root_full(entry.key)
+                        continue
+                    if exc.status == 429 and exc.reason == "rate":
+                        limits = (self.access or {}).get("limits") or {}
+                        retry = int(exc.retry) if exc.retry and exc.retry.isdigit() else 5
+                        raise refused(
+                            fair_queue.rate_limited(limits.get("requestsPerMinute"), retry)
+                        ) from None
+                    raise
+                except BaseException:
+                    queue.undo(entry, ticket)
+                    raise
+                self.ticket = ticket
+                return ticket
+        finally:
+            self.queued_s += entry.queued_s
+
+    async def _acquire(self) -> None:
+        """Take the key's lease as the request leaves its line. The request was
+        routed and shaped under the policy it was checked with (its models, its
+        locality, its tools); one that changed while it waited is refused here,
+        never sent under the old one (row 11 review, blocker 1). Its lease is
+        given back by the middleware, as for any refusal after an acquire."""
+        checked = self.access
+        self.attempted = True
+        acquired = await self.contact("acquire")
+        if checked is not None and bound_policy(checked) != bound_policy(acquired):
+            raise AdmissionFailure(
+                409,
+                "This key's permissions or limits changed while it waited in line. "
+                "Send the request again.",
+            )
+        self.access = acquired
+        self.ready.set()
 
     @property
     def allowed_models(self) -> set[str] | None:
@@ -142,7 +364,9 @@ class ClientRequest:
                 retry = response.headers.get("Retry-After", "5") if status in (429, 503) else None
                 if retry is not None and (not retry.isdigit() or len(retry) > 5):
                     retry = "5"
-                raise AdmissionFailure(status, message, retry)
+                raise AdmissionFailure(
+                    status, message, retry, reason=response.headers.get(REASON_HEADER)
+                )
             result = ClientAdmissionResult.model_validate(response.json())
             if result.keyId != self.key_id:
                 raise ValueError("authority returned another key")
@@ -171,8 +395,16 @@ class ClientRequest:
                 "5",
             ) from exc
 
-    async def authorize(self, request: Request, model: str | None, streamed: bool = False) -> None:
+    async def authorize(
+        self, request: Request, model: str | None, streamed: bool = False, *, defer: bool = False
+    ) -> None:
+        """Check the key when the request arrives; acquire its lease when it
+        leaves the line (row 11). A door that names a model and runs no turn of
+        its own waits for its key's turn here; a chat door (`defer`) waits in
+        `TieredClient._admit`, where the runtimes are known."""
         self.model, self.streamed = model, streamed
+        asked = request.headers.get(BAND_HEADER)
+        self.asked_band = asked.strip().lower() if asked else None
         operation = request.headers.getlist("x-eugene-app-operation")
         if operation:
             if (
@@ -200,10 +432,13 @@ class ClientRequest:
         self.guard = getattr(request.app.state, "client_key_guard", None)
         if self.guard is None:
             raise AdmissionFailure(503, "Client admission is unavailable.", "5")
-        self.attempted = model is not None
-        self.access = await self.contact("acquire" if model is not None else "check")
-        if model is not None:
-            self.ready.set()
+        self.access = await self.contact("check")
+        if model is not None and not defer:
+            entry = self.entry(model=model)
+            try:
+                await self.take_turn(_queue_of(request.app), entry)
+            except fair_queue.Waited as waited:
+                raise refused(waited.refusal) from None
 
     async def reserve_search(self) -> None:
         """Hold the key's allowance for a web search, which names no model.
@@ -212,12 +447,20 @@ class ClientRequest:
         as it does an inference request (purpose `search`), and the middleware renews
         and releases it with the request.
         """
-        if self.key_id is None or self.guard is None or self.attempted:
+        if self.key_id is None or self.guard is None or self.attempted or self.ready.is_set():
             return
         self.purpose = "search"
-        self.attempted = True
-        self.access = await self.contact("acquire")
-        self.ready.set()
+        entry = self.entry(model="web_search")
+        try:
+            try:
+                await self.take_turn(_queue_of(self.scope.get("app")), entry)
+            except fair_queue.Waited as waited:
+                raise refused(waited.refusal) from None
+        except AdmissionFailure:
+            if self.refusal is not None:
+                # Kept as a row, as the door keeps a search it ran.
+                self.model = "web_search"
+            raise
 
     async def renew(self) -> None:
         async with self.lease_lock:
@@ -236,28 +479,44 @@ class ClientRequest:
 
     async def release(self) -> None:
         """Release once. A cancelled release stays unreleased, so the
-        middleware's `finally` tries again."""
-        if not self.attempted or self.guard is None:
-            return
-        async with self.lease_lock:
-            if self.released:
+        middleware's `finally` tries again. The key's place on this gateway is
+        given back after the authority's lease, so the next request of the key
+        leaving the line does not meet a lease the authority still counts."""
+        try:
+            if not self.attempted or self.guard is None:
                 return
-            with contextlib.suppress(Exception):
-                async with asyncio.timeout(2):
-                    await self.contact("release")
-            self.released = True
+            async with self.lease_lock:
+                if self.released:
+                    return
+                with contextlib.suppress(Exception):
+                    async with asyncio.timeout(2):
+                        await self.contact("release")
+                self.released = True
+        finally:
+            if self.ticket is not None and (self.released or not self.attempted):
+                self.ticket.release_key()
 
     def record_missing(self, app: Any, status: int) -> None:
         metrics = getattr(app.state, "metrics", None)
         if self.model is None or self.recorded or metrics is None:
             return
+        outcome = (
+            "refused"
+            if self.refusal is not None
+            else "served"
+            if status < 400 and self.embedding_result is not None
+            else "error"
+        )
         metrics.record(
             RequestRow(
                 started_at=self.at,
                 requested_model=self.model,
                 total_ms=int((time.perf_counter() - self.started) * 1000),
                 attempts=len(self.tries),
-                outcome="served" if status < 400 and self.embedding_result is not None else "error",
+                outcome=outcome,
+                queued_ms=self.queued_ms,
+                band=self.band,
+                refusal=self.refusal,
                 streamed=self.streamed,
                 tries=self.tries,
                 served_model=getattr(self.embedding_result, "modelId", None),
@@ -278,10 +537,57 @@ class ClientRequest:
         self.recorded = True
 
 
-async def authorize(request: Request, model: str | None = None, *, streamed: bool = False) -> None:
+async def authorize(
+    request: Request, model: str | None = None, *, streamed: bool = False, defer: bool = False
+) -> None:
     context = current.get()
     if context is not None:
-        await context.authorize(request, model, streamed)
+        await context.authorize(request, model, streamed, defer=defer)
+
+
+async def take_turn(
+    queue: fair_queue.FairQueue | None,
+    *,
+    seats: Sequence[fair_queue.Seat] = (),
+    model: str | None = None,
+    prompt: int = 0,
+    tokens: int = 0,
+    reserve: Callable[[fair_queue.Seat], None] | None = None,
+    unreserve: Callable[[], None] | None = None,
+    wait_seconds: float | None = None,
+) -> fair_queue.Ticket | None:
+    """One turn in line for the request running now (row 11): its key's turn
+    and, with `seats`, a runtime's. A request outside the client middleware
+    (a test, an internal call) waits as nobody in particular, with no key."""
+    context = current.get()
+    if context is not None:
+        return await context.take_turn(
+            queue,
+            context.entry(
+                seats=seats,
+                model=model,
+                prompt=prompt,
+                tokens=tokens,
+                reserve=reserve,
+                unreserve=unreserve,
+                wait_seconds=wait_seconds,
+            ),
+        )
+    if queue is None or not seats:
+        return None
+    entry = fair_queue.Entry(
+        seats=list(seats),
+        model=model,
+        prompt=prompt,
+        tokens=tokens,
+        reserve=reserve,
+        unreserve=unreserve,
+        wait_seconds=fair_queue.DEFAULT_WAIT_SECONDS if wait_seconds is None else wait_seconds,
+    )
+    try:
+        return await queue.wait(entry)
+    except fair_queue.Refused as exc:
+        raise refused(exc.refusal) from None
 
 
 async def reserve_search() -> None:
@@ -917,19 +1223,30 @@ class ClientAdmissionMiddleware:
             )
             if exc.kind is not None and not anthropic:
                 kind = exc.kind
-            error: dict[str, Any] = {"error": {"type": kind, "message": exc.message}}
+            if anthropic and exc.code is not None and status == 503:
+                # The queue's 503s are load, in the type Anthropic's SDKs back off on.
+                kind = "overloaded_error"
+            message = exc.message
+            if response_started and exc.code is not None and exc.retry:
+                # A stream's head is sent, so no `Retry-After` reaches the client:
+                # the words carry it (row 11).
+                message = f"{message} Retry after {exc.retry} s."
+            error: dict[str, Any] = {"error": {"type": kind, "message": message}}
             if exc.param is not None:
                 error["error"]["param"] = exc.param
+            if exc.code is not None and not anthropic:
+                error["error"]["code"] = exc.code
             if anthropic:
                 error["type"] = "error"
             if gemini.is_request(scope):
-                error = gemini.error_body(status, exc.message)
+                error = gemini.error_body(status, message)
             if not response_started:
-                await JSONResponse(
-                    error,
-                    status_code=status,
-                    headers={"Retry-After": exc.retry} if exc.retry else None,
-                )(scope, incoming, outgoing)
+                headers = {"Retry-After": exc.retry} if exc.retry else {}
+                if exc.code is not None:
+                    headers[REASON_HEADER] = exc.code
+                await JSONResponse(error, status_code=status, headers=headers or None)(
+                    scope, incoming, outgoing
+                )
             elif not response_complete:
                 if scope["path"] == "/v1/responses":
                     # `response.failed`, never a bare `error` event: Codex
@@ -939,7 +1256,7 @@ class ClientAdmissionMiddleware:
 
                     frame = responses.failed_frame(
                         responses.new_id(uuid.UUID(context.id)),
-                        exc.message,
+                        message,
                         code=responses.middleware_code(exc.status),
                     )
                 else:

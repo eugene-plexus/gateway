@@ -442,8 +442,8 @@ FIELDS: list[ConfigField] = [
         key="swapWaitSeconds",
         label="Start-on-demand wait",
         description=(
-            "How long a request waits for a stopped start-on-demand runtime to "
-            "become ready.\n\n"
+            "How long a request waits for a start-on-demand runtime, or one already "
+            "starting, to become ready.\n\n"
             "After that the next fallback is tried, or a 503 is returned. Loading "
             "varies by engine: llama.cpp loads a small model in seconds and a 30B "
             "model from disk in about a minute; vLLM can take minutes. The response "
@@ -454,6 +454,56 @@ FIELDS: list[ConfigField] = [
         default=120,
         minimum=5,
         maximum=900,
+    ),
+    ConfigField(
+        key="queueWaitSeconds",
+        label="Longest wait in line",
+        description=(
+            "How long a request waits in line for its key's turn or for room on a "
+            "busy model.\n\n"
+            "Requests leave by priority, then by person in turns, then by arrival. "
+            "After this long, a request waiting for room moves to the slot's next "
+            "target when it has one, and is refused when it does not. The Metrics "
+            "page shows each wait and each move."
+        ),
+        category="lifecycle",
+        valueType=ConfigValueType.duration,
+        default=60,
+        minimum=5,
+        maximum=600,
+    ),
+    ConfigField(
+        key="queueMaxRequests",
+        label="Requests that may wait",
+        description=(
+            "How many requests may wait in this gateway's line at once.\n\n"
+            "When the line is full, a request of a higher priority takes the place "
+            "of the newest one of the lowest priority, which is refused. Any other "
+            "request is refused with a time to retry. Each key also has its own "
+            "limit on how many of its requests may wait."
+        ),
+        category="lifecycle",
+        valueType=ConfigValueType.integer,
+        default=256,
+        minimum=16,
+        maximum=4096,
+    ),
+    ConfigField(
+        key="answerReserveFloorTokens",
+        label="Smallest room kept for an answer",
+        description=(
+            "The fewest tokens a request keeps free for its answer in a model's "
+            "shared context.\n\n"
+            "Each request keeps room for its conversation's long answers (95 of "
+            "100 are shorter), or 4,096 tokens for a new conversation, and never "
+            "less than this. Raise it when the Metrics page counts many answers "
+            "that ran out of room."
+        ),
+        category="lifecycle",
+        valueType=ConfigValueType.integer,
+        default=1024,
+        minimum=0,
+        maximum=131072,
     ),
     ConfigField(
         key="idleCheckSeconds",
