@@ -328,7 +328,9 @@ async def test_reporter_reports_open_drains_only() -> None:
 
     reporter.on_draining = moved
     assert await reporter.report_once() == [("a", "r")]
-    assert [(name, body["running"], node) for _agent, name, body, node in sent] == [("r", 0, "a")]
+    assert [(name, body["running"], body["state"], node) for _agent, name, body, node in sent] == [
+        ("r", 0, "draining", "a")
+    ]
     assert hooked == ["r"], "row 44's hook runs before a 0 is reported"
 
 

@@ -312,6 +312,9 @@ class DrainReport:
     idle_seconds: float | None
     other_copies: int
     covered: bool
+    #: The drain state this gateway's table holds: the agent counts a 0 only
+    #: from a table that already shows the runtime draining.
+    state: str | None = None
 
     def body(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -319,6 +322,8 @@ class DrainReport:
             "otherCopies": self.other_copies,
             "covered": self.covered,
         }
+        if self.state is not None:
+            out["state"] = self.state
         if self.idle_seconds is not None:
             out["idleSeconds"] = round(max(0.0, self.idle_seconds), 1)
         return out
@@ -350,6 +355,7 @@ def report_for(table: Any, facts: Any) -> DrainReport:
         idle_seconds=table.idle_seconds(facts.key),
         other_copies=len(live),
         covered=bool(ready) and demand <= capacity,
+        state=_drain_state(facts),
     )
 
 
