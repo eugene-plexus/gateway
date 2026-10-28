@@ -726,7 +726,14 @@ async def _await_starting(
 
     async def poll() -> str | None:
         await table.refresh_if_stale(1.0)
-        return next((r.status for r in table.runtimes() if r.key == facts.key), None)
+        now = next((r for r in table.runtimes() if r.key == facts.key), None)
+        if now is None:
+            return None
+        # Row 13: draining to restart on a new build is coming up, as is the
+        # stop between the drain and the start.
+        if now.restarting or (now.status == "stopped" and facts.restarting):
+            return "starting"
+        return now.status
 
     seat = fair_queue.Seat(runtime=facts.key, model=facts.alias or facts.name, node=facts.node)
     context = admission.current.get()

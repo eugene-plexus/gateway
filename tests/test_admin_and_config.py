@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -135,24 +134,23 @@ def test_probe_rejects_an_invalid_url(client: TestClient) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_restart_returns_202_and_schedules_an_exit(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    calls: list[float] = []
-
-    class _Loop:
-        def call_later(self, delay: float, _fn: object) -> None:
-            calls.append(delay)
-
-    monkeypatch.setattr(asyncio, "get_event_loop", lambda: _Loop())
-    response = client.post("/v1/admin/restart")
-
-    assert response.status_code == 202
-    body = response.json()
-    assert body["scheduled"] is True
-    assert body["delayMs"] > 0
-    # Scheduled, not executed — the response has to flush first.
-    assert calls == [body["delayMs"] / 1000.0]
+def test_restart_returns_202_and_exits_once_drained(app: FastAPI) -> None:
+    """Row 13: the restart drains first, then asks the server to exit; with
+    nothing in flight that is at once."""
+    exits: list[bool] = []
+    app.state.request_exit = lambda: exits.append(True)
+    with TestClient(app) as client:
+        response = client.post("/v1/admin/restart")
+        assert response.status_code == 202
+        body = response.json()
+        assert body["scheduled"] is True
+        assert "then restarting" in body["message"]
+        for _ in range(50):
+            if exits:
+                break
+            asyncio.run(asyncio.sleep(0.02))
+        assert client.get("/v1/admin/drain").json()["state"] == "exiting"
+    assert exits == [True]
 
 
 # --------------------------------------------------------------------------- #
@@ -195,6 +193,8 @@ def test_config_schema_lists_the_gateway_fields(client: TestClient) -> None:
         "queueMaxRequests",
         "answerReserveFloorTokens",
         "idleCheckSeconds",
+        # Row 13: how long a restart lets the answers in flight finish.
+        "shutdownDrainSeconds",
         "controlUrl",
         "metricsEnabled",
         "metricsRetentionDays",

@@ -161,3 +161,43 @@ def require_operator(
     config or read what every other caller asked it, and neither may
     any component's token."""
     return _validate(request, creds, front_door=False)
+
+
+def require_operator_or_local_agent(
+    request: Request,
+    creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
+) -> tokens.Claims | None:
+    """An operator session, or **this machine's own agent** speaking for
+    itself: a service token its key minted with `sub: agent`, addressed to
+    this machine alone (row 13, `/v1/admin/drain`).
+
+    The agent drains its gateway before every stop, which works where a
+    console signal cannot be sent (the Windows service). Nothing else: not
+    this machine's other components (a driver's token is `sub: inference-
+    driver`), not another machine's agent (its `iss` is its own), and never
+    a client key."""
+    auth: AuthState = request.app.state.auth_state
+    if auth.auth_disabled:
+        return None
+    if creds is None or not creds.credentials:
+        raise _problem(
+            status.HTTP_401_UNAUTHORIZED,
+            "Missing token",
+            "Provide a bearer token via the Authorization: Bearer header.",
+        )
+    try:
+        claims = auth.verify(creds.credentials, classes=(tokens.TYP_SESSION, tokens.TYP_SERVICE))
+    except tokens.TokenError as e:
+        raise _problem(
+            status.HTTP_401_UNAUTHORIZED, "Invalid token", f"Bearer token rejected: {e}"
+        ) from e
+    if claims.is_session:
+        return claims
+    if claims.sub == tokens.SUB_AGENT and claims.is_local_service(str(auth.recipient)):
+        return claims
+    raise _problem(
+        status.HTTP_401_UNAUTHORIZED,
+        "Invalid token",
+        f"A {claims.sub!r} service token from {claims.iss!r} may not drain this gateway; "
+        "only an operator or this machine's own agent may.",
+    )

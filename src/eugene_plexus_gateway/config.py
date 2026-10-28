@@ -501,6 +501,22 @@ FIELDS: list[ConfigField] = [
         maximum=300,
     ),
     ConfigField(
+        key="shutdownDrainSeconds",
+        label="Answers finish on a restart for",
+        description=(
+            "How long a restart or a stop lets the answers in flight finish.\n\n"
+            "New requests are refused with a time to retry. An answer still running "
+            "after this long is cut, and the Metrics page counts it as cut. The agent "
+            "waits this long plus 5 seconds before it ends a gateway that has not "
+            "exited, and at most 20 seconds when the agent itself is stopping."
+        ),
+        category="lifecycle",
+        valueType=ConfigValueType.duration,
+        default=120,
+        minimum=0,
+        maximum=900,
+    ),
+    ConfigField(
         key="controlUrl",
         label="Control root",
         description=(

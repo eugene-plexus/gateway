@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import os
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, status
 
+from .. import drain
 from .._generated.models import (
     BackendKind,
     DriverHealth,
@@ -19,6 +18,10 @@ from .._generated.models import (
     RoutingTableView,
     RuntimeSwitchRequest,
 )
+from .._generated.models import (
+    GatewayDrain as GatewayDrainView,
+)
+from ..drain import GatewayDrain
 from ..driver_client import DriverClient, HttpDriverClient
 from ..routing import RoutingTable
 
@@ -207,30 +210,42 @@ async def probe_driver(request: Request, body: DriverProbeRequest) -> DriverHeal
         await client.aclose()
 
 
-# Long enough for the 202 response body to flush back to the client over
-# a slow LAN, short enough that the operator doesn't sit waiting.
-_RESTART_DELAY_MS = 500
+#: Row 13: the gateway's own drain. On its own router, because it takes this
+#: machine's agent as well as an operator (`require_operator_or_local_agent`).
+drain_router = APIRouter(tags=["admin"])
+
+
+def _drain(request: Request) -> GatewayDrain:
+    found = drain.of(request.app)
+    if found is None:
+        raise HTTPException(status_code=503, detail="The gateway's drain is not set up.")
+    return found
 
 
 @router.post("/v1/admin/restart", response_model=RestartResult, status_code=202)
-async def restart() -> RestartResult:
-    """Schedule a process exit so a supervisor can relaunch with new config.
+async def restart(request: Request) -> RestartResult:
+    """Restart once the answers in flight finish, so a supervisor relaunches
+    the gateway with new config (`requiresRestart` keys are read at startup).
 
-    Mirrors the inference-driver restart endpoint. The gateway only
-    re-reads `requiresRestart: true` config keys at startup; this is the
-    UI's mechanism for completing a config-change flow.
+    Row 13: it drains first (`POST /v1/admin/drain`). Until then it exited
+    500 ms after answering and cut every stream.
     """
-    log.warning("restart requested via /v1/admin/restart; exiting in %dms", _RESTART_DELAY_MS)
-
-    loop = asyncio.get_event_loop()
-    loop.call_later(_RESTART_DELAY_MS / 1000.0, lambda: os._exit(0))
-
+    view = _drain(request).start()
+    log.warning("restart requested via /v1/admin/restart; draining first")
     return RestartResult(
         scheduled=True,
-        delayMs=_RESTART_DELAY_MS,
-        message=(
-            f"Process exiting in {_RESTART_DELAY_MS}ms. A supervisor (systemd, "
-            "docker, deploy launcher, …) is expected to relaunch it; in v0.1 "
-            "personal-use installs without one, relaunch manually."
-        ),
+        delayMs=0,
+        message=view.message or "Restarting once the answers in flight finish.",
     )
+
+
+@drain_router.post("/v1/admin/drain", response_model=GatewayDrainView, status_code=202)
+async def drain_gateway(request: Request) -> GatewayDrainView:
+    """Refuse new inference, finish what runs (up to `shutdownDrainSeconds`),
+    cut what is left, then exit 0. A second call answers the drain running."""
+    return _drain(request).start()
+
+
+@drain_router.get("/v1/admin/drain", response_model=GatewayDrainView)
+async def get_gateway_drain(request: Request) -> GatewayDrainView:
+    return _drain(request).view()

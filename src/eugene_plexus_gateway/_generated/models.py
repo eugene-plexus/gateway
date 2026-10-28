@@ -4381,6 +4381,8 @@ class MetricOutcome(StrEnum):
     """
     `refused` (row 11, schema v14): the queue turned the request away
     before any backend was asked, for the `refusal` the row names.
+    `cut` (row 13): the gateway was draining to restart or stop, and
+    the answer was still running when `shutdownDrainSeconds` ran out.
     Named rather than inline, so a new value cannot rename an enum.
 
     """
@@ -4388,6 +4390,39 @@ class MetricOutcome(StrEnum):
     served = 'served'
     error = 'error'
     refused = 'refused'
+    cut = 'cut'
+
+
+class GatewayDrainState(StrEnum):
+    """
+    `serving`: no drain. `draining`: new inference refused, answers in
+    flight finishing. `exiting`: done; the process is exiting.
+
+    """
+
+    serving = 'serving'
+    draining = 'draining'
+    exiting = 'exiting'
+
+
+class GatewayDrain(BaseModel):
+    """
+    The gateway's own drain (row 13).
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    state: GatewayDrainState
+    running: int = Field(
+        ..., description='Inference requests in flight on this gateway now.', ge=0
+    )
+    startedAt: AwareDatetime | None = None
+    deadline: AwareDatetime | None = Field(
+        None, description='When the answers still running are cut.'
+    )
+    cut: int | None = Field(None, description='Answers cut at the deadline.', ge=0)
+    message: str | None = None
 
 
 class RetryDisposition1(StrEnum):

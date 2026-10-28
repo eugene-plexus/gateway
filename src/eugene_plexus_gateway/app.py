@@ -27,7 +27,9 @@ from .client_keys import ClientKeyGuard
 from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS, ConfigStore
 from .control_tokens import SpecialTokenSpellings
 from .cors import FrontDoorCors
-from .dependencies import require_operator
+from .dependencies import require_operator, require_operator_or_local_agent
+from .drain import DEFAULT_SECONDS as DRAIN_SECONDS
+from .drain import DrainMiddleware, DrainReporter, GatewayDrain
 from .library_cache import LibraryCache
 from .lifecycle import AgentLifecycleClient, LifecycleManager
 from .metrics import MetricsStore
@@ -154,6 +156,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     profiles: ProfileDefaults | None = None
     spellings: SpecialTokenSpellings | None = None
     lifecycle: LifecycleManager | None = None
+    reporter: DrainReporter | None = None
     saved = LibraryCache(settings.config_file.parent / "library-cache.json")
     app.state.library_cache = saved
     if not hasattr(app.state, "routing"):
@@ -205,12 +208,19 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
             await lifecycle.start()
             app.state.lifecycle = lifecycle
+            # Row 13: this gateway's reports on runtimes whose agents drain them.
+            reporter = DrainReporter(table, report=lifecycle.client.report_drain)
+            await reporter.start()
+            app.state.drain_reporter = reporter
 
     # Row 11: a stop signal refuses the line's waiters at once (`__main__`).
     app.state.loop = asyncio.get_running_loop()
     try:
         yield
     finally:
+        if reporter is not None:
+            await reporter.aclose()
+        await app.state.gateway_drain.aclose()
         # Row 11: every waiter is refused `shutting_down`, never left hanging.
         close_queue(app)
         store_client = getattr(app.state, "store_client", None)
@@ -237,10 +247,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 def close_queue(app: FastAPI) -> None:
     """Refuse every request waiting in the fair queue `shutting_down`, and every
-    later one (row 11). Row 13 adds the drain of what runs."""
+    later one (row 11). Row 13's drain of what runs is `drain.GatewayDrain`."""
     routing = getattr(app.state, "routing", None)
     if routing is not None:
         fair_queue.of(routing).close()
+
+
+def _drain_seconds(app: FastAPI) -> float:
+    """`shutdownDrainSeconds` now (row 13), read when a drain starts."""
+    store = getattr(app.state, "config_store", None)
+    value = store.get("shutdownDrainSeconds") if store is not None else None
+    return float(value) if isinstance(value, int | float) and value >= 0 else DRAIN_SECONDS
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -257,6 +274,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=_lifespan,
     )
     app.state.settings = settings
+    # Row 13: a restart or a stop finishes the answers in flight first. The
+    # server's own exit hook is set by `__main__`; unset, it exits directly.
+    app.state.gateway_drain = GatewayDrain(app, seconds=lambda: _drain_seconds(app))
 
     # Health stays unauthenticated — supervisors and load balancers need
     # to probe it without holding credentials.
@@ -269,6 +289,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(config_routes.router, dependencies=operator_only)
     app.include_router(roles_routes.router, dependencies=operator_only)
     app.include_router(admin_routes.router, dependencies=operator_only)
+    # Row 13: the drain also takes this machine's own agent, which drains its
+    # gateway before every stop (the reviewer's first target).
+    app.include_router(
+        admin_routes.drain_router, dependencies=[Depends(require_operator_or_local_agent)]
+    )
     app.include_router(info_routes.router, dependencies=operator_only)
     # Metrics are operator-only too, and unlike other reads they do not
     # accept a service token: no component needs them, and model names
@@ -300,6 +325,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     from .gemini import BODY_PATHS, QueryKeyRedaction
     from .gemini_body_limit import GeminiBodyLimit
 
+    # Row 13: added first, so it runs inside the admission middleware, which
+    # answers its refusals and cuts in each door's own shape.
+    app.add_middleware(DrainMiddleware)
     app.add_middleware(ClientAdmissionMiddleware)
     app.add_middleware(FrontDoorCors)
 
