@@ -44,6 +44,7 @@ from urllib.parse import quote
 
 import httpx
 
+from . import drain
 from ._http import internal_client
 from .outbound import Outbound
 from .routing import READY, Key, Resolution, RoutingTable, _RuntimeFacts
@@ -128,6 +129,33 @@ class AgentLifecycleClient:
             log.info("admission dry run at %s failed: %s", agent_url, e)
             return None
 
+    async def report_drain(
+        self, agent_url: str, name: str, body: dict[str, Any], node: str | None = None
+    ) -> bool:
+        """This gateway's report on a runtime whose agent holds a drain open
+        (row 13): what it has running there, and what it sees of the model's
+        other copies. Whether the agent took it."""
+        try:
+            response = await self._client.post(
+                f"{agent_url.rstrip('/')}/v1/runtimes/{quote(name, safe='')}/drain/report",
+                json=body,
+                headers=await self._headers(node),
+            )
+        except httpx.HTTPError as e:
+            log.info("could not report the drain of %r to %s: %s", name, agent_url, e)
+            return False
+        if response.status_code >= 400:
+            # 409: the drain ended between the read and the report.
+            log.debug(
+                "agent %s did not take the drain report for %r: %d %s",
+                agent_url,
+                name,
+                response.status_code,
+                response.text[:200],
+            )
+            return False
+        return True
+
     async def runtime(
         self, agent_url: str, name: str, *, node: str | None = None
     ) -> dict[str, Any] | None:
@@ -198,6 +226,11 @@ class LifecycleManager:
         """Runtimes this gateway unloaded for idleness, most recent last.
         For the admin view and the acceptance run; not authoritative."""
 
+    @property
+    def client(self) -> AgentLifecycleClient:
+        """The agent client, which the drain reporter shares (row 13)."""
+        return self._client
+
     async def start(self) -> None:
         if self._task is None:
             self._task = asyncio.create_task(self._idle_loop(), name="lifecycle-idle")
@@ -241,16 +274,19 @@ class LifecycleManager:
                 raise ValueError("The source must be ready and the target stopped.")
             agent = self._table.agent_url_for(old)
             with self._table.stopping(old.key), self._table.stopping(new.key):
-                deadline = time.perf_counter() + 30
-                while self._table.runtime_inflight(old.key) or self._table.runtime_inflight(
-                    new.key
+                # Row 13: the wait every drain shares.
+                if not await drain.wait_inflight(
+                    lambda: (
+                        self._table.runtime_inflight(old.key)
+                        + self._table.runtime_inflight(new.key)
+                    ),
+                    30,
+                    poll=self._poll,
                 ):
-                    if time.perf_counter() >= deadline:
-                        raise ValueError(
-                            "The current answer is still running. Nothing was stopped; "
-                            "try again when it finishes."
-                        )
-                    await asyncio.sleep(self._poll)
+                    raise ValueError(
+                        "The current answer is still running. Nothing was stopped; "
+                        "try again when it finishes."
+                    )
                 admission = await self._client.admission(agent, new.spec, node=node)
                 if admission is None:
                     raise ValueError("Cannot check the target runtime. Nothing was stopped.")

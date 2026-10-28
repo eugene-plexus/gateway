@@ -80,7 +80,8 @@ def main() -> None:
 
 
 class _Server(uvicorn.Server):
-    """uvicorn, refusing the fair queue's waiters as a stop begins (row 11).
+    """uvicorn, refusing the fair queue's waiters as a stop begins (row 11), and
+    the exit a finished drain asks for (row 13).
 
     uvicorn waits for every request in flight before the app's lifespan ends,
     and a request waiting in line is one: closed only there, a stop with
@@ -91,6 +92,12 @@ class _Server(uvicorn.Server):
     def __init__(self, config: uvicorn.Config, app: Any) -> None:
         super().__init__(config)
         self._app = app
+        # Row 13: a drain that has finished asks the server to exit, so the
+        # lifespan closes normally and the process exits 0.
+        app.state.request_exit = self.request_exit
+
+    def request_exit(self) -> None:
+        self.should_exit = True
 
     def handle_exit(self, sig: int, frame: FrameType | None) -> None:
         loop = getattr(self._app.state, "loop", None)

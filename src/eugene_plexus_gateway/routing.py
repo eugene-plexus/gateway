@@ -217,6 +217,15 @@ DEFAULT_PLACEMENT = SPREAD
 # model would have been told "none of its runtimes asked to be started
 # on demand", which is both false and unactionable.
 COMING_UP = frozenset({"copying", "starting", "loading"})
+#: How often the table refreshes while a runtime's agent holds a drain open
+#: (row 13), whatever `routingRefreshSeconds` says.
+DRAIN_REFRESH_SECONDS = 2.0
+#: Why a runtime drains, as the words of its ineligible reason.
+_DRAIN_WHY = {
+    "update": " for an update",
+    "check": " for a check",
+    "maintenance": " for maintenance",
+}
 
 # The fields of the agent's `Runtime` that are also its `RuntimeSpec`.
 # Carried so a wake can ask the agent's admission dry run about exactly
@@ -283,11 +292,29 @@ class _RuntimeFacts:
     #: `capabilities.contextPoolTokens`. None when they do not share one,
     #: or the agent cannot say, and then the gateway does not budget it.
     context_pool: int | None = None
+    #: Row 13: the drain its agent holds open, as the agent reports it
+    #: (`Runtime.drain`). Raw JSON, like the rest of this.
+    drain: dict[str, Any] | None = None
 
     @property
     def key(self) -> Key:
         """`(node, name)` — how every map in this module keys it."""
         return (self.node, self.name)
+
+    @property
+    def drain_open(self) -> bool:
+        """Whether its agent holds a drain open on it, waiting or draining."""
+        return isinstance(self.drain, dict) and self.drain.get("state") not in (None, "cancelled")
+
+    @property
+    def restarting(self) -> bool:
+        """Draining to restart (row 13): counted as coming up, so a request
+        whose only runtime it is waits in line rather than being refused."""
+        return (
+            self.status == "draining"
+            and isinstance(self.drain, dict)
+            and self.drain.get("then") == "restart"
+        )
 
 
 #: Which capability confirms each kind of attachment.
@@ -461,6 +488,10 @@ class _Backend:
         assert self.runtime is not None
         if self.stopping.get(self.runtime.key, 0) > 0:
             return f"runtime {self.runtime.name!r} is being stopped"
+        if self.runtime.status == "draining":
+            # Row 13: out of routing while its answers finish, and why.
+            why = _DRAIN_WHY.get(str((self.runtime.drain or {}).get("reason")), "")
+            return f"runtime {self.runtime.name!r} is draining{why}"
         return f"runtime {self.runtime.name!r} is {self.runtime.status or 'unknown'}"
 
     @property
@@ -798,8 +829,9 @@ class Resolution:
         return [r for r in self.runtimes() if r.status == STOPPED and r.start_on_demand]
 
     def waking(self) -> list[_RuntimeFacts]:
-        """Runtimes coming up on their own, so a caller should wait."""
-        return [r for r in self.runtimes() if r.status in COMING_UP]
+        """Runtimes coming up on their own, so a caller should wait: and,
+        since row 13, one draining to restart on a new build."""
+        return [r for r in self.runtimes() if r.status in COMING_UP or r.restarting]
 
 
 class RoutingTable:
@@ -993,10 +1025,19 @@ class RoutingTable:
             await self._json_client.aclose()
         self._snapshot = _Snapshot(agents={None: self._agent_url})
 
+    def refresh_interval(self) -> float:
+        """`routingRefreshSeconds`, or 2 s while an agent holds a drain open
+        on a runtime here (row 13): the agent waits on this gateway's
+        reports, and the report follows each refresh."""
+        seconds = float(self._refresh_seconds())
+        if any(f.drain_open for f in self.runtimes()):
+            return min(seconds, DRAIN_REFRESH_SECONDS)
+        return seconds
+
     async def _refresh_loop(self) -> None:
         try:
             while True:
-                await asyncio.sleep(self._refresh_seconds())
+                await asyncio.sleep(self.refresh_interval())
                 try:
                     await self.refresh()
                 except Exception as e:
@@ -1649,6 +1690,7 @@ class RoutingTable:
                 stop_reason=str(entry["stopReason"]) if entry.get("stopReason") else None,
                 spec={k: entry[k] for k in _SPEC_FIELDS if entry.get(k) is not None},
                 context_pool=pool if isinstance(pool, int) and pool > 0 else None,
+                drain=entry["drain"] if isinstance(entry.get("drain"), dict) else None,
             )
         return facts, True
 
