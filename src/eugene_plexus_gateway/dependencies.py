@@ -170,19 +170,27 @@ def require_operator(
     return _validate(request, creds, front_door=False)
 
 
+#: Row 13 review: the token this machine's agent mints for a drain alone. Its
+#: own `sub`, so the agent's year-long `sub: agent` token (which the Library
+#: also accepts) cannot drain a gateway, and short-lived.
+DRAIN_SUB = "gateway-drain"
+DRAIN_TOKEN_MAX_SECONDS = 300
+
+
 def require_operator_or_local_agent(
     request: Request,
     creds: HTTPAuthorizationCredentials | None = Depends(_bearer_scheme),
 ) -> tokens.Claims | None:
-    """An operator session, or **this machine's own agent** speaking for
-    itself: a service token its key minted with `sub: agent`, addressed to
-    this machine alone (row 13, `/v1/admin/drain`).
+    """An operator session, or **this machine's own agent** asking for a
+    drain: a service token its key minted with `sub: gateway-drain`, addressed
+    to this machine alone, that lives at most 5 minutes (row 13,
+    `/v1/admin/drain`).
 
     The agent drains its gateway before every stop, which works where a
     console signal cannot be sent (the Windows service). Nothing else: not
-    this machine's other components (a driver's token is `sub: inference-
-    driver`), not another machine's agent (its `iss` is its own), and never
-    a client key."""
+    the agent's own `sub: agent` token, not this machine's other components,
+    not another machine's agent (its `iss` is its own), and never a client
+    key."""
     auth: AuthState = request.app.state.auth_state
     if auth.auth_disabled:
         return None
@@ -200,11 +208,15 @@ def require_operator_or_local_agent(
         ) from e
     if claims.is_session:
         return claims
-    if claims.sub == tokens.SUB_AGENT and claims.is_local_service(str(auth.recipient)):
+    if (
+        claims.sub == DRAIN_SUB
+        and claims.is_local_service(str(auth.recipient))
+        and claims.exp - claims.iat <= DRAIN_TOKEN_MAX_SECONDS
+    ):
         return claims
     raise _problem(
         status.HTTP_401_UNAUTHORIZED,
         "Invalid token",
         f"A {claims.sub!r} service token from {claims.iss!r} may not drain this gateway; "
-        "only an operator or this machine's own agent may.",
+        "only an operator or this machine's own agent, with a drain token, may.",
     )

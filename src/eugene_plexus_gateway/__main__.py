@@ -97,6 +97,12 @@ class _Server(uvicorn.Server):
         app.state.request_exit = self.request_exit
 
     def request_exit(self) -> None:
+        # Row 13 review #1: the connections still open get a bounded grace,
+        # then uvicorn ends them; without one, a client that stopped reading
+        # kept the process alive with its port closed.
+        from .drain import EXIT_GRACE_SECONDS
+
+        self.config.timeout_graceful_shutdown = EXIT_GRACE_SECONDS
         self.should_exit = True
 
     def handle_exit(self, sig: int, frame: FrameType | None) -> None:

@@ -151,6 +151,65 @@ async def test_restart_finishes_open_streams(
         await asyncio.gather(serving, return_exceptions=True)
 
 
+class Flood(FakeDriverClient):
+    """An answer without end, as a long one to a client that stopped reading
+    looks to the gateway."""
+
+    async def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]:
+        self.calls.append(request)
+        while True:
+            yield StreamEvent(text="x" * 65536)
+            await asyncio.sleep(0)
+
+
+async def test_a_client_that_stops_reading_does_not_keep_the_gateway_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review #1: the drain's exit waited for every connection to close, so a
+    client that stopped reading (or a download the drain does not count) kept
+    the process alive with its port closed, forever. The exit now gives open
+    connections `EXIT_GRACE_SECONDS`, then ends them."""
+    monkeypatch.setattr(drain_module, "EXIT_GRACE_SECONDS", 1)
+    (tmp_path / "gateway.yaml").write_text("shutdownDrainSeconds: 0\n", encoding="utf-8")
+    app = create_app(
+        settings=Settings(
+            config_file=tmp_path / "gateway.yaml", metrics_file=tmp_path / "m.sqlite3"
+        )
+    )
+    app.state.routing = make_routing_table(Flood(name="slow", model_id=MODEL))
+    port = _free_port()
+    server = _Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error", lifespan="on"), app
+    )
+    serving = asyncio.create_task(server.serve())
+    stalled = socket.socket()
+    try:
+        for _ in range(200):
+            if server.started:
+                break
+            await asyncio.sleep(0.05)
+        body = json.dumps(_chat(True)).encode()
+        stalled.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        stalled.connect(("127.0.0.1", port))
+        stalled.sendall(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: gw\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+        await asyncio.sleep(1.0)  # the answer streams into a socket nobody reads
+        async with httpx.AsyncClient(timeout=10, trust_env=False) as client:
+            restart = await client.post(f"http://127.0.0.1:{port}/v1/admin/restart")
+        assert restart.status_code == 202, restart.text
+        done, _ = await asyncio.wait({serving}, timeout=15)
+        assert done, "the gateway still runs: a client that stopped reading held it"
+    finally:
+        stalled.close()
+        server.force_exit = True
+        server.should_exit = True
+        await asyncio.gather(serving, return_exceptions=True)
+
+
 async def test_stream_still_open_at_the_limit_is_cut(tmp_path: Path) -> None:
     """Past `shutdownDrainSeconds` a stream gets its door's error frame, its
     metrics row says `cut`, and the process exits anyway."""
@@ -196,9 +255,13 @@ async def test_stream_still_open_at_the_limit_is_cut(tmp_path: Path) -> None:
 
 
 def test_only_local_agent_token_may_drain_gateway(settings: Settings, install: FakeInstall) -> None:
-    """`/v1/admin/drain` takes an operator session, or this machine's own
-    agent's token for itself. Not a gateway's or a driver's token, not
-    another machine's agent, not a client key."""
+    """`/v1/admin/drain` takes an operator session, or the short-lived token
+    this machine's agent mints for a drain alone (`sub: gateway-drain`, at most
+    5 minutes). Not the agent's year-long `sub: agent` token, which the Library
+    also accepts (review note), nor a gateway's or a driver's token, another
+    machine's, or a client key."""
+    from eugene_plexus_gateway.dependencies import DRAIN_SUB
+
     app = create_app(settings=settings)
     app.state.routing = make_routing_table(FakeDriverClient(name="d"))
     app.state.auth_state = install.auth_state()
@@ -209,9 +272,11 @@ def test_only_local_agent_token_may_drain_gateway(settings: Settings, install: F
 
     with TestClient(app) as c:
         for refused in (
+            install.service("agent"),
+            install.service(DRAIN_SUB, ttl=3600),
             install.service("gateway"),
             install.service("inference-driver"),
-            install.foreign_service("agent"),
+            install.foreign_service(DRAIN_SUB, ttl=60),
             install.client_key(),
         ):
             assert c.get("/v1/admin/drain", headers=bearer(refused)).status_code == 401
@@ -220,13 +285,12 @@ def test_only_local_agent_token_may_drain_gateway(settings: Settings, install: F
         assert c.get("/v1/admin/drain", headers=bearer(install.session())).json()["state"] == (
             "serving"
         )
-        started = c.post("/v1/admin/drain", headers=bearer(install.service("agent")))
+        drain = install.service(DRAIN_SUB, ttl=60)
+        started = c.post("/v1/admin/drain", headers=bearer(drain))
         assert started.status_code == 202, started.text
         assert started.json()["state"] in ("draining", "exiting")
         # Restart stays an operator's: the agent drains, it does not restart.
-        assert c.post(
-            "/v1/admin/restart", headers=bearer(install.service("agent"))
-        ).status_code == (401)
+        assert c.post("/v1/admin/restart", headers=bearer(drain)).status_code == 401
 
 
 def test_config_and_health_answer_while_draining(settings: Settings) -> None:

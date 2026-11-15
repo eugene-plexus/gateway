@@ -50,6 +50,10 @@ log = logging.getLogger(__name__)
 DEFAULT_SECONDS = 120.0
 #: How long a cut request is given to send its error frame and end.
 CUT_SETTLE_SECONDS = 5.0
+#: Once the drain is over, how long the server waits for connections still open
+#: (a client that stopped reading, a download the drain does not count) before
+#: it ends them (review #1): an exit must not wait on a client.
+EXIT_GRACE_SECONDS = 10
 #: What a drain reporter waits between reports while a drain is open.
 REPORT_SECONDS = 2.0
 #: The runtime drain states in which a gateway reports.
