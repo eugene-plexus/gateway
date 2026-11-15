@@ -235,6 +235,38 @@ class _Recording:
     strategy: str | None = None
     candidates: list[CandidateRow] = dc_field(default_factory=list)
     streamed: bool = False
+    #: Which key placed it (gateway#19): `chain`, `client`, `session`, `start`.
+    affinity_key: str | None = None
+
+
+def _affinity_kind(key: str | None, session: str | None) -> str | None:
+    """The kind of key `affinity.key_for` made, from its own prefix: `c:` a
+    stored conversation's or a chain's first response, `k:` the caller's
+    `prompt_cache_key` or (when `session` was given) Claude Code's session id,
+    `f:` the hash of the conversation's opening words. Never the key itself."""
+    if not key:
+        return None
+    if key.startswith("c:"):
+        return "chain"
+    if key.startswith("k:"):
+        return "session" if session else "client"
+    return "start"
+
+
+def _door_path() -> str | None:
+    context = admission.current.get()
+    return str(context.scope.get("path")) if context is not None else None
+
+
+def _trace_parent() -> str | None:
+    """The caller's `traceparent`, for a span that continues its trace."""
+    context = admission.current.get()
+    if context is None:
+        return None
+    for name, value in context.scope.get("headers", ()):
+        if name == b"traceparent":
+            return str(value.decode("latin-1"))[:128]
+    return None
 
 
 def _record(
@@ -245,7 +277,8 @@ def _record(
     | image_doors.ImageAsk
     | video_doors.VideoAsk
     | moderation_door.ModerationAsk
-    | rerank_door.RerankAsk,
+    | rerank_door.RerankAsk
+    | SystemOneRequest,
     tries: list[AttemptRow],
     *,
     served_model: str | None = None,
@@ -339,6 +372,9 @@ def _record(
                 band=context.band if context else None,
                 tier_moves=getattr(getattr(client, "_inner", client), "tier_moves", None),
                 outran_reserve=getattr(getattr(client, "_inner", client), "outran_reserve", None),
+                affinity_key=rec.affinity_key,
+                path=_door_path(),
+                trace_parent=_trace_parent(),
             )
         )
         if (context := admission.current.get()) is not None:
@@ -1441,6 +1477,12 @@ async def _prepare(
         # Row 54: a stored conversation's id or a chain's first response, first.
         chain=getattr(request.state, "affinity_chain", None),
     )
+    # gateway#19: the kind of key that placed it, for its metrics row.
+    placed_by = (
+        _affinity_kind(conversation, getattr(request.state, "affinity_key", None))
+        if table.affinity_on()
+        else None
+    )
     client = table.pick(resolution, needs=needs, surface=only, affinity=conversation)
     if client is None and await table.refresh_if_stale():
         refreshed = True
@@ -1655,6 +1697,7 @@ async def _prepare(
             strategy=table.placement() if table is not None else None,
             candidates=considered,
             streamed=bool(body.stream),
+            affinity_key=placed_by,
         ),
     )
 
@@ -4773,32 +4816,48 @@ async def create_decision(request: Request, body: SystemOneRequest) -> Any:
         localOnly=admission.local_only(),
         requestId=str(admission.request_id()) if admission.request_id() else None,
     )
-    try:
-        result = await client.decide(driver_request)
-    except DriverError as e:
-        return _driver_failure(e).as_openai()
-    except httpx.TimeoutException as e:
-        return _error(
-            code=504,
-            message=(
-                f"No backend serving {body.model!r} answered within the gateway's "
-                f"requestTimeoutSeconds ({_timeout_seconds(_store(request)):g}s). It was "
-                f"not retried on another backend: a timeout after possible execution "
-                f"never justifies silently sending the same decision to a different "
-                f"model, and the outcome is uncertain rather than failed. "
-                f"({type(e).__name__})"
-            ),
-            error_type="timeout",
-        )
-    except httpx.HTTPError as e:
-        return _error(
-            code=502,
-            message=(
-                f"A backend serving {body.model!r} failed ({type(e).__name__}). "
-                "Work may have occurred; an uncertain outcome is not replayed "
-                "automatically, and the cascade never reached a different model."
-            ),
-            error_type="upstream_error",
+    # B2-MET: a decision is a request row like any other, on success and on
+    # failure, so a failing decision backend is not an idle one.
+    rec = _Recording(metrics=_metrics(request), started=started, strategy=table.placement())
+    with collect_attempts() as tries:
+        try:
+            result = await client.decide(driver_request)
+        except DriverError as e:
+            _record(rec, body, tries, door="decisions")
+            return _driver_failure(e).as_openai()
+        except httpx.TimeoutException as e:
+            _record(rec, body, tries, door="decisions")
+            return _error(
+                code=504,
+                message=(
+                    f"No backend serving {body.model!r} answered within the gateway's "
+                    f"requestTimeoutSeconds ({_timeout_seconds(_store(request)):g}s). It was "
+                    f"not retried on another backend: a timeout after possible execution "
+                    f"never justifies silently sending the same decision to a different "
+                    f"model, and the outcome is uncertain rather than failed. "
+                    f"({type(e).__name__})"
+                ),
+                error_type="timeout",
+            )
+        except httpx.HTTPError as e:
+            _record(rec, body, tries, door="decisions")
+            return _error(
+                code=502,
+                message=(
+                    f"A backend serving {body.model!r} failed ({type(e).__name__}). "
+                    "Work may have occurred; an uncertain outcome is not replayed "
+                    "automatically, and the cascade never reached a different model."
+                ),
+                error_type="upstream_error",
+            )
+        _record(
+            rec,
+            body,
+            tries,
+            served_model=getattr(client, "served_model", None),
+            tier=getattr(client, "tier", 1),
+            usage=result.usage,
+            door="decisions",
         )
 
     usage = None

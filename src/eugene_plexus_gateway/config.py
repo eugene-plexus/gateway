@@ -57,6 +57,7 @@ CATEGORY_LABELS: dict[str, str] = {
     "routing": "Routing",
     "lifecycle": "Lifecycle policy",
     "metrics": "Request metrics",
+    "telemetry": "Metrics export",
     "logging": "Logging",
     "clients": "Browser clients",
 }
@@ -601,6 +602,73 @@ FIELDS: list[ConfigField] = [
         default=True,
         requiresRestart=True,
     ),
+    # --- Metrics export (row 12) -----------------------------------------
+    #
+    # Prometheus needs no setting: `GET /metrics` is always there, for a key that
+    # may read metrics. These are the optional push to an OTLP collector. Every one
+    # is read at the next push, so none needs a restart. Nothing exported carries a
+    # prompt, an answer or a person's name.
+    ConfigField(
+        key="telemetryOtlpEndpoint",
+        label="Send metrics and traces to",
+        description=(
+            "The address of an OpenTelemetry collector that takes OTLP over HTTP, for "
+            "example `http://collector:4318`. Empty is off.\n\n"
+            "Eugene sends its counters and timings, and a trace for each request. **It never "
+            "sends a prompt, an answer or a person's name.** Counters need `Retain request "
+            "metrics` on. The Metrics page shows whether the last send worked, and why not."
+        ),
+        category="telemetry",
+        valueType=ConfigValueType.url,
+        default="",
+        pattern=r"^(https?://\S+)?$",
+    ),
+    ConfigField(
+        key="telemetryOtlpAuthorization",
+        label="Collector credential",
+        description=(
+            "The whole `Authorization` header value the collector wants, for example "
+            "`Bearer <token>` or `Basic <base64>`. Leave it empty for a collector that asks "
+            "for none. It is kept on this machine and never shown again."
+        ),
+        category="telemetry",
+        valueType=ConfigValueType.secret,
+        sensitive=True,
+    ),
+    ConfigField(
+        key="telemetryOtlpSignals",
+        label="What to send",
+        description="Send the counters and timings, the traces, or both.",
+        category="telemetry",
+        valueType=ConfigValueType.enum,
+        default="both",
+        enumValues=["metrics", "traces", "both"],
+        enumLabels=["Counters and timings", "Traces", "Both"],
+    ),
+    ConfigField(
+        key="telemetryTraceSampleRatio",
+        label="Share of requests traced",
+        description=(
+            "How many requests get a trace, from 0 (none) to 1 (every one). One request is "
+            "chosen once, at the front door. A caller that sends a `traceparent` it did not "
+            "sample is never traced."
+        ),
+        category="telemetry",
+        valueType=ConfigValueType.number,
+        default=1,
+        minimum=0,
+        maximum=1,
+    ),
+    ConfigField(
+        key="telemetryOtlpIntervalSeconds",
+        label="Send every",
+        description="How many seconds between sends to the collector.",
+        category="telemetry",
+        valueType=ConfigValueType.integer,
+        default=60,
+        minimum=5,
+        maximum=3600,
+    ),
     # --- Browser clients ---------------------------------------------------
     #
     # CORS on the OpenAI-compatible paths and nothing else. See `cors.py`
@@ -671,6 +739,8 @@ UNSET_MEANS: dict[str, str] = {
         "still needs a bearer key the page must hold; list origins to admit only yours."
     ),
     "modelSlots": "None: each model is served only by its own backends, with no fallback.",
+    "telemetryOtlpEndpoint": "Empty: nothing is sent. Prometheus can still read /metrics.",
+    "telemetryOtlpAuthorization": "Empty: no Authorization header is sent to the collector.",
 }
 
 

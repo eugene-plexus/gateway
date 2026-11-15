@@ -4164,6 +4164,72 @@ class MetricsPromptCache(BaseModel):
     cachedTokens: int = Field(..., ge=0)
 
 
+class MetricsSource(StrEnum):
+    """
+    Where a group's numbers came from (row 12): `raw`, the retained request
+    rows (percentiles are real); `rollup`, the stored hourly aggregates of
+    hours past `metricsRetentionDays` (counts, mean and max only).
+
+    """
+
+    raw = 'raw'
+    rollup = 'rollup'
+
+
+class Prometheus(BaseModel):
+    path: str = Field(
+        ...,
+        description="The path to scrape, on this gateway's own port. Always `/metrics`.",
+    )
+    lastScrapeAt: AwareDatetime | None = Field(
+        None,
+        description='When a scraper last read `/metrics`. Null before the first scrape since the gateway started.',
+    )
+    lastScrapeKeyName: str | None = Field(
+        None,
+        description='The name of the key that scraper used, or `operator` for a signed-in session. Never the key itself.',
+    )
+
+
+class State(StrEnum):
+    """
+    `off` with no `telemetryOtlpEndpoint`. `ok` after a push the collector
+    accepted. `failing` when the last push did not arrive; `lastError` says
+    why. A failing export never slows or refuses a request.
+
+    """
+
+    off = 'off'
+    ok = 'ok'
+    failing = 'failing'
+
+
+class Otlp(BaseModel):
+    state: State = Field(
+        ...,
+        description='`off` with no `telemetryOtlpEndpoint`. `ok` after a push the collector\naccepted. `failing` when the last push did not arrive; `lastError` says\nwhy. A failing export never slows or refuses a request.\n',
+    )
+    endpoint: str | None = Field(
+        None, description='The collector address, with no credential in it.'
+    )
+    lastSuccessAt: AwareDatetime | None = None
+    lastError: str | None = Field(
+        None, description='The observed cause of the last failed push, in words.'
+    )
+
+
+class MetricsExport(BaseModel):
+    """
+    The two ways this gateway's numbers leave it. Prometheus is pulled, so
+    the gateway says when it was last read and by which key. OTLP is pushed
+    and optional, so it says whether the last push worked, and why not.
+
+    """
+
+    prometheus: Prometheus
+    otlp: Otlp
+
+
 class MetricsAffinity(BaseModel):
     """
     Requests by what conversation affinity did with them. `evicted`
@@ -4254,6 +4320,10 @@ class ClientKeyLimits(BaseModel):
         False,
         description="Whether this key may send log records to an agent's log ingress\n(`POST /v1/logs` on `agent.yaml`, C1 in `workbench.md`). It\ngrants nothing else: reading logs stays operator-only.\n\nEvery app the registry installs gets a key with this on,\nbecause the launcher that runs an app in its own account\nforwards what the app prints. Any other key gets it when the\noperator turns it on, so a tool outside the registry sends its\nlogs the same way ours do.\n",
     )
+    readMetrics: bool | None = Field(
+        False,
+        description='Whether this key may read `GET /metrics` on a gateway or an agent,\nand `GET /v1/metrics/export` on a gateway (row 12): the numbers a\nPrometheus scraper reads. **It grants nothing else.** A key with it\nruns no inference unless `allowedModels` also names a model, and a\nkey without it is refused at every metrics path with 403.\n\nThe console\'s "Make a scrape key" sets it together with\n`allowedModels: []`, so the key can read numbers and run nothing.\nThe metrics paths ask the authority with admission purpose\n`metrics`: a check that names no model and takes no lease.\n',
+    )
     maxConcurrentRequests: int | None = Field(
         2,
         description="How many of this key's requests run at once, across every\ngateway. A request past it waits in the gateway's queue (row 11)\nwhile `maxQueuedRequests` allows, and is refused when it does not.\n",
@@ -4289,6 +4359,8 @@ class Action(StrEnum):
 
 class Purpose(StrEnum):
     """
+    Metrics (row 12) is a check for a scraper that reads `GET /metrics`: it names no model and no person token, takes no lease, and is refused with 403 ("This key may not read metrics.") unless the key's `readMetrics` is on. It never acquires, renews or releases.
+
     Logs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.
 
     Search is a web search that names no model (POST /v1/web_search, the door Open WebUI's external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key's `allowedModels` does not apply. The gateway checks the key's `allowedTools` and `localOnly`, as for every tool.
@@ -4299,6 +4371,7 @@ class Purpose(StrEnum):
     logs = 'logs'
     catalog = 'catalog'
     search = 'search'
+    metrics = 'metrics'
 
 
 class ClientAdmissionRequest(BaseModel):
@@ -4324,7 +4397,7 @@ class ClientAdmissionRequest(BaseModel):
     requestId: str = Field(..., max_length=128, min_length=1)
     purpose: Purpose | None = Field(
         'inference',
-        description="Logs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.\n\nSearch is a web search that names no model (POST /v1/web_search, the door Open WebUI's external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key's `allowedModels` does not apply. The gateway checks the key's `allowedTools` and `localOnly`, as for every tool.\n",
+        description='Metrics (row 12) is a check for a scraper that reads `GET /metrics`: it names no model and no person token, takes no lease, and is refused with 403 ("This key may not read metrics.") unless the key\'s `readMetrics` is on. It never acquires, renews or releases.\n\nLogs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.\n\nSearch is a web search that names no model (POST /v1/web_search, the door Open WebUI\'s external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key\'s `allowedModels` does not apply. The gateway checks the key\'s `allowedTools` and `localOnly`, as for every tool.\n',
     )
     model: str | None = Field(None, max_length=256, min_length=1)
     personToken: str | None = Field(
@@ -4493,6 +4566,25 @@ class MetricAttempt(BaseModel):
         None,
         description="The exception **class name** only, never its message.\nDriver error text can carry a provider's response body, and\na metrics table is the kind of thing that gets pasted into\nan issue — this must not become an accidental credential\nstore.\n",
     )
+
+
+class AffinityKey(Enum):
+    """
+    Which key placed this request (gateway#19, schema v15): `chain`, a
+    stored conversation's id or a `previous_response_id` chain's first
+    response (row 54); `client`, the caller's `prompt_cache_key`;
+    `session`, Claude Code's session id; `start`, the hash of the
+    conversation's opening words. Null when no key was made (affinity
+    off, or a door that does not place by conversation). **Never the key
+    itself**: a hash of a person's first words is not a metric.
+
+    """
+
+    chain = 'chain'
+    client = 'client'
+    session = 'session'
+    start = 'start'
+    NoneType_None = None
 
 
 class MetricToolOutcome(StrEnum):
@@ -6139,6 +6231,22 @@ class MetricsGroup(BaseModel):
 
     """
 
+    source: MetricsSource | None = None
+    latencyMeanMs: float | None = Field(
+        None,
+        description='Mean request latency in milliseconds, from the stored sums. Present\non a `source: rollup` group, which has no percentiles.\n',
+        ge=0.0,
+    )
+    latencyMaxMs: int | None = Field(
+        None,
+        description='The slowest request of the hour. Present on a `source: rollup` group.',
+        ge=0,
+    )
+    tokensPerSecondMean: float | None = Field(
+        None,
+        description="Completion tokens over the serving attempts' time, from the stored\nsums, for a `source: rollup` group whose requests reported usage.\nAbsent otherwise. A mean, so it is not given as `p50`.\n",
+        ge=0.0,
+    )
     bucketStart: AwareDatetime | None = Field(
         None, description='Present only when `bucket=hour`.'
     )
@@ -6169,7 +6277,10 @@ class MetricsGroup(BaseModel):
         description="Requests that had to wake a `startOnDemand` runtime. The\nmeasured cost of M6's idle unload, which shipped with no\nway to see what it costs.\n",
         ge=0,
     )
-    latencyMs: Percentiles
+    latencyMs: Percentiles | None = Field(
+        None,
+        description='Absent on a `source: rollup` group, which has `latencyMeanMs` and `latencyMaxMs` instead.',
+    )
     tokensPerSecond: Throughput | None = Field(
         None,
         description="Null when no request in this group reported token usage.\nWhole-attempt rate: the serving attempt's elapsed time\nincludes prefill, so this understates decode speed on long\nprompts. `decodeTokensPerSecond` beside it excludes prefill;\nthe two differing is the prefill cost made visible.\n",
@@ -6368,9 +6479,13 @@ class MetricRequest(BaseModel):
         None,
         description="What conversation affinity did with this request (PC4;\n`conversationAffinity` since CB1): `hit`, sent back to the\nreplica its conversation used before; `evicted` (CB5, schema\nv12), sent back there and the engine reused less than the\nwhole of the conversation's previous prompt, so its history\nwas gone; `new`, a conversation not seen before; `moved`, its\nreplica was full or gone and it went elsewhere. Null when\nthere was no choice to make or affinity was off (before CB1,\nwhen another strategy was in effect). A backend that does not\nreport cached tokens cannot be judged, and its turns stay\n`hit`.\n",
     )
+    affinityKey: AffinityKey | None = Field(
+        None,
+        description="Which key placed this request (gateway#19, schema v15): `chain`, a\nstored conversation's id or a `previous_response_id` chain's first\nresponse (row 54); `client`, the caller's `prompt_cache_key`;\n`session`, Claude Code's session id; `start`, the hash of the\nconversation's opening words. Null when no key was made (affinity\noff, or a door that does not place by conversation). **Never the key\nitself**: a hash of a person's first words is not a metric.\n",
+    )
     door: str | None = Field(
         None,
-        description="Which door the request came in by (P3b): `speech`,\n`transcription`, `translation` (P3-4), `images` (P4, schema v8),\n`videos` (P5, schema v9, the submit's row), `moderation` (P6)\nor `completion` (P6, a row that carries tokens as chat's does).\nNull on rows from before schema v7 and on every other door,\nwhose rows carry tokens.\n",
+        description="Which door the request came in by (P3b): `speech`,\n`transcription`, `translation` (P3-4), `images` (P4, schema v8),\n`videos` (P5, schema v9, the submit's row), `moderation` (P6),\n`completion` (P6, a row that carries tokens as chat's does) or\n`decisions` (row 12, `POST /v1/systemone`: a row that carries the\ndecision's tokens).\nNull on rows from before schema v7 and on every other door,\nwhose rows carry tokens.\n",
     )
     characters: int | None = Field(
         None,

@@ -532,6 +532,15 @@ class ClientRequest:
                 app_client_id=self.app_client_id,
                 request_id=self.id,
                 elapsed_ms=int((time.perf_counter() - self.started) * 1000),
+                path=str(self.scope.get("path")),
+                trace_parent=next(
+                    (
+                        v.decode("latin-1")[:128]
+                        for k, v in self.scope.get("headers", ())
+                        if k == b"traceparent"
+                    ),
+                    None,
+                ),
             )
         )
         self.recorded = True

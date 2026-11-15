@@ -83,9 +83,10 @@ async def get_metrics(
         windowEnd=end,
         gatewayStartedAt=store.started_at,
         rowsDropped=store.rows_dropped,
-        # Raw rows are all that is served, so a window reaching past
-        # retention describes less than it was asked for and says so.
-        truncated=start < store.oldest_retained(),
+        # A window reaching past retention describes less than it was asked
+        # for and says so, unless the hourly rollups cover it (row 12).
+        truncated=start < store.oldest_retained()
+        and not (bucket == "hour" and store.rollup_enabled),
         groups=[MetricsGroup.model_validate(g) for g in groups],
         # Row 11: what the queue refused over the window, and what waits now.
         refused=store.refused(since=start, until=end) or None,

@@ -203,6 +203,11 @@ def test_config_schema_lists_the_gateway_fields(client: TestClient) -> None:
         "logLevel",
         "corsEnabled",
         "corsAllowedOrigins",
+        "telemetryOtlpEndpoint",
+        "telemetryOtlpAuthorization",
+        "telemetryOtlpSignals",
+        "telemetryTraceSampleRatio",
+        "telemetryOtlpIntervalSeconds",
     }
     # No backend URLs and no model list: routing is derived, so there is
     # nothing here to get out of step with reality. `controlUrl` is the

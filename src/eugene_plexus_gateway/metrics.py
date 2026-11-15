@@ -42,7 +42,7 @@ import logging
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -50,7 +50,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 # Bounded because the alternative to dropping rows is stalling
 # completions, and that trade is never worth making. Sized so a burst
@@ -217,6 +217,14 @@ class RequestRow:
     refusal: str | None = None
     tier_moves: int | None = None
     outran_reserve: bool | None = None
+    # v15 (gateway#19): which key placed it: `chain`, `client`, `session` or
+    # `start`. Never the key itself: a hash of a person's first words is not a
+    # metric.
+    affinity_key: str | None = None
+    # Not stored (row 12): where it came in, and the caller's `traceparent`,
+    # for the exporters that read the row as it is recorded.
+    path: str | None = None
+    trace_parent: str | None = None
 
 
 #: The request columns each schema since v12 added, in order, for a store that
@@ -229,6 +237,22 @@ _ADDED = {
         "refusal TEXT",
         "tier_moves INTEGER",
         "outran_reserve INTEGER",
+    ),
+    15: ("affinity_key TEXT",),
+}
+
+#: The rollup columns schema v15 added (row 12): what an hour served past
+#: retention needs to say beyond counts. Added to a store moved in place, and
+#: nothing is backfilled: an hour rolled up before has them at zero.
+_ADDED_ROLLUP = {
+    15: (
+        "first_ms_sum INTEGER NOT NULL DEFAULT 0",
+        "first_ms_samples INTEGER NOT NULL DEFAULT 0",
+        "prompt_tokens INTEGER NOT NULL DEFAULT 0",
+        "cached_tokens INTEGER NOT NULL DEFAULT 0",
+        "queued_ms_sum INTEGER NOT NULL DEFAULT 0",
+        "refused INTEGER NOT NULL DEFAULT 0",
+        "token_ms_sum INTEGER NOT NULL DEFAULT 0",
     ),
 }
 
@@ -245,12 +269,16 @@ def _add_columns(conn: sqlite3.Connection, version: int) -> None:
     one that an older build left half done is finished.
     """
     present = {column[1] for column in conn.execute("PRAGMA table_info(request)")}
+    rolled = {column[1] for column in conn.execute("PRAGMA table_info(rollup)")}
     conn.execute("BEGIN")
     try:
         for later in range(version + 1, SCHEMA_VERSION + 1):
             for column in _ADDED[later]:
                 if column.split()[0] not in present:
                     conn.execute(f"ALTER TABLE request ADD COLUMN {column}")
+            for column in _ADDED_ROLLUP.get(later, ()):
+                if column.split()[0] not in rolled:
+                    conn.execute(f"ALTER TABLE rollup ADD COLUMN {column}")
         conn.execute(
             "UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),)
         )
@@ -300,7 +328,8 @@ CREATE TABLE IF NOT EXISTS request (
     band              TEXT,
     refusal           TEXT,
     tier_moves        INTEGER,
-    outran_reserve    INTEGER
+    outran_reserve    INTEGER,
+    affinity_key      TEXT
 );
 
 CREATE INDEX IF NOT EXISTS request_started_at ON request (started_at);
@@ -382,6 +411,13 @@ CREATE TABLE IF NOT EXISTS rollup (
     served_ms_sum     INTEGER NOT NULL DEFAULT 0,
     completion_tokens INTEGER NOT NULL DEFAULT 0,
     token_samples     INTEGER NOT NULL DEFAULT 0,
+    first_ms_sum      INTEGER NOT NULL DEFAULT 0,
+    first_ms_samples  INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    cached_tokens     INTEGER NOT NULL DEFAULT 0,
+    queued_ms_sum     INTEGER NOT NULL DEFAULT 0,
+    refused           INTEGER NOT NULL DEFAULT 0,
+    token_ms_sum      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (bucket_start, requested_model, driver, runtime, node, backend)
 );
 """
@@ -447,6 +483,9 @@ class MetricsStore:
         self._rows_dropped = 0
         self._started_at = datetime.now(UTC)
         self._last_prune = time.perf_counter()
+        #: Told of every row as it is recorded (row 12: the exporters). It must
+        #: not raise and must not wait; one that does is logged and ignored.
+        self.observer: Callable[[RequestRow], None] | None = None
 
     # --- lifecycle ----------------------------------------------------------
 
@@ -468,16 +507,17 @@ class MetricsStore:
         conn.commit()
 
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        # A released store (v12, v13) gains its nullable columns in place: v13
-        # person attribution (U3), v14 the queue's (row 11). Alpha schemas and
-        # unknown future schemas remain kept aside whole.
+        # A released store (v12, v13, v14) gains its nullable columns in place:
+        # v13 person attribution (U3), v14 the queue's (row 11), v15 the affinity
+        # key's kind and the rollup's sums (row 12). Alpha schemas and unknown
+        # future schemas remain kept aside whole.
         if row is None:
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
             conn.commit()
-        elif int(row[0]) in (12, 13):
+        elif int(row[0]) in (12, 13, 14):
             _add_columns(conn, int(row[0]))
         elif int(row[0]) != SCHEMA_VERSION:
             # A version this build does not write: rename the file aside
@@ -545,6 +585,10 @@ class MetricsStore:
     def started_at(self) -> datetime:
         return self._started_at
 
+    @property
+    def rollup_enabled(self) -> bool:
+        return self._rollup_enabled
+
     def oldest_retained(self) -> datetime:
         """The earliest instant raw rows could still describe.
 
@@ -558,6 +602,11 @@ class MetricsStore:
 
     def record(self, row: RequestRow) -> None:
         """Queue one request. Never raises, never blocks."""
+        if self.observer is not None:
+            try:
+                self.observer(row)
+            except Exception:
+                log.debug("a metrics observer failed", exc_info=True)
         try:
             self._queue.put_nowait(row)
         except asyncio.QueueFull:
@@ -617,10 +666,10 @@ class MetricsStore:
                     " client_key_id, client_key_name, correlation_id, elapsed_ms,"
                     " door, characters, audio_seconds, images, video_seconds,"
                     " cached_tokens, affinity, person_id, app_client_id,"
-                    " queued_ms, band, refusal, tier_moves, outran_reserve)"
+                    " queued_ms, band, refusal, tier_moves, outran_reserve, affinity_key)"
                     " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
                     " ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
-                    " ?, ?, ?, ?, ?)",
+                    " ?, ?, ?, ?, ?, ?)",
                     (
                         _iso(row.started_at),
                         row.requested_model,
@@ -655,6 +704,7 @@ class MetricsStore:
                         row.refusal,
                         row.tier_moves,
                         None if row.outran_reserve is None else int(row.outran_reserve),
+                        row.affinity_key,
                     ),
                 )
                 request_id = cursor.lastrowid
@@ -757,6 +807,10 @@ class MetricsStore:
         since = done[0] if done else "0000-01-01T00:00:00Z"
         if since >= boundary:
             return
+        # The attempt a request is ATTRIBUTED to, as `summary` attributes it: the
+        # one that served it, else the last one tried. Refused requests are left
+        # out of the counts, as the live summary leaves them out, and counted
+        # apart in `refused`.
         with conn:
             conn.execute(
                 """
@@ -764,7 +818,9 @@ class MetricsStore:
                     bucket_start, requested_model, driver, runtime, node, backend,
                     requests, errors, cascaded, swapped_in,
                     total_ms_sum, total_ms_max, served_ms_sum,
-                    completion_tokens, token_samples
+                    completion_tokens, token_samples,
+                    first_ms_sum, first_ms_samples, prompt_tokens, cached_tokens,
+                    queued_ms_sum, refused, token_ms_sum
                 )
                 SELECT
                     substr(r.started_at, 1, 13) || ':00:00Z',
@@ -781,11 +837,39 @@ class MetricsStore:
                     MAX(r.total_ms),
                     SUM(COALESCE(a.elapsed_ms, r.total_ms)),
                     SUM(COALESCE(r.completion_tokens, 0)),
-                    SUM(CASE WHEN r.completion_tokens IS NOT NULL THEN 1 ELSE 0 END)
+                    SUM(CASE WHEN r.completion_tokens IS NOT NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN a.served = 1 THEN COALESCE(a.first_ms, 0) ELSE 0 END),
+                    SUM(CASE WHEN a.served = 1 AND a.first_ms IS NOT NULL THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN r.cached_tokens IS NOT NULL
+                             THEN COALESCE(r.prompt_tokens, 0) ELSE 0 END),
+                    SUM(COALESCE(r.cached_tokens, 0)),
+                    SUM(COALESCE(r.queued_ms, 0)),
+                    0,
+                    SUM(CASE WHEN r.completion_tokens IS NOT NULL
+                             THEN COALESCE(a.elapsed_ms, r.total_ms) ELSE 0 END)
                 FROM request r
-                LEFT JOIN attempt a ON a.request_id = r.id AND a.served = 1
-                WHERE r.started_at >= ? AND r.started_at < ?
+                LEFT JOIN attempt a ON a.id = (
+                    SELECT a2.id FROM attempt a2
+                    WHERE a2.request_id = r.id
+                    ORDER BY a2.served DESC, a2.seq DESC
+                    LIMIT 1
+                )
+                WHERE r.started_at >= ? AND r.started_at < ? AND r.outcome != 'refused'
                 GROUP BY 1, 2, 3, 4, 5, 6
+                """,
+                (since, boundary),
+            )
+            conn.execute(
+                """
+                INSERT INTO rollup (bucket_start, requested_model, driver, runtime, node,
+                                    backend, refused)
+                SELECT substr(r.started_at, 1, 13) || ':00:00Z', r.requested_model,
+                       '', '', '', '', COUNT(*)
+                FROM request r
+                WHERE r.started_at >= ? AND r.started_at < ? AND r.outcome = 'refused'
+                GROUP BY 1, 2
+                ON CONFLICT (bucket_start, requested_model, driver, runtime, node, backend)
+                DO UPDATE SET refused = rollup.refused + excluded.refused
                 """,
                 (since, boundary),
             )
@@ -844,6 +928,23 @@ class MetricsStore:
         computable from per-backend p90s, so the coarse grain must be
         computed here, over the raw rows.
         """
+        # Row 12 (MET-RU): with `bucket=hour`, the hours past retention come from
+        # the stored hourly rollups (counts, a mean and a max: no percentiles),
+        # and the hours inside it from raw rows as before.
+        stored: list[dict[str, Any]] = []
+        if bucket == "hour" and self._rollup_enabled:
+            cut = _next_hour(self.oldest_retained())
+            if since < cut:
+                stored = self._stored_hours(
+                    since=since,
+                    until=min(until, cut),
+                    model=model,
+                    driver=driver,
+                    group_by=group_by,
+                )
+                since = max(since, cut)
+                if until <= since:
+                    return stored
         where = ["r.started_at >= ?", "r.started_at < ?", "r.outcome != 'refused'"]
         params: list[Any] = [_iso(since), _iso(until)]
         if model:
@@ -929,6 +1030,7 @@ class MetricsStore:
             g = groups.get(key)
             if g is None:
                 g = groups[key] = {
+                    "source": "raw",
                     "bucketStart": bucket_start,
                     # A collapsed grain omits the dimensions it collapsed
                     # rather than carrying whichever value arrived first —
@@ -1087,7 +1189,100 @@ class MetricsStore:
                 else None
             )
             out.append(g)
+        out = stored + out
         out.sort(key=lambda x: (x["bucketStart"] or "", -x["requests"]))
+        return out
+
+    def _stored_hours(
+        self,
+        *,
+        since: datetime,
+        until: datetime,
+        model: str | None,
+        driver: str | None,
+        group_by: str,
+    ) -> list[dict[str, Any]]:
+        """The hours of `[since, until)` that only the rollup still knows, grouped
+        as `summary` groups raw rows. Sums recombine; percentiles do not, so a group
+        carries a mean and a max and says `source: rollup`."""
+        where = ["bucket_start >= ?", "bucket_start < ?", "requests > 0"]
+        params: list[Any] = [_iso(_this_hour(since)), _iso(until)]
+        if model:
+            where.append("requested_model = ?")
+            params.append(model)
+        if driver:
+            where.append("driver = ?")
+            params.append(driver)
+        with self._reader() as conn:
+            if conn is None:
+                return []
+            rows = conn.execute(
+                f"""
+                SELECT bucket_start, requested_model, driver, runtime, node, backend,
+                       requests, errors, cascaded, swapped_in, total_ms_sum, total_ms_max,
+                       completion_tokens, token_ms_sum
+                FROM rollup WHERE {" AND ".join(where)}
+                """,
+                params,
+            ).fetchall()
+        groups: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for (
+            bucket_start,
+            requested_model,
+            r_driver,
+            r_runtime,
+            r_node,
+            r_backend,
+            requests,
+            errors,
+            cascaded,
+            swapped_in,
+            total_ms_sum,
+            total_ms_max,
+            completion_tokens,
+            token_ms_sum,
+        ) in rows:
+            if group_by == "total":
+                key: tuple[Any, ...] = (bucket_start,)
+            elif group_by == "model":
+                key = (bucket_start, requested_model)
+            else:
+                key = (bucket_start, requested_model, r_driver, r_runtime, r_node, r_backend)
+            g = groups.get(key)
+            if g is None:
+                g = groups[key] = {
+                    "source": "rollup",
+                    "bucketStart": bucket_start,
+                    "model": requested_model if group_by != "total" else None,
+                    "driver": (r_driver or None) if group_by == "backend" else None,
+                    "runtime": (r_runtime or None) if group_by == "backend" else None,
+                    "node": (r_node or None) if group_by == "backend" else None,
+                    "backend": (r_backend or None) if group_by == "backend" else None,
+                    "requests": 0,
+                    "errors": 0,
+                    "cascaded": 0,
+                    "swappedIn": 0,
+                    "_total_ms": 0,
+                    "latencyMaxMs": 0,
+                    "_tokens": 0,
+                    "_token_ms": 0,
+                }
+            g["requests"] += int(requests)
+            g["errors"] += int(errors)
+            g["cascaded"] += int(cascaded)
+            g["swappedIn"] += int(swapped_in)
+            g["_total_ms"] += int(total_ms_sum)
+            g["latencyMaxMs"] = max(g["latencyMaxMs"], int(total_ms_max))
+            g["_tokens"] += int(completion_tokens)
+            g["_token_ms"] += int(token_ms_sum)
+        out: list[dict[str, Any]] = []
+        for g in groups.values():
+            g["latencyMeanMs"] = round(g.pop("_total_ms") / g["requests"], 1)
+            tokens, token_ms = g.pop("_tokens"), g.pop("_token_ms")
+            # Absent, not zero, when nothing in the hour reported tokens.
+            if tokens and token_ms > 0:
+                g["tokensPerSecondMean"] = round(tokens * 1000.0 / token_ms, 2)
+            out.append(g)
         return out
 
     def refused(self, *, since: datetime, until: datetime) -> dict[str, int]:
@@ -1177,7 +1372,7 @@ class MetricsStore:
                        client_key_id, client_key_name, correlation_id, elapsed_ms,
                        door, characters, audio_seconds, images, video_seconds,
                        cached_tokens, affinity, person_id, app_client_id,
-                       queued_ms, band, refusal, tier_moves, outran_reserve
+                       queued_ms, band, refusal, tier_moves, outran_reserve, affinity_key
                 FROM request r {clause}
                 ORDER BY id DESC LIMIT ?
                 """,
@@ -1337,6 +1532,7 @@ class MetricsStore:
                 "refusal": r[31],
                 "tierMoves": r[32],
                 "outranReserve": None if r[33] is None else bool(r[33]),
+                "affinityKey": r[34],
                 "tries": tries[r[0]],
                 "candidates": considered[r[0]],
                 **_tool_lists(searched[r[0]]),
@@ -1344,6 +1540,18 @@ class MetricsStore:
             for r in rows
         ]
         return out, (str(rows[-1][0]) if more else None)
+
+
+def _this_hour(value: datetime) -> datetime:
+    """The start of the hour `value` is in."""
+    return value.astimezone(UTC).replace(minute=0, second=0, microsecond=0)
+
+
+def _next_hour(value: datetime) -> datetime:
+    """`value` itself on an hour boundary, else the next one: the first instant
+    from which raw rows describe whole hours."""
+    start = _this_hour(value)
+    return start if start == value.astimezone(UTC) else start + timedelta(hours=1)
 
 
 def _spread(values: list[int]) -> dict[str, int] | None:

@@ -21,7 +21,8 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 
-from . import __version__, fair_queue
+from . import __version__, fair_queue, telemetry
+from ._http import client_for
 from .auth_state import AuthState, load_auth_state
 from .client_keys import ClientKeyGuard
 from .config import DEFAULT_REQUEST_TIMEOUT_SECONDS, ConfigStore
@@ -40,6 +41,7 @@ from .routes import inference as inference_routes
 from .routes import info as info_routes
 from .routes import metrics as metrics_routes
 from .routes import roles as roles_routes
+from .routes import telemetry as telemetry_routes
 from .routes import web_search as web_search_routes
 from .routing import RoutingTable
 from .settings import Settings, load_settings
@@ -128,6 +130,47 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 metrics = candidate
                 app.state.metrics = candidate
 
+    # Row 12: the numbers for a scraper and for an optional OTLP collector. Built
+    # whatever the store did, so `GET /metrics` always answers; the counters need the
+    # store, which tells this object of every row as it is recorded.
+    def _otlp_settings() -> telemetry.OtlpSettings:
+        signals = store.get("telemetryOtlpSignals") or "both"
+        ratio = store.get("telemetryTraceSampleRatio")
+        interval = store.get("telemetryOtlpIntervalSeconds")
+        return telemetry.OtlpSettings(
+            endpoint=str(store.get("telemetryOtlpEndpoint") or "").strip(),
+            authorization=str(store.get("telemetryOtlpAuthorization") or ""),
+            metrics=signals in ("metrics", "both"),
+            traces=signals in ("traces", "both"),
+            sample_ratio=float(1 if ratio is None else ratio),
+            interval_seconds=float(interval or 60),
+        )
+
+    def _known_model(name: str) -> bool:
+        table = getattr(app.state, "routing", None)
+        return table is not None and (name in table.configured_slots() or table.serves(name))
+
+    numbers = telemetry.Telemetry(
+        known_model=_known_model, settings=_otlp_settings, version=__version__
+    )
+    app.state.telemetry = numbers
+    if metrics is not None:
+        metrics.observer = numbers.observe
+    exporter: telemetry.OtlpExporter | None = None
+    if not settings.safe_mode:
+        exporter = telemetry.OtlpExporter(
+            numbers,
+            settings=_otlp_settings,
+            gauges=lambda: telemetry.read_gauges(
+                getattr(app.state, "routing", None),
+                rows_dropped=metrics.rows_dropped if metrics is not None else None,
+                enabled=metrics is not None,
+            ),
+            client_for=client_for,
+        )
+        exporter.start()
+    app.state.otlp_exporter = exporter
+
     # A3: persisted, bounded-age policy from this node's agent, which relays
     # the active install authority when enrolled. No JWT signing key is needed.
     guard: ClientKeyGuard | None = None
@@ -213,6 +256,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     finally:
         # Row 11: every waiter is refused `shutting_down`, never left hanging.
         close_queue(app)
+        if exporter is not None:
+            await exporter.aclose()
         store_client = getattr(app.state, "store_client", None)
         if store_client is not None:
             await store_client.aclose()
@@ -274,6 +319,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # accept a service token: no component needs them, and model names
     # plus traffic volumes are not nothing on a shared tailnet.
     app.include_router(metrics_routes.router, dependencies=operator_only)
+    # Row 12: `GET /metrics` and `GET /v1/metrics/export` take an operator session or
+    # a client key that may read metrics, and check which in their own dependency.
+    app.include_router(telemetry_routes.router)
 
     # The front door accepts operator OR service tokens: a UI playground
     # and another component are both legitimate callers. Declared on the

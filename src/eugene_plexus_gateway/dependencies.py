@@ -117,6 +117,14 @@ async def require_authorized(
     if context is not None:
         context.key_id = claims.jti
         context.key_name = claims.sub
+    await check_client_key(request, claims)
+    return claims
+
+
+async def check_client_key(request: Request, claims: tokens.Claims) -> None:
+    """Raise the 401 or 503 that says why a verified client key may not be used now:
+    it was turned off, replaced or never registered, or the policy that says so is
+    not available. Shared by the front door and the metrics paths (row 12)."""
     guard: ClientKeyGuard | None = getattr(request.app.state, "client_key_guard", None)
     decision = await guard.decision(claims.jti, claims.exp) if guard is not None else "unavailable"
     if decision == "unavailable":
@@ -148,7 +156,6 @@ async def require_authorized(
             "This client key was turned off. Make a new one under "
             "Home -> Use it from your apps, and paste it into the app that is failing.",
         )
-    return claims
 
 
 def require_operator(
