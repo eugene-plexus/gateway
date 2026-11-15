@@ -28,6 +28,9 @@ The checks, in the order `verify` makes them, each one a line of RFC
 6. The token lives no longer than its class allows.
 7. A session is not signed out, and every machine it names, as a
    console or as the one that exchanged it, is still in the bundle.
+   An operations token (row 39) is about a person, to one machine, with
+   known powers, and neither it, its session nor the person's
+   administration version is signed out.
 8. A token the control root signed (anything but a client key) was
    minted at the epoch of the root this verifier follows, or later
    (`ep`, row 4). A root that was replaced by a promotion keeps the token
@@ -63,6 +66,15 @@ log = logging.getLogger(__name__)
 TYP_SESSION = "ep-session+jwt"
 TYP_ADMINISTRATION = "ep-administration+jwt"
 ADMINISTRATION_TTL_SECONDS = 3600
+TYP_OPERATIONS = "ep-operations+jwt"
+"""Row 39: a person's operations powers on one machine, exchanged at the
+root for their administration session. Addressed to `node:<name>` only,
+10 minutes, carrying `ops` (the powers), `name`, `sid` (the session) and
+`administration_version`."""
+OPERATIONS_TTL_SECONDS = 600
+POWER_OPERATE_MODELS = "operate-models"
+POWER_OPERATE_MACHINES = "operate-machines"
+POWERS = (POWER_OPERATE_MODELS, POWER_OPERATE_MACHINES)
 TYP_SERVICE = "ep-service+jwt"
 TYP_CLIENT = "ep-client+jwt"
 TYP_BUNDLE = "ep-trust-bundle+jwt"
@@ -558,14 +570,28 @@ class Claims:
     browser_session: str | None = None
     """Optional parent shared sign-in for a named administration token."""
     sid: str | None = None
-    """On an exchanged session: the `jti` of the session it came from."""
+    """On an exchanged session: the `jti` of the session it came from. On
+    an operations token: the administration session's."""
     epoch: int | None = None
     """`ep`: the epoch of the control root that signed it (row 4). None on a
     token from any other issuer, a client key, or a root older than row 4."""
 
+    ops: tuple[str, ...] = ()
+    """On an operations token (row 39): the powers it carries."""
+    name: str | None = None
+    """On an operations token: the person's name, to show."""
+
     @property
     def is_session(self) -> bool:
         return self.typ == TYP_SESSION
+
+    @property
+    def is_operations(self) -> bool:
+        return self.typ == TYP_OPERATIONS
+
+    def holds(self, power: str) -> bool:
+        """An operations token that carries `power`."""
+        return self.typ == TYP_OPERATIONS and power in self.ops
 
     @property
     def is_service(self) -> bool:
@@ -582,6 +608,13 @@ class Claims:
     def is_local_service(self, recipient: str) -> bool:
         """A service token its own machine minted for itself."""
         return self.is_service and self.iss == recipient and self.aud == (recipient,)
+
+
+def operations_revocation(sub: str, administration_version: int) -> str:
+    """The sign-out entry that ends every operations token a person holds
+    at one administration version (row 39). The root lists it when their
+    grants, password or enabled state change."""
+    return f"ops:{sub}:{administration_version}"
 
 
 def _require_str(claims: Mapping[str, Any], name: str) -> str:
@@ -603,7 +636,7 @@ def _aud(claims: Mapping[str, Any]) -> tuple[str, ...]:
 def _check_grants(key: TrustKey, typ: str, sub: str, aud: tuple[str, ...]) -> None:
     if GRANT_AUTHORITY in key.grants:
         return
-    if typ in (TYP_SESSION, TYP_CLIENT, TYP_ADMINISTRATION):
+    if typ in (TYP_SESSION, TYP_CLIENT, TYP_ADMINISTRATION, TYP_OPERATIONS):
         raise TokenError(f"{key.issuer} may not issue a {typ}: only the authority mints one")
     if GRANT_NODE not in key.grants:
         if GRANT_FILES in key.grants:
@@ -638,6 +671,8 @@ def _check_grants(key: TrustKey, typ: str, sub: str, aud: tuple[str, ...]) -> No
 def _check_lifetime(typ: str, iss: str, aud: tuple[str, ...], lifetime: int, act: Any) -> None:
     if typ == TYP_ADMINISTRATION:
         limit = ADMINISTRATION_TTL_SECONDS
+    elif typ == TYP_OPERATIONS:
+        limit = OPERATIONS_TTL_SECONDS
     elif typ == TYP_SESSION:
         limit = MAX_EXCHANGED_SECONDS if act is not None else MAX_SESSION_SECONDS
     elif typ == TYP_CLIENT:
@@ -730,9 +765,19 @@ def verify(
             or sid_claim is not None
         ):
             raise TokenError("invalid administration session")
-    if typ in (TYP_SESSION, TYP_ADMINISTRATION):
+    ops: tuple[str, ...] = ()
+    name: str | None = None
+    if typ == TYP_OPERATIONS:
+        ops, name, administration_version = _operations_claims(claims, iss, sub, aud, sid_claim)
+    if typ in (TYP_SESSION, TYP_ADMINISTRATION, TYP_OPERATIONS):
         if jti in bundle.revoked_sessions or (sid_claim and sid_claim in bundle.revoked_sessions):
             raise TokenError("this session was signed out")
+        if (
+            typ == TYP_OPERATIONS
+            and administration_version is not None
+            and operations_revocation(sub, administration_version) in bundle.revoked_sessions
+        ):
+            raise TokenError("this session was signed out: the owner changed this access")
         if GRANT_AUTHORITY in key.grants and iss == ISSUER_CONTROL:
             members = bundle.members
             named = [node_of(a) for a in aud] + [node_of(act) if act else None]
@@ -752,7 +797,42 @@ def verify(
         administration_version=administration_version,
         browser_session=browser_session,
         epoch=epoch,
+        ops=ops,
+        name=name,
     )
+
+
+_RESERVED_SUBJECTS = frozenset({SUB_OPERATOR, SUB_AGENT, SUB_GATEWAY, SUB_CONTROL, SUB_STANDBY})
+
+
+def _operations_claims(
+    claims: Mapping[str, Any], iss: str, sub: str, aud: tuple[str, ...], sid: Any
+) -> tuple[tuple[str, ...], str | None, int]:
+    """Row 39: what an operations token must say, or `TokenError`.
+
+    From the root, about a person (never the owner or a component), to
+    exactly one machine, with one or more known powers, each once, and
+    the administration session and version it came from."""
+    if len(aud) != 1 or node_of(aud[0]) is None:
+        raise TokenError("an operations token is addressed to one machine, node:<name>")
+    ops = claims.get("ops")
+    version = claims.get("administration_version")
+    name = claims.get("name")
+    if (
+        iss != ISSUER_CONTROL
+        or sub in _RESERVED_SUBJECTS
+        or not isinstance(ops, list)
+        or not ops
+        or len(set(ops)) != len(ops)
+        or any(p not in POWERS for p in ops)
+        or not isinstance(sid, str)
+        or not sid
+        or type(version) is not int
+        or version < 0
+        or (name is not None and (not isinstance(name, str) or len(name) > 64))
+    ):
+        raise TokenError("invalid operations token")
+    return tuple(ops), name, version
 
 
 def no_longer_followed(minted: int | str, follows: int) -> str:

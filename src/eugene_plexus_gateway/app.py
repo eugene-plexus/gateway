@@ -34,6 +34,7 @@ from .drain import DrainMiddleware, DrainReporter, GatewayDrain
 from .library_cache import LibraryCache
 from .lifecycle import AgentLifecycleClient, LifecycleManager
 from .metrics import MetricsStore
+from .operations import operations_read
 from .outbound import Outbound
 from .profiles import ProfileDefaults
 from .routes import admin as admin_routes
@@ -342,7 +343,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # component has no business restarting the gateway.
     operator_only = [Depends(require_operator)]
     app.include_router(config_routes.router, dependencies=operator_only)
-    app.include_router(roles_routes.router, dependencies=operator_only)
+    # Row 39: a person with an operations power reads roles and the metrics
+    # summary (`operations.py`); every other route here is the owner's.
+    operations_or_owner = [Depends(operations_read)]
+    app.include_router(roles_routes.router, dependencies=operations_or_owner)
     app.include_router(admin_routes.router, dependencies=operator_only)
     # Row 13: the drain also takes this machine's own agent, which drains its
     # gateway before every stop (the reviewer's first target).
@@ -353,7 +357,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # Metrics are operator-only too, and unlike other reads they do not
     # accept a service token: no component needs them, and model names
     # plus traffic volumes are not nothing on a shared tailnet.
-    app.include_router(metrics_routes.router, dependencies=operator_only)
+    app.include_router(metrics_routes.router, dependencies=operations_or_owner)
     # Row 12: `GET /metrics` and `GET /v1/metrics/export` take an operator session or
     # a client key that may read metrics, and check which in their own dependency.
     app.include_router(telemetry_routes.router)

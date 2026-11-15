@@ -656,3 +656,137 @@ def test_a_bundle_with_a_malformed_token_epoch_mark_is_refused(
     jws = jwt.encode(payload, authority, algorithm="EdDSA", headers={"typ": tokens.TYP_BUNDLE})
     with pytest.raises(tokens.BundleError, match="tokenEpochs"):
         tokens.parse_bundle(jws, authority=tokens.public_b64(authority))
+
+
+# ------------------------------------------------------------- operations (row 39)
+
+
+def _operations(
+    install: dict[str, object],
+    *,
+    signer: str = "root",
+    sub: str = "p-dana",
+    aud: tuple[str, ...] = ("node:nas",),
+    ops: object = ("operate-models",),
+    ttl: int = tokens.OPERATIONS_TTL_SECONDS,
+    sid: object = "admin-session-1",
+    version: object = 3,
+    jti: str | None = None,
+) -> str:
+    minter = install[signer]
+    assert isinstance(minter, tokens.Signer)
+    extra: dict[str, object] = {"ops": ops, "name": "Dana", "administration_version": version}
+    if sid is not None:
+        extra["sid"] = sid
+    token, _ = minter.mint(
+        typ=tokens.TYP_OPERATIONS, sub=sub, aud=list(aud), ttl_seconds=ttl, jti=jti, extra=extra
+    )
+    return token
+
+
+def test_an_operations_token_carries_the_person_the_powers_and_the_session(
+    install: dict[str, object],
+) -> None:
+    claims = _verify(install, _operations(install), "node:nas", tokens.TYP_OPERATIONS)
+    assert claims.is_operations
+    assert claims.sub == "p-dana" and claims.name == "Dana"
+    assert claims.ops == ("operate-models",)
+    assert claims.sid == "admin-session-1" and claims.administration_version == 3
+    assert claims.holds(tokens.POWER_OPERATE_MODELS)
+    assert not claims.holds(tokens.POWER_OPERATE_MACHINES)
+
+
+def test_an_operations_token_is_no_session_and_no_service_token(
+    install: dict[str, object],
+) -> None:
+    token = _operations(install)
+    with pytest.raises(tokens.TokenError, match="not accepted here"):
+        _verify(install, token, "node:nas", tokens.TYP_SESSION, tokens.TYP_SERVICE)
+    session, _ = install["root"].mint(  # type: ignore[attr-defined]
+        typ=tokens.TYP_SESSION, sub="operator", aud=["node:nas"], ttl_seconds=600
+    )
+    with pytest.raises(tokens.TokenError, match="not accepted here"):
+        _verify(install, session, "node:nas", tokens.TYP_OPERATIONS)
+
+
+@pytest.mark.parametrize(
+    ("change", "why"),
+    [
+        ({"signer": "nas"}, "only the authority mints"),
+        ({"aud": ("node:nas", "node:gpu-box")}, "one machine"),
+        ({"aud": ("control",)}, "one machine"),
+        ({"sub": "operator"}, "invalid operations token"),
+        ({"sub": "agent"}, "invalid operations token"),
+        ({"ops": []}, "invalid operations token"),
+        ({"ops": ["operate-models", "operate-models"]}, "invalid operations token"),
+        ({"ops": ["read-secrets"]}, "invalid operations token"),
+        ({"ops": "operate-models"}, "invalid operations token"),
+        ({"sid": None}, "invalid operations token"),
+        ({"version": -1}, "invalid operations token"),
+        ({"version": True}, "invalid operations token"),
+        ({"ttl": tokens.OPERATIONS_TTL_SECONDS + 1}, "may live"),
+    ],
+)
+def test_a_malformed_operations_token_is_refused(
+    install: dict[str, object], change: dict[str, object], why: str
+) -> None:
+    token = _operations(install, **change)  # type: ignore[arg-type]
+    recipient = "control" if change.get("aud") == ("control",) else "node:nas"
+    with pytest.raises(tokens.TokenError, match=why):
+        _verify(install, token, recipient, tokens.TYP_OPERATIONS)
+
+
+def test_an_operations_token_for_one_machine_is_refused_at_another(
+    install: dict[str, object],
+) -> None:
+    with pytest.raises(tokens.TokenError, match="not to 'node:gpu-box'"):
+        _verify(install, _operations(install), "node:gpu-box", tokens.TYP_OPERATIONS)
+
+
+def test_signing_out_or_a_grant_change_revokes_an_operations_token(
+    install: dict[str, object],
+) -> None:
+    authority = install["authority"]
+    bundle = install["bundle"]
+    assert isinstance(authority, Ed25519PrivateKey) and isinstance(bundle, tokens.TrustBundle)
+    token = _operations(install, jti="ops-1")
+    for revoked in ("ops-1", "admin-session-1", tokens.operations_revocation("p-dana", 3)):
+        later = tokens.build_bundle(
+            authority=authority,
+            version=11,
+            epoch=1,
+            keys=list(bundle.keys.values()),
+            revoked_sessions=[(revoked, _now() + 3600)],
+        )
+        with pytest.raises(tokens.TokenError, match="signed out"):
+            tokens.verify(
+                token, bundle=later, recipient="node:nas", classes=[tokens.TYP_OPERATIONS]
+            )
+    # Another version's revocation leaves this token alone.
+    other = tokens.build_bundle(
+        authority=authority,
+        version=11,
+        epoch=1,
+        keys=list(bundle.keys.values()),
+        revoked_sessions=[(tokens.operations_revocation("p-dana", 2), _now() + 3600)],
+    )
+    assert tokens.verify(token, bundle=other, recipient="node:nas", classes=[tokens.TYP_OPERATIONS])
+
+
+def test_an_operations_token_for_a_removed_machine_is_refused(
+    install: dict[str, object],
+) -> None:
+    authority = install["authority"]
+    bundle = install["bundle"]
+    assert isinstance(authority, Ed25519PrivateKey) and isinstance(bundle, tokens.TrustBundle)
+    token = _operations(install)
+    without_nas = tokens.build_bundle(
+        authority=authority,
+        version=11,
+        epoch=1,
+        keys=[k for k in bundle.keys.values() if k.issuer != "node:nas"],
+    )
+    with pytest.raises(tokens.TokenError, match="no longer in the install"):
+        tokens.verify(
+            token, bundle=without_nas, recipient="node:nas", classes=[tokens.TYP_OPERATIONS]
+        )
