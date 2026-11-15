@@ -81,6 +81,9 @@ class TwoAgents:
         # When true, agent A's own `/v1/node` answers 503 -- a blip in
         # the read that tells the gateway which node it runs on.
         self.own_node_fails = False
+        # When true, agent A answers nothing at all: an agent that is
+        # stopping (its listener closed while it drains this gateway).
+        self.agent_a_silent = False
         # **The names are IDENTICAL on both nodes, and that is the
         # reproduction** (R1.6, review §6.1 #8). This fixture used to say
         # `qwen-a` / `qwen-b`, which no install produces: the UI names a
@@ -170,6 +173,8 @@ class TwoAgents:
                 )
             return httpx.Response(404, json={"detail": path})
 
+        if host == "agent-a" and self.agent_a_silent:
+            raise httpx.ConnectError("connection refused", request=request)
         if host in ("agent-a", "agent-b") and port == 8079:
             node = "node-a" if host == "agent-a" else "node-b"
             if path == "/v1/node":
@@ -837,6 +842,23 @@ async def test_an_unenrolled_agent_that_runs_the_control_root_still_names_it(
     assert _nodes_for(table) == ["node-a", "node-b"]
     assert _root(table)["source"] == "agent"
     assert _root(table)["url"] == CONTROL
+
+
+async def test_a_silent_own_agent_keeps_the_agent_map(two: TwoAgents) -> None:
+    """Row 13's check 6: while an agent stops, it drains its gateway with its
+    listener already closed. The gateway could not ask it for the control
+    root, read that as a single-host install, dropped every node's drivers
+    and closed their clients under the answers it was draining. An agent
+    that does not answer at all keeps the last agent map."""
+    two.enrolled_to = CONTROL
+    table = RoutingTable(agent_url=AGENT_A, refresh_seconds=3600)
+    await table.refresh()
+    assert _nodes_for(table) == ["node-a", "node-b"]
+    two.agent_a_silent = True
+    await table.refresh()
+    assert _nodes_for(table) == ["node-a", "node-b"]
+    assert _root(table)["url"] == CONTROL
+    await table.aclose()
 
 
 async def test_no_control_root_anywhere_is_a_single_host_install(two: TwoAgents) -> None:

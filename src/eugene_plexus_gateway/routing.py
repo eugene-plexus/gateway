@@ -891,6 +891,9 @@ class RoutingTable:
         # the next one with no restart and no refresh.
         self._search_order: Callable[[], Any] = search_order or (lambda: None)
         self._snapshot = _Snapshot(agents={None: self._agent_url})
+        #: Whether the last read of this gateway's own agent got no answer
+        #: at all (row 13): see `_discover`.
+        self._own_agent_silent = False
         # Clients are cached by (node, name, url) and reused across
         # refreshes. Rebuilding an httpx.AsyncClient every 15s would
         # throw away the connection pool and leak sockets. The node is in
@@ -1024,6 +1027,9 @@ class RoutingTable:
         with contextlib.suppress(BaseException):
             await self._json_client.aclose()
         self._snapshot = _Snapshot(agents={None: self._agent_url})
+        #: Whether the last read of this gateway's own agent got no answer
+        #: at all (row 13): see `_discover`.
+        self._own_agent_silent = False
 
     def refresh_interval(self) -> float:
         """`routingRefreshSeconds`, or 2 s while an agent holds a drain open
@@ -1170,6 +1176,9 @@ class RoutingTable:
             if isinstance(url, str) and url.strip():
                 return url.strip().rstrip("/"), "node"
         body = await self._get_json(f"{self._agent_url}/v1/components", self.recipient_for(None))
+        # Neither read answered: the agent is silent (stopping, restarting),
+        # which says nothing about where the control root is (row 13).
+        self._own_agent_silent = node is None and body is None
         components = body.get("components") if isinstance(body, dict) else None
         for entry in components if isinstance(components, list) else []:
             if isinstance(entry, dict) and entry.get("kind") == "control":
@@ -1237,6 +1246,13 @@ class RoutingTable:
         else:
             control_url, via = await self._derive_control_url(own_node)
             source = "agent" if control_url is not None else "none"
+            if control_url is None and self._own_agent_silent and self._snapshot.agents:
+                # This gateway's own agent answered nothing at all, which is
+                # not "a single-host install": an agent stopping drains its
+                # gateway with its listener already closed, and reading it
+                # as single-host dropped every node's drivers under the
+                # answers being drained (row 13, check 6). Keep the last map.
+                return dict(self._snapshot.agents), self._snapshot.control_root
         self._announce_control_root(control_url, source, via)
         if control_url is None:
             return {None: self._agent_url}, ControlRootFacts()
