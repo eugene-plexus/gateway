@@ -1082,14 +1082,25 @@ def test_a_stream_whose_turn_waits_for_room_in_a_pool_still_opens_at_once(
     with TestClient(timeline) as client:
         portal = client.portal
         assert portal is not None
-        freed = threading.Timer(0.6, lambda: portal.call(ledger.give, (None, "rt-a"), 9_500))
+        given: list[float] = []
+
+        def give_back() -> None:
+            given.append(time.perf_counter())
+            portal.call(ledger.give, (None, "rt-a"), 9_500)
+
+        freed = threading.Timer(0.6, give_back)
         freed.start()
         r = _post(client, door, stream=True, **FORCED[door])
         freed.join()
     assert r.status_code == 200 and "pelican" in r.text
     opened, headers = timeline.head()
     token = timeline.first(b"pelican")
-    assert token - opened >= 0.5, f"the head came {token - opened:.2f}s before the first token"
+    # The subject is the order, not a span from when the timer was armed: the
+    # head goes out before the room is given back, the token after it. (A span
+    # measured from the timer's start failed on a slow CI runner.)
+    assert opened < given[0] <= token, (
+        f"head {opened - given[0]:+.2f}s and token {token - given[0]:+.2f}s from the room given back"
+    )
     assert headers[HEADER].split(", ")[-1] == "tool_choice"
 
 
