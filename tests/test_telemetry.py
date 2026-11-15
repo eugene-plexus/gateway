@@ -30,6 +30,7 @@ from eugene_plexus_gateway._generated.driver_models import Usage
 from eugene_plexus_gateway.app import create_app
 from eugene_plexus_gateway.metrics import AttemptRow, MetricsStore, RequestRow
 from eugene_plexus_gateway.routes import inference
+from eugene_plexus_gateway.routes import telemetry as telemetry_route
 from eugene_plexus_gateway.settings import Settings
 
 from .conftest import (
@@ -292,7 +293,8 @@ class ScrapeAgent(FakeAgent):
 def agent() -> ScrapeAgent:
     found = ScrapeAgent()
     found.limits = {
-        "key-scrape": {"readMetrics": True, "allowedModels": []},
+        # What the console's "Make a scrape key" makes: numbers, no model, no tool.
+        "key-scrape": {"readMetrics": True, "allowedModels": [], "allowedTools": []},
         "key-chat": {"allowedModels": None},
     }
     found.registered = ["key-scrape", "key-chat"]
@@ -367,6 +369,9 @@ def test_a_scrape_key_runs_no_inference_and_an_inference_key_reads_no_metrics(
     assert (
         client.post("/v1/chat/completions", json=body, headers=_bearer(scrape)).status_code == 403
     )
+    # Nor a web search: absent `allowedTools` would permit every tool the install runs.
+    searched = client.post("/v1/web_search", json={"query": "anything"}, headers=_bearer(scrape))
+    assert searched.status_code == 403, searched.text
     assert client.post("/v1/chat/completions", json=body, headers=_bearer(chat)).status_code == 200
     assert client.get("/metrics", headers=_bearer(chat)).status_code == 403
     # And the scrape key opens no operator path.
@@ -381,18 +386,30 @@ def test_a_revoked_scrape_key_is_refused(
     scrape = install.client_key(name="prometheus", jti="key-scrape")
     assert client.get("/metrics", headers=_bearer(scrape)).status_code == 200
     agent.revoke("key-scrape")
-    client.app.state.metrics_keys.clear()
+    # The kept standing is not cleared: the gateway's own key policy refuses a
+    # revoked key at once, before the standing is read.
     assert client.get("/metrics", headers=_bearer(scrape)).status_code == 401
 
 
 def test_a_key_that_lost_the_grant_is_refused_once_the_standing_expires(
-    authed: tuple[TestClient, FakeInstall], agent: ScrapeAgent
+    authed: tuple[TestClient, FakeInstall],
+    agent: ScrapeAgent,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client, install = authed
     scrape = install.client_key(name="prometheus", jti="key-scrape")
     assert client.get("/metrics", headers=_bearer(scrape)).status_code == 200
     agent.limits["key-scrape"] = {"allowedModels": []}
+    # Held, the standing still says yes: it is kept for a few seconds so a scraper
+    # every fifteen is not a question to the root each time.
+    assert client.get("/metrics", headers=_bearer(scrape)).status_code == 200
+    # Expired at once, the same cache asks again each time, and the answer is the
+    # authority's.
+    monkeypatch.setattr(telemetry_route, "_STANDING_SECONDS", 0.0)
     client.app.state.metrics_keys.clear()
+    agent.limits["key-scrape"] = {"readMetrics": True, "allowedModels": []}
+    assert client.get("/metrics", headers=_bearer(scrape)).status_code == 200
+    agent.limits["key-scrape"] = {"allowedModels": []}
     assert client.get("/metrics", headers=_bearer(scrape)).status_code == 403
 
 
@@ -864,3 +881,206 @@ def test_the_config_says_what_it_sends_and_keeps_the_credential_secret(client: T
     assert document["telemetryOtlpAuthorization"] == "<redacted>"
     bad = client.patch("/v1/config", json={"telemetryOtlpEndpoint": "ftp://nope"})
     assert bad.json()["rejected"], bad.text
+
+
+# --------------------------------------------------------------------- #
+# review: a credential is never said, a bad address is named, gauges say their machine
+# --------------------------------------------------------------------- #
+
+SECRET = "r12-SECRET-TOKEN-123"
+
+
+class _Collector:
+    """A real HTTP listener, so the real HTTP library judges the header."""
+
+    def __init__(self) -> None:
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        owner = self
+        self.seen: list[dict[str, str]] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                self.rfile.read(int(self.headers.get("content-length") or 0))
+                owner.seen.append({k.lower(): v for k, v in self.headers.items()})
+                self.send_response(200)
+                self.send_header("content-length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args: Any) -> None:
+                pass
+
+        self.server = HTTPServer(("127.0.0.1", 0), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def stop(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _real_exporter(settings: telemetry.OtlpSettings) -> telemetry.OtlpExporter:
+    from eugene_plexus_gateway._http import client_for
+
+    numbers = telemetry.Telemetry(settings=lambda: settings)
+    return telemetry.OtlpExporter(
+        numbers,
+        settings=lambda: settings,
+        gauges=lambda: {},
+        client_for=client_for,
+        timeout_seconds=3.0,
+    )
+
+
+def test_describe_says_only_the_type_of_an_error_it_does_not_know() -> None:
+    cause = telemetry.describe(
+        httpx.LocalProtocolError(f"Illegal header value b'Bearer {SECRET}'"), "http://c:4318"
+    )
+    assert cause == "LocalProtocolError"
+    assert SECRET not in telemetry.describe(
+        httpx.UnsupportedProtocol(f"Request URL has an unsupported protocol {SECRET}"),
+        "http://c:4318",
+    )
+
+
+def test_a_credential_a_header_cannot_hold_is_never_said(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    collector = _Collector()
+    try:
+        # A NUL inside: h11 refuses the header and quotes it in its own error.
+        settings = telemetry.OtlpSettings(
+            endpoint=collector.url, authorization=f"Bearer {SECRET}\x00more"
+        )
+
+        async def run() -> dict[str, Any]:
+            exporter = _real_exporter(settings)
+            with caplog.at_level("DEBUG"):
+                await exporter.push_once()
+                await exporter.push_once()
+            snapshot = exporter.snapshot()
+            await exporter.aclose()
+            return snapshot
+
+        snapshot = asyncio.run(run())
+    finally:
+        collector.stop()
+    assert snapshot["state"] == "failing"
+    assert "header cannot hold" in snapshot["lastError"]
+    assert collector.seen == [], "a refused credential was still sent"
+    said = json.dumps(snapshot, default=str) + "\n".join(r.getMessage() for r in caplog.records)
+    assert SECRET not in said
+    # Said once, not at every interval.
+    warned = [r for r in caplog.records if "OTLP export" in r.getMessage()]
+    assert len(warned) == 1
+
+
+def test_a_credential_with_a_trailing_space_is_trimmed_and_sent() -> None:
+    collector = _Collector()
+    try:
+        settings = telemetry.OtlpSettings(
+            endpoint=collector.url, authorization=f"Bearer {SECRET} \n"
+        )
+
+        async def run() -> dict[str, Any]:
+            exporter = _real_exporter(settings)
+            await exporter.push_once()
+            snapshot = exporter.snapshot()
+            await exporter.aclose()
+            return snapshot
+
+        snapshot = asyncio.run(run())
+    finally:
+        collector.stop()
+    assert snapshot["state"] == "ok", snapshot
+    assert collector.seen and all(h["authorization"] == f"Bearer {SECRET}" for h in collector.seen)
+
+
+def test_the_gateway_trims_the_credential_it_reads_from_the_config(client: TestClient) -> None:
+    patched = client.patch("/v1/config", json={"telemetryOtlpAuthorization": f"Bearer {SECRET} \n"})
+    assert patched.status_code == 200, patched.text
+    read = client.app.state.otlp_exporter._settings()
+    assert read.authorization == f"Bearer {SECRET}"
+
+
+def test_an_address_that_is_not_a_url_is_named_and_not_taken_for_working() -> None:
+    settings = telemetry.OtlpSettings(endpoint="http://[bad")
+
+    async def run() -> dict[str, Any]:
+        exporter = _real_exporter(settings)
+        await exporter.push_once()
+        snapshot = exporter.snapshot()
+        await exporter.aclose()
+        return snapshot
+
+    snapshot = asyncio.run(run())
+    assert snapshot["state"] == "failing"
+    assert snapshot["lastError"] == "the collector address is not a valid URL"
+
+
+def test_the_exporter_sends_again_when_any_export_setting_changes() -> None:
+    seen: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(dict(request.headers))
+        return httpx.Response(200, json={})
+
+    box = {"settings": telemetry.OtlpSettings(endpoint="http://c:4318", authorization="Bearer one")}
+    numbers = telemetry.Telemetry(settings=lambda: box["settings"])
+    exporter = telemetry.OtlpExporter(
+        numbers,
+        settings=lambda: box["settings"],
+        gauges=lambda: {},
+        client_for=lambda url: httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+    )
+
+    async def run() -> None:
+        exporter.start()
+        for _ in range(60):
+            if seen:
+                break
+            await asyncio.sleep(0.1)
+        first = len(seen)
+        assert first, "nothing was sent"
+        # The interval is a minute: only the change can make this send now.
+        box["settings"] = telemetry.OtlpSettings(
+            endpoint="http://c:4318", authorization="Bearer two"
+        )
+        for _ in range(60):
+            if len(seen) > first:
+                break
+            await asyncio.sleep(0.1)
+        await exporter.aclose()
+
+    asyncio.run(run())
+    assert seen[0]["authorization"] == "Bearer one"
+    assert seen[-1]["authorization"] == "Bearer two"
+
+
+def test_a_budget_gauge_and_the_queue_say_which_machine_they_are_about() -> None:
+    from eugene_plexus_gateway import fair_queue
+
+    table = make_routing_table(
+        runtimes=[
+            runtime_facts("rt", node="a", context_pool=1000),
+            runtime_facts("rt", node="b", context_pool=2000),
+        ]
+    )
+    fair_queue.of(table).ledger.take(("a", "rt"), 50)
+    fair_queue.of(table).snapshot = lambda: [  # type: ignore[method-assign]
+        {
+            "model": "m",
+            "runtime": "rt",
+            "node": "b",
+            "waiting": {"interactive": 2, "background": 0, "sheddable": 0},
+            "running": 0,
+            "slots": None,
+        }
+    ]
+    page = telemetry.Telemetry().render(telemetry.read_gauges(table, rows_dropped=0, enabled=True))
+    assert value(page, "eugene_budget_pool_tokens", runtime="rt", node="a") == 1000
+    assert value(page, "eugene_budget_pool_tokens", runtime="rt", node="b") == 2000
+    assert value(page, "eugene_budget_reserved_tokens", runtime="rt", node="a") == 50
+    assert value(page, "eugene_queue_waiting", runtime="rt", node="b", band="interactive") == 2

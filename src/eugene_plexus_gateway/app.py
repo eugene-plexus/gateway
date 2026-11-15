@@ -139,7 +139,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         interval = store.get("telemetryOtlpIntervalSeconds")
         return telemetry.OtlpSettings(
             endpoint=str(store.get("telemetryOtlpEndpoint") or "").strip(),
-            authorization=str(store.get("telemetryOtlpAuthorization") or ""),
+            # Trimmed: a trailing space or newline pasted with the credential is
+            # not part of it, and a header cannot carry one.
+            authorization=str(store.get("telemetryOtlpAuthorization") or "").strip(),
             metrics=signals in ("metrics", "both"),
             traces=signals in ("traces", "both"),
             sample_ratio=float(1 if ratio is None else ratio),

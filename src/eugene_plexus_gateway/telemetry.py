@@ -183,10 +183,16 @@ GAUGES: dict[str, tuple[str, tuple[str, ...]]] = {
     "eugene_runtime_slots": ("Parallel slots a runtime has.", ("runtime", "node")),
     "eugene_budget_reserved_tokens": (
         "Prompt tokens held in a runtime's shared context pool.",
-        ("runtime",),
+        ("runtime", "node"),
     ),
-    "eugene_budget_pool_tokens": ("Size of a runtime's shared context pool.", ("runtime",)),
-    "eugene_queue_waiting": ("Requests waiting in the fair queue now.", ("runtime", "band")),
+    "eugene_budget_pool_tokens": (
+        "Size of a runtime's shared context pool.",
+        ("runtime", "node"),
+    ),
+    "eugene_queue_waiting": (
+        "Requests waiting in the fair queue now.",
+        ("runtime", "node", "band"),
+    ),
     "eugene_circuit_open": ("1 while a driver's circuit is open.", ("driver",)),
     "eugene_metrics_rows_dropped_total": (
         "Request rows dropped because the write queue was full.",
@@ -805,8 +811,8 @@ def read_gauges(
             if facts.parallel_slots:
                 slots.append((who, float(facts.parallel_slots)))
             if facts.context_pool:
-                pools.append(((facts.name,), float(facts.context_pool)))
-                reserved.append(((facts.name,), float(queue.ledger.in_flight(facts.key))))
+                pools.append((who, float(facts.context_pool)))
+                reserved.append((who, float(queue.ledger.in_flight(facts.key))))
         out["eugene_in_flight"] = inflight
         out["eugene_runtime_slots"] = slots
         out["eugene_budget_reserved_tokens"] = reserved
@@ -816,7 +822,12 @@ def read_gauges(
         for group in fair_queue.of(table).snapshot():
             for band, count in group["waiting"].items():
                 if count:
-                    waiting.append(((group["runtime"] or group["model"], band), float(count)))
+                    waiting.append(
+                        (
+                            (group["runtime"] or group["model"], group["node"], band),
+                            float(count),
+                        )
+                    )
         out["eugene_queue_waiting"] = waiting
     with contextlib.suppress(Exception):
         open_by_driver: dict[str, float] = {}
@@ -834,7 +845,10 @@ def read_gauges(
 
 def describe(exc: BaseException, endpoint: str) -> str:
     """The observed cause of a failed push, in words, with no credential in it."""
-    host = httpx.URL(endpoint).netloc.decode() if endpoint else "the collector"
+    try:
+        host = httpx.URL(endpoint).netloc.decode() if endpoint else "the collector"
+    except httpx.InvalidURL:
+        host = "the collector"
     if isinstance(exc, httpx.ConnectTimeout | httpx.ReadTimeout | httpx.WriteTimeout):
         return f"{host} did not answer in time"
     if isinstance(exc, httpx.ConnectError):
@@ -842,8 +856,11 @@ def describe(exc: BaseException, endpoint: str) -> str:
         return f"could not connect to {host}" + (f": {said[:160]}" if said else "")
     if isinstance(exc, httpx.HTTPStatusError):
         return f"{host} answered {exc.response.status_code}"
-    said = str(exc).strip()
-    return f"{type(exc).__name__}" + (f": {said[:160]}" if said else "")
+    if isinstance(exc, httpx.InvalidURL):
+        return "the collector address is not a valid URL"
+    # Anything else says its type and nothing more: the text of an error from the
+    # request can hold what was sent, and a header holds the credential.
+    return type(exc).__name__
 
 
 def display_endpoint(endpoint: str) -> str | None:
@@ -905,7 +922,7 @@ class OtlpExporter:
         """Look every second; send when the interval is up or the address is new, so
         a collector set in the console is tried at once and not a minute later."""
         last: float | None = None
-        seen = ""
+        seen: OtlpSettings | None = None
         while True:
             try:
                 settings = self._settings()
@@ -913,13 +930,13 @@ class OtlpExporter:
                 due = last is None or time.perf_counter() - last >= max(
                     1.0, settings.interval_seconds
                 )
-                if endpoint and (due or endpoint != seen):
+                if endpoint and (due or settings != seen):
                     last = time.perf_counter()
                     await self.push_once()
                 elif not endpoint:
                     self.state = "off"
                     last = None
-                seen = endpoint
+                seen = settings
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -958,9 +975,19 @@ class OtlpExporter:
             self.state = "off"
             return
         headers = {"Content-Type": "application/json"}
-        if settings.authorization:
-            headers["Authorization"] = settings.authorization
-        client = self._http(endpoint)
+        credential = settings.authorization.strip()
+        if credential:
+            if any(ord(ch) < 32 or ord(ch) == 127 for ch in credential):
+                # A header cannot hold it, and what the HTTP library would say
+                # about it would repeat it.
+                self._fail("the collector credential has a character a header cannot hold")
+                return
+            headers["Authorization"] = credential
+        try:
+            client = self._http(endpoint)
+        except (ValueError, httpx.InvalidURL):
+            self._fail("the collector address is not a valid URL")
+            return
         spans: list[Span] = []
         try:
             if settings.metrics:
@@ -984,13 +1011,20 @@ class OtlpExporter:
                     spans = []
         except (httpx.HTTPError, OSError, ValueError) as exc:
             self._telemetry.give_back_spans(spans)
-            self.state = "failing"
-            self.last_error = describe(exc, endpoint)
-            log.warning("OTLP export to %s failed: %s", display_endpoint(endpoint), self.last_error)
+            self._fail(describe(exc, endpoint), endpoint)
             return
         self.state = "ok"
         self.last_error = None
         self.last_success_at = datetime.now(UTC)
+
+    def _fail(self, cause: str, endpoint: str = "") -> None:
+        """Say the export is failing, and why, once per change: the log and the
+        console read the same sentence, which has no credential in it."""
+        changed = self.state != "failing" or self.last_error != cause
+        self.state = "failing"
+        self.last_error = cause
+        if changed:
+            log.warning("OTLP export to %s failed: %s", display_endpoint(endpoint), cause)
 
 
 async def _close(client: httpx.AsyncClient) -> None:
