@@ -87,8 +87,12 @@ def test_any_power_reads_roles_and_metrics(client: TestClient, install: FakeInst
 
 def test_config_patch_stays_owner_only(client: TestClient, install: FakeInstall) -> None:
     everything = _bearer(_operations(install, *tokens.POWERS))
-    assert client.patch("/v1/config", json={}, headers=everything).status_code in (401, 403)
-    assert client.get("/v1/config", headers=everything).status_code in (401, 403)
+    for answer in (
+        client.patch("/v1/config", json={}, headers=everything),
+        client.get("/v1/config", headers=everything),
+    ):
+        assert answer.status_code == 403
+        assert "Only the owner" in answer.json()["detail"]["detail"]
 
 
 def test_nothing_else_takes_an_operations_token(client: TestClient, install: FakeInstall) -> None:

@@ -72,6 +72,15 @@ def front_door_claims(auth: AuthState, token: str) -> tokens.Claims:
     return claims
 
 
+def _is_operations(token: str) -> bool:
+    import jwt
+
+    try:
+        return bool(jwt.get_unverified_header(token).get("typ") == tokens.TYP_OPERATIONS)
+    except jwt.InvalidTokenError:
+        return False
+
+
 def _validate(
     request: Request,
     creds: HTTPAuthorizationCredentials | None,
@@ -90,6 +99,15 @@ def _validate(
     try:
         if front_door:
             return front_door_claims(auth, creds.credentials)
+        if _is_operations(creds.credentials):
+            # Row 39: a person's operations token, valid here, on a route
+            # that is the owner's: say so rather than that it is the wrong kind.
+            auth.verify(creds.credentials, classes=(tokens.TYP_OPERATIONS,))
+            raise _problem(
+                status.HTTP_403_FORBIDDEN,
+                "Owner only",
+                "Only the owner can do this. Your operations powers do not include it.",
+            )
         return auth.verify(creds.credentials, classes=(tokens.TYP_SESSION,))
     except tokens.TokenError as e:
         raise _problem(
