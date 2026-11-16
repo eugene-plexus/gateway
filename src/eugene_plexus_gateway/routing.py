@@ -860,6 +860,7 @@ class RoutingTable:
         search_order: Callable[[], Any] | None = None,
         move_by_first_token: Callable[[], Any] | None = None,
         move_penalty_ms: Callable[[], Any] | None = None,
+        spread_by_tokens: Callable[[], Any] | None = None,
     ) -> None:
         self._agent_url = agent_url.rstrip("/")
         # CB3: the prompt tokens in flight on each runtime with a shared
@@ -873,6 +874,8 @@ class RoutingTable:
         #: `moveByFirstToken` and `moveFirstTokenPenaltyMs`, read at every turn.
         self._move_on: Callable[[], Any] = move_by_first_token or (lambda: True)
         self._move_penalty: Callable[[], Any] = move_penalty_ms or (lambda: 2000)
+        #: `spreadByTokensHeld`, read at every placement.
+        self._spread_tokens: Callable[[], Any] = spread_by_tokens or (lambda: True)
         self._room_wait: Callable[[], float] = room_wait_seconds or (lambda: 120.0)
         # Read live on every refresh, for the same reason `slots` and
         # `strategy` are: `controlUrl` is a config field whose own
@@ -2253,7 +2256,9 @@ class RoutingTable:
     def _spread_key(
         self, target: str, backends: list[_Backend], affinity: str | None
     ) -> Callable[[_Backend], tuple[float, ...]]:
-        """How `spread` ranks a replica for a new conversation, lowest first (DI5):
+        """How `spread` ranks a replica for a new conversation, lowest first (DI5).
+        With `spreadByTokensHeld` off, only the conversations per slot and then the
+        requests in flight, as before row 14. On:
 
         1. the prompt tokens it holds as a share of its context, in steps of a
            twentieth, so a small difference leaves the rest to decide. Left out
@@ -2266,6 +2271,13 @@ class RoutingTable:
         in step 2, and in step 1 they do not.
         """
         held = self._affinity.held(target, besides=affinity)
+        if self._spread_tokens() is False:
+            # The expert override: the order before row 14, conversations per slot
+            # then this gateway's requests in flight.
+            return lambda b: (
+                held.get(b.key, 0) / b.parallel_slots,
+                self.inflight(b.key) / b.parallel_slots,
+            )
         capacities = {b.key: self._capacity(b) for b in backends}
         tokens = (
             self._affinity.held_tokens(target, self._sizes, besides=affinity)

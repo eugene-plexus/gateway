@@ -477,6 +477,23 @@ FIELDS: list[ConfigField] = [
         maximum=600,
     ),
     ConfigField(
+        key="spreadByTokensHeld",
+        label="Place new conversations by the tokens a replica holds",
+        description=(
+            "Lets `spread` count the tokens each replica holds, not only its conversations.\n\n"
+            "On (the default), a new conversation goes to the replica holding the fewest "
+            "prompt tokens as a share of its context, so one 80,000-token agent session "
+            "weighs more than three short chats. Ties go to the fewest conversations, then "
+            "the shortest expected wait, then the lightest load. This needs every replica "
+            "to report its context; otherwise conversations decide alone.\n\n"
+            "Off: `spread` counts conversations per slot, then requests in flight, as it did "
+            "before tokens were counted. Used only when New conversations go to is `spread`."
+        ),
+        category="lifecycle",
+        valueType=ConfigValueType.boolean,
+        default=True,
+    ),
+    ConfigField(
         key="moveByFirstToken",
         label="Move a conversation when another replica answers sooner",
         description=(

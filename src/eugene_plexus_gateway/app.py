@@ -233,6 +233,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 # Row 14 (LD3): live, so a PATCH applies to the next turn.
                 move_by_first_token=lambda: store.get("moveByFirstToken"),
                 move_penalty_ms=lambda: store.get("moveFirstTokenPenaltyMs"),
+                spread_by_tokens=lambda: store.get("spreadByTokensHeld"),
             )
             if metrics is not None:
                 # Row 14: each runtime's prefill rate and answer time from the

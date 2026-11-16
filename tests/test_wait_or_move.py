@@ -277,7 +277,7 @@ def _held_conversations(table, home, sizes) -> None:  # type: ignore[no-untyped-
         table._sizes.put(MODEL, key, prompt_tokens=tokens, chars=tokens * 4)
 
 
-def _four_slots(*, pools=(200_000, 200_000), loads=(None, None)):  # type: ignore[no-untyped-def]
+def _four_slots(*, pools=(200_000, 200_000), loads=(None, None), **options):  # type: ignore[no-untyped-def]
     fakes = []
     for letter in ("a", "b"):
         fake = FakeDriverClient(
@@ -295,7 +295,7 @@ def _four_slots(*, pools=(200_000, 200_000), loads=(None, None)):  # type: ignor
         )
         for letter, pool, load in zip(("a", "b"), pools, loads, strict=True)
     ]
-    return make_routing_table(*fakes, runtimes=runtimes, strategy="spread"), fakes
+    return make_routing_table(*fakes, runtimes=runtimes, strategy="spread", **options), fakes
 
 
 def _first(table, key: str = "k:new") -> str:  # type: ignore[no-untyped-def]
@@ -309,6 +309,19 @@ def test_a_new_conversation_goes_to_the_replica_holding_fewer_tokens():
     _held_conversations(table, KEY_A, [80_000])
     _held_conversations(table, KEY_B, [500, 500, 500])
     assert _first(table) == "llama-b-driver"
+
+
+def test_turned_off_spread_counts_conversations_alone_as_before():
+    """The expert override: `spreadByTokensHeld` off restores the earlier order, the
+    conversations per slot, then the requests this gateway has in flight. The same
+    80,000-token session on A against three chats on B now says A is the lighter
+    one, and neither the engine's own load nor the expected wait counts."""
+    table, _fakes = _four_slots(spread_by_tokens=False, loads=(5, None))
+    _held_conversations(table, KEY_A, [80_000])
+    _held_conversations(table, KEY_B, [500, 500, 500])
+    assert _first(table) == "llama-a-driver"
+    quiet, _fakes = _four_slots(spread_by_tokens=False, loads=(5, None))
+    assert _first(quiet) == "llama-a-driver", "vLLM's load decided a tie it should not"
 
 
 def test_equal_tokens_fall_to_the_fewer_conversations():

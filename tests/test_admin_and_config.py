@@ -194,6 +194,7 @@ def test_config_schema_lists_the_gateway_fields(client: TestClient) -> None:
         "queueMaxRequests",
         "answerReserveFloorTokens",
         # Row 14: wait or move by predicted time to first token.
+        "spreadByTokensHeld",
         "moveByFirstToken",
         "moveFirstTokenPenaltyMs",
         "idleCheckSeconds",

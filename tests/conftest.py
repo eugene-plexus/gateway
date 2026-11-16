@@ -505,6 +505,7 @@ def make_routing_table(
     affinity: bool = True,
     move: bool = True,
     penalty_ms: float = 2000,
+    spread_by_tokens: bool = True,
 ) -> RoutingTable:
     """A RoutingTable pre-loaded with fakes, without any HTTP.
 
@@ -524,6 +525,7 @@ def make_routing_table(
         affinity=lambda: affinity,
         move_by_first_token=lambda: move,
         move_penalty_ms=lambda: penalty_ms,
+        spread_by_tokens=lambda: spread_by_tokens,
     )
     install_snapshot(table, *fakes, unreachable=unreachable, runtimes=runtimes)
     return table
