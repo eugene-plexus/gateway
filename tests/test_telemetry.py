@@ -643,7 +643,8 @@ def test_a_v14_store_moves_to_v15_in_place_and_keeps_its_history(tmp_path: Path)
     assert len(rows) == 1 and rows[0]["affinityKey"] is None
     assert not list(tmp_path.glob("*.bak")), "the store was set aside, not moved forward"
     conn = sqlite3.connect(path)
-    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "15"
+    # v16 (row 38) moved it on again, past v15.
+    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "16"
     assert "token_ms_sum" in {c[1] for c in conn.execute("PRAGMA table_info(rollup)")}
     conn.close()
 

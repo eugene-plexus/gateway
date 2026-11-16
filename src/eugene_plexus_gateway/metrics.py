@@ -50,7 +50,7 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 # Bounded because the alternative to dropping rows is stalling
 # completions, and that trade is never worth making. Sized so a burst
@@ -239,6 +239,7 @@ _ADDED = {
         "outran_reserve INTEGER",
     ),
     15: ("affinity_key TEXT",),
+    16: (),
 }
 
 #: The rollup columns schema v15 added (row 12): what an hour served past
@@ -254,6 +255,9 @@ _ADDED_ROLLUP = {
         "refused INTEGER NOT NULL DEFAULT 0",
         "token_ms_sum INTEGER NOT NULL DEFAULT 0",
     ),
+    # v16 (row 38): what the woken requests waited for their runtime, summed, so
+    # the wake cost of an hour past retention is still known.
+    16: ("waited_ms_sum INTEGER NOT NULL DEFAULT 0",),
 }
 
 
@@ -418,6 +422,7 @@ CREATE TABLE IF NOT EXISTS rollup (
     queued_ms_sum     INTEGER NOT NULL DEFAULT 0,
     refused           INTEGER NOT NULL DEFAULT 0,
     token_ms_sum      INTEGER NOT NULL DEFAULT 0,
+    waited_ms_sum     INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (bucket_start, requested_model, driver, runtime, node, backend)
 );
 """
@@ -507,17 +512,18 @@ class MetricsStore:
         conn.commit()
 
         row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
-        # A released store (v12, v13, v14) gains its nullable columns in place:
+        # A released store (v12 to v15) gains its nullable columns in place:
         # v13 person attribution (U3), v14 the queue's (row 11), v15 the affinity
-        # key's kind and the rollup's sums (row 12). Alpha schemas and unknown
-        # future schemas remain kept aside whole.
+        # key's kind and the rollup's sums (row 12), v16 the rollup's wake wait
+        # (row 38). Alpha schemas and unknown future schemas remain kept aside
+        # whole.
         if row is None:
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
             conn.commit()
-        elif int(row[0]) in (12, 13, 14):
+        elif int(row[0]) in (12, 13, 14, 15):
             _add_columns(conn, int(row[0]))
         elif int(row[0]) != SCHEMA_VERSION:
             # A version this build does not write: rename the file aside
@@ -820,7 +826,7 @@ class MetricsStore:
                     total_ms_sum, total_ms_max, served_ms_sum,
                     completion_tokens, token_samples,
                     first_ms_sum, first_ms_samples, prompt_tokens, cached_tokens,
-                    queued_ms_sum, refused, token_ms_sum
+                    queued_ms_sum, refused, token_ms_sum, waited_ms_sum
                 )
                 SELECT
                     substr(r.started_at, 1, 13) || ':00:00Z',
@@ -846,7 +852,8 @@ class MetricsStore:
                     SUM(COALESCE(r.queued_ms, 0)),
                     0,
                     SUM(CASE WHEN r.completion_tokens IS NOT NULL
-                             THEN COALESCE(a.elapsed_ms, r.total_ms) ELSE 0 END)
+                             THEN COALESCE(a.elapsed_ms, r.total_ms) ELSE 0 END),
+                    SUM(CASE WHEN r.swapped_in = 1 THEN COALESCE(r.waited_ms, 0) ELSE 0 END)
                 FROM request r
                 LEFT JOIN attempt a ON a.id = (
                     SELECT a2.id FROM attempt a2
@@ -1045,6 +1052,7 @@ class MetricsStore:
                     "errors": 0,
                     "cascaded": 0,
                     "swappedIn": 0,
+                    "waitedMsSum": 0,
                     "_latency": [],
                     "_waited": [],
                     "_tps": [],
@@ -1067,6 +1075,7 @@ class MetricsStore:
             if swapped_in:
                 g["swappedIn"] += 1
                 g["_waited"].append(int(waited_ms or 0))
+                g["waitedMsSum"] += int(waited_ms or 0)
             g["_latency"].append(int(total_ms or 0))
             if outcome != "error" and tier:
                 key_t = str(tier)
@@ -1136,6 +1145,10 @@ class MetricsStore:
             )
             g["routingMs"] = _spread(routing)
             g["overheadMs"] = _spread(overhead)
+            # Row 38: a mean beside the percentiles, so a chart over 90 days can
+            # join hours inside retention with the rollup's hours past it.
+            if latency:
+                g["latencyMeanMs"] = round(sum(latency) / len(latency), 1)
             g["latencyMs"] = {
                 "p50": _percentile(latency, 0.50),
                 "p90": _percentile(latency, 0.90),
@@ -1220,7 +1233,7 @@ class MetricsStore:
                 f"""
                 SELECT bucket_start, requested_model, driver, runtime, node, backend,
                        requests, errors, cascaded, swapped_in, total_ms_sum, total_ms_max,
-                       completion_tokens, token_ms_sum
+                       completion_tokens, token_ms_sum, waited_ms_sum
                 FROM rollup WHERE {" AND ".join(where)}
                 """,
                 params,
@@ -1241,6 +1254,7 @@ class MetricsStore:
             total_ms_max,
             completion_tokens,
             token_ms_sum,
+            waited_ms_sum,
         ) in rows:
             if group_by == "total":
                 key: tuple[Any, ...] = (bucket_start,)
@@ -1262,6 +1276,7 @@ class MetricsStore:
                     "errors": 0,
                     "cascaded": 0,
                     "swappedIn": 0,
+                    "waitedMsSum": 0,
                     "_total_ms": 0,
                     "latencyMaxMs": 0,
                     "_tokens": 0,
@@ -1271,6 +1286,7 @@ class MetricsStore:
             g["errors"] += int(errors)
             g["cascaded"] += int(cascaded)
             g["swappedIn"] += int(swapped_in)
+            g["waitedMsSum"] += int(waited_ms_sum)
             g["_total_ms"] += int(total_ms_sum)
             g["latencyMaxMs"] = max(g["latencyMaxMs"], int(total_ms_max))
             g["_tokens"] += int(completion_tokens)

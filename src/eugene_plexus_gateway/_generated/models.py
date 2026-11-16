@@ -6329,7 +6329,7 @@ class MetricsGroup(BaseModel):
     source: MetricsSource | None = None
     latencyMeanMs: float | None = Field(
         None,
-        description='Mean request latency in milliseconds, from the stored sums. Present\non a `source: rollup` group, which has no percentiles.\n',
+        description='Mean request latency in milliseconds. On a `source: rollup` group,\nwhich has no percentiles, from the stored sums; on a raw group\n(row 38) beside `latencyMs`, so a chart can join hours inside\nretention with the hours past it. Absent from a raw group of a\ngateway older than metrics v16.\n',
         ge=0.0,
     )
     latencyMaxMs: int | None = Field(
@@ -6370,6 +6370,11 @@ class MetricsGroup(BaseModel):
     swappedIn: int = Field(
         ...,
         description="Requests that had to wake a `startOnDemand` runtime. The\nmeasured cost of M6's idle unload, which shipped with no\nway to see what it costs.\n",
+        ge=0,
+    )
+    waitedMsSum: int | None = Field(
+        None,
+        description="Row 38: the milliseconds the `swappedIn` requests waited for\ntheir runtime to start, summed, so a wake's cost adds up across\nhours and backends. On a `source: rollup` group from an hour\nrolled up before metrics v16 it is 0 while `swappedIn` is not:\nthat wait was not kept. Absent from a gateway older than v16.\n",
         ge=0,
     )
     latencyMs: Percentiles | None = Field(

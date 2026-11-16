@@ -2,8 +2,8 @@
 
 Schema 13 adds person attribution to the released schema 12 without losing
 dashboard history, schema 14 (row 11) adds the queue's columns to 12 and 13
-the same way, and schema 15 (row 12) adds the affinity key's kind and the
-rollup's sums to 12, 13 and 14. Other schemas retain the prior backup-and-reset behavior
+the same way, schema 15 (row 12) adds the affinity key's kind and the
+rollup's sums to 12, 13 and 14, and schema 16 (row 38) the rollup's wake wait. Other schemas retain the prior backup-and-reset behavior
 (`metrics.v<N>.bak`, history readable in it).
 
 **The fixtures are real files of the old formats.** Schema 2 is the DDL of the
@@ -12,8 +12,9 @@ commit, with rows written as that build wrote them. Schema 11 (`601f4c7`) has
 the same DDL as 12 (`2a2be9c`), which added a value to a column and no column.
 Removing the two attribution columns, the queue's five and schema 15's from
 today's `_DDL` reproduces it; removing the queue's five and 15's reproduces 13,
-and 15's alone reproduces 14. Schema 16 represents a build newer than this
-one.
+and 15's alone reproduces 14. Schema 16 (row 38) adds the rollup's wake wait
+(`tests/test_alert_reads.py` moves a v15 store). Schema 17 represents a build
+newer than this one.
 
 The cases: each such file is set aside whole and its history is readable
 there; nothing old is read back; a second start opens the fresh file in place
@@ -138,9 +139,15 @@ for _column in (
     "queued_ms_sum",
     "refused",
     "token_ms_sum",
+    "waited_ms_sum",
 ):
     V14_DDL = V14_DDL.replace(f"    {_column:<17} INTEGER NOT NULL DEFAULT 0,\n", "")
-assert V14_DDL != _DDL and "token_ms_sum" not in V14_DDL and "affinity_key" not in V14_DDL
+assert (
+    V14_DDL != _DDL
+    and "token_ms_sum" not in V14_DDL
+    and "waited_ms_sum" not in V14_DDL
+    and "affinity_key" not in V14_DDL
+)
 V13_DDL = V14_DDL.replace(
     "    affinity          TEXT,\n    queued_ms         INTEGER,\n    band              TEXT,\n"
     "    refusal           TEXT,\n    tier_moves        INTEGER,\n"
@@ -284,7 +291,7 @@ async def test_released_v12_history_is_preserved_when_person_attribution_is_adde
     assert not list(tmp_path.glob("*.bak"))
 
 
-@pytest.mark.parametrize("version", ["2", "11", "16"])
+@pytest.mark.parametrize("version", ["2", "11", "17"])
 async def test_a_store_of_another_schema_is_kept_aside_whole(
     tmp_path: Path, version: str, caplog: pytest.LogCaptureFixture
 ) -> None:
