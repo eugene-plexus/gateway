@@ -1145,6 +1145,10 @@ class MetricsStore:
             )
             g["routingMs"] = _spread(routing)
             g["overheadMs"] = _spread(overhead)
+            # Row 38: a mean beside the percentiles, so a chart over 90 days can
+            # join hours inside retention with the rollup's hours past it.
+            if latency:
+                g["latencyMeanMs"] = round(sum(latency) / len(latency), 1)
             g["latencyMs"] = {
                 "p50": _percentile(latency, 0.50),
                 "p90": _percentile(latency, 0.90),

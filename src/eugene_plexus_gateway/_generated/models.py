@@ -6284,7 +6284,7 @@ class MetricsGroup(BaseModel):
     source: MetricsSource | None = None
     latencyMeanMs: float | None = Field(
         None,
-        description='Mean request latency in milliseconds, from the stored sums. Present\non a `source: rollup` group, which has no percentiles.\n',
+        description='Mean request latency in milliseconds. On a `source: rollup` group,\nwhich has no percentiles, from the stored sums; on a raw group\n(row 38) beside `latencyMs`, so a chart can join hours inside\nretention with the hours past it. Absent from a raw group of a\ngateway older than metrics v16.\n',
         ge=0.0,
     )
     latencyMaxMs: int | None = Field(

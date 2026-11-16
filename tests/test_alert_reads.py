@@ -136,6 +136,8 @@ def test_the_wake_wait_is_summed_live_and_kept_in_the_rollups(tmp_path: Path) ->
     old = next(g for g in hourly if g["source"] == "rollup")
     assert (old["swappedIn"], old["waitedMsSum"]) == (2, 10_000)
     assert live[0]["swappedIn"] == 2 and live[0]["waitedMsSum"] == 4000
+    # A mean beside the percentiles, as the rollup's hours have.
+    assert live[0]["latencyMeanMs"] == 2500.0  # (3500 + 1500) / 2
 
 
 def test_a_v15_store_gains_the_wake_wait_in_place(tmp_path: Path) -> None:
