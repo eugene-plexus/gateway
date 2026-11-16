@@ -107,7 +107,7 @@ from .driver_client import (
 from .driver_client import Key as DriverKey
 from .image_doors import ImageAsk, rules_out
 from .metrics import AttemptRow, CandidateRow
-from .model_patterns import permits
+from .model_patterns import Allowed, ModelScope, permits
 from .model_roles import role_info
 from .outbound import RECIPIENT_CONTROL, Outbound, token_refused_words
 from .prefill import PrefillModel, WaitOrMove, wait_seconds
@@ -730,6 +730,36 @@ class _Tier:
         return [b for b in self.backends if b.eligible]
 
 
+def _person_routing() -> dict[str, list[str]]:
+    """Row 37: the routing by role of the person the current request acts
+    for (their active group's, from the root's admission answer), or none.
+    Read from the request's own context, so a request without a verified
+    person, and every read outside a request, gets the install's routing."""
+    from .admission import current
+
+    context = current.get()
+    return context.role_routing if context is not None else {}
+
+
+def _personal_targets(model: str) -> list[str]:
+    """Row 37: the models a role request tries for this request's person:
+    their group's list for the role, less every model outside the allowed
+    set (the key's and the person's). Empty when the group does not route
+    the role, or routes it to nothing they may reach: the install's slot
+    applies then, filtered the same way when the request runs."""
+    if not model.startswith("role:"):
+        return []
+    routing = _person_routing()
+    listed = routing.get(model.removeprefix("role:"))
+    if not listed:
+        return []
+    from .admission import current
+
+    context = current.get()
+    allowed = context.allowed_models if context is not None else None
+    return [target for target in listed if permits(allowed, target) and target != model]
+
+
 @dataclass
 class Resolution:
     """A request's model, resolved to its slot."""
@@ -738,9 +768,16 @@ class Resolution:
     configured: bool
     tiers: list[_Tier]
 
-    def restricted(self, allowed: set[str] | None, *, local_only: bool = False) -> Resolution:
+    def restricted(self, allowed: Allowed, *, local_only: bool = False) -> Resolution:
         if allowed is None and not local_only:
             return self
+        if isinstance(allowed, ModelScope) and not allowed.permits(self.model):
+            # Row 37: the root checks the name a key asked for; the gateway
+            # checks it against the person's group, so a slot alias outside
+            # their models is refused as a model is, not served by its targets.
+            return Resolution(
+                self.model, self.configured, [_Tier(t.target, []) for t in self.tiers]
+            )
         return Resolution(
             self.model,
             self.configured,
@@ -2124,7 +2161,8 @@ class RoutingTable:
         diagnosis an operator wants: *you asked for `local-8b` and
         nothing serves it.*
         """
-        configured, targets = self._slot_targets(model)
+        personal = _personal_targets(model)
+        configured, targets = (True, [model, *personal]) if personal else self._slot_targets(model)
         declared = self._declares_runtime(model)
         tiers: list[_Tier] = []
         for index, target in enumerate(targets):
@@ -2880,9 +2918,11 @@ class RoutingTable:
 
     def known_models(self) -> list[str]:
         """Every model a request could name: each served model id, plus
-        each configured slot that resolves to anything."""
+        each configured slot that resolves to anything, and each role the
+        request's person's group routes (row 37)."""
         names = set(self._snapshot.by_model)
-        for slot in self.configured_slots():
+        routed = [f"role:{role}" for role in _person_routing()]
+        for slot in dict.fromkeys([*self.configured_slots(), *routed]):
             if self.resolve(slot).has_backends():
                 names.add(slot)
         return sorted(names)
@@ -2897,9 +2937,7 @@ class RoutingTable:
 
     # --- read models ------------------------------------------------------
 
-    def as_model_list(
-        self, allowed: set[str] | None = None, *, local_only: bool = False
-    ) -> list[Model]:
+    def as_model_list(self, allowed: Allowed = None, *, local_only: bool = False) -> list[Model]:
         """The OpenAI-compatible model list.
 
         Two drivers serving one model produce one entry: replicas are a

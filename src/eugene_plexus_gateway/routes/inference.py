@@ -507,6 +507,9 @@ class _Failure:
     context_tokens: int | None = None
     #: The queue's `QueueRefusalCode` (row 11), for `X-Eugene-Refusal-Reason`.
     refusal: str | None = None
+    #: The error's `code` on the OpenAI door when it is not a queue refusal
+    #: (row 37: `model_not_allowed`).
+    error_code: str | None = None
 
     def _named(self, response: JSONResponse) -> JSONResponse:
         if self.retry_after:
@@ -526,7 +529,7 @@ class _Failure:
             message=self.message,
             error_type=self.error_type,
             param=self.param,
-            error_code=self.refusal,
+            error_code=self.refusal or self.error_code,
         )
         return self._named(response)
 
@@ -538,7 +541,7 @@ class _Failure:
             self.message,
             error_type=self.error_type,
             param=self.param,
-            code=responses.error_code(self.code, self.message, self.error_type),
+            code=self.error_code or responses.error_code(self.code, self.message, self.error_type),
         )
         return self._named(response)
 
@@ -579,12 +582,54 @@ def _control_root_hint(table: RoutingTable | None) -> str:
     return ""
 
 
+def _outside_group(model: str, table: RoutingTable, role: Any, allowed: Any) -> _Failure | None:
+    """Row 37: the refusal that names the person's group, when their groups'
+    models are why nothing could serve `model`; None otherwise.
+
+    A model one of their groups leaves out is a 403 (`model_not_allowed`)
+    naming that group. A role whose models are all outside their lists is a
+    404 naming the role, so a member knows to ask the owner rather than wait
+    for a backend."""
+    from ..model_patterns import MAX_MODEL_NAME, ModelScope
+
+    if not isinstance(allowed, ModelScope) or len(model) > MAX_MODEL_NAME:
+        return None
+    if role is None:
+        group = allowed.excluded_by(model)
+        if group is None:
+            return None
+        return _Failure(
+            code=403,
+            message=(
+                f"Your group {group} does not include {model}. Ask the owner, or choose "
+                "another model."
+            ),
+            error_type="permission_error",
+            param="model",
+            error_code="model_not_allowed",
+        )
+    targets = [tier.target for tier in table.resolve(model).tiers if tier.target != model]
+    if not targets or any(allowed.permits(target) for target in targets):
+        return None
+    label = "Reads pages" if role.role.value == "reads-pages" else role.label
+    return _Failure(
+        code=404,
+        message=f"No model your groups allow has the role {label}.",
+        error_type="model_not_found",
+        param="model",
+    )
+
+
 def _no_such_model(model: str, table: RoutingTable | None) -> _Failure:
     from ..model_patterns import permits
     from ..model_roles import role_info
 
     role = role_info(model)
     context = admission.current.get()
+    if context is not None and table is not None:
+        refusal = _outside_group(model, table, role, context.allowed_models)
+        if refusal is not None:
+            return refusal
     unassigned_role = role is not None and (
         table is None or (not table.resolve(model).configured and not table.serves(model))
     )

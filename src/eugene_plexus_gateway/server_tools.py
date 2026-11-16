@@ -76,7 +76,7 @@ from .capabilities import calls_tools
 from .chat_contract import _field_name
 from .driver_client import DriverClient, DriverError, StreamEvent
 from .image_doors import ImageAsk, format_name, to_driver
-from .model_patterns import permits
+from .model_patterns import Allowed, permits
 from .remote_mcp import (
     McpApproval,
     McpExecution,
@@ -331,7 +331,7 @@ def request_limit(
 # --------------------------------------------------------------------------- #
 
 
-def _image_models(table: Any, allowed: set[str] | None, local_only: bool) -> dict[str, Any]:
+def _image_models(table: Any, allowed: Allowed, local_only: bool) -> dict[str, Any]:
     """Every image model this key may use, by the id a request names."""
     found: dict[str, Any] = {}
     for model_id in table.known_models():
@@ -344,7 +344,7 @@ def _image_models(table: Any, allowed: set[str] | None, local_only: bool) -> dic
     return found
 
 
-def _serves_images(table: Any, model: str, allowed: set[str] | None, local_only: bool) -> bool:
+def _serves_images(table: Any, model: str, allowed: Allowed, local_only: bool) -> bool:
     if not permits(allowed, model):
         return False
     resolution = table.resolve(model).restricted(allowed, local_only=local_only)

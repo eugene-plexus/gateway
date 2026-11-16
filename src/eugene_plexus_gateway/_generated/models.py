@@ -4427,27 +4427,39 @@ class Purpose(StrEnum):
     metrics = 'metrics'
 
 
-class ClientAdmissionResult(BaseModel):
+class RoleRoutingItem(RootModel[str]):
+    root: str = Field(..., max_length=256, min_length=1)
+
+
+class ModelGroup(BaseModel):
+    """
+    A permission group, as a refusal names it (row 37).
+    """
+
     model_config = ConfigDict(
         extra='forbid',
     )
-    keyId: str
-    keyName: str
-    lineage: str | None = Field(
-        None,
-        description="The id of the first key of this key's rotations (row 24): a\nreplacement shares its predecessor's lineage. The store names a\nkey's objects by it, so a rotated key keeps its files (row 53).\nReaders take it when present and use `keyId` when absent; the\nauthority starts sending it once every reader knows the field,\nbecause an older reader refuses an unknown one.\n",
-        max_length=128,
-        min_length=1,
+    id: str = Field(..., max_length=64, min_length=1)
+    name: str = Field(..., max_length=80, min_length=1)
+
+
+class Model1(RootModel[str]):
+    root: str = Field(..., max_length=256, min_length=1)
+
+
+class GroupModelLimit(BaseModel):
+    """
+    One group's model list, as it limits a person (row 37).
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
     )
-    personId: str | None = Field(
-        None, description='Stable subject verified by the root, never caller supplied.'
-    )
-    appClientId: str | None = None
-    limits: ClientKeyLimits | None = None
-    leaseSeconds: float | None = Field(None, gt=0.0, le=30.0)
-    queueBand: QueueBand | None = Field(
-        None,
-        description="The verified person's queue band from their permission groups\n(row 70): the highest band any of their groups sets. Present only\nwhen the root verified a person (`personId`) and one of their\ngroups sets a band. Absent for a key with no person, a release, or\na person whose groups set none: the key's own band, or the\ninstall's default, applies. Never taken from the caller.\n",
+    group: ModelGroup
+    models: list[Model1] = Field(
+        ...,
+        description='Exact ids or patterns with `*`, at most 8 `*` in one entry. Empty allows none.',
+        max_length=64,
     )
 
 
@@ -6499,6 +6511,54 @@ class ClientKeyCreateRequest(BaseModel):
     name: str = Field(..., max_length=64, min_length=1)
     ttlDays: int | None = Field(365, ge=1, le=3650)
     limits: ClientKeyLimits | None = None
+
+
+class ClientAdmissionResult(BaseModel):
+    """
+    Row 37: an agent or gateway from before row 37 refuses an answer that
+    carries `roleRouting`, `routingGroup` or `modelLimits` (its model
+    forbids unknown fields), so a person whose groups set them is refused
+    there until that machine is updated: it fails closed, never open.
+    The root sends them only when a group sets them.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    keyId: str
+    keyName: str
+    lineage: str | None = Field(
+        None,
+        description="The id of the first key of this key's rotations (row 24): a\nreplacement shares its predecessor's lineage. The store names a\nkey's objects by it, so a rotated key keeps its files (row 53).\nReaders take it when present and use `keyId` when absent; the\nauthority starts sending it once every reader knows the field,\nbecause an older reader refuses an unknown one.\n",
+        max_length=128,
+        min_length=1,
+    )
+    personId: str | None = Field(
+        None, description='Stable subject verified by the root, never caller supplied.'
+    )
+    appClientId: str | None = None
+    limits: ClientKeyLimits | None = None
+    leaseSeconds: float | None = Field(None, gt=0.0, le=30.0)
+    queueBand: QueueBand | None = Field(
+        None,
+        description="The verified person's queue band from their permission groups\n(row 70): the highest band any of their groups sets. Present only\nwhen the root verified a person (`personId`) and one of their\ngroups sets a band. Absent for a key with no person, a release, or\na person whose groups set none: the key's own band, or the\ninstall's default, applies. Never taken from the caller.\n",
+    )
+    roleRouting: dict[str, list[RoleRoutingItem]] | None = Field(
+        None,
+        description="The verified person's routing by model role (row 37), from their\nactive group (`Person.activeGroup`). Present only when the root\nverified a person and that group routes at least one role. A\nrequest for `role:<role>` that this names tries these models in\norder, after the gateway drops every model outside the allowed\nset (`modelLimits` and the key's list); a role it does not name\nuses the install's slot. Absent: the\ninstall's routing for every role, as before row 37. Never taken\nfrom the caller.\n",
+        max_length=16,
+        min_length=1,
+    )
+    routingGroup: ModelGroup | None = Field(
+        None,
+        description="The group `roleRouting` comes from (row 37): the person's active\ngroup. Present with `roleRouting`.\n",
+    )
+    modelLimits: list[GroupModelLimit] | None = Field(
+        None,
+        description="Row 37 (call R37-SELF, Choice 3): the model list of every group\nthe verified person is in that sets one, sorted by group name. A\nmodel is allowed only when the key's own `allowedModels` and\nevery list here allow it, for the model asked for, every fallback\nand every model a server-run tool calls; the person's choice of\nactive group never widens it. A `role:<role>` name is not checked\nagainst these lists: the role's models are. Absent when no group\nof theirs sets a list: no limit beyond the key's.\n",
+        max_length=64,
+    )
 
 
 class ModelPriceHint(BaseModel):

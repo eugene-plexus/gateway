@@ -26,6 +26,7 @@ from .driver_client import credential_refused_next_step, each_named
 from .ignored_settings import carried as carried_words
 from .ignored_settings import door_of, worded
 from .metrics import AttemptRow, RequestRow
+from .model_patterns import Allowed, ModelScope
 from .outbound import token_refused_words
 
 log = logging.getLogger(__name__)
@@ -137,13 +138,20 @@ def refused(refusal: fair_queue.Refusal) -> AdmissionFailure:
 QUEUE_LIMITS = frozenset({"band", "maxQueuedRequests"})
 
 
+#: Row 37: what the root says of a verified person's group that a request is
+#: routed under, beside the key's limits.
+PERSON_ROUTING = ("roleRouting", "modelLimits")
+
+
 def bound_policy(access: dict[str, Any]) -> Any:
     """What a request is routed and shaped under: the key's limits, but for the
-    queue's own (`QUEUE_LIMITS`), as the authority's policy digest reads them."""
+    queue's own (`QUEUE_LIMITS`), as the authority's policy digest reads them,
+    and the person's routing and models (row 37)."""
     limits = access.get("limits")
-    if not isinstance(limits, dict):
-        return limits
-    return {k: v for k, v in limits.items() if k not in QUEUE_LIMITS and v is not None}
+    if isinstance(limits, dict):
+        limits = {k: v for k, v in limits.items() if k not in QUEUE_LIMITS and v is not None}
+    person = {k: access[k] for k in PERSON_ROUTING if access.get(k) is not None}
+    return (limits, person) if person else limits
 
 
 def queue_settings(app: Any) -> tuple[float, int]:
@@ -378,10 +386,31 @@ class ClientRequest:
         self.ready.set()
 
     @property
-    def allowed_models(self) -> set[str] | None:
-        limits = (self.access or {}).get("limits")
+    def allowed_models(self) -> Allowed:
+        """The models this request may reach: the key's `allowedModels`, and
+        with a verified person whose groups limit models, every one of those
+        lists too (row 37, call R37-SELF). Every check that reads it
+        (resolution, fallbacks, the model list, server-run tools) applies
+        them all."""
+        access = self.access or {}
+        limits = access.get("limits")
         allowed = limits.get("allowedModels") if limits else None
+        person = access.get("modelLimits")
+        if person and self.person_id:
+            return ModelScope(
+                allowed,
+                [(str(item["group"]["name"]), list(item["models"])) for item in person],
+            )
         return set(allowed) if allowed is not None else None
+
+    @property
+    def role_routing(self) -> dict[str, list[str]]:
+        """Row 37: the verified person's models for each role their group
+        routes; empty when none (the install's routing)."""
+        routing = (self.access or {}).get("roleRouting")
+        if not self.person_id or not isinstance(routing, dict):
+            return {}
+        return {str(role): [str(m) for m in models] for role, models in routing.items()}
 
     @property
     def local_only(self) -> bool:
@@ -516,7 +545,15 @@ class ClientRequest:
                     "Wait or cancel an active request; switching gateways does not add allowance.",
                     503: f"Client access needs the admission authority, which answered {answered}. "
                     "Check the local agent and active control root; operator management "
-                    "remains available.",
+                    "remains available."
+                    + (
+                        # Row 37 review: an agent older than its root fails on an answer
+                        # that carries a person's group routing or model lists.
+                        " If this machine's Eugene is older than the control root's, update "
+                        "it: an older agent cannot pass on a person's group models."
+                        if self.person_token and answered == 500
+                        else ""
+                    ),
                 }[status]
                 retry = response.headers.get("Retry-After", "5") if status in (429, 503) else None
                 if retry is not None and (not retry.isdigit() or len(retry) > 5):
