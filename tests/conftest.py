@@ -474,6 +474,7 @@ def runtime_facts(
     start_on_demand: bool = False,
     stop_reason: str | None = None,
     context_pool: int | None = None,
+    engine_load: int | None = None,
 ) -> _RuntimeFacts:
     """What the agent would report about one runtime, shaped by the test."""
     return _RuntimeFacts(
@@ -489,6 +490,7 @@ def runtime_facts(
         stop_reason=stop_reason,
         spec={"name": name, "engine": "llama_cpp", "modelPath": f"/models/{name}.gguf"},
         context_pool=context_pool,
+        engine_load=engine_load,
     )
 
 
@@ -501,6 +503,8 @@ def make_routing_table(
     agent_url: str = "http://fake-agent",
     room_wait_seconds: float = 120.0,
     affinity: bool = True,
+    move: bool = True,
+    penalty_ms: float = 2000,
 ) -> RoutingTable:
     """A RoutingTable pre-loaded with fakes, without any HTTP.
 
@@ -518,6 +522,8 @@ def make_routing_table(
         strategy=lambda: strategy,
         room_wait_seconds=lambda: room_wait_seconds,
         affinity=lambda: affinity,
+        move_by_first_token=lambda: move,
+        move_penalty_ms=lambda: penalty_ms,
     )
     install_snapshot(table, *fakes, unreachable=unreachable, runtimes=runtimes)
     return table

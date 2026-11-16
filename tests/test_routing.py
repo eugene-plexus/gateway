@@ -590,3 +590,27 @@ def test_a_refusal_is_said_in_the_drivers_own_words() -> None:
     assert unreachable_reason(error, url="http://192.168.16.75:8093/", timeout=5) == (
         "answered 401: Provide a bearer token."
     )
+
+
+async def test_a_runtimes_engine_load_is_read_off_its_agent(route_http: Any) -> None:
+    """Row 14 (M4-LOAD): `engineLoad` is vLLM's own count of requests on the engine,
+    and the gateway keeps it only as a count: a missing or odd value is no 0."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/components":
+            return httpx.Response(
+                200, json=_components(_driver_entry("a", 8081), _driver_entry("b", 8082))
+            )
+        return httpx.Response(200, json=_info("qwen"))
+
+    busy = _runtime_entry("qwen-a", "qwen")
+    busy["engineLoad"] = 6
+    silent = _runtime_entry("qwen-b", "qwen")
+    odd = _runtime_entry("qwen-c", "qwen")
+    odd["engineLoad"] = "many"
+    route_http(handler, runtimes=[busy, silent, odd])
+    table = RoutingTable(agent_url="http://agent")
+    await table.refresh()
+    loads = {facts.name: facts.engine_load for facts in table.runtimes()}
+    assert loads == {"qwen-a": 6, "qwen-b": None, "qwen-c": None}
+    await table.aclose()

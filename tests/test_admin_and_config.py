@@ -193,6 +193,9 @@ def test_config_schema_lists_the_gateway_fields(client: TestClient) -> None:
         "queueWaitSeconds",
         "queueMaxRequests",
         "answerReserveFloorTokens",
+        # Row 14: wait or move by predicted time to first token.
+        "moveByFirstToken",
+        "moveFirstTokenPenaltyMs",
         "idleCheckSeconds",
         # Row 13: how long a restart lets the answers in flight finish.
         "shutdownDrainSeconds",

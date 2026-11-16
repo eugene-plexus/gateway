@@ -110,6 +110,7 @@ from .metrics import AttemptRow, CandidateRow
 from .model_patterns import permits
 from .model_roles import role_info
 from .outbound import RECIPIENT_CONTROL, Outbound, token_refused_words
+from .prefill import PrefillModel, WaitOrMove, wait_seconds
 from .tool_client import ToolDriverClient, ToolDriverInfo
 
 # Deadline for one topology read (an agent's `/v1/components`, a control
@@ -295,6 +296,9 @@ class _RuntimeFacts:
     #: Row 13: the drain its agent holds open, as the agent reports it
     #: (`Runtime.drain`). Raw JSON, like the rest of this.
     drain: dict[str, Any] | None = None
+    #: Row 14 (M4-LOAD): requests occupying the engine now from every client,
+    #: from its agent's `engineLoad`. Only vLLM says; None otherwise.
+    engine_load: int | None = None
 
     @property
     def key(self) -> Key:
@@ -612,6 +616,10 @@ class _Backend:
             return max(1, self.runtime.parallel_slots)
         return 1
 
+    @property
+    def engine_load(self) -> int | None:
+        return self.runtime.engine_load if self.runtime is not None else None
+
 
 @dataclass
 class _Unreachable:
@@ -850,6 +858,8 @@ class RoutingTable:
         room_wait_seconds: Callable[[], float] | None = None,
         affinity: Callable[[], Any] | None = None,
         search_order: Callable[[], Any] | None = None,
+        move_by_first_token: Callable[[], Any] | None = None,
+        move_penalty_ms: Callable[[], Any] | None = None,
     ) -> None:
         self._agent_url = agent_url.rstrip("/")
         # CB3: the prompt tokens in flight on each runtime with a shared
@@ -857,6 +867,12 @@ class RoutingTable:
         # for room. See `budget.py`.
         self._ledger = PoolLedger()
         self._sizes = ConversationSizes()
+        #: Row 14 (LD3, DI5): each runtime's peak prefill rate and answer time, from
+        #: the retained metrics at start and from every answer since. See `prefill.py`.
+        self.prefill = PrefillModel()
+        #: `moveByFirstToken` and `moveFirstTokenPenaltyMs`, read at every turn.
+        self._move_on: Callable[[], Any] = move_by_first_token or (lambda: True)
+        self._move_penalty: Callable[[], Any] = move_penalty_ms or (lambda: 2000)
         self._room_wait: Callable[[], float] = room_wait_seconds or (lambda: 120.0)
         # Read live on every refresh, for the same reason `slots` and
         # `strategy` are: `controlUrl` is a config field whose own
@@ -1422,10 +1438,13 @@ class RoutingTable:
             if facts.status == READY:
                 self._ready_since.setdefault(key, now)
             else:
-                self._ready_since.pop(key, None)
+                # Row 14: its next engine may read at another speed.
+                if self._ready_since.pop(key, None) is not None:
+                    self.prefill.forget(key)
         for key in list(self._ready_since):
             if key not in runtimes:
                 self._ready_since.pop(key, None)
+                self.prefill.forget(key)
 
         self._snapshot = snapshot
         log.debug(
@@ -1684,6 +1703,7 @@ class RoutingTable:
             slots = capabilities.get("parallelSlots") if isinstance(capabilities, dict) else None
             pool = capabilities.get("contextPoolTokens") if isinstance(capabilities, dict) else None
             idle = entry.get("idleUnloadSeconds")
+            load = entry.get("engineLoad")
             # **The node we asked, never the one the agent reports.** The
             # drivers from this same agent are keyed by the node we asked,
             # and a runtime must join them. The two were read as "the same
@@ -1707,6 +1727,7 @@ class RoutingTable:
                 spec={k: entry[k] for k in _SPEC_FIELDS if entry.get(k) is not None},
                 context_pool=pool if isinstance(pool, int) and pool > 0 else None,
                 drain=entry["drain"] if isinstance(entry.get("drain"), dict) else None,
+                engine_load=load if isinstance(load, int) and load >= 0 else None,
             )
         return facts, True
 
@@ -1879,6 +1900,13 @@ class RoutingTable:
             self._last_request[key] = now
             if runtime is not None:
                 self._runtime_last_request[runtime] = now
+                self.prefill.observe(
+                    runtime,
+                    prompt=getattr(usage, "promptTokens", None),
+                    cached=getattr(usage, "cachedPromptTokens", None),
+                    first_ms=first_ms,
+                    elapsed_ms=elapsed_ms,
+                )
         self._note_attempt(
             AttemptRow(
                 driver=driver,
@@ -2166,24 +2194,21 @@ class RoutingTable:
             ordered = rotated
         elif placement == SPREAD:
             # Stable on the rotation, so the last tie goes in turn.
-            held = self._affinity.held(target, besides=affinity)
-            ordered = sorted(
-                rotated,
-                key=lambda b: (
-                    held.get(b.key, 0) / b.parallel_slots,
-                    self.inflight(b.key) / b.parallel_slots,
-                ),
-            )
+            ordered = sorted(rotated, key=self._spread_key(target, rotated, affinity))
         else:
-            ordered = sorted(rotated, key=lambda b: self.inflight(b.key) / b.parallel_slots)
+            ordered = sorted(rotated, key=lambda b: self._load(b) / b.parallel_slots)
         if affinity is None:
             return ordered
         pinned_key = self._affinity.get(target, affinity)
         pinned = next((b for b in backends if b.key == pinned_key), None)
         if pinned is None:
             self.last_affinity = MOVED if pinned_key is not None else NEW
-        elif self.inflight(pinned.key) < pinned.parallel_slots or all(
-            self.inflight(b.key) >= b.parallel_slots for b in backends
+        elif (
+            self.inflight(pinned.key) < pinned.parallel_slots
+            or all(self.inflight(b.key) >= b.parallel_slots for b in backends)
+            # Row 14: where a turn's prediction can be made, it is sized and judged
+            # when it joins the line (`wait_or_move`), not moved by a count here.
+            or self._can_predict(pinned, target, affinity)
         ):
             ordered = [pinned, *(b for b in ordered if b is not pinned)]
             self.last_affinity = HIT
@@ -2191,6 +2216,125 @@ class RoutingTable:
             self.last_affinity = MOVED
         self._affinity.put(target, affinity, ordered[0].key)
         return ordered
+
+    def _load(self, backend: _Backend) -> int:
+        """Requests on this backend now: what this gateway sent, or the engine's own
+        count where it says one (row 14, M4-LOAD, vLLM's `/load`), whichever is more.
+        The engine's count includes other doors' requests, which this gateway never saw."""
+        return max(self.inflight(backend.key), backend.engine_load or 0)
+
+    @staticmethod
+    def _capacity(backend: _Backend) -> int | None:
+        """The tokens a replica's slots can hold together, when it says: its shared
+        pool, else a context for each slot."""
+        if backend.context_pool:
+            return backend.context_pool
+        runtime = backend.runtime
+        if runtime is not None and runtime.context_length:
+            return runtime.context_length * backend.parallel_slots
+        return None
+
+    def _expected_wait(self, backend: _Backend) -> int:
+        """Whole seconds a new request would wait for a place there, or 0 (row 14)."""
+        runtime = backend.runtime
+        if runtime is None:
+            return 0
+        service = self.prefill.service_seconds(runtime.key)
+        queue = fair_queue.of(self)
+        waiting = queue.waiting_for(runtime.key)
+        if service is None or (
+            waiting == 0 and queue.running(runtime.key) < backend.parallel_slots
+        ):
+            return 0
+        return round(
+            wait_seconds(waiting=waiting, parallel=backend.parallel_slots, service_seconds=service)
+        )
+
+    def _spread_key(
+        self, target: str, backends: list[_Backend], affinity: str | None
+    ) -> Callable[[_Backend], tuple[float, ...]]:
+        """How `spread` ranks a replica for a new conversation, lowest first (DI5):
+
+        1. the prompt tokens it holds as a share of its context, in steps of a
+           twentieth, so a small difference leaves the rest to decide. Left out
+           unless every replica says how much it can hold;
+        2. the conversations it holds per slot;
+        3. the seconds a new request would wait for a place there;
+        4. its requests in flight per slot (`_load`).
+
+        Three short chats and three 80,000-token agent sessions count the same
+        in step 2, and in step 1 they do not.
+        """
+        held = self._affinity.held(target, besides=affinity)
+        capacities = {b.key: self._capacity(b) for b in backends}
+        tokens = (
+            self._affinity.held_tokens(target, self._sizes, besides=affinity)
+            if all(capacities.values())
+            else None
+        )
+
+        def key(b: _Backend) -> tuple[float, ...]:
+            share = 0.0
+            if tokens is not None:
+                share = round(tokens.get(b.key, 0) / (capacities[b.key] or 1) * 20)
+            return (
+                share,
+                held.get(b.key, 0) / b.parallel_slots,
+                self._expected_wait(b),
+                self._load(b) / b.parallel_slots,
+            )
+
+        return key
+
+    def move_enabled(self) -> bool:
+        """`moveByFirstToken`: anything but an explicit off is on."""
+        return self._move_on() is not False
+
+    def _can_predict(self, backend: _Backend, target: str, conversation: str | None) -> bool:
+        """Whether a turn held by `backend` can be judged: the rule is on, the runtime's
+        prefill rate and answer time are known, and the conversation's last prompt is."""
+        runtime = backend.runtime
+        return (
+            conversation is not None
+            and runtime is not None
+            and self.move_enabled()
+            and self.prefill.rate(runtime.key) is not None
+            and self.prefill.service_seconds(runtime.key) is not None
+            and self._sizes.get(target, conversation) is not None
+        )
+
+    def wait_or_move(
+        self, home: fair_queue.Seat, *, prompt: int, held: int | None
+    ) -> WaitOrMove | None:
+        """The choice for a turn that waits for `home`, which holds `held` tokens of
+        its `prompt` (row 14, LD3). None when it cannot be predicted: the turn then
+        waits for `home` as CB3 had it, or goes to any seat with room."""
+        runtime = home.runtime
+        if (
+            held is None
+            or runtime is None
+            or not self.move_enabled()
+            or self.prefill.rate(runtime) is None
+            or self.prefill.service_seconds(runtime) is None
+        ):
+            return None
+        try:
+            penalty = max(0.0, float(self._move_penalty()))
+        except (TypeError, ValueError):
+            penalty = 2000.0
+        return WaitOrMove(
+            model=self.prefill,
+            queue=fair_queue.of(self),
+            home=home,
+            prompt=prompt,
+            held=held,
+            penalty_ms=penalty,
+        )
+
+    def _moved(self, target: str, conversation: str, backend: _Backend | None) -> None:
+        """A held turn went to another replica: its prompt is there now."""
+        if backend is not None:
+            self._affinity.put(target, conversation, backend.key)
 
     def placement(self) -> str:
         """Where a new conversation goes now: `loadBalancing`, with PC4's
@@ -2263,6 +2407,7 @@ class RoutingTable:
         # not always: a circuit may be open, and a replica with room is moved up.
         client.entries = {b.client: b.model for b in picked}
         client.budget = self._budget_for(resolution, picked, affinity, outcome)
+        client.waits = self.wait_or_move
         # Row 11: the one line every turn waits in, for its key and for room,
         # and what gates each candidate there: its runtime's slots, when the
         # agent reports them, and its shared pool, when it reports one.
@@ -2282,6 +2427,11 @@ class RoutingTable:
         }
         if affinity is not None:
             seen = self._sizes.get(resolution.model, affinity)
+            backends = {b.client: b for b in picked}
+            first_target = resolution.tiers[0].target
+            client.on_moved = lambda candidate: self._moved(
+                first_target, affinity, backends.get(candidate)
+            )
             client.conversation = Conversation(
                 sizes=self._sizes,
                 target=resolution.model,
@@ -2952,6 +3102,11 @@ class RoutingTable:
             idle_unload_seconds=facts.idle_unload_seconds if facts else None,
             start_on_demand=facts.start_on_demand if facts else None,
             idle_seconds=self.driver_idle_seconds(backend.key),
+            engine_load=facts.engine_load if facts else None,
+            prefill_tokens_per_second=(
+                round(rate, 1) if facts and (rate := self.prefill.rate(facts.key)) else None
+            ),
+            prefill_samples=(self.prefill.samples(facts.key) or None) if facts else None,
         )
 
 

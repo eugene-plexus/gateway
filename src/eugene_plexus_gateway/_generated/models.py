@@ -3341,6 +3341,21 @@ class RoutingBackendView(BaseModel):
         description='Seconds since the gateway last sent this backend a request.\nAbsent when it never has.\n',
         ge=0,
     )
+    engine_load: int | None = Field(
+        None,
+        description="Requests occupying the runtime's engine now from every client, as\nits agent reports them (`Runtime.engineLoad`, row 14). Only vLLM\nsays; absent for llama.cpp, for a cloud account, and when the last\nread failed.\n",
+        ge=0,
+    )
+    prefill_tokens_per_second: float | None = Field(
+        None,
+        description="The runtime's calibrated peak prefill rate (row 14, LD3): the 90th\npercentile of uncached prompt tokens over first-token time across\nits last 256 served requests that read at least 256 uncached\ntokens, from the retained metrics at start and from every answer\nsince. Forgotten when the runtime leaves `ready`. Absent until\n`prefill_samples` reaches 8, and a conversation is then never moved\nfor its sake.\n",
+        ge=0.0,
+    )
+    prefill_samples: int | None = Field(
+        None,
+        description='How many served requests the calibration of this runtime holds.\n',
+        ge=0,
+    )
 
 
 class AnthropicTokenCount(BaseModel):
@@ -6512,7 +6527,7 @@ class MetricRequest(BaseModel):
     )
     affinity: str | None = Field(
         None,
-        description="What conversation affinity did with this request (PC4;\n`conversationAffinity` since CB1): `hit`, sent back to the\nreplica its conversation used before; `evicted` (CB5, schema\nv12), sent back there and the engine reused less than the\nwhole of the conversation's previous prompt, so its history\nwas gone; `new`, a conversation not seen before; `moved`, its\nreplica was full or gone and it went elsewhere. Null when\nthere was no choice to make or affinity was off (before CB1,\nwhen another strategy was in effect). A backend that does not\nreport cached tokens cannot be judged, and its turns stay\n`hit`.\n",
+        description="What conversation affinity did with this request (PC4;\n`conversationAffinity` since CB1): `hit`, sent back to the\nreplica its conversation used before; `evicted` (CB5, schema\nv12), sent back there and the engine reused less than the\nwhole of the conversation's previous prompt, so its history\nwas gone; `new`, a conversation not seen before; `moved`, its\nreplica was full or gone, or another replica's predicted first\ntoken was sooner by more than `moveFirstTokenPenaltyMs` (row 14),\nand it went elsewhere. Null when\nthere was no choice to make or affinity was off (before CB1,\nwhen another strategy was in effect). A backend that does not\nreport cached tokens cannot be judged, and its turns stay\n`hit`.\n",
     )
     affinityKey: AffinityKey | None = Field(
         None,

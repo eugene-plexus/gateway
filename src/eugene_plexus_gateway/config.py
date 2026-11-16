@@ -405,10 +405,13 @@ FIELDS: list[ConfigField] = [
             "Where a new conversation goes among the replicas serving one model.\n\n"
             "A conversation already under way stays on its replica (see Keep each "
             "conversation on its replica).\n\n"
-            "- `spread` (default): the replica holding the fewest conversations per "
-            "slot, counting those served in the last 30 minutes whether or not a "
-            "request is in flight. It suits agent sessions, whose pauses between "
-            "turns make a replica look empty to `least_busy`.\n"
+            "- `spread` (default): the replica holding the fewest prompt tokens as a "
+            "share of its context, then the fewest conversations per slot, counting "
+            "those served in the last 30 minutes whether or not a request is in "
+            "flight. It suits agent sessions, whose pauses between turns make a "
+            "replica look empty to `least_busy`, and whose conversations differ "
+            "in size by a factor of a hundred. A replica that does not report its "
+            "context is compared by conversations alone.\n"
             "- `least_busy`: the replica with the fewest requests in flight per "
             "slot.\n"
             "- `round_robin`: each replica in turn, for comparing replicas or "
@@ -472,6 +475,40 @@ FIELDS: list[ConfigField] = [
         default=60,
         minimum=5,
         maximum=600,
+    ),
+    ConfigField(
+        key="moveByFirstToken",
+        label="Move a conversation when another replica answers sooner",
+        description=(
+            "Lets a conversation leave its replica when another would answer sooner.\n\n"
+            "A conversation waiting for room on the replica that holds its prompt either "
+            "keeps waiting or goes to a replica with room now. On (the default), the "
+            "gateway predicts the first token each way: the wait for a place plus reading "
+            "the new text, or reading the whole prompt again. A short turn goes at once. "
+            "A turn with a long history waits. The prediction needs each replica's "
+            "measured prefill speed and answer time; until they are known, a conversation "
+            "behaves as when this is off.\n\n"
+            "Off: where replicas share a context pool, a conversation waits for its own "
+            "replica. Otherwise it goes at once to any replica with a free slot."
+        ),
+        category="lifecycle",
+        valueType=ConfigValueType.boolean,
+        default=True,
+    ),
+    ConfigField(
+        key="moveFirstTokenPenaltyMs",
+        label="Extra wait before a conversation moves",
+        description=(
+            "How many milliseconds sooner another replica must answer before a "
+            "conversation moves.\n\n"
+            "A larger value keeps more conversations where their cache is. A smaller one "
+            "moves them sooner. Used only when `moveByFirstToken` is on."
+        ),
+        category="lifecycle",
+        valueType=ConfigValueType.integer,
+        default=2000,
+        minimum=0,
+        maximum=600000,
     ),
     ConfigField(
         key="queueMaxRequests",

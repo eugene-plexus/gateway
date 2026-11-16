@@ -53,11 +53,12 @@ from ._generated.driver_models import (
     VideoRequest,
 )
 from ._http import internal_client
-from .affinity import EVICTED, HIT
-from .budget import Conversation, TurnBudget, request_chars
+from .affinity import EVICTED, HIT, MOVED
+from .budget import Conversation, TurnBudget, estimate, request_chars
 from .circuit import Circuit
 from .execution import Executor, StreamPolicy
-from .fair_queue import FairQueue, Seat, Ticket
+from .fair_queue import FairQueue, Moves, Seat, Ticket
+from .prefill import WaitOrMove
 from .repetition import Detection, Guard, Policy, stop_message
 
 log = logging.getLogger(__name__)
@@ -1181,6 +1182,12 @@ class TieredClient:
         #: How long a turn waits in line, when not the gateway's setting
         #: (`queueWaitSeconds`): a test's, or a caller's own.
         self.queue_wait_seconds: float | None = None
+        #: Row 14 (LD3): builds the wait-or-move choice for a turn held by a
+        #: replica, or None when it cannot be predicted. Set by `RoutingTable.pick`.
+        self.waits: Callable[..., WaitOrMove | None] | None = None
+        #: Row 14: told which candidate a held turn moved to, so the conversation's
+        #: next turn goes where its prompt now is. Set by `RoutingTable.pick`.
+        self.on_moved: Callable[[DriverClient], None] | None = None
         #: Times this turn moved to the next tier after waiting (TIER-SPILL).
         self.tier_moves = 0
         #: Whether an answer was longer than the room its turn held (CB-C2).
@@ -1292,11 +1299,15 @@ class TieredClient:
             waiting_on = budget.waiting_on(tier) if budget is not None and index == first else tier
             # A replica whose circuit would not take an attempt is not waited for.
             waiting_on = [c for c in waiting_on if _available(c)]
+            moves = self._moves(request, tier) if index == first else None
+            if moves is not None:
+                waiting_on = [moves[0]]
             has_next = index is not None and any(self._tiers[index + 1 :])
             try:
                 ticket = await admission.take_turn(
                     self.queue,
                     seats=[self._seat(candidate) for candidate in waiting_on],
+                    moves=moves[1] if moves is not None else None,
                     model=self.name,
                     prompt=budget.prompt if budget is not None else 0,
                     tokens=budget.tokens if budget is not None else 0,
@@ -1320,7 +1331,54 @@ class TieredClient:
             if seat is not None and index is not None and seat.candidate in self._tiers[index]:
                 chosen = seat.candidate
                 self._tiers[index] = [chosen, *(c for c in self._tiers[index] if c is not chosen)]
+                self._moved(index == first, chosen)
             return
+
+    def _moves(
+        self, request: GenerateRequest, tier: Sequence[DriverClient]
+    ) -> tuple[DriverClient, Moves] | None:
+        """Row 14 (LD3): `(home, moves)` for a turn that goes back to the replica
+        holding its prompt, when waiting or moving can be predicted; else None and
+        the turn waits as CB3 had it.
+
+        The turn then waits for `home` alone, and may leave for any other replica of
+        its tier that has room when rereading its whole prompt there is predicted
+        to come sooner by more than the penalty (`WaitOrMove.allows`, asked at each
+        pass of the queue).
+        """
+        convo = self.conversation
+        if self.waits is None or convo is None or convo.home is None or self.affinity != HIT:
+            return None
+        home = convo.home
+        others = [c for c in tier if c is not home and _available(c)]
+        if home not in tier or not _available(home) or not others:
+            return None
+        budget = self.budget
+        if budget is not None:
+            prompt = budget.prompt
+        else:
+            seen = convo.sizes.get(convo.target, convo.key)
+            prompt, _total = estimate(request_chars(request), None, seen)
+        seat = self._seat(home)
+        decide = self.waits(seat, prompt=prompt, held=convo.previous_prompt)
+        if decide is None:
+            return None
+        return home, Moves(seats=[self._seat(c) for c in others], allows=decide.allows)
+
+    def _moved(self, first_tier: bool, chosen: DriverClient) -> None:
+        """A held turn the queue let go on another replica than its home: it is
+        `moved`, and its conversation is pinned where its prompt will be."""
+        convo = self.conversation
+        if (
+            first_tier
+            and convo is not None
+            and convo.home is not None
+            and chosen is not convo.home
+            and self.affinity == HIT
+        ):
+            self.affinity = MOVED
+            if self.on_moved is not None:
+                self.on_moved(chosen)
 
     async def _admit_attempt(
         self,

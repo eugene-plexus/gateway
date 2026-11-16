@@ -605,3 +605,52 @@ def test_asking_what_the_balancer_saw_does_not_change_what_it_does(
 
     # Still strictly alternating, as it would be with no reads at all.
     assert firsts == ["replica-a", "replica-b", "replica-a", "replica-b"]
+
+
+async def test_the_retained_attempts_seed_the_prefill_calibration(tmp_path: Path) -> None:
+    """Row 14: a restart does not start each runtime's prefill rate from nothing.
+    Served attempts on a runtime come back oldest first; a failed one, and one
+    with no runtime (a cloud account), do not."""
+    store = await _store(tmp_path / "m.sqlite3")
+    now = datetime.now(UTC)
+
+    def row(runtime: str | None, *, served: bool = True, first_ms: int = 800) -> RequestRow:
+        return RequestRow(
+            started_at=now,
+            requested_model="m",
+            attempts=1,
+            total_ms=2_000,
+            outcome="served" if served else "error",
+            tries=[
+                AttemptRow(
+                    driver="d",
+                    elapsed_ms=2_000,
+                    served=served,
+                    runtime=runtime,
+                    node="tower",
+                    first_ms=first_ms,
+                    prompt_tokens=5_000,
+                    cached_tokens=1_000,
+                )
+            ],
+        )
+
+    for index in range(10):
+        store.record(row("qwen", first_ms=800 + index))
+    store.record(row("qwen", served=False))
+    store.record(row(None))
+    await store.aclose()
+    store = await _store(tmp_path / "m.sqlite3")
+    try:
+        seeded = store.prefill_samples()
+        assert [s[0] for s in seeded] == [("tower", "qwen")] * 10
+        assert [s[4] for s in seeded] == [2_000] * 10
+        assert [s[3] for s in seeded] == [800 + i for i in range(10)], "oldest first"
+        assert store.prefill_samples(limit=3)[-1][3] == 809, "the newest are the ones kept"
+        from eugene_plexus_gateway.prefill import PrefillModel
+
+        model = PrefillModel()
+        model.seed(seeded)
+        assert model.rate(("tower", "qwen")) == pytest.approx(4_000 / 0.8, rel=0.02)
+    finally:
+        await store.aclose()

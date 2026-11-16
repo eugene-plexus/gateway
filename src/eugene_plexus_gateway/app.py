@@ -230,7 +230,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 # CB3: a turn waits for room in a shared pool as long as a
                 # request waits for a model to load.
                 room_wait_seconds=lambda: float(store.get("swapWaitSeconds") or 120),
+                # Row 14 (LD3): live, so a PATCH applies to the next turn.
+                move_by_first_token=lambda: store.get("moveByFirstToken"),
+                move_penalty_ms=lambda: store.get("moveFirstTokenPenaltyMs"),
             )
+            if metrics is not None:
+                # Row 14: each runtime's prefill rate and answer time from the
+                # retained attempts, so a restart does not start from nothing.
+                table.prefill.seed(await asyncio.to_thread(metrics.prefill_samples))
             app.state.routing = table
             owns_routing = True
             profiles = ProfileDefaults(

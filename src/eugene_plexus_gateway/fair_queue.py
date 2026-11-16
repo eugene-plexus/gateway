@@ -28,6 +28,11 @@ nothing after it leaves on R, so a big turn is never starved by small ones.
 An entry held back by its key claims nothing, so a key at its limit never
 holds back another key.
 
+**Moving off the replica that holds the prompt (row 14, LD3).** An entry may carry
+`moves`: other seats it may leave for when its own have no room, each asked
+`allows(seat)` at every pass. Its own seats alone claim runtimes, so a turn
+waiting for its home does not hold back others on the replicas it could move to.
+
 **Bounds.** At most `maxQueuedRequests` wait for each key and person, and at
 most `queueMaxRequests` in the gateway; past that a request of a higher band
 takes the place of the newest one of the lowest band, which is refused as set
@@ -224,6 +229,18 @@ class Seat:
 
 
 @dataclass(eq=False)
+class Moves:
+    """Seats an entry may leave its own for, when `allows` says so (row 14).
+
+    `allows` is asked at every pass for a seat that has room now, and answers
+    whether going there beats waiting: it reads the queue as it is then.
+    """
+
+    seats: list[Seat]
+    allows: Callable[[Seat], bool]
+
+
+@dataclass(eq=False)
 class Entry:
     """One request's place in line."""
 
@@ -237,6 +254,8 @@ class Entry:
     #: The key's `maxQueuedRequests`; None for no per-key bound.
     max_queued: int | None = None
     seats: list[Seat] = field(default_factory=list)
+    #: Row 14: where it may go instead, when its own seats have no room.
+    moves: Moves | None = None
     prompt: int = 0
     tokens: int = 0
     wait_seconds: float = DEFAULT_WAIT_SECONDS
@@ -370,6 +389,10 @@ class FairQueue:
 
     def key_running(self, key: str) -> int:
         return self._key_running.get(key, 0)
+
+    def waiting_for(self, runtime: Key) -> int:
+        """Entries waiting on `runtime` now (row 14: the line a turn would join)."""
+        return self._waiting_runtimes.get(runtime, 0)
 
     def snapshot(self) -> list[dict[str, Any]]:
         """What waits now, by runtime: `MetricsSummary.queue`."""
@@ -695,6 +718,8 @@ class FairQueue:
                 if self._has_room(candidate, entry):
                     seat = candidate
                     break
+            if seat is None and entry.seats and entry.moves is not None:
+                seat = self._move_seat(entry, claimed)
             if seat is not None or not entry.seats:
                 self._go(entry, seat)
                 continue
@@ -711,6 +736,17 @@ class FairQueue:
             del self._root_full[key]
         if held_back:
             self._arm(min(held_back))
+
+    def _move_seat(self, entry: Entry, claimed: set[Key]) -> Seat | None:
+        """The first seat `entry` may move to that has room now and that nobody
+        ahead claims, when going there beats waiting (row 14)."""
+        assert entry.moves is not None
+        for candidate in entry.moves.seats:
+            if candidate.runtime is not None and candidate.runtime in claimed:
+                continue
+            if self._has_room(candidate, entry) and entry.moves.allows(candidate):
+                return candidate
+        return None
 
     def _go(self, entry: Entry, seat: Seat | None) -> None:
         """Let `entry` leave on `seat`: count its key and its slot, take its
@@ -827,6 +863,7 @@ __all__ = [
     "Entry",
     "FairQueue",
     "MoveRule",
+    "Moves",
     "Refusal",
     "Refused",
     "Seat",

@@ -1331,6 +1331,32 @@ class MetricsStore:
         )
         return [dict(zip(names, row, strict=True)) for row in rows]
 
+    def prefill_samples(
+        self, limit: int = 4096
+    ) -> list[tuple[tuple[str | None, str], int | None, int | None, int | None, int | None]]:
+        """The newest served attempts on a runtime, oldest first, for the routing table's
+        prefill calibration at start (row 14): `((node, runtime), prompt tokens, cached
+        tokens, first-token ms, attempt ms)`. No new column: these are what every attempt
+        row has held since v11."""
+        with self._reader() as conn:
+            if conn is None:
+                return []
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT node, runtime, prompt_tokens, cached_tokens, first_ms, elapsed_ms
+                    FROM attempt
+                    WHERE served = 1 AND runtime IS NOT NULL AND elapsed_ms > 0
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+            except sqlite3.Error as exc:
+                log.warning("could not read the retained attempts for prefill rates: %s", exc)
+                return []
+        return [((r[0], r[1]), r[2], r[3], r[4], r[5]) for r in reversed(rows)]
+
     def requests(
         self,
         *,

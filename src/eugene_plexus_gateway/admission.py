@@ -205,6 +205,7 @@ class ClientRequest:
         reserve: Callable[[fair_queue.Seat], None] | None = None,
         unreserve: Callable[[], None] | None = None,
         wait_seconds: float | None = None,
+        moves: fair_queue.Moves | None = None,
     ) -> fair_queue.Entry:
         """This request's place in line, for one turn."""
         limits = (self.access or {}).get("limits") if self.key_id is not None else None
@@ -220,6 +221,7 @@ class ClientRequest:
             limit=limits.get("maxConcurrentRequests") if limits else None,
             max_queued=bound if limits else None,
             seats=list(seats),
+            moves=moves,
             prompt=prompt,
             tokens=tokens,
             wait_seconds=wait,
@@ -564,6 +566,7 @@ async def take_turn(
     reserve: Callable[[fair_queue.Seat], None] | None = None,
     unreserve: Callable[[], None] | None = None,
     wait_seconds: float | None = None,
+    moves: fair_queue.Moves | None = None,
 ) -> fair_queue.Ticket | None:
     """One turn in line for the request running now (row 11): its key's turn
     and, with `seats`, a runtime's. A request outside the client middleware
@@ -580,12 +583,14 @@ async def take_turn(
                 reserve=reserve,
                 unreserve=unreserve,
                 wait_seconds=wait_seconds,
+                moves=moves,
             ),
         )
     if queue is None or not seats:
         return None
     entry = fair_queue.Entry(
         seats=list(seats),
+        moves=moves,
         model=model,
         prompt=prompt,
         tokens=tokens,

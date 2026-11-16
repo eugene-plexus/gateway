@@ -140,5 +140,27 @@ class AffinityTable:
                 counts[backend] = counts.get(backend, 0) + 1
         return counts
 
+    def held_tokens(self, target: str, sizes: Any, *, besides: str | None = None) -> dict[Any, int]:
+        """Backend -> the prompt tokens its live conversations of `target` hold (DI5).
+
+        Each conversation counts as its last prompt, as the engine counted it
+        (`ConversationSizes`); one whose size is not known counts none. Counted
+        like `held`: every key inside its TTL, in flight or not, and `besides`
+        left out.
+        """
+        now = time.perf_counter()
+        with self._lock:
+            pinned = [
+                (key, backend)
+                for (entry_target, key), (backend, seen) in self._entries.items()
+                if entry_target == target and key != besides and now - seen <= self._ttl
+            ]
+        counts: dict[Any, int] = {}
+        for key, backend in pinned:
+            seen_size = sizes.get(target, key)
+            if seen_size is not None:
+                counts[backend] = counts.get(backend, 0) + seen_size.prompt_tokens
+        return counts
+
     def __len__(self) -> int:
         return len(self._entries)
