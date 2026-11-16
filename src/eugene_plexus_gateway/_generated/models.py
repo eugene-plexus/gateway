@@ -2257,11 +2257,9 @@ class ProviderModelPrice(BaseModel):
     output_per_million_micros: int = Field(..., ge=0)
     source: str | None = Field(
         None,
-        description="Where the driver read it (`openrouter`, or `table` for Eugene's price table of OpenAI, Anthropic and Gemini).",
+        description="Where the driver read it (`openrouter`, the provider's own listing).",
     )
-    as_of: date | None = Field(
-        None, description='The date the price was read or the table was made.'
-    )
+    as_of: date | None = Field(None, description='The day the price was read.')
 
 
 class VideoPriceUnit(StrEnum):
@@ -4380,19 +4378,19 @@ class ClientKeyLimits(BaseModel):
     )
     tokensPerDay: int | None = Field(
         None,
-        description="Row 40: how many tokens (in and out) this key's lineage may use in\none UTC day, across every gateway. A request is refused before it\nruns once the day's tokens reach it (429, `insufficient_quota`,\n`X-Eugene-Refusal-Reason: allowance`); a request that crosses the\nline while it runs finishes. **Absent means no limit**, and no\ndefault is declared on purpose, as for `readMetrics`: the\nauthority writes it only when it is set. Not part of the policy a\nrunning request is bound to, and never sent in an admission answer.\n",
+        description="**On an edit (`PUT .../limits`), an allowance left out keeps the\nkey's current one and `null` clears it**, so a console a release\nbehind, which knows none of the three, never clears them. Every\nother limit is replaced whole, as before.\n\nRow 40: how many tokens (in and out) this key's lineage may use in\none UTC day, across every gateway. A request is refused before it\nruns once the day's tokens reach it (429, `insufficient_quota`,\n`X-Eugene-Refusal-Reason: allowance`); a request that crosses the\nline while it runs finishes. **Absent means no limit**, and no\ndefault is declared on purpose, as for `readMetrics`: the\nauthority writes it only when it is set. Not part of the policy a\nrunning request is bound to, and never sent in an admission answer.\n",
         ge=1,
         le=1000000000000,
     )
     tokensPerMonth: int | None = Field(
         None,
-        description='Row 40. As `tokensPerDay`, for one calendar month (UTC). Absent means no limit.',
+        description='Row 40. As `tokensPerDay`, for one calendar month (UTC). Absent means no limit; on an edit, absent keeps and null clears.',
         ge=1,
         le=1000000000000000,
     )
     costPerMonthMicros: int | None = Field(
         None,
-        description="Row 40: how much this key's lineage may spend in one calendar month\n(UTC), in millionths of a US dollar, at the install's prices (the\nowner's rate for a model, else its provider's published price, else\nnothing for a local model). A model with no price is refused while\nthis is set, because its cost cannot be counted. `0` allows only\nmodels that cost nothing. Absent means no limit.\n",
+        description="Row 40: how much this key's lineage may spend in one calendar month\n(UTC), in millionths of a US dollar, at the install's prices (the\nowner's rate for a model, else its provider's published price, else\nnothing for a local model). A model with no price is refused while\nthis is set, because its cost cannot be counted. `0` allows only\nmodels that cost nothing. Absent means no limit; on an edit,\nabsent keeps and null clears.\n",
         ge=0,
         le=1000000000000000,
     )
@@ -6520,7 +6518,9 @@ class AdmissionUsage(BaseModel):
     """
     Row 40: what one served request used, as the gateway that served it
     measured it. `model` is the model that served it (a fallback's, not
-    the one asked for), and `price` that model's hint.
+    the one asked for), and `price` that model's hint. When the serving
+    model has no price at the authority, the request is priced at the
+    model its lease was acquired for.
 
     """
 
@@ -6531,6 +6531,10 @@ class AdmissionUsage(BaseModel):
     promptTokens: int = Field(..., ge=0, le=100000000)
     completionTokens: int = Field(..., ge=0, le=100000000)
     price: ModelPriceHint
+    estimated: bool | None = Field(
+        None,
+        description="True when the tokens are the gateway's estimate, not the backend's\ncount: the backend reported none, or the answer was cut before its\nend (the client hung up, the backend failed after its first token,\nthe gateway stopped a repetition). The prompt is the estimate the\nqueue made of it; the answer is what was forwarded. Absent is false.\n",
+    )
 
 
 class ClientKeyCreated(BaseModel):

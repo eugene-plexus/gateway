@@ -2549,11 +2549,10 @@ class DecisionCapability(BaseModel):
 
 class DriverPriceSource(StrEnum):
     """
-    Where a driver read a model's price (row 40).
+    Where a driver read a model's price (row 40). Only a provider's own listing.
     """
 
     openrouter = 'openrouter'
-    table = 'table'
 
 
 class DriverCatalogue(BaseModel):
@@ -3508,9 +3507,7 @@ class DriverModelPrice(BaseModel):
     inputPerMillionMicros: int = Field(..., ge=0)
     outputPerMillionMicros: int = Field(..., ge=0)
     source: DriverPriceSource
-    asOf: date | None = Field(
-        None, description="The day the listing was read, or the table's date."
-    )
+    asOf: date | None = Field(None, description='The day the listing was read.')
 
 
 class VideoCapabilities(BaseModel):
@@ -3994,7 +3991,7 @@ class DriverModel(BaseModel):
     capabilities: Capabilities | None = None
     price: DriverModelPrice | None = Field(
         None,
-        description="Row 40: the provider's published price for this model's tokens,\nwhen the driver knows it. An OpenRouter account reads it from the\nlisting (`pricing.prompt` and `pricing.completion`, dollars a\ntoken); an OpenAI, Anthropic or Gemini account from Eugene's price\ntable (`specs/docs/data/model-prices.json`, copied into the driver\nand refreshed at each release). Absent for a local engine and for\na model the driver has no price for. The owner's own rate, kept at\nthe control root, wins over it.\n",
+        description="Row 40: the price the provider itself reports for this model's\ntokens, when its listing carries one: an OpenRouter account reads\n`pricing.prompt` and `pricing.completion` (dollars a token). Absent\nfor a local engine and for every provider whose listing carries no\nprice: Eugene keeps no price table of its own, because a list\nwritten down once shows yesterday's prices as facts. The owner's\nown rate, kept at the control root, wins over it.\n",
     )
 
 

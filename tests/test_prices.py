@@ -33,7 +33,7 @@ def test_two_backends_list_the_higher_price_and_none_when_one_has_none():
     (model,) = _table(cheap, dear).as_model_list()
     listed = model.x_eugene_plexus.provider_price
     assert (listed.input_per_million_micros, listed.output_per_million_micros) == (5, 9)
-    assert listed.source == "table" and str(listed.as_of) == "2026-11-01"
+    assert listed.source == "openrouter" and str(listed.as_of) == "2026-11-01"
     unpriced = FakeDriverClient(name="c", model_id="m", locality="external")
     assert "providerPrice" not in prices.hint_for(_table(cheap, unpriced), "m")
 

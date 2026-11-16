@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import time
 import uuid
 from collections.abc import Callable, Sequence
@@ -26,6 +27,8 @@ from .ignored_settings import carried as carried_words
 from .ignored_settings import door_of, worded
 from .metrics import AttemptRow, RequestRow
 from .outbound import token_refused_words
+
+log = logging.getLogger(__name__)
 
 
 class AdmissionFailure(Exception):
@@ -94,6 +97,18 @@ def allowance_spent(response: httpx.Response) -> AdmissionFailure:
         code=INSUFFICIENT_QUOTA,
         reason="allowance",
     )
+
+
+#: Review S3: how long a release the authority did not take is asked again,
+#: the longest a lease is held without a renewal.
+RELEASE_RETRY_SECONDS = 30.0
+_retrying: set[asyncio.Task[None]] = set()
+
+
+def _keep(task: asyncio.Task[None]) -> None:
+    """Hold a background release until it ends, so it is not collected early."""
+    _retrying.add(task)
+    task.add_done_callback(_retrying.discard)
 
 
 #: The header a request lowers its own queue band with (row 11).
@@ -194,6 +209,17 @@ class ClientRequest:
         #: Row 40: what it used once it was served (the model that served it and
         #: its tokens), given to the root with the release.
         self.usage: dict[str, Any] | None = None
+        #: Row 40 review B1/S4: what the gateway saw itself, for an estimate when the
+        #: backend's own count never arrives. The queue's prompt estimate, the bytes
+        #: the caller sent, the model a backend was asked for, and the output
+        #: fragments and characters forwarded from it.
+        self.prompt_estimate = 0
+        self.body_bytes = 0
+        self.asked_model: str | None = None
+        self.output_events = 0
+        self.output_chars = 0
+        #: The caller hung up before the answer ended.
+        self.cut = False
 
     @property
     def band(self) -> str:
@@ -252,6 +278,8 @@ class ClientRequest:
         moves: fair_queue.Moves | None = None,
     ) -> fair_queue.Entry:
         """This request's place in line, for one turn."""
+        if prompt > self.prompt_estimate:
+            self.prompt_estimate = prompt
         limits = (self.access or {}).get("limits") if self.key_id is not None else None
         wait, most = queue_settings(self.scope.get("app"))
         if wait_seconds is not None:
@@ -366,17 +394,64 @@ class ClientRequest:
         tools = ((self.access or {}).get("limits") or {}).get("allowedTools")
         return list(tools) if isinstance(tools, list) else None
 
+    def contacted(self, model: str | None) -> None:
+        """A backend was asked for `model` (its public id): from here on, the
+        request may cost something even if its answer never ends."""
+        if model:
+            self.asked_model = model
+
+    def forwarded(self, text: str = "", reasoning: str = "", calls: Any = None) -> None:
+        """One output fragment forwarded from a backend."""
+        size = len(text) + len(reasoning) + (len(json.dumps(calls)) if calls else 0)
+        if size:
+            self.output_events += 1
+            self.output_chars += size
+
+    def estimate(self) -> tuple[int, int]:
+        """`(prompt, output)` tokens as the gateway saw them: the queue's prompt
+        estimate (else the request's size, four bytes a token), and the output
+        forwarded (a fragment is at least one token, and at most four characters
+        make one). Rounded up, so an estimate never undercounts a cut answer."""
+        prompt = self.prompt_estimate or -(-self.body_bytes // 4)
+        output = max(self.output_events, -(-self.output_chars // 4))
+        return prompt, output
+
     def used(self, served_model: str | None, prompt: Any, completion: Any) -> None:
-        """Row 40: note what the request used once it is served, for the release."""
+        """Row 40: note what the request used once it is served, for the release.
+        A count the backend did not report is the gateway's estimate (review S4),
+        and the release says so."""
         if not served_model:
             return
         table = getattr(getattr(self.scope.get("app"), "state", None), "routing", None)
+        guess_prompt, guess_output = self.estimate()
+        estimated = not isinstance(prompt, int) or not isinstance(completion, int)
+        hint = prices.hint_for(table, served_model)
+        if hint == prices.UNKNOWN and self.model and self.model != served_model:
+            # Review S1: a backend that answers under a name this gateway does not
+            # route (its dated snapshot) is the model it was asked for.
+            hint = prices.hint_for(table, self.model)
         self.usage = {
             "model": str(served_model)[:256],
-            "promptTokens": max(0, int(prompt)) if isinstance(prompt, int) else 0,
-            "completionTokens": max(0, int(completion)) if isinstance(completion, int) else 0,
-            "price": prices.hint_for(table, served_model),
+            "promptTokens": max(0, int(prompt)) if isinstance(prompt, int) else guess_prompt,
+            "completionTokens": max(0, int(completion))
+            if isinstance(completion, int)
+            else guess_output,
+            "price": hint,
+            **({"estimated": True} if estimated else {}),
         }
+
+    def cut_short(self) -> None:
+        """Review B1: an answer that ended without the backend's count (the caller
+        hung up, the backend failed after its first token, the gateway stopped a
+        repetition) still used what was forwarded and the prompt it was sent. The
+        release counts the gateway's estimate of both."""
+        if self.usage is not None or self.asked_model is None:
+            return
+        if self.output_events == 0 and not self.cut:
+            # Nothing came back and the caller waited to the end: a backend that
+            # failed before its first token is an attempt, not a use.
+            return
+        self.used(self.asked_model, None, None)
 
     def _row_40(self, action: str) -> dict[str, Any]:
         """What an `acquire` or `release` tells a root since row 40: the price
@@ -577,13 +652,49 @@ class ClientRequest:
                         getattr(embedded, "promptTokens", None),
                         0,
                     )
-                with contextlib.suppress(Exception):
+                self.cut_short()
+                try:
                     async with asyncio.timeout(2):
                         await self.contact("release")
+                except Exception as exc:
+                    # Review S3: never silently: the lease and the use it carries
+                    # are retried in the background while the lease can be held.
+                    log.warning(
+                        "The release of request %s did not reach the admission authority "
+                        "(%s); trying again for up to %.0f s.",
+                        self.id,
+                        _observed(exc),
+                        RELEASE_RETRY_SECONDS,
+                    )
+                    _keep(asyncio.create_task(self._release_later()))
                 self.released = True
         finally:
             if self.ticket is not None and (self.released or not self.attempted):
                 self.ticket.release_key()
+
+    async def _release_later(self) -> None:
+        """Ask again, with a growing pause, until the authority takes the release
+        or the lease would have run out on its own (`RELEASE_RETRY_SECONDS`)."""
+        deadline = time.perf_counter() + RELEASE_RETRY_SECONDS
+        pause = 0.5
+        while time.perf_counter() < deadline:
+            await asyncio.sleep(min(pause, max(0.0, deadline - time.perf_counter())))
+            pause = min(pause * 2, 8.0)
+            try:
+                async with asyncio.timeout(4):
+                    await self.contact("release")
+                return
+            except AdmissionFailure as exc:
+                if exc.status < 500:
+                    log.warning("The authority refused the release of %s: %s", self.id, exc)
+                    return
+            except Exception:
+                pass
+        log.warning(
+            "The release of request %s never reached the admission authority; its lease "
+            "runs out by itself and what it used is not counted.",
+            self.id,
+        )
 
     def record_missing(self, app: Any, status: int) -> None:
         metrics = getattr(app.state, "metrics", None)
@@ -1283,7 +1394,11 @@ class ClientAdmissionMiddleware:
         async def pump() -> None:
             while True:
                 message = await receive()
+                if message["type"] == "http.request":
+                    context.body_bytes += len(message.get("body", b""))
                 if message["type"] == "http.disconnect":
+                    if not response_complete:
+                        context.cut = True
                     disconnected.set()
                     await queue.put(message)
                     return

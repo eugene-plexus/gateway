@@ -137,3 +137,21 @@ def test_an_older_root_is_asked_again_without_the_new_fields(setup):
     refused = [call for call in older.calls if call.get("refused")]
     assert [call["action"] for call in refused] == ["acquire"], "asked once, then left out"
     assert [c["action"] for c in older.calls if not c.get("refused")].count("release") == 2
+
+
+def test_a_served_name_the_gateway_does_not_route_takes_the_asked_models_hint(setup):
+    """S1: a backend answering as its dated snapshot keeps the asked model's price."""
+    from eugene_plexus_gateway import admission
+
+    app, _, allowed, _, _, _ = setup
+    allowed.locality = "external"
+    allowed.price = (3_000_000, 15_000_000)
+    from tests.conftest import install_snapshot
+
+    install_snapshot(app.state.routing, allowed)
+    request = admission.ClientRequest({"type": "http", "app": app, "path": "/v1/chat/completions"})
+    request.model = "allowed"
+    request.used("allowed-2024-08-06", 10, 5)
+    assert request.usage is not None
+    assert request.usage["model"] == "allowed-2024-08-06"
+    assert request.usage["price"]["providerPrice"]["inputPerMillionMicros"] == 3_000_000

@@ -233,7 +233,7 @@ class FakeDriverClient:
                 price={
                     "inputPerMillionMicros": self.price[0],
                     "outputPerMillionMicros": self.price[1],
-                    "source": "table",
+                    "source": "openrouter",
                     "asOf": "2026-11-01",
                 }
                 if self.price is not None

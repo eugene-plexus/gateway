@@ -851,6 +851,14 @@ class HttpDriverClient:
         await self._client.aclose()
 
 
+def _meter() -> Any:
+    """The admission of the request this call is for, if it has one (row 40):
+    it notes the model a backend was asked for and the output forwarded."""
+    from . import admission
+
+    return admission.current.get()
+
+
 class BoundClient:
     """One model on one driver: what a tier holds since P1 (2026-09-27).
 
@@ -920,6 +928,9 @@ class BoundClient:
             return await info()
 
     async def generate(self, request: GenerateRequest) -> GenerateResponse:
+        meter = _meter()
+        if meter is not None:
+            meter.contacted(self.public_model)
         result = await self._inner.generate(self._bind(request))
         result.modelId = self._publish(result.modelId)
         return result
@@ -1017,11 +1028,17 @@ class BoundClient:
                 await closer()
 
     async def stream(self, request: GenerateRequest) -> AsyncGenerator[StreamEvent, None]:
+        meter = _meter()
+        if meter is not None:
+            meter.contacted(self.public_model)
         events = self._inner.stream(self._bind(request))
         try:
             async for event in events:
                 if event.done and event.result is not None:
                     event.result.modelId = self._publish(event.result.modelId)
+                elif meter is not None:
+                    # Row 40 review B1: what was forwarded, for an answer cut short.
+                    meter.forwarded(event.text, event.reasoning, event.tool_calls)
                 yield event
         finally:
             closer = getattr(events, "aclose", None)
