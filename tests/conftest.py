@@ -76,8 +76,14 @@ class FakeDriverClient:
         models: list[str] | None = None,
         account: bool = False,
         degraded: str | None = None,
+        locality: str | None = None,
+        price: tuple[int, int] | None = None,
     ) -> None:
         self.name = name
+        #: `DriverInfo.locality`, and row 40's provider price per model
+        #: (micro-dollars a million tokens in and out), when a test sets them.
+        self.locality = locality
+        self.price = price
         #: A driver that answers but could not build its engine (2026-10-10).
         self.degraded = degraded
         #: Several models on one driver (P1). None is the single-model
@@ -224,6 +230,14 @@ class FakeDriverClient:
                 id=i,
                 surfaces=list(surfaces),
                 capabilities=capabilities.model_copy() if self.capabilities_reported else None,
+                price={
+                    "inputPerMillionMicros": self.price[0],
+                    "outputPerMillionMicros": self.price[1],
+                    "source": "table",
+                    "asOf": "2026-11-01",
+                }
+                if self.price is not None
+                else None,
             )
             for i in ids
         ]
@@ -237,6 +251,7 @@ class FakeDriverClient:
             runtime=self.runtime,
             degraded=self.degraded,
             version="0.0.0-fake",
+            locality=self.locality,
         )
 
     async def info(self, *, models: bool = True, model: str | None = None) -> DriverInfo:

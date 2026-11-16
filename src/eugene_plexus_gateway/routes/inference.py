@@ -307,6 +307,7 @@ def _record(
     Never raises. An instrumentation bug must not turn a served
     completion into a 500.
     """
+    _note_usage(served_model, any(a.served for a in tries), usage)
     if rec.metrics is None:
         return
     try:
@@ -381,6 +382,23 @@ def _record(
             context.recorded = True
     except Exception:
         log.debug("could not record request metrics", exc_info=True)
+
+
+def _note_usage(served_model: str | None, served: bool, usage: Any) -> None:
+    """Row 40: tell the request's admission what it used, for the root that
+    counts it at release. Only a served request counts; a failed one used
+    nothing the caller is charged for."""
+    context = admission.current.get()
+    if context is None or not served:
+        return
+    try:
+        context.used(
+            served_model,
+            getattr(usage, "promptTokens", getattr(usage, "inputTokens", None)),
+            getattr(usage, "completionTokens", getattr(usage, "outputTokens", None)),
+        )
+    except Exception:
+        log.debug("could not note request usage", exc_info=True)
 
 
 def _tool_rows(searched: server_tools.SearchingClient | None) -> list[ToolExecutionRow]:

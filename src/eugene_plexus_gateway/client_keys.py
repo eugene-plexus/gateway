@@ -28,6 +28,9 @@ CLOCK_TOLERANCE_SECONDS = 5.0
 # from a policy up to a refresh old; one re-read settles it. Bounded, so a
 # stream of unknown keys cannot turn into a stream of reads.
 MISS_REFRESH_SECONDS = 1.0
+#: Row 40: after a root or agent before row 40 refused an admission's price
+#: hint or usage (422), how long they are left out before they are tried again.
+PLAIN_SECONDS = 300.0
 type Decision = Literal["allowed", "revoked", "replaced", "unregistered", "unavailable"]
 
 
@@ -71,7 +74,25 @@ class ClientKeyGuard:
         # When the most recent policy read began: a request is answered by
         # a read that began after it arrived, never by an older one.
         self._last_fetch_started = -math.inf
+        self._plain_until = -math.inf
         self._load()
+
+    @property
+    def plain(self) -> bool:
+        """Whether admissions leave out row 40's fields: the authority refused
+        them within `PLAIN_SECONDS`. Its usage is then not counted, and it
+        enforces no allowance, which it does not know."""
+        return time.perf_counter() < self._plain_until
+
+    @plain.setter
+    def plain(self, value: bool) -> None:
+        if value and not self.plain:
+            log.warning(
+                "The admission authority refused usage counting (it is older than this "
+                "gateway); requests are admitted without it for %.0f s.",
+                PLAIN_SECONDS,
+            )
+        self._plain_until = time.perf_counter() + PLAIN_SECONDS if value else -math.inf
 
     @property
     def revision(self) -> int | None:

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from enum import StrEnum
 from typing import Any, Literal
 from uuid import UUID
@@ -2546,6 +2547,15 @@ class DecisionCapability(BaseModel):
     )
 
 
+class DriverPriceSource(StrEnum):
+    """
+    Where a driver read a model's price (row 40).
+    """
+
+    openrouter = 'openrouter'
+    table = 'table'
+
+
 class DriverCatalogue(BaseModel):
     """
     Present only on a **provider account**, and its presence is what
@@ -3485,6 +3495,24 @@ class DecisionRequest(BaseModel):
     requestId: str | None = Field(None, description='Correlation id, echoed back.')
 
 
+class DriverModelPrice(BaseModel):
+    """
+    Millionths of a US dollar for each million tokens (one pico-dollar a
+    token). A provider price finer than that is rounded up.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    inputPerMillionMicros: int = Field(..., ge=0)
+    outputPerMillionMicros: int = Field(..., ge=0)
+    source: DriverPriceSource
+    asOf: date | None = Field(
+        None, description="The day the listing was read, or the table's date."
+    )
+
+
 class VideoCapabilities(BaseModel):
     """
     For a `video` model (P5): what OpenRouter's `GET /videos/models`
@@ -3964,6 +3992,10 @@ class DriverModel(BaseModel):
         description="A display name for each voice in `voices` that the backend\nnames, keyed by the voice's id (ElevenLabs' `name` from\n`GET /v1/voices`: `21m00Tcm4TlvDq8ikWAM` is *Rachel*). The id\nis still what a request sends; a voice with no name here is\nshown by its id. Absent when the backend names none. Added\n2026-10-08 (Workbench media screens: ElevenLabs voices showed\nas ids).\n",
     )
     capabilities: Capabilities | None = None
+    price: DriverModelPrice | None = Field(
+        None,
+        description="Row 40: the provider's published price for this model's tokens,\nwhen the driver knows it. An OpenRouter account reads it from the\nlisting (`pricing.prompt` and `pricing.completion`, dollars a\ntoken); an OpenAI, Anthropic or Gemini account from Eugene's price\ntable (`specs/docs/data/model-prices.json`, copied into the driver\nand refreshed at each release). Absent for a local engine and for\na model the driver has no price for. The owner's own rate, kept at\nthe control root, wins over it.\n",
+    )
 
 
 class DriverInfo(BaseModel):

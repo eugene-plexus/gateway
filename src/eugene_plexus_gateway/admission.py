@@ -18,7 +18,7 @@ from fastapi import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from . import door_paths, fair_queue, gemini
+from . import door_paths, fair_queue, gemini, prices
 from ._generated.client_key_models import ClientAdmissionResult
 from .capabilities import TOOL_SETTINGS, calls_tools, chats, said_tools, tools_refused
 from .driver_client import credential_refused_next_step, each_named
@@ -50,9 +50,50 @@ class AdmissionFailure(Exception):
         #: The queue's `QueueRefusalCode` (row 11), for the error's `code` and the
         #: `X-Eugene-Refusal-Reason` header.
         self.code = code
-        #: Which limit the authority's 429 was (`concurrency` or `rate`, row 11).
+        #: Which limit the authority's 429 was (`concurrency`, `rate`, or row 40's
+        #: `allowance`).
         self.reason = reason
         super().__init__(message)
+
+
+#: Row 40: the error `type` and `code` of a spent usage allowance, OpenAI's own
+#: for a spent quota, and the refusal code a metrics row keeps.
+INSUFFICIENT_QUOTA = "insufficient_quota"
+
+
+def _said(response: httpx.Response) -> str | None:
+    """The authority's own sentence in a refusal, directly or as an agent
+    passed it on (`{"detail": {"detail": ...}}`)."""
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if isinstance(detail, dict):
+        detail = detail.get("detail")
+    if not isinstance(detail, str) or not detail.strip():
+        return None
+    return detail.strip()[:600]
+
+
+def allowance_spent(response: httpx.Response) -> AdmissionFailure:
+    """The root's `allowance` 429 as the caller sees it: OpenAI's
+    `insufficient_quota`, the root's sentence (which allowance, how much was
+    used, when it resets) and `Retry-After` until the reset (row 40)."""
+    retry = response.headers.get("Retry-After")
+    if retry is not None and (not retry.isdigit() or len(retry) > 8):
+        retry = None
+    context = current.get()
+    if context is not None:
+        context.refusal = INSUFFICIENT_QUOTA
+    return AdmissionFailure(
+        429,
+        _said(response) or "A usage allowance of this key, person or group is spent.",
+        retry,
+        kind=INSUFFICIENT_QUOTA,
+        code=INSUFFICIENT_QUOTA,
+        reason="allowance",
+    )
 
 
 #: The header a request lowers its own queue band with (row 11).
@@ -150,6 +191,9 @@ class ClientRequest:
         self.queued_s = 0.0
         #: Its key's place on this gateway, given back with the lease.
         self.ticket: fair_queue.Ticket | None = None
+        #: Row 40: what it used once it was served (the model that served it and
+        #: its tokens), given to the root with the release.
+        self.usage: dict[str, Any] | None = None
 
     @property
     def band(self) -> str:
@@ -270,6 +314,8 @@ class ClientRequest:
                             ) from None
                         queue.root_full(entry.key)
                         continue
+                    if exc.reason == "allowance":
+                        raise
                     if exc.status == 429 and exc.reason == "rate":
                         limits = (self.access or {}).get("limits") or {}
                         retry = int(exc.retry) if exc.retry and exc.retry.isdigit() else 5
@@ -320,23 +366,57 @@ class ClientRequest:
         tools = ((self.access or {}).get("limits") or {}).get("allowedTools")
         return list(tools) if isinstance(tools, list) else None
 
+    def used(self, served_model: str | None, prompt: Any, completion: Any) -> None:
+        """Row 40: note what the request used once it is served, for the release."""
+        if not served_model:
+            return
+        table = getattr(getattr(self.scope.get("app"), "state", None), "routing", None)
+        self.usage = {
+            "model": str(served_model)[:256],
+            "promptTokens": max(0, int(prompt)) if isinstance(prompt, int) else 0,
+            "completionTokens": max(0, int(completion)) if isinstance(completion, int) else 0,
+            "price": prices.hint_for(table, served_model),
+        }
+
+    def _row_40(self, action: str) -> dict[str, Any]:
+        """What an `acquire` or `release` tells a root since row 40: the price
+        hint of the model asked for, or what the request used. Nothing for a
+        root that refused it once (`ClientKeyGuard.plain`)."""
+        if getattr(self.guard, "plain", False) or self.purpose != "inference":
+            return {}
+        if action == "acquire" and self.model:
+            table = getattr(getattr(self.scope.get("app"), "state", None), "routing", None)
+            return {"price": prices.hint_for(table, self.model)}
+        if action == "release" and self.usage is not None:
+            return {"usage": self.usage}
+        return {}
+
     async def contact(self, action: str) -> dict[str, Any]:
         began = time.perf_counter()
         try:
             timeout = min(4.0, self.deadline - began) if action == "renew" else 4.0
             if timeout <= 0:
                 raise TimeoutError
+            body = {
+                "action": action,
+                "keyId": self.key_id,
+                "requestId": self.id,
+                **({"purpose": self.purpose} if self.purpose != "inference" else {}),
+                **({"model": self.model} if self.model else {}),
+                **({"personToken": self.person_token} if self.person_token else {}),
+            }
+            extra = self._row_40(action)
             async with asyncio.timeout(timeout):
-                response = await self.guard.admission(
-                    {
-                        "action": action,
-                        "keyId": self.key_id,
-                        "requestId": self.id,
-                        **({"purpose": self.purpose} if self.purpose != "inference" else {}),
-                        **({"model": self.model} if self.model else {}),
-                        **({"personToken": self.person_token} if self.person_token else {}),
-                    }
-                )
+                response = await self.guard.admission({**body, **extra})
+                if response.status_code == 422 and extra:
+                    # A root or agent before row 40 refuses the new fields: ask again
+                    # without them, and stop sending them for a while.
+                    self.guard.plain = True
+                    response = await self.guard.admission(body)
+            if response.status_code == 429 and response.headers.get(REASON_HEADER) == "allowance":
+                if action == "acquire":
+                    self.attempted = False
+                raise allowance_spent(response)
             if response.status_code >= 400:
                 if action == "acquire" and response.status_code < 500:
                     self.attempted = False
@@ -490,6 +570,13 @@ class ClientRequest:
             async with self.lease_lock:
                 if self.released:
                     return
+                if self.usage is None and self.embedding_result is not None:
+                    embedded = getattr(self.embedding_result, "usage", None)
+                    self.used(
+                        getattr(self.embedding_result, "modelId", None),
+                        getattr(embedded, "promptTokens", None),
+                        0,
+                    )
                 with contextlib.suppress(Exception):
                     async with asyncio.timeout(2):
                         await self.contact("release")

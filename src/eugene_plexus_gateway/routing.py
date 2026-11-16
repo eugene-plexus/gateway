@@ -62,7 +62,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from . import fair_queue, video_doors
+from . import fair_queue, prices, video_doors
 from ._generated.driver_models import (
     Capabilities,
     DriverInfo,
@@ -2969,6 +2969,8 @@ class RoutingTable:
                         audio_output=any(takes(b.caps, _SPEAKS) for b in backends),
                         **_video_listing(backends),
                         **_image_listing(backends),
+                        # Row 40: what the provider publishes, for the console.
+                        provider_price=prices.listed(backends),
                         locality=locality,
                         voices=self.voices_for(resolution),
                         voice_names=self.voice_names_for(resolution),

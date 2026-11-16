@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from enum import Enum, StrEnum
 from typing import Any, Literal
 
@@ -2242,6 +2243,27 @@ class Surface(StrEnum):
     rerank = 'rerank'
 
 
+class ProviderModelPrice(BaseModel):
+    """
+    A model's token price, in millionths of a US dollar per million
+    tokens (one pico-dollar a token), as its provider publishes it.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    input_per_million_micros: int = Field(..., ge=0)
+    output_per_million_micros: int = Field(..., ge=0)
+    source: str | None = Field(
+        None,
+        description="Where the driver read it (`openrouter`, or `table` for Eugene's price table of OpenAI, Anthropic and Gemini).",
+    )
+    as_of: date | None = Field(
+        None, description='The date the price was read or the table was made.'
+    )
+
+
 class VideoPriceUnit(StrEnum):
     """
     What one unit of a `VideoPrice` is: a second of video made, one
@@ -4356,6 +4378,24 @@ class ClientKeyLimits(BaseModel):
         ge=0,
         le=64,
     )
+    tokensPerDay: int | None = Field(
+        None,
+        description="Row 40: how many tokens (in and out) this key's lineage may use in\none UTC day, across every gateway. A request is refused before it\nruns once the day's tokens reach it (429, `insufficient_quota`,\n`X-Eugene-Refusal-Reason: allowance`); a request that crosses the\nline while it runs finishes. **Absent means no limit**, and no\ndefault is declared on purpose, as for `readMetrics`: the\nauthority writes it only when it is set. Not part of the policy a\nrunning request is bound to, and never sent in an admission answer.\n",
+        ge=1,
+        le=1000000000000,
+    )
+    tokensPerMonth: int | None = Field(
+        None,
+        description='Row 40. As `tokensPerDay`, for one calendar month (UTC). Absent means no limit.',
+        ge=1,
+        le=1000000000000000,
+    )
+    costPerMonthMicros: int | None = Field(
+        None,
+        description="Row 40: how much this key's lineage may spend in one calendar month\n(UTC), in millionths of a US dollar, at the install's prices (the\nowner's rate for a model, else its provider's published price, else\nnothing for a local model). A model with no price is refused while\nthis is set, because its cost cannot be counted. `0` allows only\nmodels that cost nothing. Absent means no limit.\n",
+        ge=0,
+        le=1000000000000000,
+    )
 
 
 class ClientKeyUpdateRequest(BaseModel):
@@ -4389,40 +4429,6 @@ class Purpose(StrEnum):
     metrics = 'metrics'
 
 
-class ClientAdmissionRequest(BaseModel):
-    """
-    Since row 11 the gateway sends `check` when a request arrives and
-    `acquire` when the request leaves its queue, so a request that waits
-    holds no lease. A `check` that names a `model` applies the key's
-    `allowedModels` as `acquire` does, and takes nothing.
-
-    An `acquire` refused for the key's limits is a 429 with
-    `Retry-After` and `X-Eugene-Refusal-Reason`: `concurrency` when the
-    key already runs `maxConcurrentRequests` requests (on any gateway;
-    the gateway keeps the request's place and asks again), `rate` when
-    its `requestsPerMinute` are used (the gateway refuses the request).
-
-    """
-
-    model_config = ConfigDict(
-        extra='forbid',
-    )
-    action: Action
-    keyId: str = Field(..., max_length=128, min_length=1)
-    requestId: str = Field(..., max_length=128, min_length=1)
-    purpose: Purpose | None = Field(
-        'inference',
-        description='Metrics (row 12) is a check for a scraper that reads `GET /metrics`: it names no model and no person token, takes no lease, and is refused with 403 ("This key may not read metrics.") unless the key\'s `readMetrics` is on. It never acquires, renews or releases.\n\nLogs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.\n\nSearch is a web search that names no model (POST /v1/web_search, the door Open WebUI\'s external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key\'s `allowedModels` does not apply. The gateway checks the key\'s `allowedTools` and `localOnly`, as for every tool.\n',
-    )
-    model: str | None = Field(None, max_length=256, min_length=1)
-    personToken: str | None = Field(
-        None,
-        description='Root-issued OIDC access token carried alongside the app key in\nX-Eugene-Person-Token. The root checks its signature, session,\ncurrent person access and exact registered app owner on every check,\nacquisition and renewal. Required for app:workbench@ keys. Never\npersist or log this token. A standalone authority refuses it.\n',
-        max_length=16384,
-        min_length=1,
-    )
-
-
 class ClientAdmissionResult(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -4452,7 +4458,12 @@ class AdmissionRefusalReason(StrEnum):
     Why an `acquire` was refused with a 429, in its
     `X-Eugene-Refusal-Reason` header (row 11): `concurrency`, the key
     already runs `maxConcurrentRequests` requests; `rate`, its
-    `requestsPerMinute` are used. An agent that forwards the root's
+    `requestsPerMinute` are used; `allowance` (row 40), a token or money
+    allowance of the key, the person or one of their groups is spent, or
+    the model has no price while a money allowance applies. An
+    `allowance` refusal is final until the allowance resets: its
+    `Retry-After` is the seconds until then, and its `detail` is the
+    sentence the caller is shown. An agent that forwards the root's
     answer passes the header on, and a standalone agent sets it the same
     way.
 
@@ -4460,6 +4471,34 @@ class AdmissionRefusalReason(StrEnum):
 
     concurrency = 'concurrency'
     rate = 'rate'
+    allowance = 'allowance'
+
+
+class ModelPrice(BaseModel):
+    """
+    Row 40: a model's rate, in millionths of a US dollar for each million
+    tokens. One micro-dollar for a million tokens is one pico-dollar a
+    token, so a request's cost is a whole number of pico-dollars:
+    `promptTokens * inputPerMillionMicros + completionTokens *
+    outputPerMillionMicros`. Integers, so every sum is exact.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    inputPerMillionMicros: int = Field(..., ge=0, le=1000000000000)
+    outputPerMillionMicros: int = Field(..., ge=0, le=1000000000000)
+
+
+class ModelPriceLocality(StrEnum):
+    """
+    Where a model runs, as the gateway's `ModelLocality` says it (row 40).
+    """
+
+    local = 'local'
+    external = 'external'
+    unknown = 'unknown'
 
 
 class ClientKeyPolicyEntry(BaseModel):
@@ -4494,6 +4533,9 @@ class ClientKeyPolicy(BaseModel):
 
 class QueueRefusalCode(StrEnum):
     """
+    `insufficient_quota` (row 40): a usage allowance is spent, as the
+    root said.
+
     Why the queue refused a request (row 11), on its
     `X-Eugene-Refusal-Reason` header and its metrics row. "Waiting in
     line" in this document's description has the table.
@@ -4508,6 +4550,7 @@ class QueueRefusalCode(StrEnum):
     still_starting = 'still_starting'
     shutting_down = 'shutting_down'
     rate_limited = 'rate_limited'
+    insufficient_quota = 'insufficient_quota'
 
 
 class MetricOutcome(StrEnum):
@@ -5531,6 +5574,10 @@ class ModelRoutingInfo(BaseModel):
         None,
         description='For a `video` model, at least one backend takes an `input_reference`.',
     )
+    provider_price: ProviderModelPrice | None = Field(
+        None,
+        description="Row 40: what the model's provider publishes for its tokens, as its\ndrivers report it (`DriverModel.price`), so the console can show it\nbeside the owner's rate. **Listed only when every backend serving\nthe model reports a price**, and the highest when they differ.\nAbsent for a local model and for a cloud model none of whose\ndrivers knows a price: *no price listed*, never free. The owner's\nrate, kept at the control root (`GET /v1/usage/prices`), wins over\nit when the root counts a request.\n",
+    )
     video_prices: list[VideoPrice] | None = Field(
         None,
         description="For a `video` model: the provider's price list, as its driver\nreads it (OpenRouter's `pricing_skus`), so a client can say\nwhat a job will cost before it sends one. **Listed only when\nevery backend serving the model lists the same prices**: a\nrequest may land on any of them. Absent when none is listed\nor they differ, which a client says as *no price listed*,\nnever as free. Added 2026-10-08 (Workbench media screens,\n§6.4).\n\n**A request's price** is its seconds times the `second` line\nthat applies, plus each input image (a first frame) times the\n`input_image` line, and at least the `minimum` line. The\n`second` line that applies is one whose `sizes` holds the\nsize sent; failing that, one with no `resolution`. Lines that\nstill differ only by `audio` (whether sound is added is the\nprovider's default) or are left open by an unsent size give a\nrange, not one figure. A line whose `first_frame` disagrees\nwith the request does not apply.\n",
@@ -6449,6 +6496,41 @@ class ClientKeyCreateRequest(BaseModel):
     name: str = Field(..., max_length=64, min_length=1)
     ttlDays: int | None = Field(365, ge=1, le=3650)
     limits: ClientKeyLimits | None = None
+
+
+class ModelPriceHint(BaseModel):
+    """
+    Row 40: what a gateway knows about a model's price from its drivers.
+    `locality` is the model's `ModelLocality` (`local` only when every
+    backend serving it is local). `providerPrice` is the price its
+    provider publishes, as its driver reported it; absent when no driver
+    reported one, or when two backends report different prices and one
+    of them has none. The authority's owner rate wins over both.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    locality: ModelPriceLocality
+    providerPrice: ModelPrice | None = None
+
+
+class AdmissionUsage(BaseModel):
+    """
+    Row 40: what one served request used, as the gateway that served it
+    measured it. `model` is the model that served it (a fallback's, not
+    the one asked for), and `price` that model's hint.
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    model: str = Field(..., max_length=256, min_length=1)
+    promptTokens: int = Field(..., ge=0, le=100000000)
+    completionTokens: int = Field(..., ge=0, le=100000000)
+    price: ModelPriceHint
 
 
 class ClientKeyCreated(BaseModel):
@@ -7370,6 +7452,48 @@ class MetricsSummary(BaseModel):
     queue: list[MetricsQueueRuntime] | None = Field(
         None,
         description="What waits in this gateway's line now (row 11), one entry for\neach runtime something waits for, and one with no runtime for\nrequests that wait only for their key's turn. Live, not a\nfigure over the window.\n",
+    )
+
+
+class ClientAdmissionRequest(BaseModel):
+    """
+    Since row 11 the gateway sends `check` when a request arrives and
+    `acquire` when the request leaves its queue, so a request that waits
+    holds no lease. A `check` that names a `model` applies the key's
+    `allowedModels` as `acquire` does, and takes nothing.
+
+    An `acquire` refused for the key's limits is a 429 with
+    `Retry-After` and `X-Eugene-Refusal-Reason`: `concurrency` when the
+    key already runs `maxConcurrentRequests` requests (on any gateway;
+    the gateway keeps the request's place and asks again), `rate` when
+    its `requestsPerMinute` are used (the gateway refuses the request).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    action: Action
+    keyId: str = Field(..., max_length=128, min_length=1)
+    requestId: str = Field(..., max_length=128, min_length=1)
+    purpose: Purpose | None = Field(
+        'inference',
+        description='Metrics (row 12) is a check for a scraper that reads `GET /metrics`: it names no model and no person token, takes no lease, and is refused with 403 ("This key may not read metrics.") unless the key\'s `readMetrics` is on. It never acquires, renews or releases.\n\nLogs and catalog permit only a check without a model/person token; neither acquires or renews inference. Catalog is only GET /v1/models with X-Eugene-App-Operation set to catalog, for app settings.\n\nSearch is a web search that names no model (POST /v1/web_search, the door Open WebUI\'s external search engine calls). It takes the same check, acquire, renew and release as inference, and the same concurrency and rolling-minute limits, but it carries no `model` (a body that names one is refused with 422) and the key\'s `allowedModels` does not apply. The gateway checks the key\'s `allowedTools` and `localOnly`, as for every tool.\n',
+    )
+    model: str | None = Field(None, max_length=256, min_length=1)
+    price: ModelPriceHint | None = Field(
+        None,
+        description="Row 40, `acquire` only: how the gateway sees the requested model's\nprice, so the authority can tell whether a money allowance can\ncount it. An authority before row 40 refuses the field (422) and\nthe gateway asks again without it.\n",
+    )
+    usage: AdmissionUsage | None = Field(
+        None,
+        description="Row 40, `release` only: what the request used. The authority counts\nit for the key's lineage, the person it verified at `acquire`, and\nthat person's groups. Absent (a request that was never served, or a\ngateway before row 40) counts nothing. An authority before row 40\nrefuses the field (422) and the gateway releases again without it.\n",
+    )
+    personToken: str | None = Field(
+        None,
+        description='Root-issued OIDC access token carried alongside the app key in\nX-Eugene-Person-Token. The root checks its signature, session,\ncurrent person access and exact registered app owner on every check,\nacquisition and renewal. Required for app:workbench@ keys. Never\npersist or log this token. A standalone authority refuses it.\n',
+        max_length=16384,
+        min_length=1,
     )
 
 
