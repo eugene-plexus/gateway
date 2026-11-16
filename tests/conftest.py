@@ -767,3 +767,35 @@ class FakeInstall:
 @pytest.fixture
 def install(tmp_path: Path) -> FakeInstall:
     return FakeInstall(tmp_path / "node")
+
+
+# Row 39 review: an in-process call reached the live agent on a developer's
+# machine (port 8079), because the test settings keep the default port. No
+# test may reach the live install's ports, on this machine or any other.
+_LIVE_PORTS = frozenset(range(8079, 8084)) | frozenset(range(8279, 8284))
+_LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1", "[::1]"})
+
+
+@pytest.fixture(autouse=True)
+def _never_the_live_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    import httpx as _httpx
+
+    real_async = _httpx.AsyncHTTPTransport.handle_async_request
+    real_sync = _httpx.HTTPTransport.handle_request
+
+    def refuse(request: _httpx.Request) -> None:
+        if request.url.host in _LOOPBACK and request.url.port in _LIVE_PORTS:
+            raise _httpx.ConnectError(
+                f"tests never reach the live install's port {request.url.port}", request=request
+            )
+
+    async def guarded_async(self: object, request: _httpx.Request) -> _httpx.Response:
+        refuse(request)
+        return await real_async(self, request)  # type: ignore[arg-type]
+
+    def guarded_sync(self: object, request: _httpx.Request) -> _httpx.Response:
+        refuse(request)
+        return real_sync(self, request)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(_httpx.AsyncHTTPTransport, "handle_async_request", guarded_async)
+    monkeypatch.setattr(_httpx.HTTPTransport, "handle_request", guarded_sync)
